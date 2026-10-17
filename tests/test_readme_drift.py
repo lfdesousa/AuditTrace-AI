@@ -1,9 +1,9 @@
 """README drift guard.
 
-Pins two high-value, deterministic facts in ``README.md`` to the live
-system so #365-class staleness (a 68-day-old README claiming a wrong
-test count and documenting endpoints that had drifted) surfaces as a
-test failure instead of rotting silently.
+Pins high-value, deterministic facts in ``README.md`` to the live system
+so #365-class staleness (a 68-day-old README claiming a wrong test count
+and documenting endpoints that had drifted) surfaces as a test failure
+instead of rotting silently.
 
 Two gates, both run in the normal suite (so CI *and* the local
 CI-Agent gate enforce them):
@@ -16,31 +16,38 @@ CI-Agent gate enforce them):
    table); the failure that bit us in #365 was a *documented* endpoint
    drifting, not an *undocumented* one.
 
-2. **Test-count freshness (regenerable gate)** — the ``NNNN tests``
-   figure the README quotes must equal the live collected count. On
-   mismatch the fix is one command::
-
-       make readme-export
-
-   which rewrites the count in place from a fresh collection.
+2. **No hardcoded test count (regression guard)** — the README used to
+   hardcode the exact suite size in two prose sites
+   (``**Comprehensive Test Suite** -- N tests,`` and ``full suite is N
+   tests /``). Because every branch that added or removed a test then
+   had to rewrite that integer, two branches in flight both bumping the
+   same line conflicted on rebase/merge (#456, #412 —
+   ``feedback_dev_cycle_stabilization_pain_is_signal``: the recurring
+   conflict is the signal). The number was moved OFF git entirely: CI
+   (``.github/workflows/test-count-badge.yml``) computes the live count
+   on every push to ``main`` and publishes it as a shields *endpoint*
+   badge on the orphan ``badges`` branch; README.md renders it via the
+   ``![Tests](...)`` badge instead of a committed integer. This gate is
+   therefore inverted from the old freshness check: it asserts the two
+   old hardcoded-integer patterns are **absent**, so nobody reintroduces
+   the churn.
 
 Coverage %% is deliberately kept OUT of these gates: it fluctuates
-per-run and is circular to assert from inside the suite. Test count and
-the endpoint table are the deterministic, high-value invariants.
+per-run and is circular to assert from inside the suite (and, per spec,
+is not a per-PR churner the way the test count was).
 
-Mirrors the blessed OpenAPI-drift pattern
+Gate 1 mirrors the blessed OpenAPI-drift pattern
 (``tests/test_openapi_drift.py`` + ``make openapi-export``,
 ``OPENAPI_SNAPSHOT_UPDATE=1``): the runtime is the source of truth, a
 Make target regenerates the doc-side figure, and the diff lands in git
-for the reviewer.
+for the reviewer. Gate 2 deliberately does NOT follow that pattern —
+there is nothing to regenerate; CI owns the number and the repo only
+enforces its committed absence.
 """
 
 from __future__ import annotations
 
-import os
 import re
-import subprocess
-import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -48,12 +55,11 @@ README_PATH = REPO_ROOT / "README.md"
 
 _HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
 
-# The two README sites that quote the suite size. Each capture group is
-# the integer count; the surrounding text is stable and unique enough to
-# target without matching unrelated "N tests" prose.
-_COUNT_PATTERNS = (
-    re.compile(r"(\*\*Comprehensive Test Suite\*\* -- )(\d+)( tests,)"),
-    re.compile(r"(full suite is )(\d+)( tests /)"),
+# The two prose sites that used to hardcode the suite size. Kept as a
+# regression guard: neither pattern may reappear in README.md.
+_HARDCODED_COUNT_PATTERNS = (
+    re.compile(r"\*\*Comprehensive Test Suite\*\* -- \d+ tests,"),
+    re.compile(r"full suite is \d+ tests"),
 )
 
 
@@ -149,56 +155,6 @@ def _live_openapi_paths() -> dict[str, set[str]]:
     }
 
 
-def _live_collected_count() -> int:
-    """Collect ``tests/`` in a fresh subprocess and return the total
-    number of collected test items.
-
-    A subprocess is used so the count is independent of the running
-    pytest session (no self-reference into this module's own collection)
-    and deterministic regardless of ``-k`` / selection args the parent
-    invocation used. ``-o addopts=""`` strips the coverage addopts so
-    ``--collect-only`` stays a pure count.
-    """
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            str(REPO_ROOT / "tests"),
-            "--collect-only",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            "-o",
-            "addopts=",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    match = re.search(r"(\d+) tests? collected", proc.stdout)
-    if match is None:
-        raise AssertionError(
-            "Could not determine live collected test count from "
-            f"pytest --collect-only output:\n{proc.stdout[-2000:]}\n"
-            f"{proc.stderr[-2000:]}"
-        )
-    return int(match.group(1))
-
-
-def _readme_stated_counts(readme: str) -> list[int]:
-    counts: list[int] = []
-    for pattern in _COUNT_PATTERNS:
-        match = pattern.search(readme)
-        assert match is not None, (
-            f"README is missing the test-count site matched by {pattern.pattern!r}. "
-            "The README drift guard depends on both count sites being present."
-        )
-        counts.append(int(match.group(2)))
-    return counts
-
-
 # ── Gate 1: documented endpoints must exist live ────────────────────────────
 
 
@@ -232,47 +188,28 @@ def test_documented_endpoints_exist_in_live_openapi() -> None:
     )
 
 
-# ── Gate 2: README test count must match the live collected count ────────────
+# ── Gate 2: no hardcoded test count may be committed ─────────────────────────
 
 
-def test_readme_test_count_matches_live() -> None:
-    """The ``NNNN tests`` figure quoted in the README (two sites) must
-    equal the live collected count. On mismatch, run ``make
-    readme-export`` to refresh it."""
-    readme = _readme_text()
-    stated = _readme_stated_counts(readme)
+def test_readme_has_no_hardcoded_test_count() -> None:
+    """README.md must never again hardcode the exact suite size.
 
-    # Both README sites must already agree with each other.
-    assert len(set(stated)) == 1, (
-        f"README quotes inconsistent test counts across its two sites: {stated}. "
-        "Run 'make readme-export'."
-    )
-
-    live_count = _live_collected_count()
-    assert stated[0] == live_count, (
-        f"README test count is stale — run 'make readme-export' "
-        f"(README says {stated[0]} tests, live collection is {live_count})."
-    )
-
-
-# ── Regeneration entrypoint (mirrors OPENAPI_SNAPSHOT_UPDATE=1) ──────────────
-
-
-def test_readme_count_export() -> None:
-    """When ``README_STATS_UPDATE=1`` is set, rewrite the README test
-    count in place from the live collection (this is what ``make
-    readme-export`` runs); otherwise no-op.
-
-    Kept in the test module — not a standalone script — so the exact
-    parse/rewrite logic the gate asserts against is the same code that
-    regenerates the figure, exactly like ``test_openapi_drift`` doubles
-    as its own snapshot writer under ``OPENAPI_SNAPSHOT_UPDATE=1``.
+    The two prose patterns that used to churn on every add/remove-a-test
+    branch (``**Comprehensive Test Suite** -- N tests,`` and ``full suite
+    is N tests``) must be absent. The live count now lives exclusively in
+    the CI-published shields endpoint badge
+    (``.github/workflows/test-count-badge.yml`` -> ``badges`` branch ->
+    ``test-count.json``); README.md renders it via the badge image, never
+    as a committed integer.
     """
-    if os.environ.get("README_STATS_UPDATE") != "1":
-        return
-
-    live_count = _live_collected_count()
     readme = _readme_text()
-    for pattern in _COUNT_PATTERNS:
-        readme = pattern.sub(rf"\g<1>{live_count}\g<3>", readme)
-    README_PATH.write_text(readme, encoding="utf-8")
+    offenders = [
+        pattern.pattern
+        for pattern in _HARDCODED_COUNT_PATTERNS
+        if pattern.search(readme)
+    ]
+    assert not offenders, (
+        "README.md re-introduces a hardcoded test-count pattern: "
+        f"{offenders}. The count is CI-derived (test-count-badge.yml -> "
+        "badges branch); do not hand-edit an integer into README.md."
+    )

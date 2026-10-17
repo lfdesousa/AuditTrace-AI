@@ -289,6 +289,50 @@ def test_cors_origins_empty_list_from_env_disables_cors():
         del os.environ["AUDITTRACE_CORS_ORIGINS"]
 
 
+# ───────────────────── FLEET-ROUTE: model_routes settings ───────────────────
+
+
+def test_model_routes_default_is_empty_dict():
+    """SPEC invariant 1 (default-unchanged): the empty dict is what makes
+    resolve_chat_upstream fall back to llama_url for every request when
+    an operator has not opted into FLEET-ROUTE."""
+    settings = Settings()
+    assert settings.model_routes == {}
+    assert settings.llama_url == "http://host.docker.internal:11435/v1"
+
+
+def test_model_routes_parses_json_object_from_env():
+    """Chart values inject the map as a JSON object literal — same
+    mechanism pydantic-settings already uses for
+    AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS / AUDITTRACE_CORS_ORIGINS. This is
+    the laptop FLEET-ROUTE map (builder=Mistral :11438, reviewer=Qwen
+    :11435)."""
+    os.environ["AUDITTRACE_MODEL_ROUTES"] = (
+        '{"qwen":"http://host.docker.internal:11435/v1",'
+        '"mistral":"http://host.docker.internal:11438/v1"}'
+    )
+    try:
+        settings = Settings()
+        assert settings.model_routes == {
+            "qwen": "http://host.docker.internal:11435/v1",
+            "mistral": "http://host.docker.internal:11438/v1",
+        }
+    finally:
+        del os.environ["AUDITTRACE_MODEL_ROUTES"]
+
+
+def test_model_routes_empty_object_from_env_disables_routing():
+    """An explicit '{}' env value round-trips to the same default-
+    unchanged empty dict (operator can force-disable routing without
+    unsetting the var)."""
+    os.environ["AUDITTRACE_MODEL_ROUTES"] = "{}"
+    try:
+        settings = Settings()
+        assert settings.model_routes == {}
+    finally:
+        del os.environ["AUDITTRACE_MODEL_ROUTES"]
+
+
 # ─────────────────── ADR-025: memory-as-tools settings ──────────────────────
 
 

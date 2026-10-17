@@ -1,10 +1,10 @@
 """Memory tool handlers (ADR-025 §Decision.1).
 
 The four tools exposed to the LLM by the proxy-internal tool-call loop.
-Each handler is a thin adapter from the canonical
-``{matches, total, truncated}`` tool result schema to the underlying
-memory service. All four handlers share the same shape so the LLM sees
-a stable result schema regardless of which layer answered.
+Each handler is a thin adapter from the canonical recall-tool result
+schema to the underlying memory service. All four handlers share the same
+shape so the LLM sees a stable result schema regardless of which layer
+answered.
 
 Handler contract (observed by every handler in this file):
 
@@ -12,11 +12,65 @@ Handler contract (observed by every handler in this file):
     always threaded into the underlying service's per-user filter.
   - Second positional argument is ``args: dict`` — the JSON payload
     the LLM produced for this tool call.
-  - Returns a dict. On success the dict is
-    ``{"matches": [...], "total": N, "truncated": bool}``. On known
-    bad input (e.g. missing required argument) the dict is
+  - Returns a dict. On success the dict is::
+
+        {
+            "matches": [...],
+            "total": N,        # true candidate count, bounded by
+                                # MAX_RECALL_WINDOW — NOT len(matches)
+            "limit": k,
+            "offset": offset,
+            "sort": "relevance" | "recency" | "id",
+            "order": "asc" | "desc",
+            "has_more": bool,  # offset + limit < total
+            "truncated": bool, # DEPRECATED alias of has_more — see
+                                # CHANGELOG note below. Removed one
+                                # release after 2026-08-03.
+        }
+
+    On known bad input (e.g. missing required argument) the dict is
     ``{"error": "..."}``. Unexpected exceptions propagate to
     ``tools.invoke_tool`` which wraps them as ``{"error": ...}``.
+
+CHANGELOG (SPEC #374 RESHAPE, 2026-08-18): the ``corpus_status`` gate is
+reshaped from "``total == 0`` AND any accessible un-indexed doc" to
+"``summary.matched`` non-empty" — i.e. the block attaches iff at least one
+accessible doc whose key/title matches a query token is un-indexed or
+dead-lettered, INDEPENDENT of the recall result. ChromaDB ANN never
+returns an empty page, so the old gate could never fire (the bug the
+reshape fixes), and a non-empty recall with a matched un-indexed doc
+still deserves the signal (the doc exists but cannot be found by search).
+DELIBERATE BEHAVIOR CHANGE: an empty recall with only UNRELATED
+pending/dead-lettered docs now stays SILENT (the old gate fired on ANY
+pending doc). The enrichment stays best-effort (``_maybe_corpus_status``
+never breaks recall on failure) and tenancy-scoped.
+
+CHANGELOG (SPEC #374 / recall-not-indexed-signal, 2026-08-16):
+``recall_decisions``/``recall_skills``/``recall_semantic`` (the three
+ChromaDB-backed recall tools — NOT ``recall_recent_sessions``, which is
+Postgres-session-backed and index-status-irrelevant) now attach an
+OPTIONAL ``corpus_status`` block when, and only when, ``total == 0`` AND
+the caller has at least one accessible un-indexed/dead-lettered document
+(``_maybe_corpus_status`` — best-effort, never breaks recall on failure).
+It closes the gap where an empty result was indistinguishable from "this
+topic doesn't exist" even when a matching document exists but was never
+indexed or was dead-lettered (#450). Purely additive to the existing
+empty-result shape above; a caller that never sees a non-empty
+``pending_index + dead_lettered`` accessible to it observes byte-identical
+behaviour to before this change. (Superseded by the RESHAPE entry above.)
+
+CHANGELOG (backlog #15 residual, #375 / RECALL-PAGINATION-20260803,
+2026-08-03): recall_decisions/recall_skills/recall_semantic/
+recall_recent_sessions gained ``offset`` (all four) and ``sort``/``order``
+(the three ChromaDB-backed ones) so a caller can page past a relevance
+cut-off instead of being stuck re-issuing the same query. ``total`` used
+to be ``len(matches)`` (a lie — it was always <= the requested page size,
+so a caller could never tell how much more existed); it is now the true
+candidate count up to ``MAX_RECALL_WINDOW`` (services/semantic.py). A call
+with none of the new params returns the exact same top-k as before this
+change (backward-compat, R2/R6). ``truncated`` is kept as a DEPRECATED
+alias of ``has_more`` for one release; new callers should read
+``has_more``.
 
 The handlers do NOT check the scope gate — that is enforced at tool
 advertisement time by ``tools_visible_to``. By the time the tool-call
@@ -31,15 +85,20 @@ registered import it explicitly.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from audittrace.dependencies import (
     get_conversational_service,
     get_episodic_service,
+    get_memory_manifest_service,
     get_procedural_service,
     get_semantic_service,
+    get_session_memory_service,
 )
 from audittrace.identity import UserContext
+from audittrace.services.recall_telemetry import emit_recall_telemetry
+from audittrace.services.semantic import MAX_RECALL_WINDOW, SearchPage
 from audittrace.tools import register_memory_tool
 
 logger = logging.getLogger(__name__)
@@ -59,6 +118,193 @@ _SNIPPET_LIMIT = 400
 # substring hit; a vector store needs a bounded top-k. Kept small because these
 # are discovery previews (pick a candidate → read the full .md), not answers.
 _DISCOVERY_K = 5
+
+# Pagination (backlog #15 residual, #375 / RECALL-PAGINATION-20260803).
+_VALID_SORT = {"relevance", "recency", "id"}
+_VALID_ORDER = {"asc", "desc"}
+
+_PAGE_DOC = (
+    "Page forward when has_more is true by re-calling with a larger "
+    "offset (offset += limit) — do NOT re-issue the same query to find "
+    "more; the response's top-k already contains everything reachable "
+    "without paging."
+)
+_SORT_DOC = (
+    "Result order. 'relevance' (default) = closest semantic match first. "
+    "'recency' = newest first — turns recall into a pageable enumeration "
+    "over the whole collection, useful when you know roughly what you're "
+    "looking for but relevance ranking keeps missing it. 'id' = stable "
+    "lexicographic order, useful for exhaustive paging."
+)
+_ORDER_DOC = (
+    "Sort direction. Defaults to 'asc' for relevance/id and 'desc' "
+    "(newest-first) for recency."
+)
+
+
+def _parse_offset(args: dict[str, Any], tool_name: str) -> int | dict[str, Any]:
+    """Parse+validate the optional ``offset`` arg. Returns the int (>=0) on
+    success, or an ``{"error": ...}`` dict on bad input — the same
+    convention every other arg parser in this module follows."""
+    offset_raw = args.get("offset", 0)
+    try:
+        offset = int(offset_raw)
+    except (TypeError, ValueError):
+        return {"error": f"{tool_name}: 'offset' must be an integer"}
+    if offset < 0:
+        return {"error": f"{tool_name}: 'offset' must be >= 0"}
+    return offset
+
+
+def _parse_sort_order(
+    args: dict[str, Any], tool_name: str
+) -> tuple[str, str | None] | dict[str, Any]:
+    """Parse+validate the optional ``sort``/``order`` args. Returns
+    ``(sort, order)`` on success (``order`` may be ``None`` — the service
+    layer applies the per-sort default) or an ``{"error": ...}`` dict."""
+    sort = args.get("sort", "relevance")
+    if sort not in _VALID_SORT:
+        return {"error": f"{tool_name}: 'sort' must be one of {sorted(_VALID_SORT)}"}
+    order = args.get("order")
+    if order is not None and order not in _VALID_ORDER:
+        return {"error": f"{tool_name}: 'order' must be one of {sorted(_VALID_ORDER)}"}
+    return sort, order
+
+
+def _page_fields(page: SearchPage) -> dict[str, Any]:
+    """The pagination tail shared by every recall tool's response —
+    ``total``/``limit``/``offset``/``sort``/``order``/``has_more`` plus the
+    DEPRECATED ``truncated`` alias (R2, one-release compat window)."""
+    return {
+        "total": page.total,
+        "limit": page.limit,
+        "offset": page.offset,
+        "sort": page.sort,
+        "order": page.order,
+        "has_more": page.has_more,
+        "truncated": page.has_more,
+    }
+
+
+# ── SPEC #374 — recall corpus-incompleteness signal ──────────────────────
+# A recall on ChromaDB alone is blind to un-indexed / dead-lettered docs
+# by definition (no vectors were ever written for them), so "no match" is
+# indistinguishable from "the topic genuinely doesn't exist".
+# ``_maybe_corpus_status`` closes that gap with a best-effort health signal
+# (see the module docstring's callers below); ``_doc_tokens`` is its pure
+# token-extraction half (sub-decision #5). Reshaped 2026-08-18: the signal
+# fires on a query-matched UN-INDEXED doc, independent of the recall
+# result (ANN never returns empty, so the old empty-only gate never fired).
+
+# Doc-like token: a letter-led run of 3+ letters/digits/hyphens — catches
+# identifiers such as "ADR-058" or "SPEC-374" without matching short noise
+# words. Ratified regex, sub-decision #5.
+_DOC_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]{2,}")
+_QUOTED_PHRASE_RE = re.compile(r'"([^"]+)"|\'([^\']+)\'')
+# Bounds the number of ILIKE clauses ``index_status_summary`` builds per
+# call — a best-effort name-match input, not an exhaustive index.
+_MAX_DOC_TOKENS = 8
+
+
+def _doc_tokens(query: str) -> list[str]:
+    """Extract doc-like tokens from a recall query (SPEC #374, sub-decision
+    #5): every quoted phrase (taken whole), plus every ``_DOC_TOKEN_RE``
+    match. Lower-cased and de-duplicated (order-preserving; quoted phrases
+    win the earlier slot when a phrase and one of its own words would
+    otherwise collide), bounded to :data:`_MAX_DOC_TOKENS`.
+
+    Pure function — deterministic, no I/O. The SQL ``%token%`` ILIKE
+    wrapping happens in ``MemoryManifestService.index_status_summary``
+    (WU-1); this function only decides WHICH substrings are worth
+    matching on, keeping the extraction RULE and the query MECHANICS in
+    their own single-responsibility homes.
+    """
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        token = raw.strip().lower()
+        if token and token not in seen:
+            seen.add(token)
+            tokens.append(token)
+
+    for match in _QUOTED_PHRASE_RE.finditer(query):
+        _add(match.group(1) or match.group(2) or "")
+    for match in _DOC_TOKEN_RE.finditer(query):
+        _add(match.group(0))
+
+    return tokens[:_MAX_DOC_TOKENS]
+
+
+async def _maybe_corpus_status(
+    user_context: UserContext, query: str
+) -> dict[str, Any] | None:
+    """Best-effort ``corpus_status`` enrichment for recall (SPEC #374,
+    sub-decisions #2/#3/#6; RESHAPED 2026-08-18) — the single choke point
+    wired into all three ChromaDB-backed recall tools (sub-decision #3)
+    so a query-matched UN-INDEXED doc carries an honest signal that the
+    corpus may be incomplete instead of silently reading as "this topic
+    doesn't exist".
+
+    Unified rule: the enrichment attaches iff ``summary.matched`` is
+    non-empty — at least one accessible doc whose key/title matches a
+    query token is un-indexed or dead-lettered. Recall emptiness is
+    IRRELEVANT: ChromaDB ANN never returns an empty page, so the old
+    ``page.total == 0`` gate could not fire at all (the bug the reshape
+    fixes), and a NON-empty recall with a matched un-indexed doc still
+    deserves the signal (the doc exists but cannot be found by search).
+    Only-UNRELATED pending/dead-lettered docs (``matched`` empty) stay
+    SILENT — sub-decision #2's "don't cry wolf", now keyed on the match
+    instead of the corpus-wide total (a deliberate behavior change: the
+    old gate fired on ANY pending doc).
+
+    Returns ``None`` (attach nothing) when:
+      - no query-matched un-indexed doc is accessible to the caller
+        (``summary.matched`` empty — sub-decision #2, "don't cry wolf":
+        a fully-indexed corpus, or unrelated pending noise, is the
+        CORRECT answer and adding it would erode trust in the signal), or
+      - the lookup itself fails for any reason (sub-decision #6 — this
+        enrichment must NEVER break recall; the caller falls back to its
+        normal page).
+
+    Tenancy: ``index_status_summary`` is threaded the caller's
+    ``user_context`` and applies the owner-or-corpus predicate itself —
+    see that method's docstring for why (``memory_items`` carries no
+    Postgres RLS policy). This function never re-derives or overrides
+    that scoping.
+    """
+    try:
+        manifest = get_memory_manifest_service()
+        tokens = _doc_tokens(query)
+        # skip_counts_if_no_match: this runs on EVERY recall now (the reshape dropped
+        # the page.total==0 gate); when nothing matched we return None below without
+        # reading the counts, so skip the two COUNT queries on that hot path.
+        summary = await manifest.index_status_summary(
+            user_context, tokens, skip_counts_if_no_match=True
+        )
+    except Exception:
+        logger.warning(
+            "corpus_status enrichment failed; omitting from recall result",
+            exc_info=True,
+        )
+        return None
+
+    if not summary.matched:
+        return None
+
+    return {
+        "pending_index": summary.pending,
+        "dead_lettered": summary.dead_lettered,
+        "matched_unindexed": [
+            {"key": m.key, "state": m.state, "code": m.index_failure_code}
+            for m in summary.matched
+        ],
+        "note": (
+            f"{len(summary.matched)} document(s) matching your query are "
+            "not yet indexed and cannot be found by search; do not "
+            "conclude the topic is absent."
+        ),
+    }
 
 
 def _recall_identity_fields(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -129,6 +375,23 @@ def _recall_identity_fields(metadata: dict[str, Any]) -> dict[str, Any]:
                     "'KV cache compression' or 'OAuth2 token validation'."
                 ),
             },
+            "offset": {
+                "type": "integer",
+                "description": _PAGE_DOC,
+                "default": 0,
+                "minimum": 0,
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["relevance", "recency", "id"],
+                "description": _SORT_DOC,
+                "default": "relevance",
+            },
+            "order": {
+                "type": "string",
+                "enum": ["asc", "desc"],
+                "description": _ORDER_DOC,
+            },
         },
         "required": ["query"],
     },
@@ -149,21 +412,45 @@ async def recall_decisions(
     """Discover decisions (ADRs) via the ChromaDB ``decisions`` vector
     collection (#383), shaped into the canonical tool-result schema.
 
-    Repointed from the S3 keyword layer to ``ChromaSemanticService.search``
+    Repointed from the S3 keyword layer to ``ChromaSemanticService.search_page``
     with ``collections=["decisions"]`` and the per-user ``where`` filter (the
     service derives it from ``user_context``). The match's ``source`` field
     stays the ``.md`` filename the indexer stamps (``metadata["source"]``), so
-    the model can chain recall → ``read_decision`` unchanged.
+    the model can chain recall → ``read_decision`` unchanged. Pagination
+    (offset/sort/order) — see the module CHANGELOG note.
     """
     query = args.get("query")
     if not isinstance(query, str) or not query.strip():
         return {"error": "recall_decisions: 'query' is required and must be a string"}
 
+    offset = _parse_offset(args, "recall_decisions")
+    if isinstance(offset, dict):
+        return offset
+    sort_order = _parse_sort_order(args, "recall_decisions")
+    if isinstance(sort_order, dict):
+        return sort_order
+    sort, order = sort_order
+
     semantic = get_semantic_service()
-    matches = await semantic.search(
-        user_context, query, k=_DISCOVERY_K, collections=["decisions"]
+    page = await semantic.search_page(
+        user_context,
+        query,
+        k=_DISCOVERY_K,
+        collections=["decisions"],
+        offset=offset,
+        sort=sort,
+        order=order,
     )
-    return {
+    emit_recall_telemetry(
+        "tool",
+        "decisions",
+        page.total,
+        cache="miss",
+        best_match_distance=page.matches[0].metadata.get("distance")
+        if page.matches
+        else None,
+    )
+    result: dict[str, Any] = {
         "matches": [
             {
                 **_recall_identity_fields(d.metadata),
@@ -182,11 +469,19 @@ async def recall_decisions(
                 # by — never the chunk id. ``file`` is a legacy fallback.
                 "source": d.metadata.get("source") or d.metadata.get("file", ""),
             }
-            for d in matches
+            for d in page.matches
         ],
-        "total": len(matches),
-        "truncated": False,
+        **_page_fields(page),
     }
+    # SPEC #374 (reshaped 2026-08-18): always evaluate — the enrichment
+    # fires on a query-matched UN-INDEXED doc, independent of the recall
+    # result (ChromaDB ANN never returns empty, so the old
+    # ``page.total == 0`` gate never fired); ``_maybe_corpus_status``
+    # returns None when nothing matched.
+    corpus_status = await _maybe_corpus_status(user_context, query)
+    if corpus_status is not None:
+        result["corpus_status"] = corpus_status
+    return result
 
 
 # ─────────────────────────────── recall_skills ──────────────────────────────
@@ -210,6 +505,23 @@ async def recall_decisions(
                     "'OAuth2 BFF pattern' or 'C4 model Structurizr DSL'."
                 ),
             },
+            "offset": {
+                "type": "integer",
+                "description": _PAGE_DOC,
+                "default": 0,
+                "minimum": 0,
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["relevance", "recency", "id"],
+                "description": _SORT_DOC,
+                "default": "relevance",
+            },
+            "order": {
+                "type": "string",
+                "enum": ["asc", "desc"],
+                "description": _ORDER_DOC,
+            },
         },
         "required": ["query"],
     },
@@ -227,20 +539,44 @@ async def recall_skills(
     """Discover skills via the ChromaDB ``skills`` vector collection (#383),
     shaped into the canonical tool-result schema.
 
-    Repointed from the S3 keyword layer to ``ChromaSemanticService.search``
+    Repointed from the S3 keyword layer to ``ChromaSemanticService.search_page``
     with ``collections=["skills"]`` and the per-user ``where`` filter. The
     match's ``source`` field stays the ``.md`` filename (``metadata["source"]``)
-    so the model can chain recall → ``read_skill`` unchanged.
+    so the model can chain recall → ``read_skill`` unchanged. Pagination
+    (offset/sort/order) — see the module CHANGELOG note.
     """
     query = args.get("query")
     if not isinstance(query, str) or not query.strip():
         return {"error": "recall_skills: 'query' is required and must be a string"}
 
+    offset = _parse_offset(args, "recall_skills")
+    if isinstance(offset, dict):
+        return offset
+    sort_order = _parse_sort_order(args, "recall_skills")
+    if isinstance(sort_order, dict):
+        return sort_order
+    sort, order = sort_order
+
     semantic = get_semantic_service()
-    matches = await semantic.search(
-        user_context, query, k=_DISCOVERY_K, collections=["skills"]
+    page = await semantic.search_page(
+        user_context,
+        query,
+        k=_DISCOVERY_K,
+        collections=["skills"],
+        offset=offset,
+        sort=sort,
+        order=order,
     )
-    return {
+    emit_recall_telemetry(
+        "tool",
+        "skills",
+        page.total,
+        cache="miss",
+        best_match_distance=page.matches[0].metadata.get("distance")
+        if page.matches
+        else None,
+    )
+    result: dict[str, Any] = {
         "matches": [
             {
                 **_recall_identity_fields(d.metadata),
@@ -258,11 +594,19 @@ async def recall_skills(
                 # the chunk id.
                 "source": d.metadata.get("source") or d.metadata.get("file", ""),
             }
-            for d in matches
+            for d in page.matches
         ],
-        "total": len(matches),
-        "truncated": False,
+        **_page_fields(page),
     }
+    # SPEC #374 (reshaped 2026-08-18): always evaluate — the enrichment
+    # fires on a query-matched UN-INDEXED doc, independent of the recall
+    # result (ChromaDB ANN never returns empty, so the old
+    # ``page.total == 0`` gate never fired); ``_maybe_corpus_status``
+    # returns None when nothing matched.
+    corpus_status = await _maybe_corpus_status(user_context, query)
+    if corpus_status is not None:
+        result["corpus_status"] = corpus_status
+    return result
 
 
 # ───────────────────────── recall_recent_sessions ──────────────────────────
@@ -293,6 +637,12 @@ async def recall_skills(
                 "minimum": 1,
                 "maximum": 50,
             },
+            "offset": {
+                "type": "integer",
+                "description": _PAGE_DOC,
+                "default": 0,
+                "minimum": 0,
+            },
         },
         "required": ["project"],
     },
@@ -306,6 +656,24 @@ async def recall_recent_sessions(
     Session key points are appended to the ``snippet`` field so the LLM
     sees them inline without the schema needing a bespoke ``key_points``
     column.
+
+    Sessions are ALREADY ordered by recency (most-recent-first) at the
+    service layer — there is no relevance ranking to sort by here, so this
+    tool advertises ``offset`` only (R2) and reports a fixed
+    ``sort="recency"``/``order="desc"`` in the response rather than
+    exposing a ``sort``/``order`` request param that would have no other
+    valid value (a deliberate scoping choice, unlike the three ChromaDB-
+    backed recall tools which mirror the LIST endpoint's full sort
+    vocabulary). ``ConversationalService.load_sessions`` has no native
+    ``offset`` of its own (out of scope for this change — see
+    services/conversational.py), so pagination is applied HERE: request
+    ``offset + n + 1`` sessions (the same "+1 probe" refinement as
+    ``ChromaSemanticService.search_page``'s relevance path — see there for
+    the full rationale), bounded by ``MAX_RECALL_WINDOW``, and slice
+    locally. Without the +1, a fully-filled window makes
+    ``total == offset + n`` exactly and ``has_more`` (``offset + n <
+    total``) would incorrectly read ``False`` even when more sessions
+    exist.
     """
     project = args.get("project")
     if not isinstance(project, str) or not project.strip():
@@ -319,11 +687,25 @@ async def recall_recent_sessions(
     except (TypeError, ValueError):
         return {"error": "recall_recent_sessions: 'n' must be an integer"}
 
+    offset = _parse_offset(args, "recall_recent_sessions")
+    if isinstance(offset, dict):
+        return offset
+
     conversational = get_conversational_service()
-    sessions = await conversational.load_sessions(user_context, project, n)
+    window = min(offset + n + 1, MAX_RECALL_WINDOW)
+    sessions = await conversational.load_sessions(user_context, project, window)
+    total = len(sessions)
+    page_sessions = sessions[offset : offset + n]
+    has_more = offset + n < total
+    # recall_recent_sessions has no ChromaDB-backed SearchPage of its own (it
+    # paginates ``load_sessions`` locally, see the docstring above) — build a
+    # minimal SearchPage carrying only the page fields telemetry needs
+    # (``total``); ``matches=[]`` is fine, ``emit_recall_telemetry`` never
+    # reads it.
+    emit_recall_telemetry("tool", "sessions", total, cache="miss")
 
     matches: list[dict[str, Any]] = []
-    for s in sessions:
+    for s in page_sessions:
         snippet = s.get("summary", "")[:_SNIPPET_LIMIT]
         key_points = s.get("key_points") or []
         if key_points:
@@ -343,8 +725,126 @@ async def recall_recent_sessions(
         )
     return {
         "matches": matches,
-        "total": len(matches),
-        "truncated": False,
+        "total": total,
+        "limit": n,
+        "offset": offset,
+        "sort": "recency",
+        "order": "desc",
+        "has_more": has_more,
+        "truncated": has_more,
+    }
+
+
+# ───────────────────────────── recall_attachments ────────────────────────────
+# WU-5, Sovereign-Attach EPIC (2026-09-06-SPEC-wu5-same-turn-session-recall.md).
+# Same-turn recall of the caller's OWN ephemeral ``session``-layer uploads —
+# closes the gap where a chat file-attachment (WU-1..3) existed but was
+# invisible to every recall tool in the SAME turn ("summarise what I just
+# attached" returned nothing). D-a: a recency-ordered LIST, not a vector
+# search — session content is ephemeral scratch (WU-6 GCs it), so indexing it
+# into ChromaDB would add a GC/consistency burden for no benefit. Deliberately
+# named ``recall_attachments`` (D-c), distinct from ``recall_recent_sessions``
+# (conversational history), to avoid tool-selection confusion.
+
+
+@register_memory_tool(
+    name="recall_attachments",
+    description=(
+        "Recall the caller's own recently attached files/notes from the "
+        "current chat's ephemeral upload scratch space. Use when the user "
+        "refers to something they just attached or uploaded — 'summarise "
+        "what I just attached', 'what does that file say' — before it has "
+        "been promoted to durable memory. Scoped to the caller: only "
+        "returns uploads owned by this user."
+    ),
+    parameters_schema={
+        "type": "object",
+        "properties": {
+            "n": {
+                "type": "integer",
+                "description": "Max number of attachments to return. Default 5.",
+                "default": 5,
+                "minimum": 1,
+                "maximum": 50,
+            },
+            "offset": {
+                "type": "integer",
+                "description": _PAGE_DOC,
+                "default": 0,
+                "minimum": 0,
+            },
+        },
+        "required": [],
+    },
+    required_scope="memory:session:read-own",
+)
+async def recall_attachments(
+    user_context: UserContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Wrap ``SessionMemoryService.list_own`` in the canonical shape.
+
+    Mirrors ``recall_recent_sessions`` exactly: recency-ordered
+    (``sort="recency"``/``order="desc"`` fixed, no request-side ``sort``/
+    ``order`` param — there is no relevance ranking for an ephemeral
+    per-user list), offset-only pagination, snippet capped at
+    ``_SNIPPET_LIMIT`` with the same deprecated ``truncated`` alias of
+    ``has_more`` in the response tail.
+
+    **WU-5 v2 AMENDMENT B** (2026-09-06-SPEC-wu5-same-turn-session-
+    recall-v2.md, pass-1 REJECT fix): the response-level ``truncated``
+    field is just the ``has_more`` pagination alias — it says nothing
+    about whether any ONE match's own content was cut down to fit the
+    snippet cap. Each match therefore carries its OWN boolean
+    ``content_truncated``, DISTINCT from ``truncated``/``has_more``:
+    ``True`` iff THIS item's raw content exceeded ``_SNIPPET_LIMIT`` and
+    was shortened, ``False`` otherwise — computed from the RAW
+    ``d.page_content`` length before the cap is applied, so the LLM can
+    tell a returned attachment is partial.
+
+    ``list_own`` returns the RAW window (see its docstring) — the "+1
+    probe" division of labour is applied HERE, identically to
+    ``recall_recent_sessions`` over ``load_sessions``: ``total =
+    len(window)``, the page is ``window[offset:offset+n]``, and
+    ``has_more = offset + n < total``.
+    """
+    n_raw = args.get("n", 5)
+    try:
+        n = max(1, min(int(n_raw), 50))
+    except (TypeError, ValueError):
+        return {"error": "recall_attachments: 'n' must be an integer"}
+
+    offset = _parse_offset(args, "recall_attachments")
+    if isinstance(offset, dict):
+        return offset
+
+    session_memory = get_session_memory_service()
+    window = await session_memory.list_own(user_context, limit=n, offset=offset)
+    total = len(window)
+    page_docs = window[offset : offset + n]
+    has_more = offset + n < total
+    emit_recall_telemetry("tool", "session", total, cache="miss")
+
+    matches: list[dict[str, Any]] = [
+        {
+            "title": d.metadata.get("filename", "attachment"),
+            "snippet": d.page_content[:_SNIPPET_LIMIT],
+            # AMENDMENT B — per-item signal, computed from the RAW
+            # (un-capped) content length, DISTINCT from the response-level
+            # truncated/has_more pagination alias below.
+            "content_truncated": len(d.page_content) > _SNIPPET_LIMIT,
+            "source": d.metadata.get("created_at_ms", ""),
+        }
+        for d in page_docs
+    ]
+    return {
+        "matches": matches,
+        "total": total,
+        "limit": n,
+        "offset": offset,
+        "sort": "recency",
+        "order": "desc",
+        "has_more": has_more,
+        "truncated": has_more,
     }
 
 
@@ -373,6 +873,23 @@ async def recall_recent_sessions(
                 "minimum": 1,
                 "maximum": 20,
             },
+            "offset": {
+                "type": "integer",
+                "description": _PAGE_DOC,
+                "default": 0,
+                "minimum": 0,
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["relevance", "recency", "id"],
+                "description": _SORT_DOC,
+                "default": "relevance",
+            },
+            "order": {
+                "type": "string",
+                "enum": ["asc", "desc"],
+                "description": _ORDER_DOC,
+            },
         },
         "required": ["query"],
     },
@@ -381,7 +898,8 @@ async def recall_recent_sessions(
 async def recall_semantic(
     user_context: UserContext, args: dict[str, Any]
 ) -> dict[str, Any]:
-    """Wrap ``ChromaSemanticService.search`` in the canonical shape."""
+    """Wrap ``ChromaSemanticService.search_page`` in the canonical shape.
+    Pagination (offset/sort/order) — see the module CHANGELOG note."""
     query = args.get("query")
     if not isinstance(query, str) or not query.strip():
         return {"error": "recall_semantic: 'query' is required and must be a string"}
@@ -392,9 +910,28 @@ async def recall_semantic(
     except (TypeError, ValueError):
         return {"error": "recall_semantic: 'k' must be an integer"}
 
+    offset = _parse_offset(args, "recall_semantic")
+    if isinstance(offset, dict):
+        return offset
+    sort_order = _parse_sort_order(args, "recall_semantic")
+    if isinstance(sort_order, dict):
+        return sort_order
+    sort, order = sort_order
+
     semantic = get_semantic_service()
-    matches = await semantic.search(user_context, query, k=k)
-    return {
+    page = await semantic.search_page(
+        user_context, query, k=k, offset=offset, sort=sort, order=order
+    )
+    emit_recall_telemetry(
+        "tool",
+        "semantic",
+        page.total,
+        cache="miss",
+        best_match_distance=page.matches[0].metadata.get("distance")
+        if page.matches
+        else None,
+    )
+    result: dict[str, Any] = {
         "matches": [
             {
                 **_recall_identity_fields(d.metadata),
@@ -402,11 +939,19 @@ async def recall_semantic(
                 "snippet": d.page_content,
                 "source": d.metadata.get("collection", ""),
             }
-            for d in matches
+            for d in page.matches
         ],
-        "total": len(matches),
-        "truncated": False,
+        **_page_fields(page),
     }
+    # SPEC #374 (reshaped 2026-08-18): always evaluate — the enrichment
+    # fires on a query-matched UN-INDEXED doc, independent of the recall
+    # result (ChromaDB ANN never returns empty, so the old
+    # ``page.total == 0`` gate never fired); ``_maybe_corpus_status``
+    # returns None when nothing matched.
+    corpus_status = await _maybe_corpus_status(user_context, query)
+    if corpus_status is not None:
+        result["corpus_status"] = corpus_status
+    return result
 
 
 # ────────────────────────────── read_decision ──────────────────────────────
@@ -549,6 +1094,7 @@ __all__ = [
     "recall_decisions",
     "recall_skills",
     "recall_recent_sessions",
+    "recall_attachments",
     "recall_semantic",
     "read_decision",
     "read_skill",

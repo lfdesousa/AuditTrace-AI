@@ -37,6 +37,7 @@ from datetime import datetime
 from typing import Any
 
 from audittrace.config import get_settings
+from audittrace.identity import UserContext
 from audittrace.routes.memory_pdf.classification import (
     _classify_pdf_extraction_error,
 )
@@ -57,6 +58,7 @@ from audittrace.routes.memory_pdf.redactions import (
 )
 from audittrace.routes.memory_pdf.signature import _pdf_signature_status
 from audittrace.routes.memory_pdf.toc import _build_toc_index
+from audittrace.services.memory_manifest import authorize_write
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +73,12 @@ async def _index_pdf_objects(
     layer_prefix: str,
     user_id: str,
     ingestion_ts_ms: int,
+    user: UserContext,
     manifest_service: Any | None = None,
     details_log: list[dict[str, Any]] | None = None,
     dry_run: bool = False,
+    outcomes: list[bool] | None = None,
+    caller_can_write_shared: bool = False,
 ) -> int:
     """Stream-index ``.pdf`` files into *collection*, per-page.
 
@@ -99,6 +104,35 @@ async def _index_pdf_objects(
     page_count, signature_status, ocr_coverage_pct, attachment_count,
     form_field_count, the structured ``extraction_warnings`` list,
     and document_sha256 (plus the tier-C ADR-056 fields).
+
+    *outcomes* (#430 v3) — when supplied, every object in *objects*
+    appends exactly one ``bool``: ``True`` once the document reaches
+    the pipeline's terminal ``ok=True`` flush (i.e. it was actually
+    ACCEPTED and processed — independent of how many chunks the pages
+    happen to yield, so a text-free/image-free PDF still appends
+    ``True``), ``False`` on every rejection path (extension mismatch,
+    unreadable object, bomb-defense reject, encrypted, or a parse
+    exception classified + flushed ``ok=False``). This is the
+    per-object OUTCOME signal the ``/memory/index`` handler's
+    loud-422 guard reads — unconditionally available, unlike
+    ``details_log`` which is only surfaced when ``?details=true``.
+
+    *caller_can_write_shared* — forwarded verbatim to every
+    ``_flush_pdf_manifest`` call below, which forwards it to
+    ``MemoryManifestService.upsert_pdf_metadata`` as its fail-closed
+    shared-write authorization. The manifest-layer DEFENSE-IN-DEPTH guard,
+    behind *user* below.
+
+    *user* (SPEC security-memory-write-authorization-choke, 2026-08-30 —
+    SUPERSEDES relying on the manifest-layer guard alone) — the PRIMARY
+    enforcement. Checked via ``authorize_write(manifest_service, user,
+    manifest_layer, obj["key"])`` ONCE per file, right after the file's
+    bytes are read and BEFORE any manifest mutation or ChromaDB write for
+    that file (bomb-defense/encryption rejections included — no manifest
+    write of ANY kind, rejection or success, happens before authorization).
+    Raises (propagates — this function never catches its own
+    ``ManifestAuthorizationError``, callers map it to 403) before a single
+    byte of this file's chunks reaches ChromaDB.
     """
     import pymupdf  # heavy import; only load when ai_research_papers is requested
 
@@ -124,15 +158,41 @@ async def _index_pdf_objects(
     # for the manifest's ``layer`` column.
     manifest_layer = layer_prefix.rstrip("/")
 
+    def _record_outcome(ok: bool) -> None:
+        """Append this document's #430 v3 outcome, if the caller wants it."""
+        if outcomes is not None:
+            outcomes.append(ok)
+
     total = 0
     for obj in objects:
         if not obj["filename"].lower().endswith(".pdf"):
+            _record_outcome(False)
             continue
         raw = await asyncio.to_thread(
             _read_minio_object, minio_client, bucket, obj["key"]
         )
         if raw is None:
+            _record_outcome(False)
             continue
+
+        # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+        # PRE-WRITE choke, ONCE per file, BEFORE any manifest mutation
+        # (rejection-path flushes below included) or ChromaDB write for
+        # this file. ``manifest_service is None`` only ever happens in a
+        # unit test that deliberately omits it — production always
+        # resolves a real manifest service (mirrors ``_index_md_objects``'s
+        # identical None-skip contract). ``owner_exempt=True`` mirrors
+        # ``upsert_pdf_metadata``'s own looser guard (every PDF row
+        # defaults tier="corpus"; the row's own creator must keep being
+        # able to re-index it — see ``authorize_write``'s docstring).
+        if manifest_service is not None:
+            await authorize_write(
+                manifest_service,
+                user,
+                manifest_layer,
+                obj["key"],
+                owner_exempt=True,
+            )
 
         # Per-document state — accumulated through the per-page loop
         # and flushed to the manifest at end-of-file. Reset per file
@@ -195,7 +255,9 @@ async def _index_pdf_objects(
                 ok=False,
                 error="max_size",
                 details_log=details_log,
+                caller_can_write_shared=caller_can_write_shared,
             )
+            _record_outcome(False)
             continue
         source_key = (
             obj["key"][len(layer_prefix) :]
@@ -206,10 +268,14 @@ async def _index_pdf_objects(
         # for the entire downstream lifecycle.
         document_hash = hashlib.sha256(raw).hexdigest()
         # Item #12 — signature validation. Computed once per file.
-        signature_status, _signers_count = _pdf_signature_status(
+        # Awaited: pyhanko's sync wrapper does ``asyncio.run`` and fails
+        # inside this running loop (#366). key + sha only enrich log lines.
+        signature_status, _signers_count = await _pdf_signature_status(
             raw,
             enabled=settings.pdf_signature_check_enabled,
             trust_store_path=settings.pdf_signature_trust_store,
+            key=obj["key"],
+            document_sha256=document_hash,
         )
         # Tier-C #13 (ADR-056) — LTV summary. Computed once per file
         # alongside signature_status. Returns ``None`` for
@@ -245,7 +311,9 @@ async def _index_pdf_objects(
                         ok=False,
                         error="encrypted",
                         details_log=details_log,
+                        caller_can_write_shared=caller_can_write_shared,
                     )
+                    _record_outcome(False)
                     continue
                 # Tier-C item #10 — extract document metadata.
                 (
@@ -303,7 +371,9 @@ async def _index_pdf_objects(
                         ok=False,
                         error="max_pages",
                         details_log=details_log,
+                        caller_can_write_shared=caller_can_write_shared,
                     )
+                    _record_outcome(False)
                     continue
                 xref_count = doc.xref_length()
                 if xref_count > settings.pdf_max_xref_count:
@@ -346,7 +416,9 @@ async def _index_pdf_objects(
                         ok=False,
                         error="max_xref",
                         details_log=details_log,
+                        caller_can_write_shared=caller_can_write_shared,
                     )
+                    _record_outcome(False)
                     continue
                 # Tier-B item #6 — quarantine embedded attachments.
                 attachment_count_doc, attachment_warnings = _quarantine_pdf_attachments(
@@ -621,7 +693,9 @@ async def _index_pdf_objects(
                 ok=True,
                 error=None,
                 details_log=details_log,
+                caller_can_write_shared=caller_can_write_shared,
             )
+            _record_outcome(True)
         except Exception as exc:
             # Tier-C item #16 — classify pymupdf raises into closed-set
             # codes. Falls through to ``pdf_corrupted_structure`` for
@@ -659,6 +733,8 @@ async def _index_pdf_objects(
                 ok=False,
                 error=str(exc) or code,
                 details_log=details_log,
+                caller_can_write_shared=caller_can_write_shared,
             )
+            _record_outcome(False)
             continue
     return total

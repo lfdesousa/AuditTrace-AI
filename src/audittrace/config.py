@@ -1,8 +1,10 @@
 import logging
+import math
 import os
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,12 @@ def _as_sync_url(url: str) -> str:
     if url.startswith("sqlite+aiosqlite://"):
         return url.replace("sqlite+aiosqlite://", "sqlite://", 1)
     return url
+
+
+# #459 WU-459-1: the routing modes this slice accepts. ``acting`` is
+# deliberately absent: no scheduling answer exists yet (acting mode is out of
+# scope until a later slice), so it must fail at startup, not silently act.
+_MEMORY_ROUTING_MODES = frozenset({"off", "shadow"})
 
 
 # Skip .env loading entirely when AUDITTRACE_ENV=test so a developer's local
@@ -71,6 +79,22 @@ class Settings(BaseSettings):
 
     # LLM servers (external, on host machine)
     llama_url: str = "http://host.docker.internal:11435/v1"
+    # FLEET-ROUTE (Phase 1): model-field routing for the chat path.
+    # Prefix-matched (case-insensitive) against the request `model` by
+    # routes/_model_route.py::resolve_chat_upstream; first match wins;
+    # no match / empty model → llama_url. Generalises the summarizer_url
+    # per-role-upstream precedent below to the interactive chat path —
+    # empty dict (the default) byte-preserves today's single-upstream
+    # behaviour, so this is safe to ship dark. Populated from env
+    # AUDITTRACE_MODEL_ROUTES (JSON object), same mechanism pydantic-
+    # settings already uses for AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS /
+    # AUDITTRACE_CORS_ORIGINS. Qwen intentionally has NO entry — it is
+    # the default fall-through (llama_url above), never a redundant
+    # route. FLEET-ROUTE-ENABLE (2026-08-06): the chart computes this
+    # to route mistral* through the mesh-addressable `<release>-llm-
+    # mistral` Service (--set externalLLM.mistral.enabled=true), e.g.:
+    #   {"mistral": "http://audittrace-llm-mistral:11438/v1"}
+    model_routes: dict[str, str] = {}
     embed_url: str = "http://host.docker.internal:11436/v1"
     # ADR-047 — embedding always runs on the dedicated nomic-embed-server;
     # the request gateway hosts no in-process model. 768-dim.
@@ -177,6 +201,12 @@ class Settings(BaseSettings):
     # AWS S3 fields (used only when object_storage_backend = "aws")
     aws_region: str = ""
     aws_bucket: str = ""  # When set, overrides minio_shared_bucket for AWS path
+    # ADR-062 Phase B (WU-B1) — private-tier parity with ``aws_bucket``. Value
+    # + the S3/EKS provisioning of ``memory-private`` are the deferred cloud
+    # follow-up ([[#417]]); the field exists now so the code is env-
+    # parameterized (portability invariant) even though it is unset on the
+    # laptop/MinIO path this PR targets.
+    aws_private_bucket: str = ""
     aws_endpoint_url: str = ""  # Optional — for S3-compatible non-AWS endpoints
     aws_use_irsa: bool = True
     aws_access_key_id: str = ""  # Only when aws_use_irsa=False
@@ -200,6 +230,15 @@ class Settings(BaseSettings):
     # and nothing is stored. Cache keys are namespaced under
     # "sovereign:tool-result:" — disjoint from the TokenCache namespace.
     memory_tool_cache_ttl_seconds: int = 900
+
+    # ─────────────── M3 slice 1 — sources trailer (spec §3 / §4.4) ──────────
+    # Kill switch, default OFF so /v1/chat/completions is byte-identical for
+    # every existing consumer until an operator opts in for the LibreChat
+    # pilot console. "trailer" appends a deterministic markdown "Sources
+    # consultées" block built from the RECORDED recall matches in the
+    # tool-call row (ADR-060 source_ref) — never model-generated. See
+    # routes/_sources_trailer.py.
+    response_sources: str = "off"  # "trailer" | "off"
 
     # Optional override file for the memory tool registry (§Decision.3).
     # Decorators at import time populate the base registry; this TOML file —
@@ -468,6 +507,63 @@ class Settings(BaseSettings):
     scan_janitor_interval_seconds: int = 30
     scan_janitor_grace_seconds: int = 60
 
+    # ─── SPEC #387 Phase 1 — auto-index outbox (WU-2/WU-3) ────────────────
+    # One hop after the scan outbox above: ``IndexWorker`` drains the
+    # in-process index queue that ``ScanVerdictConsumer`` feeds on every
+    # ``scanned_clean`` verdict; ``IndexJanitor`` re-drives any
+    # ``indexed_at_ms IS NULL`` row past the grace window. Same two-knob
+    # shape as ``scan_janitor_*`` above — grace must be > the worker's
+    # typical embed+upsert latency so a healthy index-in-flight isn't
+    # double-indexed (idempotent upsert makes double-indexing harmless,
+    # but redundant work is still redundant work).
+    index_janitor_interval_seconds: int = 30
+    index_janitor_grace_seconds: int = 60
+    # SPEC #450 — attempt cap before a non-permanent-code failure is
+    # dead-lettered as ``max_attempts_exceeded``. Mirrors
+    # ``async_persist_max_deliveries`` and the scan-side
+    # ``x-delivery-limit=5`` (same "stop looping forever" shape, one
+    # hop later in the pipeline).
+    index_max_attempts: int = 5
+
+    # ─── WU-6 (Sovereign-Attach EPIC, Part A) — session-memory GC janitor ─
+    # ``SessionGCJanitor`` (services/session_gc_janitor.py) periodically
+    # hard-DELETEs ``session_memory_items`` rows older than the retention
+    # window — the ephemeral ``session`` layer (WU-1) has no corpus tier
+    # and no soft-delete concept (A-b decision), so GC is a bounded hard
+    # delete, not a tombstone. Flag-gated (default on) so an operator can
+    # disable the sweep without removing the knobs — same shape as
+    # ``summarizer_enabled``/``async_persist_enabled`` above.
+    session_gc_enabled: bool = True
+    # How often the janitor wakes up to sweep — same two-knob shape as
+    # ``scan_janitor_*``/``index_janitor_*`` above.
+    session_gc_interval_seconds: int = 300
+    # A-a decision: a chat session's ephemeral scratch survives the
+    # conversation plus the same-turn recall/promote window (WU-4/WU-5),
+    # then is collected. Operator-tunable.
+    session_retention_hours: int = 24
+
+    # ─── ADR-063 Phase 2 Track B — MCP tool-broker gateway ─────────────────
+    # Operator-configured downstream MCP servers AuditTrace brokers (proxies
+    # + records) tool calls to. NO auto-discovery of untrusted servers — an
+    # entry must be added here (portability invariant: env-parameterized,
+    # laptop-default empty) before its tools are ever listed or callable.
+    # Shape: {"<server-name>": {"url": "<downstream /mcp endpoint>",
+    # "required_scope": "<scope gating every tool on this server>",
+    # "timeout_seconds": "<optional, default 10>", "enabled": "<optional,
+    # default true>"}}. Parsed by ``services.mcp_broker.get_downstream_registry``;
+    # a malformed entry (missing url/required_scope) is skipped with a
+    # logged warning rather than failing startup — one bad operator entry
+    # must not take down the whole MCP surface. Populated from env
+    # AUDITTRACE_MCP_BROKER_SERVERS (JSON object), same mechanism as
+    # ``model_routes`` / ``keycloak_issuer_extras`` above. Empty dict (the
+    # default) means Track B brokers nothing — Phase 1's read-tool manifest
+    # is byte-identical until an operator configures a downstream server.
+    mcp_broker_servers: dict[str, dict[str, str]] = {}
+    # Default per-call timeout (seconds) when a server entry omits
+    # "timeout_seconds". Applied to BOTH the discovery (tools/list) and the
+    # dispatch (tools/call) request to that downstream server.
+    mcp_broker_default_timeout_seconds: float = 10.0
+
     # Security
     cors_origins: list[str] = ["http://localhost:8765", "http://localhost:3000"]
     rate_limit_requests: int = 100
@@ -480,6 +576,81 @@ class Settings(BaseSettings):
     otel_service_name: str = "audittrace-server"
     metrics_enabled: bool = True
     tracing_enabled: bool = True
+
+    # #459 WU-459-1: decision-model client (llama.cpp ``/completion``).
+    # Everything is default-off: ``decision_url == ""`` means no network call
+    # is ever made and ``memory_routing_mode`` stays ``off``. Invalid values
+    # stop startup on purpose (the operator sets these deliberately, so a
+    # fail-closed config is the correct posture).
+    decision_url: str = ""
+    # Secret. Plain ``str`` is the existing pattern for secrets in this file
+    # (``langfuse_secret_key`` / ``minio_secret_key`` / ``aws_secret_access_key``);
+    # as with those, ``repr(Settings)`` contains it, so Settings must never be
+    # logged. The decision client never logs Settings, headers or this value.
+    decision_api_key: str = ""
+    decision_model: str = ""
+    # The launch label the server must report on ``GET /props``. Required when
+    # ``decision_url`` is set so the identity comparison always runs.
+    decision_model_alias: str = ""
+    # sha256 (lowercase hex) of the GGUF file this deployment is pinned to.
+    decision_model_digest: str = ""
+    # TOTAL budget (ms) for one ``decide()`` across every HTTP call it makes.
+    decision_timeout_ms: int = 2000
+    # Client-side softmax temperature over the raw logprobs (never sent to
+    # the runtime, which is always called at temperature 0).
+    decision_temperature: float = 1.0
+    # Free text recorded on every decision row (e.g. ``vulkan`` / ``f16``).
+    decision_backend: str = ""
+    decision_quantisation: str = ""
+    # ``off`` | ``shadow``. ``acting`` is rejected in this slice.
+    memory_routing_mode: str = "off"
+
+    @field_validator("decision_timeout_ms")
+    @classmethod
+    def _decision_timeout_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("decision_timeout_ms must be > 0")
+        return v
+
+    @field_validator("decision_temperature")
+    @classmethod
+    def _decision_temperature_positive_finite(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError("decision_temperature must be > 0 and finite")
+        return v
+
+    @field_validator("memory_routing_mode")
+    @classmethod
+    def _memory_routing_mode_known(cls, v: str) -> str:
+        if v not in _MEMORY_ROUTING_MODES:
+            raise ValueError(
+                "memory_routing_mode must be 'off' or 'shadow' "
+                f"('acting' is not available in this release), got {v!r}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _decision_cross_field(self) -> Self:
+        if self.decision_url:
+            # Imported here: the decision package imports this module.
+            from audittrace.services.decision.token_tables import table_for
+
+            if table_for(self.decision_model_digest) is None:
+                raise ValueError(
+                    "decision_model_digest has no vendored added-token table "
+                    "(must be the lowercase sha256 of a pinned model): an "
+                    "unknown model has no control-token denylist and may not "
+                    "take decisions"
+                )
+            if not self.decision_model_alias:
+                raise ValueError(
+                    "decision_model_alias is required when decision_url is set"
+                )
+        if self.memory_routing_mode == "shadow" and not self.decision_url:
+            raise ValueError(
+                "memory_routing_mode='shadow' requires decision_url to be set"
+            )
+        return self
 
     @property
     def database_url(self) -> str | None:

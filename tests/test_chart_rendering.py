@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests._hermetic_env import hermetic_env
+
 CHART_DIR = Path(__file__).resolve().parent.parent / "charts" / "audittrace"
 
 # Throwaway secret values to satisfy the chart's productionMode hygiene
@@ -392,7 +394,7 @@ class TestEntrypointScriptSafety:
         result = subprocess.run(
             ["bash", "scripts/entrypoint.sh"],
             cwd=str(Path(__file__).resolve().parent.parent),
-            env={"VAULT_AGENT_REQUIRED": "true", "PATH": "/usr/bin:/bin"},
+            env=hermetic_env({"VAULT_AGENT_REQUIRED": "true", "PATH": "/usr/bin:/bin"}),
             capture_output=True,
             text=True,
             timeout=10,
@@ -423,7 +425,7 @@ class TestEntrypointScriptSafety:
                 "fi; "
                 'echo "would-skip-guard"',
             ],
-            env={"PATH": "/usr/bin:/bin"},  # no VAULT_AGENT_REQUIRED
+            env=hermetic_env({"PATH": "/usr/bin:/bin"}),  # no VAULT_AGENT_REQUIRED
             capture_output=True,
             text=True,
             timeout=5,
@@ -435,12 +437,12 @@ class TestEntrypointScriptSafety:
 # ── Phase B.9: realm.json templated audittrace-webui client URIs ─────────────
 
 
-def _rendered_realm(extra_args: list[str]) -> dict:
-    """Return the audittrace-webui client dict from the rendered realm JSON."""
+def _rendered_realm(extra_args: list[str], client_id: str = "audittrace-webui") -> dict:
+    """Return the named client dict from the rendered realm JSON."""
     out = _render(extra_args)
     cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
     realm = _json.loads(cm["data"]["realm.json"])
-    return next(c for c in realm["clients"] if c["clientId"] == "audittrace-webui")
+    return next(c for c in realm["clients"] if c["clientId"] == client_id)
 
 
 class TestRealmWebuiClientFromValues:
@@ -448,25 +450,24 @@ class TestRealmWebuiClientFromValues:
     audittrace-webui client are populated from chart values via `tpl`. Without
     this, fresh installs on non-`.local` hostnames fail at first login until
     the operator kcadm-patches in their URIs (the M2 evidence pattern we
-    explicitly wanted to eliminate)."""
+    explicitly wanted to eliminate).
+
+    M3-WU-1 (OIDC-REDIRECT-URI-DRIFT): the defaults below are exact-match —
+    no ``/*`` wildcard survives, per ADR-042 §3 / RFC 9700. The local-dev
+    harness's origin (``webui/serve.py`` on ``localhost:8765``) is folded in
+    from a SEPARATE ``devRedirectUris``/``devWebOrigins`` value (a distinct,
+    droppable dev profile) rather than mixed into the same list as the
+    mesh-served exact-match entries.
+    """
 
     def test_default_includes_localhost_8765_and_local(self) -> None:
-        """Out-of-the-box defaults cover localhost-dev + .local k3s gateway.
-
-        Subset comparison rather than ``"<url>" in <list>`` because
-        CodeQL's "Incomplete URL substring sanitization" rule
-        false-positives on the latter pattern (it can't tell that the
-        right-hand side is a list, not a string, so it warns as if
-        we were doing substring matching for security validation).
-        Subset semantics are equivalent here — every expected URI must
-        be exactly present in the rendered list — and read more
-        clearly besides.
-        """
+        """Out-of-the-box defaults cover localhost-dev + .local k3s gateway,
+        both as EXACT-match entries (no ``/*`` wildcard anywhere)."""
         client = _rendered_realm(["--set", "vault.enabled=true"])
         expected_redirect_uris = {
-            "http://localhost:8765/*",
-            "https://audittrace.local/*",
-            "https://audittrace.local:30952/*",
+            "http://localhost:8765/",
+            "https://audittrace.local/oauth2/callback",
+            "https://audittrace.local:30952/oauth2/callback",
         }
         expected_web_origins = {
             "http://localhost:8765",
@@ -475,14 +476,29 @@ class TestRealmWebuiClientFromValues:
         assert expected_redirect_uris <= set(client["redirectUris"])
         assert expected_web_origins <= set(client["webOrigins"])
 
+    def test_no_wildcard_redirect_uris_or_web_origins(self) -> None:
+        """RFC 9700 + ADR-042 §3: no ``redirectUris``/``webOrigins`` entry may
+        end in a wildcard. Falsifiable: re-adding
+        ``https://audittrace.local/*`` to ``keycloak.webui.redirectUris``
+        (the OIDC-REDIRECT-URI-DRIFT regression) turns this red."""
+        client = _rendered_realm(["--set", "vault.enabled=true"])
+        offenders = [
+            uri
+            for uri in client["redirectUris"] + client["webOrigins"]
+            if uri.endswith("*")
+        ]
+        assert not offenders, (
+            f"audittrace-webui carries wildcard URI(s): {offenders} — "
+            "RFC 9700 / ADR-042 §3 forbid redirect-URI/webOrigin wildcards."
+        )
+
     def test_redirect_uris_extend_via_values_override(self) -> None:
-        """A custom redirectUris value lands verbatim in the rendered client.
-        Asserts the per-deployment override pattern works for new hostnames
-        (e.g. an operator's audittrace.allaboutdata.eu:30952)."""
+        """A custom redirectUris value lands verbatim in the rendered client
+        when the dev-profile list is cleared alongside it. Asserts the
+        per-deployment override pattern works for new hostnames (e.g. an
+        operator's audittrace.allaboutdata.eu:30952)."""
         custom = [
-            "https://audittrace.example.com/*",
             "https://audittrace.example.com/oauth2/callback",
-            "http://localhost:8765/*",
         ]
         client = _rendered_realm(
             [
@@ -490,18 +506,37 @@ class TestRealmWebuiClientFromValues:
                 "vault.enabled=true",
                 "--set-json",
                 f"keycloak.webui.redirectUris={_json.dumps(custom)}",
+                "--set-json",
+                "keycloak.webui.devRedirectUris=[]",
             ]
         )
         assert client["redirectUris"] == custom
 
+    def test_dev_redirect_uris_droppable_per_deployment(self) -> None:
+        """A stricter deployment profile can drop the dev-only localhost
+        entry entirely without touching the prod ``redirectUris`` list —
+        the whole point of splitting the two."""
+        client = _rendered_realm(
+            [
+                "--set",
+                "vault.enabled=true",
+                "--set-json",
+                "keycloak.webui.devRedirectUris=[]",
+            ]
+        )
+        assert "http://localhost:8765/" not in client["redirectUris"]
+        assert "https://audittrace.local/oauth2/callback" in client["redirectUris"]
+
     def test_web_origins_extend_via_values_override(self) -> None:
-        custom = ["https://audittrace.example.com", "http://localhost:8765"]
+        custom = ["https://audittrace.example.com"]
         client = _rendered_realm(
             [
                 "--set",
                 "vault.enabled=true",
                 "--set-json",
                 f"keycloak.webui.webOrigins={_json.dumps(custom)}",
+                "--set-json",
+                "keycloak.webui.devWebOrigins=[]",
             ]
         )
         assert client["webOrigins"] == custom
@@ -519,6 +554,58 @@ class TestRealmWebuiClientFromValues:
             client["attributes"]["post.logout.redirect.uris"]
             == "https://audittrace.example.com/logout"
         )
+
+
+class TestRealmLibrechatClientFromValues:
+    """M3-WU-1: ``audittrace-librechat`` mirrors the ``audittrace-webui``
+    values-driven pattern (Phase B.9) from day one — exact-match
+    ``redirectUris``/``webOrigins`` plus a droppable dev profile."""
+
+    def test_default_includes_dev_port_and_local(self) -> None:
+        client = _rendered_realm(
+            ["--set", "vault.enabled=true"], client_id="audittrace-librechat"
+        )
+        # M3-WU-3d (D4/D5) — the dedicated console.librechat.host root,
+        # NOT the retired `/librechat` subpath.
+        expected_redirect_uris = {
+            "http://localhost:3080/oauth/openid/callback",
+            "https://librechat.audittrace.local/oauth/openid/callback",
+        }
+        expected_web_origins = {
+            "http://localhost:3080",
+            "https://librechat.audittrace.local",
+        }
+        assert expected_redirect_uris <= set(client["redirectUris"])
+        assert expected_web_origins <= set(client["webOrigins"])
+
+    def test_no_wildcard_redirect_uris_or_web_origins(self) -> None:
+        client = _rendered_realm(
+            ["--set", "vault.enabled=true"], client_id="audittrace-librechat"
+        )
+        offenders = [
+            uri
+            for uri in client["redirectUris"] + client["webOrigins"]
+            if uri.endswith("*")
+        ]
+        assert not offenders, (
+            f"audittrace-librechat carries wildcard URI(s): {offenders} — "
+            "RFC 9700 / ADR-042 §3 forbid redirect-URI/webOrigin wildcards."
+        )
+
+    def test_redirect_uris_extend_via_values_override(self) -> None:
+        custom = ["https://audittrace.example.com/librechat/oauth/openid/callback"]
+        client = _rendered_realm(
+            [
+                "--set",
+                "vault.enabled=true",
+                "--set-json",
+                f"keycloak.librechat.redirectUris={_json.dumps(custom)}",
+                "--set-json",
+                "keycloak.librechat.devRedirectUris=[]",
+            ],
+            client_id="audittrace-librechat",
+        )
+        assert client["redirectUris"] == custom
 
     def test_realm_json_remains_valid_after_tpl_render(self) -> None:
         """tpl() rendering leaves the source file with `{{ }}` directives that
@@ -904,3 +991,94 @@ class TestPodReaperComponent:
                 if d.get("kind") == kind
             ]
             assert "audittrace-pod-reaper" not in names
+
+
+class TestGatewayStreamIdleTimeoutEnvoyFilter:
+    """Codifies the 2026-08-12 live-applied fix (feedback_no_more_drifts) —
+    an EnvoyFilter on the ingress gateway raising ``stream_idle_timeout``
+    from Envoy's 300s default to 1800s.
+
+    Root cause it closes: the ingress gateway's HTTP connection manager had
+    no explicit ``stream_idle_timeout``, so Envoy's 300s default applied.
+    A VirtualService route ``timeout:`` does NOT override
+    ``stream_idle_timeout`` — the memory tool-loop runs non-streaming, so a
+    long silent reasoning turn produced zero bytes on the wire and Envoy
+    reset the stream at 5 minutes (``{"type":"error","message":"Transport"}``).
+    An operator applied the fix live via ``kubectl apply``; these tests
+    prove the chart now renders the *same* resource, so a chart reinstall
+    reproduces it instead of depending on manual drift."""
+
+    def test_envoyfilter_renders_with_live_applied_shape(self) -> None:
+        """Field-for-field match against the manifest that was applied
+        live and confirmed to fix the Transport drop (see
+        ~/work/audittrace-private/specs/2026-08-12-envoyfilter-stream-idle.yaml).
+        Falsifiable: delete the template (or null out any field below) and
+        this test fails."""
+        out = _render(["--set", "istio.enabled=true"])
+        doc = _find_workload(
+            out, "EnvoyFilter", "audittrace-long-reasoning-stream-idle"
+        )
+        assert doc["apiVersion"] == "networking.istio.io/v1alpha3"
+        assert doc["metadata"]["namespace"] == "audittrace"
+        assert doc["spec"]["workloadSelector"]["labels"] == {
+            "istio": "audittrace-gateway"
+        }
+        patch = doc["spec"]["configPatches"][0]
+        assert patch["applyTo"] == "NETWORK_FILTER"
+        assert patch["match"]["context"] == "GATEWAY"
+        assert (
+            patch["match"]["listener"]["filterChain"]["filter"]["name"]
+            == "envoy.filters.network.http_connection_manager"
+        )
+        assert patch["patch"]["operation"] == "MERGE"
+        typed_config = patch["patch"]["value"]["typed_config"]
+        assert typed_config["@type"] == (
+            "type.googleapis.com/envoy.extensions.filters.network."
+            "http_connection_manager.v3.HttpConnectionManager"
+        )
+        assert typed_config["stream_idle_timeout"] == "1800s"
+
+    def test_default_timeout_matches_the_live_applied_value(self) -> None:
+        """Default MUST equal what is live (1800s) — no silent divergence
+        between the chart default and the manually-applied fix it
+        replaces."""
+        out = _render(["--set", "istio.enabled=true"])
+        doc = _find_workload(
+            out, "EnvoyFilter", "audittrace-long-reasoning-stream-idle"
+        )
+        stream_idle = doc["spec"]["configPatches"][0]["patch"]["value"]["typed_config"][
+            "stream_idle_timeout"
+        ]
+        assert stream_idle == "1800s"
+
+    def test_timeout_is_operator_configurable(self) -> None:
+        """An operator on a different infra profile may need a different
+        ceiling; the value must not be hardcoded in the template."""
+        out = _render(
+            [
+                "--set",
+                "istio.enabled=true",
+                "--set",
+                "istio.gateway.streamIdleTimeout=900s",
+            ]
+        )
+        doc = _find_workload(
+            out, "EnvoyFilter", "audittrace-long-reasoning-stream-idle"
+        )
+        stream_idle = doc["spec"]["configPatches"][0]["patch"]["value"]["typed_config"][
+            "stream_idle_timeout"
+        ]
+        assert stream_idle == "900s"
+
+    def test_absent_when_istio_disabled(self) -> None:
+        """Additive/default-safe: with istio.enabled=false the chart must
+        render NO EnvoyFilter at all — this is mesh-only infra config and
+        must not leak into a non-Istio install."""
+        out = _render(["--set", "istio.enabled=false"])
+        assert "audittrace-long-reasoning-stream-idle" not in out
+        names = [
+            d.get("metadata", {}).get("name")
+            for d in _docs(out)
+            if d.get("kind") == "EnvoyFilter"
+        ]
+        assert "audittrace-long-reasoning-stream-idle" not in names

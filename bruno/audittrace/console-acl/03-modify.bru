@@ -1,0 +1,35 @@
+meta {
+  name: W3 PATCH grants
+  type: http
+  seq: 3
+}
+
+patch {
+  url: {{baseUrl}}/console/acl/{{aclResourceType}}/{{aclResourceId}}/grants
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "principal_type": "user",
+    "principal_id": "{{aclPrincipalId}}",
+    "add_bits": 8
+  }
+}
+
+tests {
+  test("200 new row or 404 no active grant", function() {
+    expect([200, 404]).to.include(res.getStatus());
+    expect(res.getBody().trace_id).to.match(/^[0-9a-f]{32}$/);
+  });
+}
+
+docs {
+  Expire-and-insert with recomputed bits (never an in-place update). 404 body
+  carries the trace_id of the success row the service still wrote.
+}

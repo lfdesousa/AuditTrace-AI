@@ -554,6 +554,16 @@ def _render_with_extras(extras: list[str]) -> str:
     return result.stdout
 
 
+def _render_docs_with_extras(extras: list[str]) -> list[dict]:
+    """Like ``_render()`` but allows extra ``--set`` overrides on top of the
+    standard vault/istio + lint-secrets baseline — used by
+    ``TestD25DConsoleRedirectReconcile`` to prove the reconcile step tracks
+    a non-default ``console.librechat.host`` rather than a value baked in
+    at render time for the default host alone."""
+    raw = _render_with_extras(extras)
+    return [d for d in yaml.safe_load_all(raw) if isinstance(d, dict) and d.get("kind")]
+
+
 class TestSecretTemplatesAllRenderInProdMode:
     # Templates documented to render only in vault-disabled mode.
     # Each entry MUST cite the reason — drive-by skips are forbidden.
@@ -884,6 +894,3585 @@ class TestKeycloakOpencodeMemoryWriteScopes:
         )
 
 
+class TestConsoleMemoryProxyScopeGovernance:
+    """M3-WU-D2-1 — the Souvenirs panel's memory-proxy write scopes
+    (``memory:{episodic,procedural,semantic}:write``) reach
+    ``audittrace-librechat`` ONLY as OPTIONAL scopes, via a dedicated
+    ``MEMORY_CONSOLE_WRITE_SCOPES`` array + bind loop kept separate from
+    the plain ``SCOPES`` fan-out (which also carries ``audittrace:admin``
+    and ``audittrace:assessment:ingest`` — see
+    ``TestKeycloakOpencodeMemoryWriteScopes``). This governance class is
+    the WU-D2-1 sibling of ``TestCorpusScopeGovernance``.
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete
+      ``MEMORY_CONSOLE_WRITE_SCOPES`` arrays fails
+      ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` (e.g. silently widening to
+      ``audittrace-opencode``/``audittrace-webui``) fails
+      ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` appearing in either provisioner's
+      ``MEMORY_CONSOLE_WRITE_SCOPES`` array fails
+      ``test_never_admin_in_console_write_scopes`` — the spec's
+      non-negotiable "console never hard-deletes the audit trail"
+      invariant, enforced at the provisioner level (the realm-level
+      sibling is ``TestLibrechatConsoleClient.test_no_admin_scope_granted``).
+    """
+
+    _EXPECTED_CONSOLE_WRITE_SCOPES: frozenset[str] = frozenset(
+        {
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+        }
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    @staticmethod
+    def _console_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_CONSOLE_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONSOLE_WRITE_SCOPES=( ... ) block not found — "
+                "M3-WU-D2-1 requires a dedicated array, separate from SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _console_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_CONSOLE_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONSOLE_WRITE_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_CONSOLE_WRITE_SCOPES[@]}"; do ... done`) not '
+                "found — M3-WU-D2-1 requires a bind loop scoped to "
+                "audittrace-librechat only, separate from the CLIENT_KIND "
+                "fan-out."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._console_write_scopes_in(script_path.read_text())
+        cm_scopes = self._console_write_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_CONSOLE_WRITE_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_CONSOLE_WRITE_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_CONSOLE_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._console_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_CONSOLE_WRITE_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_CONSOLE_WRITE_SCOPES bind loop "
+                    f"references {forbidden_client!r} — M3-WU-D2-1 scopes "
+                    "the write grant to audittrace-librechat only."
+                )
+
+    def test_never_admin_in_console_write_scopes(self) -> None:
+        assert "audittrace:admin" not in self._EXPECTED_CONSOLE_WRITE_SCOPES
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._console_write_scopes_in(path.read_text())
+            assert "audittrace:admin" not in scopes, (
+                f"{label}: MEMORY_CONSOLE_WRITE_SCOPES illegally carries "
+                "audittrace:admin."
+            )
+
+
+class TestD25AMemoryWriteScopesJobRenderedBinding:
+    """D2-5A (``2026-09-01-SPEC-console-hardening-a-memory-write-scopes.md``)
+    Rule 1 render check — the ACTUAL rendered ``ensure-memory-scopes`` Job
+    ConfigMap (via ``helm template``, not the raw source file —
+    ``TestConsoleMemoryProxyScopeGovernance`` above already covers the raw
+    file for both provisioners) binds the three
+    ``memory:{episodic,procedural,semantic}:write`` scopes to
+    ``audittrace-librechat`` as OPTIONAL, and the spec's literal "own-tier
+    write only" invariant is checked scope-by-scope: NOT
+    ``audittrace:admin``, NOT any ``memory:corpus:*:{read,write}`` scope,
+    NOT ``memory:decisions:write``/``memory:skills:write`` — not merely
+    "not admin", every named forbidden scope individually.
+
+    Falsifiable: dropping/renaming a scope in the rendered
+    ``MEMORY_CONSOLE_WRITE_SCOPES`` bind loop, widening it to
+    ``audittrace-opencode``/``audittrace-webui``, flipping it from
+    ``optional`` to ``default``, or adding any forbidden scope to the
+    array fails one of the tests below. Non-vacuity proven live in the
+    D2-5A build record (neuter the array in the ConfigMap source ->
+    this class goes RED; restore -> GREEN).
+    """
+
+    _EXPECTED: frozenset[str] = (
+        TestConsoleMemoryProxyScopeGovernance._EXPECTED_CONSOLE_WRITE_SCOPES
+    )
+
+    # Every scope the spec names by exact identifier as forbidden from this
+    # bind loop — deliberately broader than "not admin" (admin, both corpus
+    # read+write triplets, and the two shared/curated-collection write
+    # scopes decisions/skills).
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:decisions:write",
+            "memory:skills:write",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _rendered_memory_scopes_script(docs: list[dict]) -> str:
+        name = f"{RELEASE}-memory-scopes-script"
+        for d in docs:
+            if d.get("kind") != "ConfigMap":
+                continue
+            if d.get("metadata", {}).get("name") != name:
+                continue
+            raw = (d.get("data") or {}).get("ensure-memory-scopes.sh", "")
+            if not raw:
+                raise AssertionError(
+                    f"ConfigMap {name} has no data['ensure-memory-scopes.sh'] "
+                    "— render regression"
+                )
+            return raw
+        raise AssertionError(f"ConfigMap {name} not present in the render")
+
+    @staticmethod
+    def _all_scopes_in_console_array(text: str) -> set[str]:
+        """Deliberately broader than
+        ``TestConsoleMemoryProxyScopeGovernance._console_write_scopes_in``
+        (which only captures ``memory:``-prefixed tokens — correct for its
+        own purpose, since by construction that array only ever holds
+        memory scopes). This helper also captures ``audittrace:``-prefixed
+        tokens so an ``audittrace:admin`` leak into the array is not
+        silently invisible to the extractor itself (caught live during the
+        D2-5A neuter/restore pass: a first draft of this test used the
+        narrower extractor and stayed vacuously GREEN with
+        ``audittrace:admin`` injected into the array)."""
+        m = re.search(r"MEMORY_CONSOLE_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONSOLE_WRITE_SCOPES=( ... ) block not found in the "
+                "rendered ConfigMap script."
+            )
+        return set(re.findall(r'"((?:memory|audittrace):[^"]+)"', m.group(1)))
+
+    def test_rendered_job_binds_exactly_the_three_console_write_scopes(
+        self,
+    ) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        scopes = self._all_scopes_in_console_array(script)
+        assert scopes == self._EXPECTED, (
+            "D2-5A: the RENDERED Job ConfigMap's MEMORY_CONSOLE_WRITE_SCOPES "
+            f"drifted from the exact expected set. Rendered: {sorted(scopes)}. "
+            f"Expected: {sorted(self._EXPECTED)}."
+        )
+
+    def test_rendered_bind_loop_targets_only_librechat_as_optional(self) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        loop_body = TestConsoleMemoryProxyScopeGovernance._console_bind_loop_body(
+            script
+        )
+        assert "audittrace-librechat" in loop_body, (
+            "D2-5A: the rendered Job's MEMORY_CONSOLE_WRITE_SCOPES bind loop "
+            "does not target audittrace-librechat."
+        )
+        for other in TestConsoleMemoryProxyScopeGovernance._OTHER_END_USER_CLIENTS:
+            assert other not in loop_body, (
+                f"D2-5A: the rendered Job's bind loop references {other!r} — "
+                "scoped to audittrace-librechat only."
+            )
+        assert '"optional"' in loop_body, (
+            "D2-5A: the rendered Job must bind the console write scopes as "
+            "OPTIONAL client scopes — the browser's own login token must "
+            "never carry write access by default."
+        )
+        assert '"default"' not in loop_body, (
+            "D2-5A: the rendered Job's console-write bind loop must never "
+            "bind as a DEFAULT (always-issued) client scope."
+        )
+
+    def test_rendered_never_binds_a_forbidden_scope(self) -> None:
+        """The spec's literal 'own-tier write only' invariant, checked one
+        forbidden scope at a time — not just 'no admin'."""
+        script = self._rendered_memory_scopes_script(_render())
+        scopes = self._all_scopes_in_console_array(script)
+        offenders = scopes & self._FORBIDDEN
+        assert not offenders, (
+            "D2-5A: the rendered Job's console-write bind loop illegally "
+            f"carries {sorted(offenders)} — own-tier write only, per the "
+            "ratified spec's non-negotiable invariant."
+        )
+
+
+class TestKeycloakSessionWriteScopeGovernance:
+    """WU-1 (Sovereign-Attach EPIC, 2026-09-03-SPEC-wu1-session-layer-
+    narrow-ingest-scope.md) — the ephemeral chat-upload least-privilege
+    wall's realm-provisioning half: ``memory:session:write`` reaches
+    ``audittrace-librechat`` ONLY as an OPTIONAL scope, via a dedicated
+    ``MEMORY_SESSION_WRITE_SCOPES`` array + bind loop kept SEPARATE from
+    ``MEMORY_CONSOLE_WRITE_SCOPES`` (the D2-1 durable-write array
+    ``TestConsoleMemoryProxyScopeGovernance`` governs) — folding it in
+    there would both fail ``TestD25AMemoryWriteScopesJobRenderedBinding``'s
+    exact-set assertion AND muddy the durable-vs-ephemeral distinction
+    this WU exists to make real.
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete ``MEMORY_SESSION_WRITE_SCOPES``
+      arrays fails ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any durable/corpus scope) appearing in
+      either provisioner's ``MEMORY_SESSION_WRITE_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_session_write_scopes``.
+    """
+
+    _EXPECTED_SESSION_WRITE_SCOPES: frozenset[str] = frozenset({"memory:session:write"})
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+            "memory:decisions:write",
+            "memory:skills:write",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _session_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_SESSION_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_SESSION_WRITE_SCOPES=( ... ) block not found — "
+                "WU-1 requires a dedicated array, separate from SCOPES "
+                "and MEMORY_CONSOLE_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _session_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_SESSION_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_SESSION_WRITE_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_SESSION_WRITE_SCOPES[@]}"; do ... done`) not '
+                "found — WU-1 requires a bind loop scoped to "
+                "audittrace-librechat only, separate from every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._session_write_scopes_in(script_path.read_text())
+        cm_scopes = self._session_write_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_SESSION_WRITE_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_SESSION_WRITE_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_SESSION_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._session_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_SESSION_WRITE_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_SESSION_WRITE_SCOPES bind loop "
+                    f"references {forbidden_client!r} — WU-1 scopes the "
+                    "ephemeral write grant to audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_session_write_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._session_write_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_SESSION_WRITE_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the "
+                "ephemeral scope, nothing durable."
+            )
+
+
+class TestSessionWriteScopeJobRenderedBinding:
+    """WU-1 Rule 1 render check — the ACTUAL rendered ``ensure-memory-
+    scopes`` Job ConfigMap (via ``helm template``, not the raw source
+    file — ``TestKeycloakSessionWriteScopeGovernance`` above already
+    covers the raw file for both provisioners) binds
+    ``memory:session:write`` to ``audittrace-librechat`` as OPTIONAL, and
+    every durable/admin/corpus scope is individually absent from that
+    bind loop — not merely "not admin".
+
+    Falsifiable: dropping/renaming the scope in the rendered
+    ``MEMORY_SESSION_WRITE_SCOPES`` bind loop, widening it to
+    ``audittrace-opencode``/``audittrace-webui``, flipping it from
+    ``optional`` to ``default``, or adding any forbidden scope to the
+    array fails one of the tests below.
+    """
+
+    _EXPECTED: frozenset[str] = (
+        TestKeycloakSessionWriteScopeGovernance._EXPECTED_SESSION_WRITE_SCOPES
+    )
+    _FORBIDDEN: frozenset[str] = TestKeycloakSessionWriteScopeGovernance._FORBIDDEN
+
+    @staticmethod
+    def _rendered_memory_scopes_script(docs: list[dict]) -> str:
+        name = f"{RELEASE}-memory-scopes-script"
+        for d in docs:
+            if d.get("kind") != "ConfigMap":
+                continue
+            if d.get("metadata", {}).get("name") != name:
+                continue
+            raw = (d.get("data") or {}).get("ensure-memory-scopes.sh", "")
+            if not raw:
+                raise AssertionError(
+                    f"ConfigMap {name} has no data['ensure-memory-scopes.sh'] "
+                    "— render regression"
+                )
+            return raw
+        raise AssertionError(f"ConfigMap {name} not present in the render")
+
+    @staticmethod
+    def _all_scopes_in_session_array(text: str) -> set[str]:
+        m = re.search(r"MEMORY_SESSION_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_SESSION_WRITE_SCOPES=( ... ) block not found in the "
+                "rendered ConfigMap script."
+            )
+        return set(re.findall(r'"((?:memory|audittrace):[^"]+)"', m.group(1)))
+
+    def test_rendered_job_binds_exactly_the_session_write_scope(self) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        scopes = self._all_scopes_in_session_array(script)
+        assert scopes == self._EXPECTED, (
+            "WU-1: the RENDERED Job ConfigMap's MEMORY_SESSION_WRITE_SCOPES "
+            f"drifted from the exact expected set. Rendered: {sorted(scopes)}. "
+            f"Expected: {sorted(self._EXPECTED)}."
+        )
+
+    def test_rendered_bind_loop_targets_only_librechat_as_optional(self) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        loop_body = TestKeycloakSessionWriteScopeGovernance._session_bind_loop_body(
+            script
+        )
+        assert "audittrace-librechat" in loop_body, (
+            "WU-1: the rendered Job's MEMORY_SESSION_WRITE_SCOPES bind loop "
+            "does not target audittrace-librechat."
+        )
+        for other in TestKeycloakSessionWriteScopeGovernance._OTHER_END_USER_CLIENTS:
+            assert other not in loop_body, (
+                f"WU-1: the rendered Job's bind loop references {other!r} — "
+                "scoped to audittrace-librechat only."
+            )
+        assert '"optional"' in loop_body, (
+            "WU-1: the rendered Job must bind memory:session:write as an "
+            "OPTIONAL client scope — the browser's own login token must "
+            "never carry write access by default."
+        )
+        assert '"default"' not in loop_body, (
+            "WU-1: the rendered Job's session-write bind loop must never "
+            "bind as a DEFAULT (always-issued) client scope."
+        )
+
+    def test_rendered_never_binds_a_forbidden_scope(self) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        scopes = self._all_scopes_in_session_array(script)
+        offenders = scopes & self._FORBIDDEN
+        assert not offenders, (
+            "WU-1: the rendered Job's session-write bind loop illegally "
+            f"carries {sorted(offenders)} — grants ONLY the ephemeral "
+            "scope, per the ratified spec's non-negotiable invariant."
+        )
+
+
+class TestKeycloakSessionReadOwnScopeGovernance:
+    """WU-5 (Sovereign-Attach EPIC, 2026-09-06-SPEC-wu5-same-turn-session-
+    recall.md) — the same-turn recall provisioning half:
+    ``memory:session:read-own`` reaches ``audittrace-librechat`` as a
+    DEFAULT scope (never optional — unlike WU-1's
+    ``memory:session:write``), via a dedicated ``MEMORY_SESSION_READ_SCOPES``
+    array + bind loop kept SEPARATE from ``MEMORY_SESSION_WRITE_SCOPES``.
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete ``MEMORY_SESSION_READ_SCOPES``
+      arrays fails ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any write/corpus scope) appearing in either
+      provisioner's ``MEMORY_SESSION_READ_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_session_read_scopes``.
+    """
+
+    _EXPECTED_SESSION_READ_SCOPES: frozenset[str] = frozenset(
+        {"memory:session:read-own"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+            "memory:session:write",
+            "memory:decisions:write",
+            "memory:skills:write",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _session_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_SESSION_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_SESSION_READ_SCOPES=( ... ) block not found — "
+                "WU-5 requires a dedicated array, separate from SCOPES "
+                "and MEMORY_SESSION_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _session_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_SESSION_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_SESSION_READ_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_SESSION_READ_SCOPES[@]}"; do ... done`) not '
+                "found — WU-5 requires a bind loop scoped to "
+                "audittrace-librechat only, separate from every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._session_read_scopes_in(script_path.read_text())
+        cm_scopes = self._session_read_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_SESSION_READ_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_SESSION_READ_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_SESSION_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._session_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_SESSION_READ_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_SESSION_READ_SCOPES bind loop "
+                    f"references {forbidden_client!r} — WU-5 scopes the "
+                    "read-own grant to audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_session_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._session_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_SESSION_READ_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the "
+                "read-own scope, nothing write/durable/corpus."
+            )
+
+
+class TestSessionReadOwnScopeJobRenderedBinding:
+    """WU-5 Rule 1 render check — the ACTUAL rendered ``ensure-memory-
+    scopes`` Job ConfigMap (via ``helm template``, not the raw source
+    file — ``TestKeycloakSessionReadOwnScopeGovernance`` above already
+    covers the raw file for both provisioners) binds
+    ``memory:session:read-own`` to ``audittrace-librechat`` as DEFAULT
+    (never optional), and every write/admin/corpus scope is individually
+    absent from that bind loop — not merely "not admin".
+
+    Falsifiable: dropping/renaming the scope in the rendered
+    ``MEMORY_SESSION_READ_SCOPES`` bind loop, widening it to
+    ``audittrace-opencode``/``audittrace-webui``, flipping it from
+    ``default`` to ``optional``, or adding any forbidden scope to the
+    array fails one of the tests below.
+    """
+
+    _EXPECTED: frozenset[str] = (
+        TestKeycloakSessionReadOwnScopeGovernance._EXPECTED_SESSION_READ_SCOPES
+    )
+    _FORBIDDEN: frozenset[str] = TestKeycloakSessionReadOwnScopeGovernance._FORBIDDEN
+
+    @staticmethod
+    def _rendered_memory_scopes_script(docs: list[dict]) -> str:
+        return TestSessionWriteScopeJobRenderedBinding._rendered_memory_scopes_script(
+            docs
+        )
+
+    @staticmethod
+    def _all_scopes_in_session_array(text: str) -> set[str]:
+        m = re.search(r"MEMORY_SESSION_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_SESSION_READ_SCOPES=( ... ) block not found in the "
+                "rendered ConfigMap script."
+            )
+        return set(re.findall(r'"((?:memory|audittrace):[^"]+)"', m.group(1)))
+
+    def test_rendered_job_binds_exactly_the_session_read_scope(self) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        scopes = self._all_scopes_in_session_array(script)
+        assert scopes == self._EXPECTED, (
+            "WU-5: the RENDERED Job ConfigMap's MEMORY_SESSION_READ_SCOPES "
+            f"drifted from the exact expected set. Rendered: {sorted(scopes)}. "
+            f"Expected: {sorted(self._EXPECTED)}."
+        )
+
+    def test_rendered_bind_loop_targets_only_librechat_as_default(self) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        loop_body = TestKeycloakSessionReadOwnScopeGovernance._session_bind_loop_body(
+            script
+        )
+        assert "audittrace-librechat" in loop_body, (
+            "WU-5: the rendered Job's MEMORY_SESSION_READ_SCOPES bind loop "
+            "does not target audittrace-librechat."
+        )
+        for other in TestKeycloakSessionReadOwnScopeGovernance._OTHER_END_USER_CLIENTS:
+            assert other not in loop_body, (
+                f"WU-5: the rendered Job's bind loop references {other!r} — "
+                "scoped to audittrace-librechat only."
+            )
+        assert '"default"' in loop_body, (
+            "WU-5: the rendered Job must bind memory:session:read-own as a "
+            "DEFAULT client scope — otherwise the plain chat-token exchange "
+            "never carries it and recall_attachments is unreachable from "
+            "the real console."
+        )
+        assert '"optional"' not in loop_body, (
+            "WU-5: the rendered Job's session-read-own bind loop must never "
+            "bind as an OPTIONAL client scope."
+        )
+
+    def test_rendered_never_binds_a_forbidden_scope(self) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        scopes = self._all_scopes_in_session_array(script)
+        offenders = scopes & self._FORBIDDEN
+        assert not offenders, (
+            "WU-5: the rendered Job's session-read-own bind loop illegally "
+            f"carries {sorted(offenders)} — grants ONLY the read-own "
+            "scope, per the ratified spec's non-negotiable invariant."
+        )
+
+
+class TestKeycloakConversationsWriteScopeGovernance:
+    """Mongo-repl WU-1 (2026-09-11-SPEC-mongo-repl-wu1-console-
+    conversations-store.md) — the console-conversations WRITE
+    provisioning half: ``memory:conversations:write`` reaches
+    ``audittrace-librechat`` as an OPTIONAL scope only, via a dedicated
+    ``MEMORY_CONVERSATIONS_WRITE_SCOPES`` array + bind loop kept SEPARATE
+    from every other scope array in this script (same discipline as
+    ``TestKeycloakSessionWriteScopeGovernance``).
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete
+      ``MEMORY_CONVERSATIONS_WRITE_SCOPES`` arrays fails
+      ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any read/corpus scope) appearing in either
+      provisioner's ``MEMORY_CONVERSATIONS_WRITE_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_conversations_write_scopes``.
+    """
+
+    _EXPECTED_CONVERSATIONS_WRITE_SCOPES: frozenset[str] = frozenset(
+        {"memory:conversations:write"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:read",
+            "memory:procedural:read",
+            "memory:semantic:read",
+            "memory:conversational:read-own",
+            "memory:session:read-own",
+            "memory:conversations:read-own",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _conversations_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_CONVERSATIONS_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONVERSATIONS_WRITE_SCOPES=( ... ) block not found — "
+                "Mongo-repl WU-1 requires a dedicated array, separate from "
+                "every other scope array in this script."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _conversations_write_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_CONVERSATIONS_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONVERSATIONS_WRITE_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}"; do ... done`) not '
+                "found — Mongo-repl WU-1 requires a bind loop scoped to "
+                "audittrace-librechat only, separate from every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._conversations_write_scopes_in(script_path.read_text())
+        cm_scopes = self._conversations_write_scopes_in(cm_path.read_text())
+
+        assert (
+            script_scopes == cm_scopes == self._EXPECTED_CONVERSATIONS_WRITE_SCOPES
+        ), (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_CONVERSATIONS_WRITE_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_CONVERSATIONS_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._conversations_write_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_CONVERSATIONS_WRITE_SCOPES bind loop "
+                "does not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_CONVERSATIONS_WRITE_SCOPES bind "
+                    f"loop references {forbidden_client!r} — Mongo-repl WU-1 "
+                    "scopes the write grant to audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_conversations_write_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._conversations_write_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_CONVERSATIONS_WRITE_SCOPES illegally "
+                f"carries {sorted(offenders)} — this array grants ONLY the "
+                "write scope, nothing read/corpus/admin."
+            )
+
+
+class TestKeycloakConversationsReadOwnScopeGovernance:
+    """Mongo-repl WU-1 — the console-conversations READ-OWN provisioning
+    half: ``memory:conversations:read-own`` reaches ``audittrace-librechat``
+    as a DEFAULT scope (never optional — unlike the write counterpart
+    above), via a dedicated ``MEMORY_CONVERSATIONS_READ_SCOPES`` array +
+    bind loop kept SEPARATE from ``MEMORY_CONVERSATIONS_WRITE_SCOPES``.
+
+    Falsifiable, same shape as
+    ``TestKeycloakSessionReadOwnScopeGovernance``.
+    """
+
+    _EXPECTED_CONVERSATIONS_READ_SCOPES: frozenset[str] = frozenset(
+        {"memory:conversations:read-own"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = (
+        TestKeycloakConversationsWriteScopeGovernance._FORBIDDEN
+        | frozenset({"memory:conversations:write"})
+    ) - frozenset({"memory:conversations:read-own"})
+
+    @staticmethod
+    def _conversations_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_CONVERSATIONS_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONVERSATIONS_READ_SCOPES=( ... ) block not found — "
+                "Mongo-repl WU-1 requires a dedicated array, separate from "
+                "MEMORY_CONVERSATIONS_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _conversations_read_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_CONVERSATIONS_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONVERSATIONS_READ_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_CONVERSATIONS_READ_SCOPES[@]}"; do ... done`) not '
+                "found — Mongo-repl WU-1 requires a bind loop scoped to "
+                "audittrace-librechat only, separate from every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._conversations_read_scopes_in(script_path.read_text())
+        cm_scopes = self._conversations_read_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_CONVERSATIONS_READ_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_CONVERSATIONS_READ_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_CONVERSATIONS_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._conversations_read_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_CONVERSATIONS_READ_SCOPES bind loop "
+                "does not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_CONVERSATIONS_READ_SCOPES bind "
+                    f"loop references {forbidden_client!r} — scoped to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_conversations_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._conversations_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_CONVERSATIONS_READ_SCOPES illegally "
+                f"carries {sorted(offenders)} — this array grants ONLY the "
+                "read-own scope, nothing write/durable/corpus."
+            )
+
+
+class TestKeycloakPresetsWriteScopeGovernance:
+    """Mongo-repl WU-presets (2026-09-11-SPEC-mongo-repl-wu-presets-
+    store.md) — the console-presets WRITE provisioning half:
+    ``memory:presets:write`` reaches ``audittrace-librechat`` as an
+    OPTIONAL scope only, via a dedicated ``MEMORY_PRESETS_WRITE_SCOPES``
+    array + bind loop kept SEPARATE from every other scope array in this
+    script (same discipline as
+    ``TestKeycloakConversationsWriteScopeGovernance``).
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete
+      ``MEMORY_PRESETS_WRITE_SCOPES`` arrays fails
+      ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any read/corpus scope) appearing in either
+      provisioner's ``MEMORY_PRESETS_WRITE_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_presets_write_scopes``.
+    """
+
+    _EXPECTED_PRESETS_WRITE_SCOPES: frozenset[str] = frozenset({"memory:presets:write"})
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:read",
+            "memory:procedural:read",
+            "memory:semantic:read",
+            "memory:conversational:read-own",
+            "memory:session:read-own",
+            "memory:conversations:read-own",
+            "memory:presets:read-own",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _presets_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_PRESETS_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_PRESETS_WRITE_SCOPES=( ... ) block not found — "
+                "Mongo-repl WU-presets requires a dedicated array, "
+                "separate from every other scope array in this script."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _presets_write_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_PRESETS_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_PRESETS_WRITE_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_PRESETS_WRITE_SCOPES[@]}"; do ... done`) not '
+                "found — Mongo-repl WU-presets requires a bind loop scoped "
+                "to audittrace-librechat only, separate from every other "
+                "loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._presets_write_scopes_in(script_path.read_text())
+        cm_scopes = self._presets_write_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_PRESETS_WRITE_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_PRESETS_WRITE_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_PRESETS_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._presets_write_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_PRESETS_WRITE_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_PRESETS_WRITE_SCOPES bind loop "
+                    f"references {forbidden_client!r} — Mongo-repl "
+                    "WU-presets scopes the write grant to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_presets_write_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._presets_write_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_PRESETS_WRITE_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the write "
+                "scope, nothing read/corpus/admin."
+            )
+
+
+class TestKeycloakPresetsReadOwnScopeGovernance:
+    """Mongo-repl WU-presets — the console-presets READ-OWN provisioning
+    half: ``memory:presets:read-own`` reaches ``audittrace-librechat`` as
+    a DEFAULT scope (never optional — unlike the write counterpart
+    above), via a dedicated ``MEMORY_PRESETS_READ_SCOPES`` array + bind
+    loop kept SEPARATE from ``MEMORY_PRESETS_WRITE_SCOPES``.
+
+    Falsifiable, same shape as
+    ``TestKeycloakConversationsReadOwnScopeGovernance``.
+    """
+
+    _EXPECTED_PRESETS_READ_SCOPES: frozenset[str] = frozenset(
+        {"memory:presets:read-own"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = (
+        TestKeycloakPresetsWriteScopeGovernance._FORBIDDEN
+        | frozenset({"memory:presets:write"})
+    ) - frozenset({"memory:presets:read-own"})
+
+    @staticmethod
+    def _presets_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_PRESETS_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_PRESETS_READ_SCOPES=( ... ) block not found — "
+                "Mongo-repl WU-presets requires a dedicated array, "
+                "separate from MEMORY_PRESETS_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _presets_read_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_PRESETS_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_PRESETS_READ_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_PRESETS_READ_SCOPES[@]}"; do ... done`) not '
+                "found — Mongo-repl WU-presets requires a bind loop scoped "
+                "to audittrace-librechat only, separate from every other "
+                "loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._presets_read_scopes_in(script_path.read_text())
+        cm_scopes = self._presets_read_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_PRESETS_READ_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_PRESETS_READ_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_PRESETS_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._presets_read_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_PRESETS_READ_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_PRESETS_READ_SCOPES bind loop "
+                    f"references {forbidden_client!r} — scoped to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_presets_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._presets_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_PRESETS_READ_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the "
+                "read-own scope, nothing write/durable/corpus."
+            )
+
+
+class TestOpencodeClientScopesUnchangedByPresets:
+    """STANDING REQUIREMENT (requirement-mongo-repl-regression-safety-
+    opencode-e2e-20260911): the new ``memory:presets:{read-own,write}``
+    scope pair is ADDITIVE on ``audittrace-librechat`` ONLY — this class
+    asserts ``audittrace-opencode``'s full scope set (both realm files,
+    both defaultClientScopes and optionalClientScopes) never gains
+    either presets scope. Mirrors the SC-09
+    (``TestRestrictedClientStaysRestricted``) and WU-1 regression-safety
+    pattern: a scope leaking onto a client that was never meant to widen
+    is a silent failure mode, not a loud one — hence a test, not a
+    comment.
+    """
+
+    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset(
+        {"memory:presets:read-own", "memory:presets:write"}
+    )
+
+    @staticmethod
+    def _client(realm: dict, client_id: str) -> dict:
+        for c in realm["clients"]:
+            if c["clientId"] == client_id:
+                return c
+        raise AssertionError(f"{client_id} is missing from the realm.")
+
+    def test_opencode_scope_set_never_gains_presets_scopes(self) -> None:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._client(realm, "audittrace-opencode")
+            both = set(c.get("defaultClientScopes", [])) | set(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = both & self._FORBIDDEN_ON_OPENCODE
+            assert not offenders, (
+                f"{label}: audittrace-opencode was granted {sorted(offenders)} "
+                "— Mongo-repl WU-presets scopes are additive on "
+                "audittrace-librechat ONLY (standing regression-safety "
+                "requirement); OpenCode's client must stay untouched."
+            )
+
+
+class TestKeycloakPromptsWriteScopeGovernance:
+    """Mongo-repl WU-prompts (2026-09-11-SPEC-mongo-repl-wu-prompts-
+    store.md) — the console-prompts WRITE provisioning half:
+    ``memory:prompts:write`` reaches ``audittrace-librechat`` as an
+    OPTIONAL scope only, via a dedicated ``MEMORY_PROMPTS_WRITE_SCOPES``
+    array + bind loop kept SEPARATE from every other scope array in this
+    script (same discipline as
+    ``TestKeycloakPresetsWriteScopeGovernance``).
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete
+      ``MEMORY_PROMPTS_WRITE_SCOPES`` arrays fails
+      ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any read/corpus scope) appearing in either
+      provisioner's ``MEMORY_PROMPTS_WRITE_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_prompts_write_scopes``.
+    """
+
+    _EXPECTED_PROMPTS_WRITE_SCOPES: frozenset[str] = frozenset({"memory:prompts:write"})
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:read",
+            "memory:procedural:read",
+            "memory:semantic:read",
+            "memory:conversational:read-own",
+            "memory:session:read-own",
+            "memory:conversations:read-own",
+            "memory:presets:read-own",
+            "memory:prompts:read-own",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _prompts_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_PROMPTS_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_PROMPTS_WRITE_SCOPES=( ... ) block not found — "
+                "Mongo-repl WU-prompts requires a dedicated array, "
+                "separate from every other scope array in this script."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _prompts_write_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_PROMPTS_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_PROMPTS_WRITE_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_PROMPTS_WRITE_SCOPES[@]}"; do ... done`) not '
+                "found — Mongo-repl WU-prompts requires a bind loop scoped "
+                "to audittrace-librechat only, separate from every other "
+                "loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._prompts_write_scopes_in(script_path.read_text())
+        cm_scopes = self._prompts_write_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_PROMPTS_WRITE_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_PROMPTS_WRITE_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_PROMPTS_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._prompts_write_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_PROMPTS_WRITE_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_PROMPTS_WRITE_SCOPES bind loop "
+                    f"references {forbidden_client!r} — Mongo-repl "
+                    "WU-prompts scopes the write grant to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_prompts_write_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._prompts_write_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_PROMPTS_WRITE_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the write "
+                "scope, nothing read/corpus/admin."
+            )
+
+
+class TestKeycloakPromptsReadOwnScopeGovernance:
+    """Mongo-repl WU-prompts — the console-prompts READ-OWN provisioning
+    half: ``memory:prompts:read-own`` reaches ``audittrace-librechat`` as
+    a DEFAULT scope (never optional — unlike the write counterpart
+    above), via a dedicated ``MEMORY_PROMPTS_READ_SCOPES`` array + bind
+    loop kept SEPARATE from ``MEMORY_PROMPTS_WRITE_SCOPES``.
+
+    Falsifiable, same shape as
+    ``TestKeycloakPresetsReadOwnScopeGovernance``.
+    """
+
+    _EXPECTED_PROMPTS_READ_SCOPES: frozenset[str] = frozenset(
+        {"memory:prompts:read-own"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = (
+        TestKeycloakPromptsWriteScopeGovernance._FORBIDDEN
+        | frozenset({"memory:prompts:write"})
+    ) - frozenset({"memory:prompts:read-own"})
+
+    @staticmethod
+    def _prompts_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_PROMPTS_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_PROMPTS_READ_SCOPES=( ... ) block not found — "
+                "Mongo-repl WU-prompts requires a dedicated array, "
+                "separate from MEMORY_PROMPTS_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _prompts_read_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_PROMPTS_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_PROMPTS_READ_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_PROMPTS_READ_SCOPES[@]}"; do ... done`) not '
+                "found — Mongo-repl WU-prompts requires a bind loop scoped "
+                "to audittrace-librechat only, separate from every other "
+                "loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._prompts_read_scopes_in(script_path.read_text())
+        cm_scopes = self._prompts_read_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_PROMPTS_READ_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_PROMPTS_READ_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_PROMPTS_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._prompts_read_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_PROMPTS_READ_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_PROMPTS_READ_SCOPES bind loop "
+                    f"references {forbidden_client!r} — scoped to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_prompts_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._prompts_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_PROMPTS_READ_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the "
+                "read-own scope, nothing write/durable/corpus."
+            )
+
+
+class TestOpencodeClientScopesUnchangedByPrompts:
+    """STANDING REQUIREMENT (requirement-mongo-repl-regression-safety-
+    opencode-e2e-20260911): the new ``memory:prompts:{read-own,write}``
+    scope pair is ADDITIVE on ``audittrace-librechat`` ONLY — this class
+    asserts ``audittrace-opencode``'s full scope set (both realm files,
+    both defaultClientScopes and optionalClientScopes) never gains
+    either prompts scope. Mirrors the SC-09
+    (``TestRestrictedClientStaysRestricted``) and WU-1/WU-presets
+    regression-safety pattern: a scope leaking onto a client that was
+    never meant to widen is a silent failure mode, not a loud one —
+    hence a test, not a comment.
+    """
+
+    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset(
+        {"memory:prompts:read-own", "memory:prompts:write"}
+    )
+
+    @staticmethod
+    def _client(realm: dict, client_id: str) -> dict:
+        for c in realm["clients"]:
+            if c["clientId"] == client_id:
+                return c
+        raise AssertionError(f"{client_id} is missing from the realm.")
+
+    def test_opencode_scope_set_never_gains_prompts_scopes(self) -> None:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._client(realm, "audittrace-opencode")
+            both = set(c.get("defaultClientScopes", [])) | set(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = both & self._FORBIDDEN_ON_OPENCODE
+            assert not offenders, (
+                f"{label}: audittrace-opencode was granted {sorted(offenders)} "
+                "— Mongo-repl WU-prompts scopes are additive on "
+                "audittrace-librechat ONLY (standing regression-safety "
+                "requirement); OpenCode's client must stay untouched."
+            )
+
+
+class TestKeycloakChatProjectsWriteScopeGovernance:
+    """Chat-Projects domain (2026-09-11-SPEC-mongo-repl-wu-chatprojects-
+    store.md) — the console-chat-projects WRITE provisioning half:
+    ``memory:chat_projects:write`` reaches ``audittrace-librechat`` as an
+    OPTIONAL scope only, via a dedicated
+    ``MEMORY_CHAT_PROJECTS_WRITE_SCOPES`` array + bind loop kept
+    SEPARATE from every other scope array in this script (same
+    discipline as ``TestKeycloakPromptsWriteScopeGovernance``).
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete
+      ``MEMORY_CHAT_PROJECTS_WRITE_SCOPES`` arrays fails
+      ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any read/corpus scope) appearing in either
+      provisioner's ``MEMORY_CHAT_PROJECTS_WRITE_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_chat_projects_write_scopes``.
+    """
+
+    _EXPECTED_CHAT_PROJECTS_WRITE_SCOPES: frozenset[str] = frozenset(
+        {"memory:chat_projects:write"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:read",
+            "memory:procedural:read",
+            "memory:semantic:read",
+            "memory:conversational:read-own",
+            "memory:session:read-own",
+            "memory:conversations:read-own",
+            "memory:presets:read-own",
+            "memory:prompts:read-own",
+            "memory:chat_projects:read-own",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _chat_projects_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_CHAT_PROJECTS_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CHAT_PROJECTS_WRITE_SCOPES=( ... ) block not found — "
+                "the Chat-Projects domain requires a dedicated array, "
+                "separate from every other scope array in this script."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _chat_projects_write_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_CHAT_PROJECTS_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CHAT_PROJECTS_WRITE_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}"; do ... done`) not '
+                "found — the Chat-Projects domain requires a bind loop scoped "
+                "to audittrace-librechat only, separate from every other "
+                "loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._chat_projects_write_scopes_in(script_path.read_text())
+        cm_scopes = self._chat_projects_write_scopes_in(cm_path.read_text())
+
+        assert (
+            script_scopes == cm_scopes == self._EXPECTED_CHAT_PROJECTS_WRITE_SCOPES
+        ), (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_CHAT_PROJECTS_WRITE_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_CHAT_PROJECTS_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._chat_projects_write_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_CHAT_PROJECTS_WRITE_SCOPES bind loop "
+                "does not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_CHAT_PROJECTS_WRITE_SCOPES bind "
+                    f"loop references {forbidden_client!r} — the "
+                    "Chat-Projects domain scopes the write grant to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_chat_projects_write_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._chat_projects_write_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_CHAT_PROJECTS_WRITE_SCOPES illegally "
+                f"carries {sorted(offenders)} — this array grants ONLY the "
+                "write scope, nothing read/corpus/admin."
+            )
+
+
+class TestKeycloakChatProjectsReadOwnScopeGovernance:
+    """Chat-Projects domain — the console-chat-projects READ-OWN
+    provisioning half: ``memory:chat_projects:read-own`` reaches
+    ``audittrace-librechat`` as a DEFAULT scope (never optional — unlike
+    the write counterpart above), via a dedicated
+    ``MEMORY_CHAT_PROJECTS_READ_SCOPES`` array + bind loop kept SEPARATE
+    from ``MEMORY_CHAT_PROJECTS_WRITE_SCOPES``.
+
+    Falsifiable, same shape as
+    ``TestKeycloakPromptsReadOwnScopeGovernance``.
+    """
+
+    _EXPECTED_CHAT_PROJECTS_READ_SCOPES: frozenset[str] = frozenset(
+        {"memory:chat_projects:read-own"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = (
+        TestKeycloakChatProjectsWriteScopeGovernance._FORBIDDEN
+        | frozenset({"memory:chat_projects:write"})
+    ) - frozenset({"memory:chat_projects:read-own"})
+
+    @staticmethod
+    def _chat_projects_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_CHAT_PROJECTS_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CHAT_PROJECTS_READ_SCOPES=( ... ) block not found — "
+                "the Chat-Projects domain requires a dedicated array, "
+                "separate from MEMORY_CHAT_PROJECTS_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _chat_projects_read_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_CHAT_PROJECTS_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CHAT_PROJECTS_READ_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}"; do ... done`) not '
+                "found — the Chat-Projects domain requires a bind loop "
+                "scoped to audittrace-librechat only, separate from every "
+                "other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._chat_projects_read_scopes_in(script_path.read_text())
+        cm_scopes = self._chat_projects_read_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_CHAT_PROJECTS_READ_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_CHAT_PROJECTS_READ_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_CHAT_PROJECTS_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._chat_projects_read_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_CHAT_PROJECTS_READ_SCOPES bind loop "
+                "does not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_CHAT_PROJECTS_READ_SCOPES bind "
+                    f"loop references {forbidden_client!r} — scoped to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_chat_projects_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._chat_projects_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_CHAT_PROJECTS_READ_SCOPES illegally "
+                f"carries {sorted(offenders)} — this array grants ONLY the "
+                "read-own scope, nothing write/durable/corpus."
+            )
+
+
+class TestOpencodeClientScopesUnchangedByChatProjects:
+    """STANDING REQUIREMENT (requirement-mongo-repl-regression-safety-
+    opencode-e2e-20260911): the new
+    ``memory:chat_projects:{read-own,write}`` scope pair is ADDITIVE on
+    ``audittrace-librechat`` ONLY — this class asserts
+    ``audittrace-opencode``'s full scope set (both realm files, both
+    defaultClientScopes and optionalClientScopes) never gains either
+    chat-projects scope. Mirrors the SC-09
+    (``TestRestrictedClientStaysRestricted``) and WU-1/WU-presets/
+    WU-prompts regression-safety pattern: a scope leaking onto a client
+    that was never meant to widen is a silent failure mode, not a loud
+    one — hence a test, not a comment.
+    """
+
+    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset(
+        {"memory:chat_projects:read-own", "memory:chat_projects:write"}
+    )
+
+    @staticmethod
+    def _client(realm: dict, client_id: str) -> dict:
+        for c in realm["clients"]:
+            if c["clientId"] == client_id:
+                return c
+        raise AssertionError(f"{client_id} is missing from the realm.")
+
+    def test_opencode_scope_set_never_gains_chat_projects_scopes(self) -> None:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._client(realm, "audittrace-opencode")
+            both = set(c.get("defaultClientScopes", [])) | set(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = both & self._FORBIDDEN_ON_OPENCODE
+            assert not offenders, (
+                f"{label}: audittrace-opencode was granted {sorted(offenders)} "
+                "— the Chat-Projects domain scopes are additive on "
+                "audittrace-librechat ONLY (standing regression-safety "
+                "requirement); OpenCode's client must stay untouched."
+            )
+
+
+class TestKeycloakFilesWriteScopeGovernance:
+    """Files-metadata domain (2026-09-11-SPEC-mongo-repl-wu-files-metadata-
+    store.md) — the console-files WRITE provisioning half:
+    ``memory:files:write`` reaches ``audittrace-librechat`` as an
+    OPTIONAL scope only, via a dedicated ``MEMORY_FILES_WRITE_SCOPES``
+    array + bind loop kept SEPARATE from every other scope array in this
+    script (same discipline as
+    ``TestKeycloakChatProjectsWriteScopeGovernance``).
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete ``MEMORY_FILES_WRITE_SCOPES``
+      arrays fails ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any read/corpus scope) appearing in either
+      provisioner's ``MEMORY_FILES_WRITE_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_files_write_scopes``.
+    """
+
+    _EXPECTED_FILES_WRITE_SCOPES: frozenset[str] = frozenset({"memory:files:write"})
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:read",
+            "memory:procedural:read",
+            "memory:semantic:read",
+            "memory:conversational:read-own",
+            "memory:session:read-own",
+            "memory:conversations:read-own",
+            "memory:presets:read-own",
+            "memory:prompts:read-own",
+            "memory:chat_projects:read-own",
+            "memory:files:read-own",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _files_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_FILES_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_FILES_WRITE_SCOPES=( ... ) block not found — the "
+                "Files-metadata domain requires a dedicated array, "
+                "separate from every other scope array in this script."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _files_write_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_FILES_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_FILES_WRITE_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_FILES_WRITE_SCOPES[@]}"; do ... done`) not '
+                "found — the Files-metadata domain requires a bind loop "
+                "scoped to audittrace-librechat only, separate from "
+                "every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._files_write_scopes_in(script_path.read_text())
+        cm_scopes = self._files_write_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_FILES_WRITE_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_FILES_WRITE_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_FILES_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._files_write_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_FILES_WRITE_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_FILES_WRITE_SCOPES bind loop "
+                    f"references {forbidden_client!r} — the "
+                    "Files-metadata domain scopes the write grant to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_files_write_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._files_write_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_FILES_WRITE_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the write "
+                "scope, nothing read/corpus/admin."
+            )
+
+
+class TestKeycloakFilesReadOwnScopeGovernance:
+    """Files-metadata domain — the console-files READ-OWN provisioning
+    half: ``memory:files:read-own`` reaches ``audittrace-librechat`` as a
+    DEFAULT scope (never optional — unlike the write counterpart above),
+    via a dedicated ``MEMORY_FILES_READ_SCOPES`` array + bind loop kept
+    SEPARATE from ``MEMORY_FILES_WRITE_SCOPES``.
+
+    Falsifiable, same shape as
+    ``TestKeycloakChatProjectsReadOwnScopeGovernance``.
+    """
+
+    _EXPECTED_FILES_READ_SCOPES: frozenset[str] = frozenset({"memory:files:read-own"})
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = (
+        TestKeycloakFilesWriteScopeGovernance._FORBIDDEN
+        | frozenset({"memory:files:write"})
+    ) - frozenset({"memory:files:read-own"})
+
+    @staticmethod
+    def _files_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_FILES_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_FILES_READ_SCOPES=( ... ) block not found — the "
+                "Files-metadata domain requires a dedicated array, "
+                "separate from MEMORY_FILES_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _files_read_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_FILES_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_FILES_READ_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_FILES_READ_SCOPES[@]}"; do ... done`) not '
+                "found — the Files-metadata domain requires a bind loop "
+                "scoped to audittrace-librechat only, separate from "
+                "every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._files_read_scopes_in(script_path.read_text())
+        cm_scopes = self._files_read_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_FILES_READ_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_FILES_READ_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_FILES_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._files_read_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_FILES_READ_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_FILES_READ_SCOPES bind loop "
+                    f"references {forbidden_client!r} — scoped to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_files_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._files_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_FILES_READ_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the "
+                "read-own scope, nothing write/durable/corpus."
+            )
+
+
+class TestOpencodeClientScopesUnchangedByFiles:
+    """STANDING REQUIREMENT (requirement-mongo-repl-regression-safety-
+    opencode-e2e-20260911): the new ``memory:files:{read-own,write}``
+    scope pair is ADDITIVE on ``audittrace-librechat`` ONLY — this class
+    asserts ``audittrace-opencode``'s full scope set (both realm files,
+    both defaultClientScopes and optionalClientScopes) never gains
+    either files scope. Mirrors the SC-09
+    (``TestRestrictedClientStaysRestricted``) and WU-1/WU-presets/
+    WU-prompts/Chat-Projects regression-safety pattern: a scope leaking
+    onto a client that was never meant to widen is a silent failure
+    mode, not a loud one — hence a test, not a comment.
+    """
+
+    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset(
+        {"memory:files:read-own", "memory:files:write"}
+    )
+
+    @staticmethod
+    def _client(realm: dict, client_id: str) -> dict:
+        for c in realm["clients"]:
+            if c["clientId"] == client_id:
+                return c
+        raise AssertionError(f"{client_id} is missing from the realm.")
+
+    def test_opencode_scope_set_never_gains_files_scopes(self) -> None:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._client(realm, "audittrace-opencode")
+            both = set(c.get("defaultClientScopes", [])) | set(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = both & self._FORBIDDEN_ON_OPENCODE
+            assert not offenders, (
+                f"{label}: audittrace-opencode was granted {sorted(offenders)} "
+                "— the Files-metadata domain scopes are additive on "
+                "audittrace-librechat ONLY (standing regression-safety "
+                "requirement); OpenCode's client must stay untouched."
+            )
+
+
+class TestKeycloakAgentsWriteScopeGovernance:
+    """Agents domain (2026-09-12-SPEC-mongo-repl-wu-agents-store.md) —
+    the console-agents WRITE provisioning half:
+    ``memory:agents:write`` reaches ``audittrace-librechat`` as an
+    OPTIONAL scope only, via a dedicated ``MEMORY_AGENTS_WRITE_SCOPES``
+    array + bind loop kept SEPARATE from every other scope array in this
+    script (same discipline as
+    ``TestKeycloakFilesWriteScopeGovernance``).
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete ``MEMORY_AGENTS_WRITE_SCOPES``
+      arrays fails ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any read/corpus scope) appearing in either
+      provisioner's ``MEMORY_AGENTS_WRITE_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_agents_write_scopes``.
+    """
+
+    _EXPECTED_AGENTS_WRITE_SCOPES: frozenset[str] = frozenset({"memory:agents:write"})
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:read",
+            "memory:procedural:read",
+            "memory:semantic:read",
+            "memory:conversational:read-own",
+            "memory:session:read-own",
+            "memory:conversations:read-own",
+            "memory:presets:read-own",
+            "memory:prompts:read-own",
+            "memory:chat_projects:read-own",
+            "memory:files:read-own",
+            "memory:agents:read-own",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _agents_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_AGENTS_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_AGENTS_WRITE_SCOPES=( ... ) block not found — the "
+                "Agents domain requires a dedicated array, separate from "
+                "every other scope array in this script."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _agents_write_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_AGENTS_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_AGENTS_WRITE_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_AGENTS_WRITE_SCOPES[@]}"; do ... done`) not '
+                "found — the Agents domain requires a bind loop scoped "
+                "to audittrace-librechat only, separate from every other "
+                "loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._agents_write_scopes_in(script_path.read_text())
+        cm_scopes = self._agents_write_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_AGENTS_WRITE_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_AGENTS_WRITE_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_AGENTS_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._agents_write_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_AGENTS_WRITE_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_AGENTS_WRITE_SCOPES bind loop "
+                    f"references {forbidden_client!r} — the Agents "
+                    "domain scopes the write grant to audittrace-librechat "
+                    "only."
+                )
+
+    def test_never_forbidden_scope_in_agents_write_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._agents_write_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_AGENTS_WRITE_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the write "
+                "scope, nothing read/corpus/admin."
+            )
+
+
+class TestKeycloakAgentsReadOwnScopeGovernance:
+    """Agents domain — the console-agents READ-OWN provisioning half:
+    ``memory:agents:read-own`` reaches ``audittrace-librechat`` as a
+    DEFAULT scope (never optional — unlike the write counterpart above),
+    via a dedicated ``MEMORY_AGENTS_READ_SCOPES`` array + bind loop kept
+    SEPARATE from ``MEMORY_AGENTS_WRITE_SCOPES``.
+
+    Falsifiable, same shape as ``TestKeycloakFilesReadOwnScopeGovernance``.
+    """
+
+    _EXPECTED_AGENTS_READ_SCOPES: frozenset[str] = frozenset({"memory:agents:read-own"})
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = (
+        TestKeycloakAgentsWriteScopeGovernance._FORBIDDEN
+        | frozenset({"memory:agents:write"})
+    ) - frozenset({"memory:agents:read-own"})
+
+    @staticmethod
+    def _agents_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_AGENTS_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_AGENTS_READ_SCOPES=( ... ) block not found — the "
+                "Agents domain requires a dedicated array, separate from "
+                "MEMORY_AGENTS_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _agents_read_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_AGENTS_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_AGENTS_READ_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_AGENTS_READ_SCOPES[@]}"; do ... done`) not '
+                "found — the Agents domain requires a bind loop scoped "
+                "to audittrace-librechat only, separate from every other "
+                "loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._agents_read_scopes_in(script_path.read_text())
+        cm_scopes = self._agents_read_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_AGENTS_READ_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_AGENTS_READ_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_AGENTS_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._agents_read_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_AGENTS_READ_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_AGENTS_READ_SCOPES bind loop "
+                    f"references {forbidden_client!r} — scoped to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_agents_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._agents_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_AGENTS_READ_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the "
+                "read-own scope, nothing write/durable/corpus."
+            )
+
+
+class TestOpencodeClientScopesUnchangedByAgents:
+    """STANDING REQUIREMENT (requirement-mongo-repl-regression-safety-
+    opencode-e2e-20260911): the new ``memory:agents:{read-own,write}``
+    scope pair is ADDITIVE on ``audittrace-librechat`` ONLY — this class
+    asserts ``audittrace-opencode``'s full scope set (both realm files,
+    both defaultClientScopes and optionalClientScopes) never gains
+    either agents scope. Mirrors the SC-09
+    (``TestRestrictedClientStaysRestricted``) and every prior Mongo-repl
+    domain's regression-safety pattern: a scope leaking onto a client
+    that was never meant to widen is a silent failure mode, not a loud
+    one — hence a test, not a comment.
+    """
+
+    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset(
+        {"memory:agents:read-own", "memory:agents:write"}
+    )
+
+    @staticmethod
+    def _client(realm: dict, client_id: str) -> dict:
+        for c in realm["clients"]:
+            if c["clientId"] == client_id:
+                return c
+        raise AssertionError(f"{client_id} is missing from the realm.")
+
+    def test_opencode_scope_set_never_gains_agents_scopes(self) -> None:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._client(realm, "audittrace-opencode")
+            both = set(c.get("defaultClientScopes", [])) | set(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = both & self._FORBIDDEN_ON_OPENCODE
+            assert not offenders, (
+                f"{label}: audittrace-opencode was granted {sorted(offenders)} "
+                "— the Agents domain scopes are additive on "
+                "audittrace-librechat ONLY (standing regression-safety "
+                "requirement); OpenCode's client must stay untouched."
+            )
+
+
+class TestKeycloakConversationTagsWriteScopeGovernance:
+    """Conversation-Tags domain
+    (2026-09-13-SPEC-mongo-repl-wu-conversation-tags-store.md) — the
+    console-conversation-tags WRITE provisioning half:
+    ``memory:conversation_tags:write`` reaches ``audittrace-librechat``
+    as an OPTIONAL scope only, via a dedicated
+    ``MEMORY_CONVERSATION_TAGS_WRITE_SCOPES`` array + bind loop kept
+    SEPARATE from every other scope array in this script (same
+    discipline as ``TestKeycloakAgentsWriteScopeGovernance``).
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete
+      ``MEMORY_CONVERSATION_TAGS_WRITE_SCOPES`` arrays fails
+      ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any read/corpus scope) appearing in either
+      provisioner's ``MEMORY_CONVERSATION_TAGS_WRITE_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_conversation_tags_write_scopes``.
+    """
+
+    _EXPECTED_CONVERSATION_TAGS_WRITE_SCOPES: frozenset[str] = frozenset(
+        {"memory:conversation_tags:write"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:read",
+            "memory:procedural:read",
+            "memory:semantic:read",
+            "memory:conversational:read-own",
+            "memory:session:read-own",
+            "memory:conversations:read-own",
+            "memory:presets:read-own",
+            "memory:prompts:read-own",
+            "memory:chat_projects:read-own",
+            "memory:files:read-own",
+            "memory:agents:read-own",
+            "memory:conversation_tags:read-own",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _conversation_tags_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_CONVERSATION_TAGS_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONVERSATION_TAGS_WRITE_SCOPES=( ... ) block not "
+                "found — the Conversation-Tags domain requires a "
+                "dedicated array, separate from every other scope array "
+                "in this script."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _conversation_tags_write_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_CONVERSATION_TAGS_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONVERSATION_TAGS_WRITE_SCOPES bind loop (`for "
+                'SCOPE in "${MEMORY_CONVERSATION_TAGS_WRITE_SCOPES[@]}"; '
+                "do ... done`) not found — the Conversation-Tags domain "
+                "requires a bind loop scoped to audittrace-librechat "
+                "only, separate from every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._conversation_tags_write_scopes_in(script_path.read_text())
+        cm_scopes = self._conversation_tags_write_scopes_in(cm_path.read_text())
+
+        assert (
+            script_scopes == cm_scopes == self._EXPECTED_CONVERSATION_TAGS_WRITE_SCOPES
+        ), (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            "divergent/incomplete MEMORY_CONVERSATION_TAGS_WRITE_SCOPES "
+            f"arrays. Script: {sorted(script_scopes)}. ConfigMap: "
+            f"{sorted(cm_scopes)}. Expected: "
+            f"{sorted(self._EXPECTED_CONVERSATION_TAGS_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._conversation_tags_write_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_CONVERSATION_TAGS_WRITE_SCOPES bind "
+                "loop does not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_CONVERSATION_TAGS_WRITE_SCOPES "
+                    f"bind loop references {forbidden_client!r} — the "
+                    "Conversation-Tags domain scopes the write grant to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_conversation_tags_write_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._conversation_tags_write_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_CONVERSATION_TAGS_WRITE_SCOPES "
+                f"illegally carries {sorted(offenders)} — this array "
+                "grants ONLY the write scope, nothing read/corpus/admin."
+            )
+
+
+class TestKeycloakConversationTagsReadOwnScopeGovernance:
+    """Conversation-Tags domain — the console-conversation-tags
+    READ-OWN provisioning half:
+    ``memory:conversation_tags:read-own`` reaches ``audittrace-librechat``
+    as a DEFAULT scope (never optional — unlike the write counterpart
+    above), via a dedicated ``MEMORY_CONVERSATION_TAGS_READ_SCOPES``
+    array + bind loop kept SEPARATE from
+    ``MEMORY_CONVERSATION_TAGS_WRITE_SCOPES``.
+
+    Falsifiable, same shape as
+    ``TestKeycloakAgentsReadOwnScopeGovernance``.
+    """
+
+    _EXPECTED_CONVERSATION_TAGS_READ_SCOPES: frozenset[str] = frozenset(
+        {"memory:conversation_tags:read-own"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = (
+        TestKeycloakConversationTagsWriteScopeGovernance._FORBIDDEN
+        | frozenset({"memory:conversation_tags:write"})
+    ) - frozenset({"memory:conversation_tags:read-own"})
+
+    @staticmethod
+    def _conversation_tags_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_CONVERSATION_TAGS_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONVERSATION_TAGS_READ_SCOPES=( ... ) block not "
+                "found — the Conversation-Tags domain requires a "
+                "dedicated array, separate from "
+                "MEMORY_CONVERSATION_TAGS_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _conversation_tags_read_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_CONVERSATION_TAGS_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONVERSATION_TAGS_READ_SCOPES bind loop (`for "
+                'SCOPE in "${MEMORY_CONVERSATION_TAGS_READ_SCOPES[@]}"; '
+                "do ... done`) not found — the Conversation-Tags domain "
+                "requires a bind loop scoped to audittrace-librechat "
+                "only, separate from every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._conversation_tags_read_scopes_in(script_path.read_text())
+        cm_scopes = self._conversation_tags_read_scopes_in(cm_path.read_text())
+
+        assert (
+            script_scopes == cm_scopes == self._EXPECTED_CONVERSATION_TAGS_READ_SCOPES
+        ), (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            "divergent/incomplete MEMORY_CONVERSATION_TAGS_READ_SCOPES "
+            f"arrays. Script: {sorted(script_scopes)}. ConfigMap: "
+            f"{sorted(cm_scopes)}. Expected: "
+            f"{sorted(self._EXPECTED_CONVERSATION_TAGS_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._conversation_tags_read_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_CONVERSATION_TAGS_READ_SCOPES bind "
+                "loop does not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_CONVERSATION_TAGS_READ_SCOPES "
+                    f"bind loop references {forbidden_client!r} — scoped "
+                    "to audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_conversation_tags_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._conversation_tags_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_CONVERSATION_TAGS_READ_SCOPES illegally "
+                f"carries {sorted(offenders)} — this array grants ONLY "
+                "the read-own scope, nothing write/durable/corpus."
+            )
+
+
+class TestOpencodeClientScopesUnchangedByConversationTags:
+    """STANDING REQUIREMENT (requirement-mongo-repl-regression-safety-
+    opencode-e2e): the new ``memory:conversation_tags:{read-own,write}``
+    scope pair is ADDITIVE on ``audittrace-librechat`` ONLY — this class
+    asserts ``audittrace-opencode``'s full scope set (both realm files,
+    both defaultClientScopes and optionalClientScopes) never gains
+    either conversation-tags scope. Mirrors the SC-09
+    (``TestRestrictedClientStaysRestricted``) and every prior Mongo-repl
+    domain's regression-safety pattern: a scope leaking onto a client
+    that was never meant to widen is a silent failure mode, not a loud
+    one — hence a test, not a comment.
+    """
+
+    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset(
+        {"memory:conversation_tags:read-own", "memory:conversation_tags:write"}
+    )
+
+    @staticmethod
+    def _client(realm: dict, client_id: str) -> dict:
+        for c in realm["clients"]:
+            if c["clientId"] == client_id:
+                return c
+        raise AssertionError(f"{client_id} is missing from the realm.")
+
+    def test_opencode_scope_set_never_gains_conversation_tags_scopes(self) -> None:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._client(realm, "audittrace-opencode")
+            both = set(c.get("defaultClientScopes", [])) | set(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = both & self._FORBIDDEN_ON_OPENCODE
+            assert not offenders, (
+                f"{label}: audittrace-opencode was granted {sorted(offenders)} "
+                "— the Conversation-Tags domain scopes are additive on "
+                "audittrace-librechat ONLY (standing regression-safety "
+                "requirement); OpenCode's client must stay untouched."
+            )
+
+
+class TestKeycloakToolFavoritesWriteScopeGovernance:
+    """Tool-Favorites domain
+    (2026-09-13-SPEC-mongo-repl-wu-tool-favorites-store.md) — the
+    console-tool-favorites WRITE provisioning half:
+    ``memory:tool_favorites:write`` reaches ``audittrace-librechat`` as
+    an OPTIONAL scope only, via a dedicated
+    ``MEMORY_TOOL_FAVORITES_WRITE_SCOPES`` array + bind loop kept
+    SEPARATE from every other scope array in this script (same
+    discipline as ``TestKeycloakConversationTagsWriteScopeGovernance``).
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete
+      ``MEMORY_TOOL_FAVORITES_WRITE_SCOPES`` arrays fails
+      ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any read/corpus scope) appearing in either
+      provisioner's ``MEMORY_TOOL_FAVORITES_WRITE_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_tool_favorites_write_scopes``.
+    """
+
+    _EXPECTED_TOOL_FAVORITES_WRITE_SCOPES: frozenset[str] = frozenset(
+        {"memory:tool_favorites:write"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:read",
+            "memory:procedural:read",
+            "memory:semantic:read",
+            "memory:conversational:read-own",
+            "memory:session:read-own",
+            "memory:conversations:read-own",
+            "memory:presets:read-own",
+            "memory:prompts:read-own",
+            "memory:chat_projects:read-own",
+            "memory:files:read-own",
+            "memory:agents:read-own",
+            "memory:conversation_tags:read-own",
+            "memory:tool_favorites:read-own",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _tool_favorites_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_TOOL_FAVORITES_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_TOOL_FAVORITES_WRITE_SCOPES=( ... ) block not "
+                "found — the Tool-Favorites domain requires a "
+                "dedicated array, separate from every other scope array "
+                "in this script."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _tool_favorites_write_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_TOOL_FAVORITES_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_TOOL_FAVORITES_WRITE_SCOPES bind loop (`for "
+                'SCOPE in "${MEMORY_TOOL_FAVORITES_WRITE_SCOPES[@]}"; '
+                "do ... done`) not found — the Tool-Favorites domain "
+                "requires a bind loop scoped to audittrace-librechat "
+                "only, separate from every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._tool_favorites_write_scopes_in(script_path.read_text())
+        cm_scopes = self._tool_favorites_write_scopes_in(cm_path.read_text())
+
+        assert (
+            script_scopes == cm_scopes == self._EXPECTED_TOOL_FAVORITES_WRITE_SCOPES
+        ), (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            "divergent/incomplete MEMORY_TOOL_FAVORITES_WRITE_SCOPES "
+            f"arrays. Script: {sorted(script_scopes)}. ConfigMap: "
+            f"{sorted(cm_scopes)}. Expected: "
+            f"{sorted(self._EXPECTED_TOOL_FAVORITES_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._tool_favorites_write_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_TOOL_FAVORITES_WRITE_SCOPES bind "
+                "loop does not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_TOOL_FAVORITES_WRITE_SCOPES "
+                    f"bind loop references {forbidden_client!r} — the "
+                    "Tool-Favorites domain scopes the write grant to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_tool_favorites_write_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._tool_favorites_write_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_TOOL_FAVORITES_WRITE_SCOPES "
+                f"illegally carries {sorted(offenders)} — this array "
+                "grants ONLY the write scope, nothing read/corpus/admin."
+            )
+
+
+class TestKeycloakToolFavoritesReadOwnScopeGovernance:
+    """Tool-Favorites domain — the console-tool-favorites READ-OWN
+    provisioning half: ``memory:tool_favorites:read-own`` reaches
+    ``audittrace-librechat`` as a DEFAULT scope (never optional —
+    unlike the write counterpart above), via a dedicated
+    ``MEMORY_TOOL_FAVORITES_READ_SCOPES`` array + bind loop kept
+    SEPARATE from ``MEMORY_TOOL_FAVORITES_WRITE_SCOPES``.
+
+    Falsifiable, same shape as
+    ``TestKeycloakConversationTagsReadOwnScopeGovernance``.
+    """
+
+    _EXPECTED_TOOL_FAVORITES_READ_SCOPES: frozenset[str] = frozenset(
+        {"memory:tool_favorites:read-own"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = (
+        TestKeycloakToolFavoritesWriteScopeGovernance._FORBIDDEN
+        | frozenset({"memory:tool_favorites:write"})
+    ) - frozenset({"memory:tool_favorites:read-own"})
+
+    @staticmethod
+    def _tool_favorites_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_TOOL_FAVORITES_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_TOOL_FAVORITES_READ_SCOPES=( ... ) block not "
+                "found — the Tool-Favorites domain requires a "
+                "dedicated array, separate from "
+                "MEMORY_TOOL_FAVORITES_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _tool_favorites_read_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_TOOL_FAVORITES_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_TOOL_FAVORITES_READ_SCOPES bind loop (`for "
+                'SCOPE in "${MEMORY_TOOL_FAVORITES_READ_SCOPES[@]}"; '
+                "do ... done`) not found — the Tool-Favorites domain "
+                "requires a bind loop scoped to audittrace-librechat "
+                "only, separate from every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._tool_favorites_read_scopes_in(script_path.read_text())
+        cm_scopes = self._tool_favorites_read_scopes_in(cm_path.read_text())
+
+        assert (
+            script_scopes == cm_scopes == self._EXPECTED_TOOL_FAVORITES_READ_SCOPES
+        ), (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            "divergent/incomplete MEMORY_TOOL_FAVORITES_READ_SCOPES "
+            f"arrays. Script: {sorted(script_scopes)}. ConfigMap: "
+            f"{sorted(cm_scopes)}. Expected: "
+            f"{sorted(self._EXPECTED_TOOL_FAVORITES_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._tool_favorites_read_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_TOOL_FAVORITES_READ_SCOPES bind "
+                "loop does not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_TOOL_FAVORITES_READ_SCOPES "
+                    f"bind loop references {forbidden_client!r} — scoped "
+                    "to audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_tool_favorites_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._tool_favorites_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_TOOL_FAVORITES_READ_SCOPES illegally "
+                f"carries {sorted(offenders)} — this array grants ONLY "
+                "the read-own scope, nothing write/durable/corpus."
+            )
+
+
+class TestOpencodeClientScopesUnchangedByToolFavorites:
+    """STANDING REQUIREMENT (requirement-mongo-repl-regression-safety-
+    opencode-e2e): the new ``memory:tool_favorites:{read-own,write}``
+    scope pair is ADDITIVE on ``audittrace-librechat`` ONLY — this class
+    asserts ``audittrace-opencode``'s full scope set (both realm files,
+    both defaultClientScopes and optionalClientScopes) never gains
+    either tool-favorites scope. Mirrors the SC-09
+    (``TestRestrictedClientStaysRestricted``) and every prior Mongo-repl
+    domain's regression-safety pattern: a scope leaking onto a client
+    that was never meant to widen is a silent failure mode, not a loud
+    one — hence a test, not a comment.
+    """
+
+    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset(
+        {"memory:tool_favorites:read-own", "memory:tool_favorites:write"}
+    )
+
+    @staticmethod
+    def _client(realm: dict, client_id: str) -> dict:
+        for c in realm["clients"]:
+            if c["clientId"] == client_id:
+                return c
+        raise AssertionError(f"{client_id} is missing from the realm.")
+
+    def test_opencode_scope_set_never_gains_tool_favorites_scopes(self) -> None:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._client(realm, "audittrace-opencode")
+            both = set(c.get("defaultClientScopes", [])) | set(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = both & self._FORBIDDEN_ON_OPENCODE
+            assert not offenders, (
+                f"{label}: audittrace-opencode was granted {sorted(offenders)} "
+                "— the Tool-Favorites domain scopes are additive on "
+                "audittrace-librechat ONLY (standing regression-safety "
+                "requirement); OpenCode's client must stay untouched."
+            )
+
+
+class TestKeycloakAclReadOwnScopeGovernance:
+    """Sovereign Authorization Layer EPIC, WU-1 (2026-09-17, READ PATH
+    ONLY, fix round 1 / F1) — the console-ACL READ-OWN provisioning
+    half: ``memory:acl:read-own`` reaches ``audittrace-librechat`` as a
+    DEFAULT scope, via a dedicated ``MEMORY_ACL_READ_SCOPES`` array +
+    bind loop kept SEPARATE from every other scope array in this
+    script. The WRITE half (``memory:acl:write``, WU-2c) has its own
+    sibling guard in ``tests/test_chart_drift_guards_acl_write.py``;
+    this class stays self-contained and keeps the read array exact.
+
+    Falsifiable, same shape as
+    ``TestKeycloakToolFavoritesReadOwnScopeGovernance``:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete ``MEMORY_ACL_READ_SCOPES``
+      arrays fails ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any write/corpus scope) appearing in either
+      provisioner's ``MEMORY_ACL_READ_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_acl_read_scopes``.
+    """
+
+    _EXPECTED_ACL_READ_SCOPES: frozenset[str] = frozenset({"memory:acl:read-own"})
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "audittrace:assessment:ingest",
+            "audittrace:scan:retrigger",
+            "memory:acl:write",
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+            "memory:session:write",
+            "memory:conversations:write",
+            "memory:presets:write",
+            "memory:prompts:write",
+            "memory:chat_projects:write",
+            "memory:files:write",
+            "memory:agents:write",
+            "memory:conversation_tags:write",
+            "memory:tool_favorites:write",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _acl_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_ACL_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_ACL_READ_SCOPES=( ... ) block not found — the "
+                "Sovereign Authorization Layer EPIC's ACL domain "
+                "requires a dedicated array, separate from every other "
+                "scope array in this script."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _acl_read_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_ACL_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_ACL_READ_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_ACL_READ_SCOPES[@]}"; do ... done`) not '
+                "found — the ACL domain requires a bind loop scoped to "
+                "audittrace-librechat only, separate from every other "
+                "loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._acl_read_scopes_in(script_path.read_text())
+        cm_scopes = self._acl_read_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_ACL_READ_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            "divergent/incomplete MEMORY_ACL_READ_SCOPES arrays. Script: "
+            f"{sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_ACL_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._acl_read_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_ACL_READ_SCOPES bind loop does not "
+                "bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_ACL_READ_SCOPES bind loop "
+                    f"references {forbidden_client!r} — scoped to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_acl_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._acl_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_ACL_READ_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the "
+                "read-own scope, nothing write/durable/corpus/admin."
+            )
+
+
+class TestOpencodeClientScopesUnchangedByAcl:
+    """STANDING REQUIREMENT (requirement-mongo-repl-regression-safety-
+    opencode-e2e), extended to the Sovereign Authorization Layer EPIC:
+    ``memory:acl:read-own`` is ADDITIVE on ``audittrace-librechat`` ONLY
+    — this class asserts ``audittrace-opencode``'s full scope set (both
+    realm files, both defaultClientScopes and optionalClientScopes)
+    never gains it. Mirrors
+    ``TestOpencodeClientScopesUnchangedByToolFavorites``.
+    """
+
+    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset(
+        {"memory:acl:read-own", "memory:acl:write"}
+    )
+
+    @staticmethod
+    def _client(realm: dict, client_id: str) -> dict:
+        for c in realm["clients"]:
+            if c["clientId"] == client_id:
+                return c
+        raise AssertionError(f"{client_id} is missing from the realm.")
+
+    def test_opencode_scope_set_never_gains_acl_scope(self) -> None:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._client(realm, "audittrace-opencode")
+            both = set(c.get("defaultClientScopes", [])) | set(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = both & self._FORBIDDEN_ON_OPENCODE
+            assert not offenders, (
+                f"{label}: audittrace-opencode was granted {sorted(offenders)} "
+                "— the ACL domain scope is additive on audittrace-librechat "
+                "ONLY (standing regression-safety requirement); OpenCode's "
+                "client must stay untouched."
+            )
+
+
+class TestAllScopesRegisteredInControlPlane:
+    """Sovereign ACL WU-1 fix round 1, F1 — the generic guard the
+    reviewer asked for: EVERY scope declared in ``auth.py::ALL_SCOPES``
+    (the app's single source of truth for what a scope MEANS) must
+    actually be reachable from a real cluster. Before this class,
+    F1 could add a Python-only ``ALL_SCOPES`` entry
+    (``memory:acl:read-own``) that existed in NO realm file and NO
+    provisioner script — a scope Keycloak can never mint, permanently
+    403ing every route that requires it, with no operator fix short of
+    a code change. Only hand-written PER-SCOPE tests caught prior
+    instances of this class (#370); sub-invariants 1 and 2 below close
+    the two REALM axes of that class generically. Sub-invariant 3 does
+    **NOT** close the PROVISIONER axis generically — see its own
+    docstring and the "Residual risk" paragraph below; this was
+    overclaimed in fix round 1's commit message (``14711b3``, since
+    corrected — see the fix-round-2 commit ``2efd21a``) and in an
+    earlier draft of this docstring. Fix round 2's own correction then
+    mis-enumerated the "genuinely absent" set as 8 entries — an
+    orchestrator error (a substring match against the raw script text,
+    which spuriously matched two scopes that only appear inside a
+    ``#`` comment on line 189, never as a quoted array element) that
+    propagated into this docstring and the fix-round-2 build record.
+    Fix round 3 (``F5``) re-derived the set from quoted array
+    membership only (this class's own ``_ensure_loop_scope_union`` /
+    ``_array_contents``, never a text-substring check) and corrected it
+    to 10; see the split below.
+
+    Three sub-invariants, each independently falsifiable:
+
+    1. **Declared** — every ``ALL_SCOPES`` key exists as a
+       ``clientScopes[].name`` entry in BOTH realm files (the dev-import
+       JSON and the chart-rendered realm ConfigMap).
+    2. **Bound** — every ``ALL_SCOPES`` key is granted (default OR
+       optional) to at least one client in BOTH realm files — a scope
+       that is declared but bound to nobody is exactly as unmintable as
+       one that was never declared.
+    3. **Provisioner parity ONLY — NOT an ``ALL_SCOPES`` membership
+       check.** The combined ensure-loop array set (the union of every
+       ``*_SCOPES`` array folded into the ``for SCOPE in ... ; do``
+       "ensure each scope exists" loop) is IDENTICAL between
+       ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+       ConfigMap — this generalises the many hand-written
+       ``test_provisioner_arrays_match_and_exact`` guards above into one
+       check that the TWO PROVISIONERS AGREE WITH EACH OTHER. It never
+       asserts ``ALL_SCOPES ⊆ (script_union | cm_union)``, and
+       deliberately so. As of this round, 10 ``ALL_SCOPES`` entries sit
+       outside ``(script_union | cm_union)`` (32 entries, of
+       ``ALL_SCOPES``'s 42) — they split into two groups, not one:
+
+       - **8 legitimately belong to no memory-scopes provisioner at
+         all** — the core chat/query/audit scopes: ``audittrace:query``,
+         ``audittrace:context``, ``audittrace:index``, ``audittrace:audit``,
+         ``audittrace:scan:retrigger``, ``memory:episodic:read``,
+         ``memory:procedural:read``, ``memory:upload:write``. Forcing
+         these into ``setup-memory-scopes.sh`` to satisfy a strict
+         subset check would misfile them into the wrong script — a
+         worse outcome than an honest, narrower parity-only guard.
+       - **2 are live candidates for the residual risk below, not
+         established as legitimately absent** — ``memory:semantic:read``
+         and ``memory:conversational:read-own``. Both are READ-OWN-style
+         memory-domain scopes; the provisioner script's own comment
+         above ``MEMORY_SESSION_READ_SCOPES`` (line 189) calls
+         ``memory:session:read-own`` *"a READ-OWN scope, same family as
+         memory:conversational:read-own/memory:semantic:read"* — and
+         that sibling, ``memory:session:read-own``, IS provisioned
+         (``MEMORY_SESSION_READ_SCOPES``). The script's own comment
+         treats this family as provisioner-owned; these two members of
+         the family are simply missing from the array. This is named as
+         a candidate, not asserted as a defect — no test in this class
+         requires provisioning either — but the "legitimately belongs
+         nowhere" framing does NOT apply to these two, and asserting
+         otherwise is not supported by the evidence above.
+
+       **Residual risk (explicit, not closed by this class): two live
+       instances on `main` today, not merely a future possibility.**
+       Any scope added to ``ALL_SCOPES`` AND declared in both realm
+       files AND bound to a client (satisfying sub-invariants 1 and 2)
+       but added to NEITHER provisioner script's ``*_SCOPES`` arrays
+       passes this class's sub-invariant 3 outright — the two
+       provisioners still agree (both omit it). ``memory:semantic:read``
+       and ``memory:conversational:read-own`` are exactly that today:
+       declared + bound (sub-invariants 1 and 2 pass for both), yet
+       absent from both provisioners' ensure-loop arrays. On a FRESH
+       cluster the realm import mints the clientScope and the omission
+       is invisible; on an EXISTING cluster upgraded via the
+       provisioner Job (the only path that runs post-install), the
+       scope is never (re-)created if it were ever removed and
+       re-added, and any route that requires it would 403 permanently
+       on that path — this is F1's exact failure mode, on the upgrade
+       path, surviving this guard. Closing it requires a per-scope
+       ownership map (which provisioner, if any, owns each
+       ``ALL_SCOPES`` entry) and is tracked as a follow-up WU, not
+       attempted here; that follow-up should also settle whether these
+       two scopes ought to be added to ``MEMORY_SESSION_READ_SCOPES``'s
+       family outright.
+
+    **Non-vacuity, proved by hand during the fix round** (not
+    re-executed by this class, which would be a guard testing itself):
+    deleting the ``memory:acl:read-own`` clientScope declaration from
+    ``keycloak/realm-audittrace.json`` alone flips
+    ``test_every_scope_declared_in_both_realms`` RED (missing in that
+    one file); additionally removing it from
+    ``defaultClientScopes``/``optionalClientScopes`` on every client
+    flips ``test_every_scope_bound_to_some_client`` RED even with the
+    declaration restored; deleting ``MEMORY_ACL_READ_SCOPES`` from only
+    one of the two provisioner files flips
+    ``test_provisioner_ensure_loop_sets_match`` RED. All three restored
+    to the tree's real (``cmp``-identical) state afterward.
+
+    **New finding surfaced by this guard, tracked NOT silently fixed**
+    (WU-1 fix round 1, out of this WU's mandate — binding an admin-
+    grade scope to a client is a security decision, not a drive-by):
+    ``test_every_scope_bound_to_some_client`` independently discovered
+    that ``audittrace:scan:retrigger`` and ``memory:upload:write`` are
+    ALREADY declared clientScopes in BOTH realm files today, on `main`,
+    with ZERO client (default or optional) holding either — pre-
+    existing and unrelated to the ACL domain. Exempted here (narrowly,
+    by name, proven by the same query this guard runs) so the ACL fix
+    doesn't silently absorb an unrelated remediation; see
+    ``_PRE_EXISTING_UNBOUND_SCOPES`` below. Follow-up: a dedicated WU
+    must decide which client(s) should hold these and bind them (or
+    deprecate the scopes if genuinely dead), then delete this
+    exemption.
+    """
+
+    # Proven pre-existing (see class docstring) — NOT part of the ACL
+    # domain this fix round touches. Deliberately exempted by NAME so
+    # the exemption cannot silently grow to cover a scope this WU
+    # actually owns (see test_exemption_list_is_narrow below, which
+    # would fail if memory:acl:* ever landed in this set).
+    _PRE_EXISTING_UNBOUND_SCOPES: frozenset[str] = frozenset(
+        {"audittrace:scan:retrigger", "memory:upload:write"}
+    )
+
+    # The combined "ensure each scope exists" loop's array-reference
+    # list is identical text in both files (see
+    # TestKeycloakOpencodeMemoryWriteScopes docstring on why these two
+    # files must mirror each other) — this pattern extracts that FIRST
+    # `for SCOPE in "${A[@]}" "${B[@]}" ...; do` header specifically
+    # (the ensure-loop, which folds in TWO OR MORE arrays), not any of
+    # the later single-array bind loops (each references exactly one).
+    _ENSURE_LOOP_HEADER_RE = re.compile(
+        r'for SCOPE in ((?:"\$\{[A-Z_]+\[@\]\}"\s*){2,}); do'
+    )
+    _ARRAY_REF_RE = re.compile(r"\$\{([A-Z_]+)\[@\]\}")
+
+    @staticmethod
+    def _array_contents(text: str, array_name: str) -> set[str]:
+        m = re.search(rf"\b{array_name}=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                f"array {array_name} referenced by the ensure-loop header "
+                "but never declared in this file."
+            )
+        return set(re.findall(r'"([^"]+)"', m.group(1)))
+
+    @classmethod
+    def _ensure_loop_scope_union(cls, text: str) -> set[str]:
+        m = cls._ENSURE_LOOP_HEADER_RE.search(text)
+        if m is None:
+            raise AssertionError(
+                "the 'ensure each scope exists' for-loop header was not "
+                "found — provisioner script structure changed; update "
+                "this guard's regex."
+            )
+        array_names = cls._ARRAY_REF_RE.findall(m.group(1))
+        assert array_names, "no array references parsed out of the ensure-loop header"
+        union: set[str] = set()
+        for name in array_names:
+            union |= cls._array_contents(text, name)
+        return union
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    def test_every_scope_declared_in_both_realms(self) -> None:
+        from audittrace.auth import ALL_SCOPES
+
+        for label, realm in self._both_realms():
+            declared = {s.get("name") for s in realm.get("clientScopes", []) or []}
+            missing = set(ALL_SCOPES) - declared
+            assert not missing, (
+                f"{label}: ALL_SCOPES entries with NO matching "
+                f"clientScopes[].name declaration: {sorted(missing)} — "
+                "Keycloak can never mint these on a fresh realm import; "
+                "add a clientScopes object for each in BOTH realm files."
+            )
+
+    def test_every_scope_bound_to_some_client(self) -> None:
+        from audittrace.auth import ALL_SCOPES
+
+        for label, realm in self._both_realms():
+            bound: set[str] = set()
+            for c in realm.get("clients", []) or []:
+                bound |= set(c.get("defaultClientScopes") or [])
+                bound |= set(c.get("optionalClientScopes") or [])
+            missing = set(ALL_SCOPES) - bound - self._PRE_EXISTING_UNBOUND_SCOPES
+            assert not missing, (
+                f"{label}: ALL_SCOPES entries declared as clientScopes "
+                f"but bound to NO client (default or optional): "
+                f"{sorted(missing)} — a scope nobody can request is "
+                "exactly as unreachable as one that was never declared; "
+                "bind it (default or optional, as the domain's read/"
+                "write discipline requires) to its intended client."
+            )
+
+    def test_exemption_list_is_narrow(self) -> None:
+        """Non-vacuity floor on the exemption itself: it must name
+        EXACTLY the two pre-existing scopes proven unbound (see class
+        docstring), never grow to swallow a scope this WU (or any
+        future one) actually owns — in particular, no ``memory:acl:*``
+        entry may ever appear here."""
+        assert self._PRE_EXISTING_UNBOUND_SCOPES == frozenset(
+            {"audittrace:scan:retrigger", "memory:upload:write"}
+        )
+        assert not any(
+            s.startswith("memory:acl:") for s in self._PRE_EXISTING_UNBOUND_SCOPES
+        )
+
+    def test_provisioner_ensure_loop_sets_match(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_union = self._ensure_loop_scope_union(script_path.read_text())
+        cm_union = self._ensure_loop_scope_union(cm_path.read_text())
+        assert script_union == cm_union, (
+            "Drift: the ensure-loop's combined array set diverges between "
+            "scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml. "
+            f"Only in script: {sorted(script_union - cm_union)}. Only in "
+            f"configmap: {sorted(cm_union - script_union)}."
+        )
+
+
+class TestCorpusScopeGovernance:
+    """ADR-062 WU-A2/A3 — granular ``memory:corpus:<collection>:{read,write}``
+    scopes for Layer 5 (the Shared Corpus), one read/write pair per recall
+    collection (``decisions``, ``skills``, ``semantic``).
+
+    Write (and, in this Phase-A pass, read too — there is no Curator client
+    yet) is operator/curator-tier: optional-only on ``admin-client``, never
+    granted (default or optional) to end-user clients (``audittrace-opencode``,
+    ``audittrace-webui``) or to the reserved SC-09 ``audittrace-restricted``
+    client (see the sibling guard added to
+    ``TestRestrictedClientStaysRestricted`` below).
+
+    Falsifiable:
+
+    * a corpus scope declared in a realm file but missing from
+      ``audittrace.auth.ALL_SCOPES`` (or vice-versa) fails
+      ``test_corpus_scopes_match_all_scopes_dict``;
+    * granting a corpus scope to ``audittrace-opencode``/``audittrace-webui``
+      fails ``test_corpus_scopes_not_on_end_user_clients``;
+    * granting a corpus scope to any client other than ``admin-client``
+      fails ``test_corpus_write_only_granted_to_admin_client``.
+    """
+
+    _EXPECTED_CORPUS_SCOPES: frozenset[str] = frozenset(
+        {
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    _END_USER_CLIENT_IDS: tuple[str, ...] = ("audittrace-opencode", "audittrace-webui")
+
+    def test_realm_declares_all_corpus_scopes(self) -> None:
+        """Chart-rendered realm (the file actually imported on a fresh
+        cluster) declares all six corpus scopes as clientScopes."""
+        realm = _rendered_realm_json(_render())
+        declared = {s.get("name") for s in realm.get("clientScopes", []) or []}
+        missing = self._EXPECTED_CORPUS_SCOPES - declared
+        assert not missing, (
+            "Drift: charts/audittrace/files/realm-audittrace.json is "
+            "missing corpus clientScope declarations for: " + ", ".join(sorted(missing))
+        )
+
+    def test_top_level_realm_declares_all_corpus_scopes(self) -> None:
+        """The dev/standalone import file declares the same six corpus
+        scopes as the chart file (WU-A2: declare in BOTH realm files, kept
+        identical)."""
+        realm = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        declared = {s.get("name") for s in realm.get("clientScopes", []) or []}
+        missing = self._EXPECTED_CORPUS_SCOPES - declared
+        assert not missing, (
+            "Drift: keycloak/realm-audittrace.json is missing corpus "
+            "clientScope declarations for: "
+            + ", ".join(sorted(missing))
+            + " — it must mirror charts/audittrace/files/realm-audittrace.json."
+        )
+
+    def test_corpus_scopes_match_all_scopes_dict(self) -> None:
+        """Cross-check the realm-declared corpus scopes against
+        ``audittrace.auth.ALL_SCOPES`` in both directions. The OpenAPI
+        security scheme is generated FROM ``ALL_SCOPES``, so a realm-only
+        scope would be grantable but invisible in Swagger/OpenAPI, and an
+        ``ALL_SCOPES``-only entry would be documented but never issuable —
+        this is the drift class WU-A2 exists to prevent."""
+        from audittrace.auth import ALL_SCOPES
+
+        code_corpus = {s for s in ALL_SCOPES if s.startswith("memory:corpus:")}
+        realm = _rendered_realm_json(_render())
+        realm_corpus = {
+            s.get("name")
+            for s in realm.get("clientScopes", []) or []
+            if (s.get("name") or "").startswith("memory:corpus:")
+        }
+        assert code_corpus == realm_corpus, (
+            "Drift between audittrace.auth.ALL_SCOPES and the realm's "
+            f"declared memory:corpus:* scopes. In ALL_SCOPES only: "
+            f"{sorted(code_corpus - realm_corpus)}. In realm only: "
+            f"{sorted(realm_corpus - code_corpus)}."
+        )
+        assert code_corpus == self._EXPECTED_CORPUS_SCOPES
+
+    @pytest.mark.parametrize("client_id", ["audittrace-opencode", "audittrace-webui"])
+    def test_corpus_scopes_not_on_end_user_clients(self, client_id: str) -> None:
+        """WU-A3: end-user clients get NO corpus scope in EITHER set for
+        this governance-floor pass — the whole ``memory:corpus:*`` family
+        stays operator/curator-tier."""
+        realm = _rendered_realm_json(_render())
+        for c in realm.get("clients", []) or []:
+            if c.get("clientId") != client_id:
+                continue
+            both = set(c.get("defaultClientScopes") or []) | set(
+                c.get("optionalClientScopes") or []
+            )
+            offenders = sorted(s for s in both if s.startswith("memory:corpus:"))
+            assert not offenders, (
+                f"Drift: client {client_id!r} was granted corpus scope(s) "
+                f"{offenders} — WU-A3 (ADR-062 §4) requires corpus scopes "
+                "stay operator/curator-tier; end-user clients never get "
+                "them, in either scope set."
+            )
+            return
+        raise AssertionError(f"Client {client_id!r} not found in rendered realm")
+
+    def test_corpus_write_only_granted_to_admin_client(self) -> None:
+        """No client other than the operator-tier ``admin-client`` may hold
+        ANY corpus scope (read or write) in this Phase-A pass — there is no
+        Curator client yet (SDLC-ADR-002 is future work)."""
+        realm = _rendered_realm_json(_render())
+        offenders: dict[str, list[str]] = {}
+        for c in realm.get("clients", []) or []:
+            client_id = c.get("clientId")
+            if client_id == "admin-client":
+                continue
+            both = set(c.get("defaultClientScopes") or []) | set(
+                c.get("optionalClientScopes") or []
+            )
+            granted = sorted(s for s in both if s.startswith("memory:corpus:"))
+            if granted:
+                offenders[client_id] = granted
+        assert not offenders, (
+            f"Drift: non-operator client(s) hold corpus scopes: {offenders}. "
+            "Only admin-client (operator-tier) may hold memory:corpus:* in "
+            "this Phase-A pass."
+        )
+
+    @staticmethod
+    def _corpus_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{CORPUS_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                'CORPUS_SCOPES bind loop (`for SCOPE in "${CORPUS_SCOPES[@]}"; '
+                "do ... done`) not found — WU-A3 requires a bind loop scoped "
+                "to admin-client only, separate from the CLIENT_KIND fan-out."
+            )
+        return m.group(1)
+
+    def test_provisioner_corpus_scopes_match_and_admin_only(self) -> None:
+        """scripts/setup-memory-scopes.sh and the chart's in-cluster Job
+        ConfigMap must maintain identical ``CORPUS_SCOPES`` arrays (all six
+        scopes), and the corpus bind loop must target ``admin-client``
+        only — never ``audittrace-opencode``/``audittrace-webui``."""
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_text = script_path.read_text()
+        cm_text = cm_path.read_text()
+
+        def _corpus_scopes_in(text: str) -> set[str]:
+            m = re.search(r"CORPUS_SCOPES=\(([^)]*)\)", text)
+            if m is None:
+                raise AssertionError(
+                    f"CORPUS_SCOPES=( ... ) block not in: {text[:200]}"
+                )
+            return set(re.findall(r'"(memory:corpus:[^"]+)"', m.group(1)))
+
+        script_corpus = _corpus_scopes_in(script_text)
+        cm_corpus = _corpus_scopes_in(cm_text)
+
+        assert script_corpus == cm_corpus == self._EXPECTED_CORPUS_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete CORPUS_SCOPES arrays. Script: "
+            f"{sorted(script_corpus)}. ConfigMap: {sorted(cm_corpus)}. "
+            f"Expected: {sorted(self._EXPECTED_CORPUS_SCOPES)}."
+        )
+
+        for text, label in ((script_text, "script"), (cm_text, "configmap")):
+            loop_body = self._corpus_bind_loop_body(text)
+            assert "admin-client" in loop_body, (
+                f"{label}: the CORPUS_SCOPES bind loop does not bind to "
+                "admin-client — WU-A3 requires corpus scopes reach only "
+                "the operator-tier client."
+            )
+            for forbidden_client in self._END_USER_CLIENT_IDS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the CORPUS_SCOPES bind loop references "
+                    f"{forbidden_client!r} — corpus scopes must never reach "
+                    "end-user clients (WU-A3, ADR-062 §4)."
+                )
+
+
 class TestPostDeployVerifyKeycloakScopeGuard:
     """Check 11 of ``scripts/post-deploy-verify.sh`` (#370).
 
@@ -1003,18 +4592,36 @@ class TestPostDeployVerifyKeycloakScopeGuard:
 
 
 class TestRestrictedClientStaysRestricted:
-    """`audittrace-restricted` must never gain an audit or admin scope (SC-09).
+    """`audittrace-restricted` must never gain an audit, admin, or memory
+    write scope (SC-09).
 
     This client exists for exactly one purpose: to hold a token that CANNOT be
     widened by asking. Keycloak silently DROPS a requested scope a client does
     not offer rather than erroring, so "the client does not offer it" is the
-    entire mechanism. Adding `audittrace:audit` to either scope set - even as
-    optional, even "just for a test" - does not weaken the evidence, it VOIDS
-    it: every SC-09 403 would then prove only that the caller did not ask.
+    entire mechanism. Adding `audittrace:audit` (or any memory:*:write scope)
+    to either scope set - even as optional, even "just for a test" - does not
+    weaken the evidence, it VOIDS it: every SC-09 403 would then prove only
+    that the caller did not ask.
 
     The failure mode this guards against is quiet. Nothing breaks, no test
     goes red, and the adversarial result silently becomes worthless while
     still being cited. Hence a test rather than a comment.
+
+    2026-09-04 independent-review fix (WU-1, Sovereign-Attach EPIC): the
+    original FORBIDDEN tuple below covered only the four ``audittrace:*``
+    scopes — SC-09 could be granted ANY ``memory:<layer>:write`` scope
+    (including the new ``memory:session:write``) and this class stayed
+    GREEN. Proven vacuous by the reviewer: granting
+    ``memory:session:write`` to ``audittrace-restricted`` in
+    ``keycloak/realm-audittrace.json`` did not turn this class red. FORBIDDEN
+    now names every ``memory:<layer>:write`` scope explicitly (per-layer
+    write scopes are added one-by-one, not by prefix, on purpose — a prefix
+    match would also swallow the *read* scopes, e.g.
+    ``memory:conversational:read-own``, which SC-09 actually holds (its
+    real default scopes) for the SC-09 adversarial-read scenario itself)
+    — see ``test_realm_grants_no_forbidden_scope`` below, which
+    now also checks BOTH realm files (the vacuous version checked only the
+    top-level file).
     """
 
     FORBIDDEN = (
@@ -1022,6 +4629,45 @@ class TestRestrictedClientStaysRestricted:
         "audittrace:admin",
         "audittrace:assessment:ingest",
         "audittrace:index",
+        # 2026-09-04 (WU-1 independent-review fix, project_restricted_client_sc09_reserved)
+        # — SC-09 is the RESERVED restricted client: it must never hold ANY
+        # memory write scope, durable or ephemeral. Named individually, not
+        # matched by a "memory:" prefix — that would also catch the READ
+        # scope SC-09 actually holds (memory:conversational:read-own,
+        # one of its defaultClientScopes) for the SC-09 adversarial
+        # cross-tenant READ scenario.
+        "memory:episodic:write",
+        "memory:procedural:write",
+        "memory:semantic:write",
+        "memory:session:write",
+        # M4 hardening (2026-09-11, Files-metadata domain build) — the
+        # FORBIDDEN tuple above predates the Mongo-repl console-* domain
+        # write scopes (conversations/presets/prompts/chat_projects
+        # landed 2026-09-11 without a corresponding SC-09 guard update).
+        # Named individually here, same "no prefix match" rationale as
+        # above, so this guard explicitly forbids EVERY domain
+        # write-scope on audittrace-restricted, not just the original
+        # four memory layers.
+        "memory:conversations:write",
+        "memory:presets:write",
+        "memory:prompts:write",
+        "memory:chat_projects:write",
+        "memory:files:write",
+        # M4 hardening (2026-09-12, Agents domain build) — append the
+        # Agents domain's write scope to the same guard, same
+        # "no prefix match" rationale as the Files-metadata addition
+        # above.
+        "memory:agents:write",
+        # M4 hardening (2026-09-13, Conversation-Tags domain build) —
+        # append the Conversation-Tags domain's write scope to the same
+        # guard, same "no prefix match" rationale as the Agents addition
+        # above.
+        "memory:conversation_tags:write",
+        # M4 hardening (2026-09-13, Tool-Favorites domain build) —
+        # append the Tool-Favorites domain's write scope to the same
+        # guard, same "no prefix match" rationale as the
+        # Conversation-Tags addition above.
+        "memory:tool_favorites:write",
     )
 
     @staticmethod
@@ -1036,23 +4682,83 @@ class TestRestrictedClientStaysRestricted:
             "boundary. See audittrace-private doc 14."
         )
 
-    def test_top_level_realm_grants_no_audit_scope(self) -> None:
-        realm = json.loads(
+    def test_realm_grants_no_forbidden_scope(self) -> None:
+        """Checked against BOTH realm files, in BOTH scope sets.
+
+        2026-09-04 fix: the pre-fix version of this test
+        (``test_top_level_realm_grants_no_audit_scope``) checked ONLY
+        ``keycloak/realm-audittrace.json`` — a forbidden scope landing
+        solely in the chart's rendered realm file would have slipped
+        through undetected. Mirrors
+        ``test_no_corpus_scope_on_restricted_client``'s both-realms loop
+        below so the two guards read the realm identically."""
+        top_level = json.loads(
             (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
                 encoding="utf-8"
             )
         )
-        c = self._restricted(realm)
-        both = list(c.get("defaultClientScopes", [])) + list(
-            c.get("optionalClientScopes", [])
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._restricted(realm)
+            both = list(c.get("defaultClientScopes", [])) + list(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = [s for s in both if s in self.FORBIDDEN]
+            assert not offenders, (
+                f"{label}: audittrace-restricted was granted "
+                f"{offenders} - this VOIDS every SC-09 result. The client's "
+                "only purpose is that these scopes are unobtainable, not "
+                "merely unrequested. Remove them, or stop citing SC-09."
+            )
+
+    def test_no_corpus_scope_on_restricted_client(self) -> None:
+        """WU-A3 (ADR-062 §4) — ``memory:corpus:*`` scopes are operator/
+        curator-tier and must never appear on ``audittrace-restricted``
+        (SC-09), in EITHER scope set, in EITHER realm file. Same VOID
+        mechanism as ``test_realm_grants_no_forbidden_scope`` above:
+        Keycloak silently drops a requested-but-not-offered scope, so "the
+        client does not offer it" is the entire guarantee an adversarial
+        cross-tenant/corpus-boundary test relies on.
+
+        Checked against both realm files via a glob (not the FORBIDDEN
+        tuple above, which is a fixed literal list — the corpus scopes are
+        a closed set named ``memory:corpus:<collection>:{read,write}`` per
+        collection, cheaper to catch by prefix here) so a corpus scope
+        added to either file's audittrace-restricted client fails here
+        regardless of which realm file it landed in. The top-level file is
+        plain JSON; the chart file has Helm templating elsewhere (webui
+        redirectUris/webOrigins) so it's read via the rendered realm, same
+        as every other chart-file check in this module."""
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
         )
-        offenders = [s for s in both if s in self.FORBIDDEN]
-        assert not offenders, (
-            "audittrace-restricted was granted "
-            f"{offenders} - this VOIDS every SC-09 result. The client's only "
-            "purpose is that these scopes are unobtainable, not merely "
-            "unrequested. Remove them, or stop citing SC-09."
-        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._restricted(realm)
+            both = list(c.get("defaultClientScopes", [])) + list(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = [s for s in both if s.startswith("memory:corpus:")]
+            assert not offenders, (
+                f"{label}: audittrace-restricted was granted corpus scope(s) "
+                f"{offenders} — this VOIDS every SC-09 result the same way "
+                "an audit/admin scope would. Corpus scopes are operator/"
+                "curator-tier (WU-A3, ADR-062 §4); remove them."
+            )
 
     def test_description_fits_keycloak_column(self) -> None:
         """Keycloak stores client.description in a varchar(255).
@@ -1180,6 +4886,117 @@ class TestPostDeployVerifyShadowClientCheck:
             "undeclared clients must call fail(), not pass() or skip() — a "
             "warning that does not redden the gate is a warning nobody reads."
         )
+
+
+class TestPrivilegedCorpusScopeSingleSourceOfTruth:
+    """#371 — the granular-corpus-scope residual gap named in ADR-062 §4:
+    "the scope-drift guard must learn the granular corpus scopes so an
+    undeclared holder is flagged." The app classifier
+    (``identity.is_privileged_scope``) and Check 11's shadow-client ranking
+    must never drift apart.
+
+    Unlike the string-shape pins in ``TestPostDeployVerifyShadowClientCheck``
+    above, the ranking tests here actually EXECUTE the extracted shell
+    snippet in a real ``bash`` subprocess against synthetic comma-joined
+    default-scope lists — a genuinely falsifiable test, not a text search:
+    delete the ``memory:corpus:*:write`` case arm (or shrink the glob) and
+    every "ranked privileged" assertion below goes RED because the real
+    shell evaluates to no match.
+    """
+
+    @staticmethod
+    def _script() -> str:
+        return (REPO_ROOT / "scripts" / "post-deploy-verify.sh").read_text(
+            encoding="utf-8"
+        )
+
+    def _extract_ranking_snippet(self) -> str:
+        """Pull the exact per-scope ranking block (the ``IFS=','`` split +
+        ``case`` loop) out of Check 11 so it can be executed standalone."""
+        script = self._script()
+        start_marker = "IFS=',' read -ra _shadow_scopes <<< \"$sc\""
+        start = script.index(start_marker)
+        end_marker = "esac\n            done\n"
+        end = script.index(end_marker, start) + len(end_marker)
+        return script[start:end]
+
+    def _rank(self, sc: str) -> str:
+        """Run the extracted ranking snippet in a real bash subshell against
+        a synthetic comma-joined ``sc`` (default-client-scopes) string and
+        return the ``$privileged`` value it computes."""
+        snippet = self._extract_ranking_snippet()
+        shell_script = (
+            f'sc="{sc}"\nprivileged=""\n{snippet}\nprintf "%s" "$privileged"\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", shell_script], capture_output=True, text=True
+        )
+        assert result.returncode == 0, (
+            f"extracted ranking snippet failed to run: {result.stderr}"
+        )
+        return result.stdout
+
+    def test_glob_literal_matches_python_constant(self) -> None:
+        """The shell guard's ``case`` pattern mirrors
+        ``identity.CORPUS_WRITE_SCOPE_GLOB`` VERBATIM — checked inside the
+        EXECUTABLE ranking snippet itself (not just anywhere in the file, so
+        a copy left behind in a comment cannot mask the literal being
+        dropped from the actual ``case`` arm). A change to one without the
+        other is exactly how #370/#371-class drift happens; this test is
+        the single source-of-truth enforcement point."""
+        from audittrace.identity import CORPUS_WRITE_SCOPE_GLOB
+
+        assert CORPUS_WRITE_SCOPE_GLOB in self._extract_ranking_snippet(), (
+            "the shell guard's corpus-write glob pattern has drifted from "
+            f"identity.CORPUS_WRITE_SCOPE_GLOB ({CORPUS_WRITE_SCOPE_GLOB!r}) "
+            "— they must be the exact same literal string inside the "
+            "ranking `case` arm, or the app classifier and the shell guard "
+            "can silently disagree."
+        )
+
+    def test_undeclared_corpus_writer_is_ranked_privileged(self) -> None:
+        """A synthetic UNDECLARED client holding
+        ``memory:corpus:decisions:write`` must rank ``!!`` privileged — the
+        exact scenario ADR-062 §4 names and #371 exists to close."""
+        assert (
+            self._rank("memory:corpus:decisions:write")
+            == "memory:corpus:decisions:write"
+        )
+
+    @pytest.mark.parametrize("collection", ["decisions", "skills", "semantic"])
+    def test_every_declared_collection_is_ranked_privileged(
+        self, collection: str
+    ) -> None:
+        """ADR-062 §4's granular collections — every one, not just
+        ``decisions``, must be recognised."""
+        sc = f"memory:corpus:{collection}:write"
+        assert self._rank(sc) == sc
+
+    def test_corpus_read_scope_is_not_ranked_privileged(self) -> None:
+        assert self._rank("memory:corpus:decisions:read") == ""
+
+    def test_plain_layer_write_scope_is_not_ranked_privileged(self) -> None:
+        """Regression lock: an ordinary per-user writer scope
+        (``memory:episodic:write``) must NOT be flagged, or the guard cries
+        wolf on every legitimate opencode/webui deployment."""
+        assert self._rank("memory:episodic:write") == ""
+
+    def test_admin_and_audit_ranking_unchanged(self) -> None:
+        """No new false positives / no lost coverage on a correct cluster:
+        the pre-#371 admin/audit ranking still works after the corpus-write
+        extension."""
+        assert self._rank("audittrace:admin") == "audittrace:admin"
+        assert self._rank("audittrace:audit") == "audittrace:audit"
+
+    def test_mixed_scope_list_does_not_bleed_across_tokens(self) -> None:
+        """Regression for the glob-bleed bug this rewrite fixes: a
+        comma-joined list containing a corpus-READ scope and an unrelated
+        write scope must not falsely match ``memory:corpus:*:write`` by the
+        middle ``*`` wildcard spanning across two unrelated scope tokens."""
+        assert self._rank("memory:corpus:decisions:read,other:write") == ""
+
+    def test_no_privileged_scope_ranks_empty(self) -> None:
+        assert self._rank("memory:read,session:read-own") == ""
 
 
 class TestChromaDBPersistPathMatchesMount:
@@ -1359,4 +5176,1234 @@ class TestSingleOwnershipKeyInVectorMetadata:
             "the search filter key changed. It must stay `user_id`, or every "
             "writer must change with it in the same commit — a reader/writer "
             "mismatch here produces zero results with no error anywhere."
+        )
+
+
+class TestLibrechatConsoleClient:
+    """M3-WU-1 — the ``audittrace-librechat`` OIDC client (the M3 LibreChat
+    console's browser-facing public PKCE client, ADR-064) must exist in
+    BOTH realm files with the expected scope grant.
+
+    **M3-WU-D2-1 (2026-08-30) superseded the original read/ask-only
+    boundary this class enforced.** The ratified
+    ``2026-08-30-SPEC-m3-souvenirs-sovereign-memory.md`` deliberately
+    grants ``audittrace-librechat`` the three per-user-layer
+    ``memory:*:write`` scopes — as OPTIONAL, never default — so the BFF's
+    Souvenirs-panel memory-proxy exchange (``bff/memory_proxy.py``,
+    ``bff/memory_scopes.py``) can request them explicitly. The browser's
+    OWN login token never carries them (they are absent from
+    ``defaultClientScopes``); only a BFF-mediated RFC 8693 exchange that
+    asks for them by name in its ``scope=`` parameter can obtain them (see
+    ``bff/exchange.py::exchange_token``'s ``requested_scope``). A
+    companion ADR documenting this boundary change is queued per the
+    spec's "Companion ADR" section.
+
+    **WU-5 (Sovereign-Attach EPIC, 2026-09-06-SPEC-wu5-same-turn-session-
+    recall.md)** added ``memory:session:read-own`` to ``defaultClientScopes``
+    — deliberately DEFAULT, unlike its write counterpart
+    ``memory:session:write``: it is a READ-OWN scope (same family as
+    ``memory:conversational:read-own``/``memory:semantic:read``, both
+    already default here), and the plain chat-token RFC 8693 exchange
+    (``bff/exchange.py::exchange_token``, ``requested_scope=None``) mints a
+    token carrying only the TARGET client's DEFAULT scopes — an
+    optional-only grant would never reach the ``/v1`` tool loop through
+    that path, making ``recall_attachments`` unreachable from the real
+    console. See ``TestKeycloakSessionReadOwnScopeGovernance`` for the
+    dedicated provisioner-side (``configmap``/``scripts/setup-memory-
+    scopes.sh``) falsifiable guards.
+
+    Falsifiable, one assertion per guard:
+
+    * renaming/removing the client from either realm file fails
+      ``test_client_present_in_both_realms``;
+    * its ``defaultClientScopes`` drifting from the exact read/ask set fails
+      ``test_default_scopes_match_expected_read_ask_set`` — write access
+      must NEVER be a default (always-issued) scope;
+    * its ``optionalClientScopes`` drifting from the exact expected set
+      (``offline_access`` + the three durable memory-write scopes +
+      ``memory:session:write``) fails ``test_optional_scopes_match_expected_set``;
+    * granting it ``audittrace:admin`` (default OR optional) fails
+      ``test_no_admin_scope_granted`` — the spec is explicit: the console
+      must never obtain hard-delete of the audit trail;
+    * granting it a ``memory:corpus:*`` scope fails
+      ``test_no_corpus_scope_granted`` (ADR-062 §4 — corpus scopes are
+      operator/curator-tier);
+    * flipping ``publicClient``/enabling implicit/ROPC/service-accounts, or
+      adding a client secret, fails ``test_public_client_no_secret_no_implicit_no_ropc``;
+    * dropping PKCE S256 fails ``test_pkce_s256_enabled``;
+    * dropping the ``aud-audittrace-server`` mapper (or its
+      ``included.custom.audience``) fails ``test_audience_mapper_present`` —
+      without it, issued tokens would not carry ``aud=audittrace-server``
+      and ``/v1`` would reject them;
+    * dropping ``preferred-username``/``email`` mappers fails
+      ``test_identity_mappers_present`` — audit rows/traces would lose the
+      human-legible identity alongside ``sub``;
+    * a wildcard ``redirectUris``/``webOrigins`` entry (the
+      OIDC-REDIRECT-URI-DRIFT regression) fails
+      ``test_no_wildcard_redirect_uris``.
+    """
+
+    _EXPECTED_DEFAULT_SCOPES: frozenset[str] = frozenset(
+        {
+            "audittrace:query",
+            "audittrace:context",
+            "audittrace:audit",
+            "memory:episodic:read",
+            "memory:procedural:read",
+            "memory:conversational:read-own",
+            "memory:semantic:read",
+            # WU-5 (Sovereign-Attach EPIC, 2026-09-06) — same-turn recall of
+            # the caller's OWN ephemeral session uploads
+            # (recall_attachments). DEFAULT, same read-own family as
+            # memory:conversational:read-own above — see the class
+            # docstring for why this must be default, not optional.
+            "memory:session:read-own",
+            # Mongo-repl WU-1 (2026-09-11) — the console-conversations
+            # store's read-own scope. DEFAULT, same read-own family as
+            # memory:session:read-own above.
+            "memory:conversations:read-own",
+            # Mongo-repl WU-presets (2026-09-11) — the console-presets
+            # store's read-own scope. DEFAULT, same read-own family as
+            # memory:conversations:read-own above.
+            "memory:presets:read-own",
+            # Mongo-repl WU-prompts (2026-09-11) — the console-prompts
+            # store's read-own scope. DEFAULT, same read-own family as
+            # memory:presets:read-own above.
+            "memory:prompts:read-own",
+            # Chat-Projects domain (2026-09-11) — the console-chat-
+            # projects store's read-own scope. DEFAULT, same read-own
+            # family as memory:prompts:read-own above.
+            "memory:chat_projects:read-own",
+            # Files-metadata domain (2026-09-11) — the console-files
+            # store's read-own scope. DEFAULT, same read-own family as
+            # memory:chat_projects:read-own above.
+            "memory:files:read-own",
+            # Agents domain (2026-09-12) — the console-agents store's
+            # read-own scope. DEFAULT, same read-own family as
+            # memory:files:read-own above.
+            "memory:agents:read-own",
+            # Conversation-Tags domain (2026-09-13) — the console-
+            # conversation-tags store's read-own scope. DEFAULT, same
+            # read-own family as memory:agents:read-own above.
+            "memory:conversation_tags:read-own",
+            # Tool-Favorites domain (2026-09-13) — the console-tool-
+            # favorites store's read-own scope. DEFAULT, same read-own
+            # family as memory:conversation_tags:read-own above.
+            "memory:tool_favorites:read-own",
+            # Sovereign Authorization Layer EPIC, WU-1 (2026-09-17,
+            # READ PATH ONLY) — the console-ACL store's read-own
+            # scope. DEFAULT, same read-own family as
+            # memory:tool_favorites:read-own above. No write
+            # counterpart exists yet (WU-2).
+            "memory:acl:read-own",
+            # M3-WU-3b (D3) — standard OIDC scopes the LibreChat console
+            # needs for its own identity claims (LibreChat's
+            # OPENID_SCOPE="openid profile email offline_access").
+            "profile",
+            "email",
+        }
+    )
+    # M3-WU-3b (D3) — offline_access (refresh token) is deliberately
+    # OPTIONAL, not default: it is the one scope that changes Keycloak's
+    # token-issuance behaviour (a refresh token gets minted), so it stays
+    # an explicit per-request opt-in rather than an always-on grant.
+    #
+    # M3-WU-D2-1 (2026-08-30) added the three per-user-layer memory-write
+    # scopes, ALSO optional — same "never auto-granted" discipline: only
+    # the BFF's memory-proxy exchange requests them explicitly (see class
+    # docstring above).
+    #
+    # WU-1 (Sovereign-Attach EPIC, 2026-09-03) added memory:session:write,
+    # ALSO optional — the ephemeral chat-upload least-privilege wall; only
+    # WU-2's narrow upload exchange requests it explicitly.
+    _EXPECTED_OPTIONAL_SCOPES: frozenset[str] = frozenset(
+        {
+            "offline_access",
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+            "memory:session:write",
+            # Mongo-repl WU-1 (2026-09-11) — the console-conversations
+            # store's write scope, ALSO optional — only the BFF's
+            # console-conversations proxy exchange requests it explicitly.
+            "memory:conversations:write",
+            # Mongo-repl WU-presets (2026-09-11) — the console-presets
+            # store's write scope, ALSO optional — only the BFF's
+            # console-presets proxy exchange requests it explicitly.
+            "memory:presets:write",
+            # Mongo-repl WU-prompts (2026-09-11) — the console-prompts
+            # store's write scope, ALSO optional — only the BFF's
+            # console-prompts proxy exchange requests it explicitly.
+            "memory:prompts:write",
+            # Chat-Projects domain (2026-09-11) — the console-chat-
+            # projects store's write scope, ALSO optional — only the
+            # BFF's console-chat-projects proxy exchange requests it
+            # explicitly.
+            "memory:chat_projects:write",
+            # Files-metadata domain (2026-09-11) — the console-files
+            # store's write scope, ALSO optional — only the BFF's
+            # console-file-records proxy exchange requests it
+            # explicitly.
+            "memory:files:write",
+            # Agents domain (2026-09-12) — the console-agents store's
+            # write scope, ALSO optional — only the BFF's console-agents
+            # proxy exchange requests it explicitly.
+            "memory:agents:write",
+            # Conversation-Tags domain (2026-09-13) — the console-
+            # conversation-tags store's write scope, ALSO optional —
+            # only the BFF's console-conversation-tags proxy exchange
+            # requests it explicitly.
+            "memory:conversation_tags:write",
+            # Tool-Favorites domain (2026-09-13) — the console-tool-
+            # favorites store's write scope, ALSO optional — only the
+            # BFF's console-tool-favorites proxy exchange requests it
+            # explicitly.
+            "memory:tool_favorites:write",
+            # ACL WU-2c (2026-10-02) — the console-ACL write scope, ALSO
+            # optional on the console's client (the dedicated E2E client
+            # holds it separately — test_chart_drift_guards_acl_write.py).
+            "memory:acl:write",
+        }
+    )
+
+    @staticmethod
+    def _client(realm: dict) -> dict:
+        for c in realm.get("clients", []) or []:
+            if c.get("clientId") == "audittrace-librechat":
+                return c
+        raise AssertionError(
+            "audittrace-librechat is missing from the realm — the M3-WU-1 "
+            "console client was renamed or removed."
+        )
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    def test_client_present_in_both_realms(self) -> None:
+        for _label, realm in self._both_realms():
+            self._client(realm)  # raises AssertionError if missing
+
+    def test_default_scopes_match_expected_read_ask_set(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            default = set(c.get("defaultClientScopes") or [])
+            assert default == self._EXPECTED_DEFAULT_SCOPES, (
+                f"{label}: audittrace-librechat defaultClientScopes drifted "
+                f"from the read/ask boundary. Extra: "
+                f"{sorted(default - self._EXPECTED_DEFAULT_SCOPES)}; missing: "
+                f"{sorted(self._EXPECTED_DEFAULT_SCOPES - default)}."
+            )
+
+    def test_optional_scopes_match_expected_set(self) -> None:
+        """The optional-scope set is exactly ``_EXPECTED_OPTIONAL_SCOPES``
+        (offline_access + the four write scopes named above); widening it
+        to anything else — or dropping any of them — fails this."""
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            optional = set(c.get("optionalClientScopes") or [])
+            assert optional == self._EXPECTED_OPTIONAL_SCOPES, (
+                f"{label}: audittrace-librechat optionalClientScopes drifted. "
+                f"Extra: {sorted(optional - self._EXPECTED_OPTIONAL_SCOPES)}; "
+                f"missing: {sorted(self._EXPECTED_OPTIONAL_SCOPES - optional)}."
+            )
+
+    def test_no_admin_scope_granted(self) -> None:
+        """M3-WU-D2-1 deliberately granted the three per-user-layer
+        memory-write scopes (optional-only — see
+        ``test_optional_scopes_match_expected_set``); it must NEVER extend
+        to ``audittrace:admin``, in either scope set. Admin is what would
+        let the console hard-delete the audit trail (``?hard=true`` on
+        ``DELETE /memory/...``) — the spec's non-negotiable invariant."""
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            both = set(c.get("defaultClientScopes") or []) | set(
+                c.get("optionalClientScopes") or []
+            )
+            assert "audittrace:admin" not in both, (
+                f"{label}: audittrace-librechat was granted audittrace:admin "
+                "— this VOIDS the M3-WU-D2-1 invariant that the console can "
+                "never hard-delete the audit trail."
+            )
+
+    def test_no_corpus_scope_granted(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            both = set(c.get("defaultClientScopes") or []) | set(
+                c.get("optionalClientScopes") or []
+            )
+            offenders = sorted(s for s in both if s.startswith("memory:corpus:"))
+            assert not offenders, (
+                f"{label}: audittrace-librechat was granted corpus scope(s) "
+                f"{offenders} — corpus scopes are operator/curator-tier "
+                "(ADR-062 §4); end-user clients never get them."
+            )
+
+    def test_public_client_no_secret_no_implicit_no_ropc(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            assert c.get("publicClient") is True, (
+                f"{label}: audittrace-librechat must be a public client (no "
+                "client secret to hold)."
+            )
+            assert c.get("standardFlowEnabled") is True, (
+                f"{label}: audittrace-librechat must have the Authorization "
+                "Code flow enabled."
+            )
+            assert c.get("implicitFlowEnabled") is not True, (
+                f"{label}: implicit grant is forbidden (RFC 9700)."
+            )
+            assert c.get("directAccessGrantsEnabled") is not True, (
+                f"{label}: Resource Owner Password Credentials is forbidden (RFC 9700)."
+            )
+            assert c.get("serviceAccountsEnabled") is not True, (
+                f"{label}: audittrace-librechat is user-facing only — no "
+                "service account grant."
+            )
+            assert "secret" not in c, (
+                f"{label}: a public client must carry no client secret."
+            )
+
+    def test_pkce_s256_enabled(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            assert (
+                c.get("attributes", {}).get("pkce.code.challenge.method") == "S256"
+            ), f"{label}: audittrace-librechat must enforce PKCE with S256."
+
+    def test_audience_mapper_present(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            mappers = {m.get("name"): m for m in c.get("protocolMappers", []) or []}
+            assert "aud-audittrace-server" in mappers, (
+                f"{label}: audittrace-librechat is missing the "
+                "aud-audittrace-server audience mapper — issued tokens would "
+                "not carry aud=audittrace-server, and /v1 would reject them."
+            )
+            config = mappers["aud-audittrace-server"].get("config", {})
+            assert config.get("included.custom.audience") == "audittrace-server", (
+                f"{label}: aud-audittrace-server mapper does not target "
+                "audittrace-server."
+            )
+
+    def test_identity_mappers_present(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            mappers = {m.get("name") for m in c.get("protocolMappers", []) or []}
+            assert {"preferred-username", "email"} <= mappers, (
+                f"{label}: audittrace-librechat must carry preferred_username "
+                "+ email protocol mappers so audit rows/traces carry a "
+                "human-legible identity alongside `sub`."
+            )
+
+    def test_no_wildcard_redirect_uris(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            offenders = [
+                u
+                for u in (c.get("redirectUris") or []) + (c.get("webOrigins") or [])
+                if u.endswith("*")
+            ]
+            assert not offenders, (
+                f"{label}: audittrace-librechat carries wildcard URI(s) "
+                f"{offenders} — RFC 9700 / ADR-042 §3 forbid redirect-URI/"
+                "webOrigin wildcards."
+            )
+
+
+class TestConsoleRealmScopeReconcile:
+    """M3-WU-3b (D3) — the ``ensure-memory-scopes`` Job's Step 5 kcadm
+    bodies (``PROFILE_BODY``/``EMAIL_BODY``/``OFFLINE_ACCESS_BODY`` in
+    ``configmap-memory-scopes-script.yaml``) are what actually provisions
+    ``profile``/``email``/``offline_access`` onto a PRE-EXISTING realm (the
+    "``--import-realm`` only imports on first run" gap). They must stay in
+    lock-step with the ``clientScopes`` entries declared in BOTH realm
+    files, or a fresh install and an upgraded pre-existing realm would end
+    up with two different scope shapes.
+
+    Falsifiable: change either side (the kcadm body, or a realm file's
+    ``protocol``/``attributes``/``protocolMappers`` for one of these three
+    scopes) without updating the other, and this goes RED. ``description``
+    is deliberately excluded from the comparison — it is realm-file-only
+    documentation kcadm's ``client-scopes`` create endpoint does not even
+    accept a value for in these bodies, not a drift-worthy field.
+    """
+
+    _SCOPE_NAMES = ("profile", "email", "offline_access")
+    _COMPARED_KEYS = ("protocol", "attributes", "protocolMappers")
+
+    @staticmethod
+    def _script_text() -> str:
+        return (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        ).read_text(encoding="utf-8")
+
+    @classmethod
+    def _kcadm_bodies(cls) -> dict[str, dict]:
+        text = cls._script_text()
+        out: dict[str, dict] = {}
+        for var, name in (
+            ("PROFILE_BODY", "profile"),
+            ("EMAIL_BODY", "email"),
+            ("OFFLINE_ACCESS_BODY", "offline_access"),
+        ):
+            m = re.search(rf"{var}='(\{{.*\}})'", text)
+            assert m is not None, (
+                f"configmap-memory-scopes-script.yaml is missing the {var} "
+                "constant Step 5 uses to reconcile the console realm scopes."
+            )
+            body = json.loads(m.group(1))
+            assert body.get("name") == name, (
+                f"{var} declares name={body.get('name')!r}, expected {name!r}."
+            )
+            out[name] = body
+        return out
+
+    @staticmethod
+    def _realm_scope(realm: dict, name: str) -> dict:
+        for s in realm.get("clientScopes", []) or []:
+            if s.get("name") == name:
+                return s
+        raise AssertionError(f"clientScope {name!r} is missing from the realm.")
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    def test_kcadm_bodies_present_for_all_three_scopes(self) -> None:
+        bodies = self._kcadm_bodies()
+        assert set(bodies) == set(self._SCOPE_NAMES)
+
+    def test_kcadm_bodies_match_realm_files_field_for_field(self) -> None:
+        bodies = self._kcadm_bodies()
+        for label, realm in self._both_realms():
+            for scope_name in self._SCOPE_NAMES:
+                realm_scope = self._realm_scope(realm, scope_name)
+                kcadm_body = bodies[scope_name]
+                for key in self._COMPARED_KEYS:
+                    realm_value = realm_scope.get(key)
+                    kcadm_value = kcadm_body.get(key)
+                    assert realm_value == kcadm_value, (
+                        f"{label}: clientScope {scope_name!r}.{key} drifted "
+                        f"from the ensure-memory-scopes Job's kcadm body. "
+                        f"realm={realm_value!r} kcadm={kcadm_value!r} — a "
+                        "fresh install (realm.json) and an upgraded "
+                        "pre-existing realm (Step 5's kcadm reconcile) "
+                        "would end up with different scope shapes."
+                    )
+
+    def test_step5_comment_does_not_reference_a_stale_test_name(self) -> None:
+        """The 2026-08-29 independent-review fix: the comment used to name
+        a test class that did not exist (a false coverage claim). Assert it
+        now names THIS class, so a future rename of either side is caught."""
+        text = self._script_text()
+        assert "TestConsoleRealmScopeReconcile" in text, (
+            "configmap-memory-scopes-script.yaml's Step 5 comment must "
+            "reference tests/test_chart_drift_guards.py::"
+            "TestConsoleRealmScopeReconcile (this class) by name."
+        )
+
+
+class TestD25DConsoleRedirectReconcile:
+    """D2-5D (``2026-09-01-SPEC-console-hardening-d-realm-reconcile.md``) —
+    the ``ensure-memory-scopes`` Job's Step 6 kcadm reconcile sets
+    ``audittrace-librechat``'s ``redirectUris``/``webOrigins`` to the
+    config-as-code target derived from ``console.librechat.host`` on
+    EVERY ``helm upgrade`` (``--import-realm`` never overwrites an
+    existing realm, so a realm.json edit to these two fields alone never
+    reaches a pre-existing running realm — the 2026-08-31 incident this
+    spec closes).
+
+    Falsifiable, one assertion per guard:
+
+    * the reconcile block missing from the rendered Job's ConfigMap fails
+      ``test_reconcile_step_present``;
+    * the target URIs not matching what ``console.librechat.host``'s
+      DEFAULT derives fails
+      ``test_redirect_uri_derived_from_console_librechat_host_default``;
+    * hardcoding the target instead of deriving it from
+      ``console.librechat.host`` fails
+      ``test_redirect_uri_tracks_a_custom_console_librechat_host`` — a
+      non-default host override must change the rendered target too;
+    * widening the reconcile to any other client (``audittrace-webui``,
+      ``audittrace-opencode``, ``admin-client``,
+      ``audittrace-librechat-bff``) fails
+      ``test_reconcile_targets_librechat_client_only``;
+    * hardcoding a client id/path instead of the resolved UUID fails
+      ``test_reconcile_uses_client_uuid_not_a_literal_client_id_path``;
+    * dropping/duplicating/widening the reconciled field set beyond
+      exactly ``redirectUris``+``webOrigins`` fails
+      ``test_reconcile_sets_exactly_redirecturis_and_weborigins``;
+    * a wildcard (``*``) suffix or a plain-HTTP scheme on either target
+      fails ``test_no_wildcard_or_plain_http_target`` (RFC 9700).
+
+    Non-vacuity proven live in the D2-5D build record: neutering
+    ``CONSOLE_REDIRECT_URI``/the ``find_client_id "audittrace-librechat"``
+    call/the ``-s`` flag set in the ConfigMap source turns each guard
+    above RED individually; restoring turns it back GREEN.
+    """
+
+    _STEP_START_MARKER = (
+        "Step 6: reconcile audittrace-librechat redirectUris/webOrigins"
+    )
+    _STEP_END_MARKER = "Istio sidecar shutdown"
+
+    _OTHER_CLIENTS: tuple[str, ...] = (
+        "audittrace-webui",
+        "audittrace-opencode",
+        "admin-client",
+        "audittrace-librechat-bff",
+    )
+
+    @classmethod
+    def _reconcile_block(cls, script: str) -> str:
+        start = script.find(cls._STEP_START_MARKER)
+        assert start != -1, (
+            "D2-5D: the rendered ensure-memory-scopes ConfigMap script is "
+            f"missing the {cls._STEP_START_MARKER!r} step — the redirect/"
+            "webOrigin reconcile was removed or renamed."
+        )
+        end = script.find(cls._STEP_END_MARKER, start)
+        assert end != -1, (
+            "D2-5D: could not bound the Step 6 block — the "
+            f"{cls._STEP_END_MARKER!r} marker that follows it in the "
+            "source is missing or was reordered."
+        )
+        return script[start:end]
+
+    @classmethod
+    def _rendered_block(cls, extra_sets: list[str] | None = None) -> str:
+        docs = _render_docs_with_extras(extra_sets) if extra_sets else _render()
+        script = (
+            TestD25AMemoryWriteScopesJobRenderedBinding._rendered_memory_scopes_script(
+                docs
+            )
+        )
+        return cls._reconcile_block(script)
+
+    @staticmethod
+    def _targets(block: str) -> tuple[str, str]:
+        m_redirect = re.search(r'CONSOLE_REDIRECT_URI="([^"]+)"', block)
+        m_origin = re.search(r'CONSOLE_WEB_ORIGIN="([^"]+)"', block)
+        assert m_redirect is not None, (
+            'D2-5D: CONSOLE_REDIRECT_URI="..." not found in the rendered Step 6 block.'
+        )
+        assert m_origin is not None, (
+            'D2-5D: CONSOLE_WEB_ORIGIN="..." not found in the rendered Step 6 block.'
+        )
+        return m_redirect.group(1), m_origin.group(1)
+
+    def test_reconcile_step_present(self) -> None:
+        self._rendered_block()  # raises AssertionError if missing
+
+    def test_redirect_uri_derived_from_console_librechat_host_default(
+        self,
+    ) -> None:
+        redirect_uri, web_origin = self._targets(self._rendered_block())
+        assert (
+            redirect_uri == "https://librechat.audittrace.local/oauth/openid/callback"
+        ), (
+            "D2-5D: default-host redirectUri target drifted from the "
+            f"expected value. Got: {redirect_uri!r}."
+        )
+        assert web_origin == "https://librechat.audittrace.local", (
+            "D2-5D: default-host webOrigin target drifted from the "
+            f"expected value. Got: {web_origin!r}."
+        )
+
+    def test_redirect_uri_tracks_a_custom_console_librechat_host(
+        self,
+    ) -> None:
+        """The whole point of D2-5D: the reconcile must be DRIVEN by
+        ``console.librechat.host``, not a value frozen at the chart's
+        default. Overriding the host must change the rendered target."""
+        block = self._rendered_block(
+            [
+                "--set",
+                "console.librechat.host=my-console.example.test",
+            ]
+        )
+        redirect_uri, web_origin = self._targets(block)
+        assert (
+            redirect_uri == "https://my-console.example.test/oauth/openid/callback"
+        ), (
+            "D2-5D: overriding console.librechat.host did not change the "
+            f"reconciled redirectUri target. Got: {redirect_uri!r}."
+        )
+        assert web_origin == "https://my-console.example.test", (
+            "D2-5D: overriding console.librechat.host did not change the "
+            f"reconciled webOrigin target. Got: {web_origin!r}."
+        )
+        # Scope the "no stale default" check to the EXECUTABLE portion only
+        # (from the CONSOLE_REDIRECT_URI= assignment onward) — the block's
+        # leading comment prose legitimately narrates the 2026-08-31
+        # incident by quoting the OLD default-host callback URL, which
+        # would otherwise false-positive this guard.
+        code_start = block.find("CONSOLE_REDIRECT_URI=")
+        assert code_start != -1
+        code = block[code_start:]
+        assert "librechat.audittrace.local" not in code, (
+            "D2-5D: the default host leaked into Step 6's EXECUTABLE code "
+            "even after overriding console.librechat.host — the "
+            "reconcile is not actually driven by the chart value."
+        )
+
+    def test_reconcile_targets_librechat_client_only(self) -> None:
+        block = self._rendered_block()
+        assert 'find_client_id "audittrace-librechat"' in block, (
+            "D2-5D: Step 6 must resolve the client UUID via "
+            'find_client_id "audittrace-librechat".'
+        )
+        for other in self._OTHER_CLIENTS:
+            assert other not in block, (
+                f"D2-5D: Step 6 references {other!r} — the reconcile must "
+                "be scoped to audittrace-librechat only."
+            )
+
+    def test_reconcile_uses_client_uuid_not_a_literal_client_id_path(
+        self,
+    ) -> None:
+        block = self._rendered_block()
+        # ACL WU-2c-A0: every kcadm invocation now goes through the
+        # acl_e2e_kc() wrapper (F2 BF1-a), not the bare "${KCADM}" var.
+        assert 'acl_e2e_kc update "clients/${LIBRECHAT_CLIENT_UUID}"' in block, (
+            "D2-5D: Step 6 must PUT to the resolved client UUID path "
+            "(clients/${LIBRECHAT_CLIENT_UUID}), never a hardcoded/"
+            "literal client-id path."
+        )
+
+    def test_reconcile_sets_exactly_redirecturis_and_weborigins(
+        self,
+    ) -> None:
+        block = self._rendered_block()
+        set_fields = re.findall(r'-s "([A-Za-z]+)=', block)
+        assert set_fields.count("redirectUris") == 1, (
+            "D2-5D: Step 6 must set redirectUris exactly once. Found: "
+            f"{set_fields.count('redirectUris')}."
+        )
+        assert set_fields.count("webOrigins") == 1, (
+            "D2-5D: Step 6 must set webOrigins exactly once. Found: "
+            f"{set_fields.count('webOrigins')}."
+        )
+        assert set(set_fields) == {"redirectUris", "webOrigins"}, (
+            "D2-5D: Step 6 must reconcile EXACTLY these two fields on the "
+            f"client — found {sorted(set(set_fields))}. Any other field "
+            "widens the reconcile beyond the spec's 'only these two "
+            "fields' invariant."
+        )
+
+    def test_no_wildcard_or_plain_http_target(self) -> None:
+        redirect_uri, web_origin = self._targets(self._rendered_block())
+        for label, value in (
+            ("redirectUri", redirect_uri),
+            ("webOrigin", web_origin),
+        ):
+            assert value.startswith("https://"), (
+                f"D2-5D: {label} target {value!r} is not HTTPS — RFC 9700 "
+                "forbids plain-HTTP redirect URIs/webOrigins."
+            )
+            assert not value.endswith("*"), (
+                f"D2-5D: {label} target {value!r} carries a wildcard "
+                "suffix — RFC 9700 / ADR-042 §3 forbid it "
+                "(OIDC-REDIRECT-URI-DRIFT)."
+            )
+
+
+class TestLibrechatBffClient:
+    """M3-WU-2 — the ``audittrace-librechat-bff`` confidential client
+    (RFC 8693 token-exchange edge for the LibreChat BFF sidecar,
+    ADR-042 §5 Option A) must exist in BOTH realm files, be genuinely
+    confidential (never a public client with an inherent secret leak),
+    hold no scope grants of its own (its only job is authenticating the
+    exchange call — the minted token's audience/scope come from the
+    exchange ``audience`` parameter targeting ``audittrace-librechat``,
+    not from this client's own grants), and never gain write/corpus/
+    admin/audit scopes it has no reason to hold.
+
+    Falsifiable, one assertion per guard:
+
+    * renaming/removing the client from either realm file fails
+      ``test_client_present_in_both_realms``;
+    * flipping ``publicClient`` to ``True``, enabling any interactive
+      flow, or committing a literal ``secret`` value fails
+      ``test_confidential_client_no_secret_committed``;
+    * granting it ANY scope (default or optional) fails
+      ``test_no_scopes_granted`` — it needs none, ever;
+    * a description over Keycloak's varchar(255) column fails
+      ``test_description_fits_keycloak_column`` (same DB-column trap as
+      ``TestRestrictedClientStaysRestricted.test_description_fits_keycloak_column``).
+    """
+
+    @staticmethod
+    def _client(realm: dict) -> dict:
+        for c in realm.get("clients", []) or []:
+            if c.get("clientId") == "audittrace-librechat-bff":
+                return c
+        raise AssertionError(
+            "audittrace-librechat-bff is missing from the realm — the M3-WU-2 "
+            "BFF token-exchange client was renamed or removed."
+        )
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    def test_client_present_in_both_realms(self) -> None:
+        for _label, realm in self._both_realms():
+            self._client(realm)  # raises AssertionError if missing
+
+    def test_confidential_client_no_secret_committed(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            assert c.get("publicClient") is False, (
+                f"{label}: audittrace-librechat-bff must be confidential "
+                "(publicClient: false) — it authenticates a server-to-"
+                "server token-exchange call, never a browser flow."
+            )
+            assert c.get("clientAuthenticatorType") == "client-secret", (
+                f"{label}: audittrace-librechat-bff must use client-secret "
+                "authentication."
+            )
+            assert c.get("standardFlowEnabled") is not True, (
+                f"{label}: audittrace-librechat-bff must not enable the "
+                "browser Authorization Code flow — it is never a redirect "
+                "target."
+            )
+            assert c.get("implicitFlowEnabled") is not True, (
+                f"{label}: implicit grant is forbidden (RFC 9700)."
+            )
+            assert c.get("directAccessGrantsEnabled") is not True, (
+                f"{label}: Resource Owner Password Credentials is forbidden (RFC 9700)."
+            )
+            assert "secret" not in c, (
+                f"{label}: a client secret must NEVER be committed to the "
+                "realm file — Keycloak generates one on import; the BFF "
+                "reads it from Vault/env at deploy time."
+            )
+
+    def test_no_scopes_granted(self) -> None:
+        """The exchange client needs no scopes of its own — the minted
+        token's audience/scope come from the ``audience=audittrace-
+        librechat`` exchange parameter (that client's own scope profile),
+        not from this client. Any scope grant here would be unused
+        privilege sitting on a confidential client — a REJECT-worthy
+        defect, not a nice-to-catch."""
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            both = set(c.get("defaultClientScopes") or []) | set(
+                c.get("optionalClientScopes") or []
+            )
+            assert not both, (
+                f"{label}: audittrace-librechat-bff was granted scope(s) "
+                f"{sorted(both)} — it should hold none; unused privilege "
+                "on a confidential client is a defect, not a convenience."
+            )
+
+    def test_description_fits_keycloak_column(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            desc = c.get("description") or ""
+            assert len(desc) <= 255, (
+                f"{label}: audittrace-librechat-bff description is "
+                f"{len(desc)} chars; Keycloak's CLIENT.DESCRIPTION column "
+                "is varchar(255) — realm import fails at container boot."
+            )
+
+
+class TestClientDescriptionsWithinKeycloakColumnLimit:
+    """Keycloak's ``CLIENT.DESCRIPTION`` column is ``varchar(255)``. A client
+    ``description`` longer than 255 chars fails realm import at container boot
+    with ``ERROR: value too long for type character varying(255)`` — the
+    keycloak container never turns healthy and the whole stack fails to start.
+
+    This class exists because a JSON-shape check is NOT enough: the file parses
+    as valid JSON with a 314-char description, every other realm guard stays
+    green, ``make test`` passes, and the failure only surfaces in CI's
+    "Build and start stack" step where a real Keycloak imports into a real
+    Postgres (PR #306, 2026-08-28). This guard moves that DB-column constraint
+    into the fast local gate.
+
+    Falsifiable: restore ANY client ``description`` to >255 chars and this turns
+    RED. Applies to BOTH realm files and every client (so WU-2's confidential
+    ``audittrace-librechat-bff`` client is covered from day one).
+    """
+
+    _KEYCLOAK_VARCHAR_LIMIT = 255
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    def test_every_client_description_within_255(self) -> None:
+        for label, realm in self._both_realms():
+            offenders = [
+                (c.get("clientId"), len(c.get("description") or ""))
+                for c in (realm.get("clients") or [])
+                if len(c.get("description") or "") > self._KEYCLOAK_VARCHAR_LIMIT
+            ]
+            assert not offenders, (
+                f"{label}: client description(s) exceed Keycloak's varchar(255) "
+                f"CLIENT.DESCRIPTION limit {offenders} — realm import will fail "
+                "at container boot (the stack never becomes healthy). Shorten "
+                "the description to <=255 chars."
+            )
+
+
+def _keycloak_container(docs: list[dict]) -> dict:
+    """Return the keycloak container spec from the rendered chart."""
+    name = f"{RELEASE}-keycloak"
+    for d in docs:
+        if d.get("kind") != "Deployment":
+            continue
+        if d.get("metadata", {}).get("name") != name:
+            continue
+        containers = (
+            d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+            or []
+        )
+        for c in containers:
+            if c.get("name") == "keycloak":
+                return c
+        raise AssertionError(f"Deployment {name} has no container named 'keycloak'")
+    raise AssertionError(f"Deployment {name} not in render")
+
+
+class TestKeycloakTokenExchangeFeatureFlags:
+    """M3-WU-2b D1 — RFC 8693 token-exchange is an OFF-by-default preview
+    feature in Keycloak 24 (the deployed ``quay.io/keycloak/keycloak:24.0``,
+    ``charts/audittrace/values.yaml``); without ``--features=token-exchange``
+    on the KC start command the BFF's live exchange returns
+    ``HTTP 400 {"error":"unsupported_grant_type"}``. The internal
+    client-to-client exchange authorization model additionally needs
+    ``admin-fine-grained-authz`` (verified live against a throwaway
+    Keycloak 24.0.5 container 2026-08-29 — see
+    ``configmap-memory-scopes-script.yaml`` Step 4 for the full mechanism).
+
+    ``templates/keycloak/deployment.yaml`` has TWO start-command branches
+    (``vault.enabled`` exec-string vs. the plain ``args:`` list) that must
+    stay byte-identical on this flag — a drift between them is exactly the
+    kind of gap ``feedback_no_more_drifts`` exists to catch.
+
+    Falsifiable: drop the ``--features=`` flag (or one of its two
+    comma-joined values) from EITHER branch and the matching test goes RED.
+    """
+
+    _REQUIRED_FEATURES: tuple[str, ...] = ("token-exchange", "admin-fine-grained-authz")
+
+    def test_vault_branch_enables_token_exchange_features(self) -> None:
+        docs = self._render_with(vault_enabled=True)
+        container = _keycloak_container(docs)
+        args = container.get("args") or []
+        assert len(args) == 1, (
+            "vault.enabled=true branch: expected a single shell-string arg "
+            f"(the vaultSecretFileGuard + exec block), got {len(args)}"
+        )
+        shell_cmd = args[0]
+        for feature in self._REQUIRED_FEATURES:
+            assert feature in shell_cmd, (
+                f"vault.enabled=true branch: keycloak exec command is missing "
+                f"'--features={feature}' — RFC 8693 token-exchange will 400 "
+                f"unsupported_grant_type live (M3-WU-2b D1). Command:\n{shell_cmd}"
+            )
+
+    def test_plain_branch_enables_token_exchange_features(self) -> None:
+        docs = self._render_with(vault_enabled=False)
+        container = _keycloak_container(docs)
+        args = container.get("args") or []
+        joined = " ".join(str(a) for a in args)
+        for feature in self._REQUIRED_FEATURES:
+            assert feature in joined, (
+                f"vault.enabled=false branch: keycloak args is missing "
+                f"'--features={feature}' — RFC 8693 token-exchange will 400 "
+                f"unsupported_grant_type live (M3-WU-2b D1). args={args!r}"
+            )
+
+    def test_both_branches_declare_identical_feature_flags(self) -> None:
+        """The two start-arg branches must request the SAME feature set —
+        not just each individually containing the substring, but the same
+        comma-joined ``--features=`` value. Catches a future edit that adds
+        a feature to one branch and forgets the other."""
+        vault_container = _keycloak_container(self._render_with(vault_enabled=True))
+        plain_container = _keycloak_container(self._render_with(vault_enabled=False))
+
+        vault_match = re.search(
+            r"--features=([\w,-]+)", vault_container.get("args", [""])[0]
+        )
+        plain_args = plain_container.get("args") or []
+        plain_flag = next(
+            (a for a in plain_args if str(a).startswith("--features=")), None
+        )
+
+        assert vault_match is not None, (
+            "vault.enabled=true branch has no --features= flag"
+        )
+        assert plain_flag is not None, (
+            "vault.enabled=false branch has no --features= flag"
+        )
+
+        vault_features = set(vault_match.group(1).split(","))
+        plain_features = set(plain_flag.split("=", 1)[1].split(","))
+
+        assert vault_features == plain_features, (
+            "Drift: the vault.enabled=true and vault.enabled=false keycloak "
+            f"start-arg branches request different feature sets. vault="
+            f"{sorted(vault_features)} plain={sorted(plain_features)} — keep "
+            "them in lockstep (deployment.yaml, both branches)."
+        )
+        missing = set(self._REQUIRED_FEATURES) - vault_features
+        assert not missing, f"Both branches are missing required feature(s): {missing}"
+
+    @staticmethod
+    def _render_with(*, vault_enabled: bool) -> list[dict]:
+        cmd = [
+            "helm",
+            "template",
+            RELEASE,
+            str(CHART_DIR),
+            "-n",
+            NAMESPACE,
+            "--set",
+            f"vault.enabled={'true' if vault_enabled else 'false'}",
+            "--set",
+            "istio.enabled=true",
+            *_LINT_SECRETS,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise AssertionError(
+                f"helm template failed (rc={result.returncode}):\n"
+                f"--- stderr ---\n{result.stderr}"
+            )
+        return [
+            d
+            for d in yaml.safe_load_all(result.stdout)
+            if isinstance(d, dict) and d.get("kind")
+        ]
+
+
+class TestKeycloakTokenExchangePermission:
+    """M3-WU-2b D2 — the fine-grained token-exchange permission that
+    authorizes ONLY ``audittrace-librechat-bff``'s service account to
+    exchange a caller's token via ``audittrace-librechat`` (the target
+    client whose own protocol mapper + default-scope grant stamp
+    ``aud=audittrace-server`` + ``scope=audittrace:query`` on the result —
+    ``bff/exchange.py``).
+
+    Three things must never drift apart, each individually falsifiable:
+
+    1. the ``token-exchange.authorized-source-client`` attribute declared
+       on ``audittrace-librechat`` in BOTH realm files (the static,
+       reviewable "who is authorized" declaration — WU-2's
+       ``TestLibrechatBffClient`` already covers the bff client's own
+       shape: confidential, no committed secret, no scope grants of its
+       own, description <=255 chars);
+    2. the in-cluster ``ensure-memory-scopes`` Job's Step 4 kcadm logic
+       (``configmap-memory-scopes-script.yaml``) that ACTUALLY provisions
+       the Keycloak fine-grained admin permission at deploy time — the
+       realm-JSON attribute above is not itself read by Keycloak; per the
+       "realm.json only imports on first run" gap Steps 1-3 close for
+       scope bindings, this Job is the mechanism that survives a
+       fresh ``--import-realm`` AND every subsequent upgrade;
+    3. ``scripts/setup-memory-scopes.sh``, the disaster-recovery backstop
+       that must authorize the exact same (source, target) pair.
+
+    The actual kcadm mechanism (enable ``management/permissions`` on the
+    target client -> find-or-create a Client policy naming the source
+    client -> attach the policy to the auto-created ``token-exchange``
+    scope-permission) was verified live against a throwaway Keycloak
+    24.0.5 container (2026-08-29): running Step 4's exact script text
+    against a fresh realm turned a `access_denied: Client not allowed to
+    exchange` response into a minted token carrying the caller's own
+    `sub`, `aud` including `audittrace-server`, and `scope` including
+    `audittrace:query`; re-running it was a clean no-op (idempotent).
+
+    Falsifiable: rename/remove the realm attribute, the ConfigMap's
+    ``TOKEN_EXCHANGE_*`` constants, or the provisioner script's mirror of
+    them, and the matching test below goes RED.
+    """
+
+    _EXPECTED_TARGET_CLIENT = "audittrace-librechat"
+    _EXPECTED_SOURCE_CLIENT = "audittrace-librechat-bff"
+    _ATTR_KEY = "token-exchange.authorized-source-client"
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    @classmethod
+    def _target_client(cls, realm: dict) -> dict:
+        for c in realm.get("clients", []) or []:
+            if c.get("clientId") == cls._EXPECTED_TARGET_CLIENT:
+                return c
+        raise AssertionError(
+            f"{cls._EXPECTED_TARGET_CLIENT} is missing from the realm."
+        )
+
+    def test_target_client_declares_authorized_source_client(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._target_client(realm)
+            attrs = c.get("attributes") or {}
+            assert attrs.get(self._ATTR_KEY) == self._EXPECTED_SOURCE_CLIENT, (
+                f"{label}: {self._EXPECTED_TARGET_CLIENT}.attributes.'{self._ATTR_KEY}' "
+                f"must equal {self._EXPECTED_SOURCE_CLIENT!r} — this is the "
+                "declared, drift-guarded record of who Step 4's kcadm "
+                "provisioning authorizes to exchange. Got: "
+                f"{attrs.get(self._ATTR_KEY)!r}"
+            )
+
+    def test_declaration_identical_across_both_realm_files(self) -> None:
+        values = {
+            label: (self._target_client(realm).get("attributes") or {}).get(
+                self._ATTR_KEY
+            )
+            for label, realm in self._both_realms()
+        }
+        distinct = set(values.values())
+        assert len(distinct) == 1, (
+            f"Drift: the '{self._ATTR_KEY}' attribute differs between the two "
+            f"realm files: {values}"
+        )
+
+    @staticmethod
+    def _configmap_script_text() -> str:
+        return (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        ).read_text(encoding="utf-8")
+
+    def _configmap_constants(self) -> dict[str, str]:
+        text = self._configmap_script_text()
+        out: dict[str, str] = {}
+        for name in ("TOKEN_EXCHANGE_TARGET_CLIENT", "TOKEN_EXCHANGE_SOURCE_CLIENT"):
+            m = re.search(rf'{name}="([^"]+)"', text)
+            assert m is not None, (
+                f"configmap-memory-scopes-script.yaml is missing the "
+                f"{name} constant used by Step 4 (M3-WU-2b)."
+            )
+            out[name] = m.group(1)
+        return out
+
+    def test_configmap_step4_constants_match_realm_declaration(self) -> None:
+        constants = self._configmap_constants()
+        assert constants["TOKEN_EXCHANGE_TARGET_CLIENT"] == self._EXPECTED_TARGET_CLIENT
+        assert constants["TOKEN_EXCHANGE_SOURCE_CLIENT"] == self._EXPECTED_SOURCE_CLIENT
+        for label, realm in self._both_realms():
+            declared = (self._target_client(realm).get("attributes") or {}).get(
+                self._ATTR_KEY
+            )
+            assert declared == constants["TOKEN_EXCHANGE_SOURCE_CLIENT"], (
+                f"{label}: the realm's declared authorized source client "
+                f"({declared!r}) does not match the in-cluster Job's "
+                f"TOKEN_EXCHANGE_SOURCE_CLIENT ({constants['TOKEN_EXCHANGE_SOURCE_CLIENT']!r})."
+            )
+
+    def test_provisioner_script_mirrors_in_cluster_job(self) -> None:
+        """``scripts/setup-memory-scopes.sh`` (the disaster-recovery
+        backstop, ``feedback_use_bruno_collection_not_curl``-adjacent
+        precedent: a manual re-run must authorize the SAME pair the Job
+        would have, or a DR re-run silently diverges from what a healthy
+        cluster already has."""
+        script_text = (REPO_ROOT / "scripts" / "setup-memory-scopes.sh").read_text(
+            encoding="utf-8"
+        )
+        cm_constants = self._configmap_constants()
+        for name, expected in cm_constants.items():
+            m = re.search(rf'{name}="([^"]+)"', script_text)
+            assert m is not None, (
+                f"scripts/setup-memory-scopes.sh is missing the {name} "
+                "constant — it must mirror the in-cluster Job's Step 4."
+            )
+            assert m.group(1) == expected, (
+                f"Drift: scripts/setup-memory-scopes.sh's {name}={m.group(1)!r} "
+                f"does not match configmap-memory-scopes-script.yaml's "
+                f"{name}={expected!r}."
+            )
+
+    _SUCCESS_MARKER = "authorized to exchange"
+
+    def _step4_snippet(self) -> str:
+        """The FULL Step 4 block: from the ``find_policy_id`` helper (the
+        first thing Step 4 defines) through the final "authorized to
+        exchange" echo — i.e. everything the happy path needs to reach a
+        genuine, successful exit 0, not just the client-lookup guards. A
+        narrower window that stopped before the permission-id
+        grep/sed/policy-attach machinery let a KCADM stub crash for an
+        UNRELATED reason (see ``test_step4_...`` docstrings below) look
+        indistinguishable from a guard correctly firing — this is the
+        2026-08-29 independent-review fix for exactly that vacuous-test
+        defect."""
+        text = self._configmap_script_text()
+        start = text.index("find_policy_id() {")
+        end = text.index('echo "✅ memory-scopes provisioning complete."')
+        snippet = text[start:end]
+        assert "find_client_id" in snippet, "Step 4 no longer calls find_client_id"
+        assert self._SUCCESS_MARKER in snippet, (
+            "Step 4's final success echo text drifted — update _SUCCESS_MARKER"
+        )
+        return snippet
+
+    def _run_step4(self, *, missing: str | None) -> subprocess.CompletedProcess:
+        """Run the ACTUAL Step 4 snippet (verbatim, from the rendered
+        ConfigMap source) in a real bash subprocess against a REALISTIC
+        ``kcadm`` stub — ``fake_kcadm`` below returns plausible JSON/CSV
+        for every call Step 4's happy path actually makes (the
+        ``management/permissions`` enable + its ``token-exchange`` id via
+        the same JSON shape a live Keycloak 24 returns — see the Step 4
+        comment block's live-verification note — the policy list/attach
+        calls), so the baseline (``missing=None``) genuinely reaches exit
+        0 by SUCCEEDING, not by the KCADM stub being too dumb to fail.
+
+        ``find_client_id`` is stubbed separately (as before) to fail for
+        exactly one client name (``missing``) — everything else, real
+        Step 4 logic, unmodified."""
+        snippet = self._step4_snippet()
+        missing_line = f'MISSING="{missing}"\n' if missing else 'MISSING=""\n'
+        harness = (
+            "set -euo pipefail\n"
+            'REALM="audittrace"\n' + missing_line + "find_client_id() {\n"
+            '  if [[ -n "${MISSING}" && "$1" == "${MISSING}" ]]; then return 1; fi\n'
+            '  echo "fake-uuid-$1"\n'
+            "}\n"
+            "fake_kcadm() {\n"
+            '  local sub="$1" path="$2"\n'
+            '  case "${sub} ${path}" in\n'
+            '    "update "*"/management/permissions")\n'
+            "      return 0 ;;\n"
+            '    "get "*"/management/permissions")\n'
+            "      cat <<'JSON'\n"
+            "{\n"
+            '  "enabled" : true,\n'
+            '  "resource" : "fake-resource-id",\n'
+            '  "scopePermissions" : {\n'
+            '    "view" : "fake-view-id",\n'
+            '    "token-exchange" : "fake-permission-id"\n'
+            "  }\n"
+            "}\n"
+            "JSON\n"
+            "      ;;\n"
+            '    "get "*"/authz/resource-server/policy")\n'
+            '      echo "fake-policy-id,${TOKEN_EXCHANGE_POLICY_NAME}" ;;\n'
+            '    "create "*"/authz/resource-server/policy/client")\n'
+            "      return 0 ;;\n"
+            '    "update "*"/authz/resource-server/permission/scope/"*)\n'
+            "      return 0 ;;\n"
+            "    *)\n"
+            '      echo "fake_kcadm: unhandled call: $*" >&2\n'
+            "      return 1 ;;\n"
+            "  esac\n"
+            "}\n"
+            # ACL WU-2c-A0: Step 4's kcadm calls now go through the
+            # acl_e2e_kc() wrapper (F2 BF1-a), not a bare "${KCADM}" var.
+            'acl_e2e_kc() { fake_kcadm "$@"; }\n'
+            'TOKEN_EXCHANGE_TARGET_CLIENT="audittrace-librechat"\n'
+            'TOKEN_EXCHANGE_SOURCE_CLIENT="audittrace-librechat-bff"\n'
+            'TOKEN_EXCHANGE_POLICY_NAME="allow-${TOKEN_EXCHANGE_SOURCE_CLIENT}-token-exchange"\n'
+            + snippet
+        )
+        return subprocess.run(["bash", "-c", harness], capture_output=True, text=True)
+
+    def test_step4_succeeds_when_all_clients_present(self) -> None:
+        """The genuinely-passing BASELINE the fail-closed parametrizations
+        below are measured against: with every client resolvable and a
+        REALISTIC kcadm stub, Step 4 must reach exit 0 and print its final
+        success line. If this test itself is not GREEN, the parametrized
+        fail-closed tests below are meaningless (a script that never
+        succeeds "fails closed" for every input vacuously)."""
+        result = self._run_step4(missing=None)
+        assert result.returncode == 0, (
+            "Step 4's happy path (every client found, realistic kcadm "
+            f"stub) must exit 0. stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert self._SUCCESS_MARKER in result.stdout, (
+            "Step 4's happy path did not reach its final success echo. "
+            f"stdout={result.stdout!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "missing",
+        ["audittrace-librechat", "audittrace-librechat-bff", "realm-management"],
+    )
+    def test_step4_fails_closed_when_one_client_is_missing(self, missing: str) -> None:
+        """Falsifiable per-guard, against the genuinely-passing baseline
+        proven above: neuter ONLY the ``if ! ...; then exit 1; fi`` block
+        for ``missing`` (e.g. swallow it into a ``|| true``) and this
+        specific parametrization goes RED — the script now reaches exit 0
+        and prints the success line even though the client Step 4 relies
+        on was never found — proving each of the three guards is
+        independently load-bearing, not redundant coverage from a
+        neighbour, and not a script that merely crashes for an unrelated
+        reason regardless of which guard is intact."""
+        result = self._run_step4(missing=missing)
+        assert result.returncode != 0, (
+            f"Step 4 must fail closed when {missing!r} is not found. It "
+            f"exited 0. stdout={result.stdout!r}"
+        )
+        assert "not found" in (result.stdout + result.stderr), (
+            f"Step 4's fail-closed path for {missing!r} should explain "
+            f"which client was missing. Got stdout={result.stdout!r} "
+            f"stderr={result.stderr!r}"
+        )
+        assert self._SUCCESS_MARKER not in result.stdout, (
+            f"Step 4 printed its SUCCESS line even though {missing!r} was "
+            "never found — the guard did not actually stop the script "
+            f"(vacuous fail-closed check). stdout={result.stdout!r}"
         )

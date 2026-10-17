@@ -1,0 +1,40 @@
+meta {
+  name: POST /memory/upload — parameterized seed (episodic/procedural)
+  type: http
+  seq: 94
+}
+
+post {
+  url: {{baseUrl}}/memory/upload?layer={{seedLayer}}&filename={{seedFilename}}
+  body: multipartForm
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  layer: {{seedLayer}}
+  filename: {{seedFilename}}
+}
+
+body:multipart-form {
+  file: @file({{seedFilePath}})
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+}
+
+docs {
+  Parameterized bulk-seed helper (added 2026-06-02). Drives the same
+  direct-MinIO upload path as upload-legacy.bru but takes seedLayer
+  (episodic|procedural), seedFilename (leaf name), and seedFilePath
+  (absolute path on disk) as env vars, so a shell loop can upload many
+  docs/ADR-*.md and SKILL-*.md with one reusable request. Run the
+  bulk POST /memory/index afterwards to build the decisions/skills/
+  semantic ChromaDB collections.
+}

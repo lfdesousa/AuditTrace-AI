@@ -3,8 +3,10 @@ security-audit row writer."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
+from collections.abc import Awaitable, Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,6 +22,39 @@ async def _make_factory():
     _f = InMemoryPostgresFactory()
     await _f.create_schema()
     return _f.get_session_factory()
+
+
+async def _poll_until(
+    condition: Callable[[], Awaitable[bool]],
+    *,
+    timeout: float = 5.0,
+    interval: float = 0.01,
+) -> None:
+    """Poll an async ``condition`` until it returns ``True``, raising
+    ``AssertionError`` once ``timeout`` elapses.
+
+    Deterministic replacement for a fixed-duration ``asyncio.sleep(N)``
+    race window (the #254/#357 flake class; see
+    ``tests/test_scan_verdict_consumer.py::_poll_until`` for the twin
+    this mirrors): the caller proceeds the instant the observable
+    side-effect lands instead of gambling on a wall-clock budget that a
+    loaded CI host can blow through.
+
+    FALSIFIABILITY: if the awaited side-effect never happens (e.g. the
+    consumer's DB-write were neutered), this raises ``AssertionError``
+    after ``timeout`` seconds — it never returns while the condition is
+    still false, so it cannot mask a genuine regression.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if await condition():
+            return
+        if loop.time() >= deadline:
+            raise AssertionError(
+                f"condition not met within {timeout}s (polled every {interval}s)"
+            )
+        await asyncio.sleep(interval)
 
 
 def _settings(url: str = "amqp://x:y@audittrace-rabbitmq:5672/") -> MagicMock:
@@ -201,7 +236,7 @@ class TestEnsureConnected:
         channel = AsyncMock()
         queue = AsyncMock()
         channel.set_qos = AsyncMock()
-        channel.get_queue = AsyncMock(return_value=queue)
+        channel.declare_queue = AsyncMock(return_value=queue)
         channel.close = AsyncMock()
         connection.channel = AsyncMock(return_value=channel)
         connection.close = AsyncMock()
@@ -218,7 +253,11 @@ class TestEnsureConnected:
             await consumer._ensure_connected()
             await consumer._ensure_connected()
         aio_pika.connect_robust.assert_awaited_once()
-        ch.get_queue.assert_awaited_once_with("audittrace.scan.audit")
+        ch.declare_queue.assert_awaited_once_with(
+            "audittrace.scan.audit",
+            durable=True,
+            arguments={"x-queue-type": "quorum"},
+        )
 
     async def test_missing_url_raises(self) -> None:
         consumer = ScanAuditConsumer(
@@ -228,37 +267,83 @@ class TestEnsureConnected:
         with pytest.raises(RuntimeError, match="scan_amqp_url is required"):
             await consumer._ensure_connected()
 
-    async def test_queue_not_found_retries_then_succeeds(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Symmetric to scan_verdict_consumer's retry test — B4b
-        fresh-install race against the topology-bootstrap Job."""
-        from aio_pika.exceptions import ChannelNotFoundEntity
-
-        monkeypatch.setattr("asyncio.sleep", AsyncMock())
-
-        aio_pika, conn, ch, queue = self._patch_aio_pika()
-        ch.get_queue = AsyncMock(
-            side_effect=[ChannelNotFoundEntity("not_found"), queue]
-        )
+    async def test_declare_args_pin_canonical_bootstrap_job_topology(self) -> None:
+        """#393 — guards against silent arg drift vs the canonical
+        declaration in ``job-amqp-topology-bootstrap.yaml``
+        (``{"auto_delete":false,"durable":true,"arguments":
+        {"x-queue-type":"quorum"}}``). A mismatch here would make
+        RabbitMQ raise ``ChannelPreconditionFailed`` in production —
+        this test pins the args so drift is caught in CI, not at a
+        live broker."""
+        aio_pika, _conn, ch, _q = self._patch_aio_pika()
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanAuditConsumer(
                 settings=_settings(),
                 session_factory=await _make_factory(),
             )
             await consumer._ensure_connected()
-        assert ch.get_queue.await_count == 2
-        assert conn.channel.await_count == 2
+        _name, kwargs = ch.declare_queue.await_args
+        assert kwargs["durable"] is True
+        assert kwargs["arguments"] == {"x-queue-type": "quorum"}
 
-    async def test_queue_not_found_exhausts_attempts_and_raises(
+    async def test_attaches_via_active_declare_when_queue_absent(self) -> None:
+        """FALSIFIABILITY (#393): simulate "queue does not pre-exist" by
+        making the PASSIVE lookup (``get_queue``) raise
+        ``ChannelNotFoundEntity`` — exactly what a genuinely-absent
+        queue does. The consumer must still attach because it declares
+        the queue itself via the ACTIVE ``declare_queue`` path, which
+        never touches ``get_queue`` at all.
+
+        RED PROOF: reverting ``scan_audit_consumer.py`` to the old
+        passive ``self._channel.get_queue(self._queue_name)`` call
+        makes this test fail — ``get_queue``'s side effect
+        (``ChannelNotFoundEntity``) propagates, the bounded retry
+        exhausts, and ``_ensure_connected`` raises ``RuntimeError``
+        instead of attaching. This is the exact regression #393 fixes."""
+        from aio_pika.exceptions import ChannelNotFoundEntity
+
+        aio_pika, _conn, ch, queue = self._patch_aio_pika()
+        ch.get_queue = AsyncMock(side_effect=ChannelNotFoundEntity("not_found"))
+        with patch.dict(sys.modules, {"aio_pika": aio_pika}):
+            consumer = ScanAuditConsumer(
+                settings=_settings(),
+                session_factory=await _make_factory(),
+            )
+            await consumer._ensure_connected()
+        assert consumer._queue is queue
+        ch.declare_queue.assert_awaited_once()
+        ch.get_queue.assert_not_called()
+
+    async def test_queue_declare_retries_transient_error_then_succeeds(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from aio_pika.exceptions import ChannelNotFoundEntity
+        """The retry loop is now a guard against transient AMQP errors
+        while (re)declaring — not the primary "wait for the queue to
+        exist" mechanism (that's the active declare itself)."""
+        from aio_pika.exceptions import AMQPError
+
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        aio_pika, conn, ch, queue = self._patch_aio_pika()
+        ch.declare_queue = AsyncMock(side_effect=[AMQPError("transient"), queue])
+        with patch.dict(sys.modules, {"aio_pika": aio_pika}):
+            consumer = ScanAuditConsumer(
+                settings=_settings(),
+                session_factory=await _make_factory(),
+            )
+            await consumer._ensure_connected()
+        assert ch.declare_queue.await_count == 2
+        assert conn.channel.await_count == 2
+
+    async def test_queue_declare_exhausts_attempts_and_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from aio_pika.exceptions import AMQPError
 
         monkeypatch.setattr("asyncio.sleep", AsyncMock())
 
         aio_pika, _conn, ch, _q = self._patch_aio_pika()
-        ch.get_queue = AsyncMock(side_effect=ChannelNotFoundEntity("not_found"))
+        ch.declare_queue = AsyncMock(side_effect=AMQPError("still failing"))
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanAuditConsumer(
                 settings=_settings(),
@@ -266,10 +351,10 @@ class TestEnsureConnected:
             )
             with pytest.raises(
                 RuntimeError,
-                match=r"audittrace\.scan\.audit.*not found after \d+ attempts",
+                match=r"audittrace\.scan\.audit.*declare failed after \d+ attempts",
             ):
                 await consumer._ensure_connected()
-        assert ch.get_queue.await_count == consumer._QUEUE_MAX_ATTEMPTS
+        assert ch.declare_queue.await_count == consumer._QUEUE_MAX_ATTEMPTS
 
 
 class TestConnectLevelRetry:
@@ -486,15 +571,39 @@ class TestRunLoop:
 
         queue = MagicMock()
         queue.iterator = MagicMock(return_value=_FakeIter())
-        channel.get_queue = AsyncMock(return_value=queue)
+        channel.declare_queue = AsyncMock(return_value=queue)
 
         _f = InMemoryPostgresFactory()
         await _f.create_schema()
         factory = _f.get_session_factory()
+
+        async def _security_row_persisted() -> bool:
+            async with factory() as session:
+                rows = (
+                    (
+                        await session.execute(
+                            select(InteractionRecord).where(
+                                InteractionRecord.event_class == "security"
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            return len(rows) == 1
+
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanAuditConsumer(settings=_settings(), session_factory=factory)
             task = _asyncio.create_task(consumer.run())
-            await _asyncio.sleep(0.05)
+            # Deterministic wait: poll until the run loop has pulled the
+            # one queued message, processed it, and committed the
+            # security-audit row — load-independent (was a fixed
+            # asyncio.sleep(0.05) race window that could lose under host
+            # contention, the #254/#357 flake class shared with
+            # ScanVerdictConsumer's identical race). Times out
+            # (AssertionError) — never passes vacuously — if the
+            # consumer never reaches the write.
+            await _poll_until(_security_row_persisted)
             task.cancel()
             with pytest.raises(_asyncio.CancelledError):
                 await task
@@ -555,7 +664,7 @@ class TestRunLoop:
 
         queue = MagicMock()
         queue.iterator = MagicMock(return_value=_FakeIter())
-        channel.get_queue = AsyncMock(return_value=queue)
+        channel.declare_queue = AsyncMock(return_value=queue)
 
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             with patch(
@@ -587,7 +696,7 @@ class TestAclose:
         channel = AsyncMock()
         queue = AsyncMock()
         channel.set_qos = AsyncMock()
-        channel.get_queue = AsyncMock(return_value=queue)
+        channel.declare_queue = AsyncMock(return_value=queue)
         channel.close = AsyncMock()
         connection.channel = AsyncMock(return_value=channel)
         connection.close = AsyncMock()

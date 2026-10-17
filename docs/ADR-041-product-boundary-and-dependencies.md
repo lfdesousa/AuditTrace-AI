@@ -1,5 +1,7 @@
 # ADR-041: Product boundary — memory-server is the product; eight named dependencies are the market
 
+> **Amended 2026-08-30:** the current chat model is Qwen 3.8-27B dense+MTP (the Qwen 3.6-35B-A3B MoE was retired 2026-08-16); the memory model is five-layer per ADR-062 (four per-user layers plus one shared corpus). The decision text below is unchanged.
+
 - **Status:** Accepted
 - **Date:** 2026-04-18
 - **Context:** ADR-014 (Python package structure), ADR-018 (4-layer memory port), ADR-024 (proxy pass-through), ADR-025 (memory-as-tools), ADR-026 (multi-user identity), ADR-028 (observability aggregation), ADR-037 (agent-tool audit boundary)

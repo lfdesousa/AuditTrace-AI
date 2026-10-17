@@ -51,6 +51,43 @@ def test_resolve_hub_happy_path(monkeypatch):
     assert any(urlparse(u).hostname == "auth.docker.io" for u in calls)
 
 
+def test_resolve_bff_repo_path_hits_the_bff_repository(monkeypatch):
+    """V-3 (fix round 1): `resolve(..., repo_path="bff")` resolves
+    `lfds/audittrace-librechat-bff`, NEVER the default memory-server
+    repository — a non-vacuous test calling `resolve` with `repo_path`
+    explicitly (the review's own finding: no pre-existing test did this at
+    all, making the prior "100% lines+branches" on `registry.py` a floor,
+    not proof, on this one conditional).
+
+    Falsifiable: hardcode `resolve` to always use `_BACKENDS` (ignore
+    `repo_path`) and this goes RED — the resolved repository/API path
+    revert to the memory-server ones.
+    """
+    calls = []
+
+    def fake_get(url, headers=None):
+        calls.append(url)
+        if urlparse(url).hostname == "auth.docker.io":
+            assert (
+                "lfds%2Faudittrace-librechat-bff" in url
+                or "lfds/audittrace-librechat-bff" in url
+            )
+            return 200, {}, json.dumps({"token": "tok123"}).encode()
+        assert "lfds/audittrace-librechat-bff" in url
+        return 200, _digest_headers("sha256:bffcafe"), b""
+
+    monkeypatch.setattr(registry, "_http_get", fake_get)
+    ref = registry.resolve("1.29.1", "hub", repo_path="bff")
+    assert ref.repository == "docker.io/lfds/audittrace-librechat-bff"
+    assert ref.digest == "sha256:bffcafe"
+    assert any("librechat-bff" in u for u in calls)
+
+
+def test_resolve_bff_repo_path_unknown_registry_backend_raises(monkeypatch):
+    with pytest.raises(ValueError, match="unknown registry backend"):
+        registry.resolve("1.29.1", "local", repo_path="bff")
+
+
 def test_resolve_hub_auth_non_200(monkeypatch):
     monkeypatch.setattr(registry, "_http_get", lambda url, headers=None: (503, {}, b""))
     with pytest.raises(DigestResolutionError, match="HTTP 503"):

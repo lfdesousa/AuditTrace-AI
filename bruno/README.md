@@ -112,6 +112,12 @@ In `environments/<env>.bru`:
   `exampleDocId` — fixture names used by the create/read/update/
   delete requests. Change them per smoke run if you don't want
   to step on a previous test artefact.
+- `indexFileKey` (ADR-062 Phase B / #426) — the FULL `?file=` key for
+  `memory/index-single-file-md-to-decisions.bru`, exactly as returned
+  by `POST /memory/upload`'s `key` field. Since WU-B5, that's a
+  PRIVATE-tier key shaped `{jwt.sub}/{layer}/{filename}`, not the
+  legacy `{layer}/{filename}` shape the default value still
+  demonstrates for a shared-tier fixture.
 - `accessToken`, `refreshToken`, `deviceCode`, `userCode`,
   `verificationUri`, `exampleSessionId` — populated automatically
   by the `script:post-response` hooks; don't edit by hand.

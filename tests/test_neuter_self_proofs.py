@@ -1,0 +1,1083 @@
+"""Self-proofs a-n (SPEC v3 §11): real triggers in a throwaway git repo,
+each with the neuter that must redden it. Every proof runs the harness's
+OWN code (``run_one_neuter`` / ``run_pool`` / ``spec.load_neuter_spec`` /
+``lock.py``) against a real git repository and real ``pytest`` subprocess
+copied from ``tests/neuter_fixture/`` -- never a mock of pytest's own
+behaviour. Docker is faked only via ``pg.py``'s ``fake=True`` seam.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from scripts.neuter import lock as lockmod
+from scripts.neuter.pg import PgHandle, start_container
+from scripts.neuter.pool import (
+    EXIT_DRIFT_UNACKNOWLEDGED,
+    WorkerContext,
+    compute_neuter_hash,
+    run_one_neuter,
+    run_pool,
+    should_skip,
+)
+from scripts.neuter.report import generate_report
+from scripts.neuter.spec import (
+    Edit,
+    GuardTestEntry,
+    NeuterEntry,
+    SpecLoadError,
+    load_neuter_spec,
+)
+from tests._neuter_test_evidence import evidence_dir_for as _ev
+
+FIXTURE_DIR = Path(__file__).parent / "neuter_fixture"
+PYTHON = sys.executable
+FIXTURE_POOL_KWARGS = {"pathcheck_module": "guarded", "src_root_relative": ""}
+
+
+def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+    )
+
+
+def _init_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for name in ("guarded.py", "test_guarded.py", "data.txt"):
+        shutil.copy(FIXTURE_DIR / name, repo / name)
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "neuter@test.invalid")
+    _run_git(repo, "config", "user.name", "neuter")
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "init")
+    return repo
+
+
+def _sha(repo: Path) -> str:
+    return _run_git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def _ctx(
+    repo: Path,
+    evidence_dir: Path,
+    *,
+    pg_handle: PgHandle | None = None,
+    timeout_s: int = 30,
+    src_root: str | None = None,
+) -> WorkerContext:
+    return WorkerContext(
+        workdir=repo,
+        worker_idx=1,
+        python=PYTHON,
+        run_id="selfproof",
+        sha=_sha(repo),
+        evidence_dir=evidence_dir,
+        pg_handle=pg_handle,
+        pathcheck_expect=src_root or str(repo),
+        pathcheck_module="guarded",
+        timeout_s=timeout_s,
+        src_root=src_root or str(repo),
+        # a per-test, never-contended lock file: `already_locked` stays
+        # False (the default), so the chokepoint self-acquires+releases
+        # this exact path around each `run_one_neuter` call -- a real,
+        # if trivially-uncontended, exercise of the lock-enforcement rule.
+        lock_path=evidence_dir.parent / "test.lock",
+    )
+
+
+def _entry(**kwargs) -> NeuterEntry:
+    base = dict(guard="G", clause="C", engines=["mock"], expect="RED")
+    base.update(kwargs)
+    return NeuterEntry(**base)
+
+
+# ─────────────────────────── a. wrong mapping ────────────────────────────
+
+
+def test_proof_a_wrong_mapping(tmp_path):
+    repo = _init_repo(tmp_path)
+    entry = _entry(
+        id="a-wrong-mapping",
+        file="guarded.py",
+        edits=[Edit(old="    return x * 2", new="    return x * 3")],  # breaks guard_b
+        tests=["test_guarded.py::test_a"],  # WRONG: test_a only exercises guard_a
+    )
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
+    assert row["verdict"] == "GREEN"
+    assert row["vacuous"] is True
+
+
+def test_proof_a_pool_exit_code_is_2(tmp_path):
+    repo = _init_repo(tmp_path)
+    evidence = _ev(tmp_path)
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "sha": _sha(repo),
+                "scope_files": ["test_guarded.py"],
+                "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+                "neuters": [
+                    {
+                        "id": "a-wrong-mapping",
+                        "file": "guarded.py",
+                        "edits": [
+                            {"old": "    return x * 2", "new": "    return x * 3"}
+                        ],
+                        "tests": ["test_guarded.py::test_a"],
+                        "engines": ["mock"],
+                        "guard": "G",
+                        "clause": "C",
+                    }
+                ],
+            }
+        )
+    )
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
+    exit_code = run_pool(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=evidence,
+        workers=1,
+        python=PYTHON,
+        fake_db=True,
+        lock_path=tmp_path / "pool.lock",
+        **FIXTURE_POOL_KWARGS,
+    )
+    # Review round 2, blocker 4: the drift sample (default sample=0.10,
+    # always covers the pool's one neuter here) now correctly measures
+    # this wrong-mapping neuter's REAL effect on the full scope -- it
+    # breaks test_b, which is outside its own `tests` mapping. A non-empty
+    # `unmapped_red` on ANY row (this one reads GREEN on its own targeted
+    # test, but that GREEN is not "clean") makes the pool exit
+    # EXIT_DRIFT_UNACKNOWLEDGED, not the bare vacuous-GREEN code -- the
+    # SAME wrong-mapping defect proof a demonstrates is now caught one
+    # layer earlier, by the pool itself, not just by `arbitrate`.
+    assert exit_code == EXIT_DRIFT_UNACKNOWLEDGED
+
+
+# ───────────────────────── b. text mismatch ──────────────────────────────
+
+
+def test_proof_b_zero_match_exits_3(tmp_path):
+    repo = _init_repo(tmp_path)
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "sha": _sha(repo),
+                "scope_files": ["test_guarded.py"],
+                "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+                "neuters": [
+                    {
+                        "id": "b-zero-match",
+                        "file": "guarded.py",
+                        "edits": [{"old": "nonexistent_text_xyz", "new": "whatever"}],
+                        "tests": ["test_guarded.py::test_a"],
+                        "engines": ["mock"],
+                    }
+                ],
+            }
+        )
+    )
+    with pytest.raises(SpecLoadError) as excinfo:
+        load_neuter_spec(
+            spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+        )
+    assert excinfo.value.reason == "match_count"
+    assert not _ev(tmp_path, create=False).exists()
+    assert (
+        _run_git(repo, "worktree", "list").stdout.count("\n") == 1
+    )  # only the main worktree
+
+
+def test_proof_b_two_match_exits_3(tmp_path):
+    repo = _init_repo(tmp_path)
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "sha": _sha(repo),
+                "scope_files": ["test_guarded.py"],
+                "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+                "neuters": [
+                    {
+                        "id": "b-two-match",
+                        "file": "guarded.py",
+                        "edits": [
+                            {"old": "return", "new": "return "}
+                        ],  # `return` appears 5x
+                        "tests": ["test_guarded.py::test_a"],
+                        "engines": ["mock"],
+                    }
+                ],
+            }
+        )
+    )
+    with pytest.raises(SpecLoadError) as excinfo:
+        load_neuter_spec(
+            spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+        )
+    assert excinfo.value.reason == "match_count"
+
+
+# ──────────────────────────── c. dirty tree ──────────────────────────────
+
+
+def test_proof_c_dirty_tree_stops_restore(tmp_path):
+    repo = _init_repo(tmp_path)
+    entry = _entry(
+        id="c-dirty-side-effect",
+        file="test_guarded.py",
+        edits=[
+            Edit(
+                old="def test_a():\n    assert guard_a(1) == 2",
+                new=(
+                    "def test_a():\n"
+                    "    with open('data.txt', 'a') as fh:\n"
+                    "        fh.write('x')\n"
+                    "    assert guard_a(1) == 2"
+                ),
+            )
+        ],
+        tests=["test_guarded.py::test_a"],
+    )
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
+    assert row["restored_clean"] is False
+    status = _run_git(repo, "status", "--porcelain").stdout
+    assert "data.txt" in status
+    # never `git checkout -- .` -- that would hide the leaked write too.
+    _run_git(repo, "checkout", "--", "data.txt")
+
+
+# ────────────────────────── d. wrong import path ─────────────────────────
+
+
+def test_proof_d_wrong_import_path(tmp_path):
+    """Both directions in ONE proof, so the self-neuter that drops
+    ``-p neuter_pathcheck`` from ``pool.py`` reddens THIS test directly
+    (not only a sibling): (1) with the CORRECT expected root, the plugin
+    must actually run and leave a log line -- drop the plugin flag and this
+    half fails, since no invocation ever writes one; (2) with a WRONG
+    expected root (a decoy), the plugin's own assertion must fire -- ERROR
+    ``pathcheck``, no log line."""
+    repo = _init_repo(tmp_path)
+
+    # (1) correct expect: the plugin runs, succeeds, and leaves its proof.
+    entry_ok = _entry(
+        id="d-ok",
+        file="guarded.py",
+        edits=[Edit(old="    return x + 1", new="    return x + 1  # noop")],
+        tests=["test_guarded.py::test_a"],
+    )
+    evidence = _ev(tmp_path)
+    row_ok = run_one_neuter(_ctx(repo, evidence), entry_ok)
+    assert row_ok["error_reason"] != "pathcheck"
+    log = evidence / "pathcheck_w1.log"
+    assert log.exists() and log.read_text().strip() != ""
+
+    # (2) wrong expect (a decoy dir): the plugin's own assertion fires.
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    shutil.copy(FIXTURE_DIR / "guarded.py", decoy / "guarded.py")
+    entry_bad = _entry(
+        id="d-bad",
+        file="guarded.py",
+        edits=[Edit(old="    return x * 2", new="    return x * 2  # noop")],
+        tests=["test_guarded.py::test_b"],
+    )
+    before_lines = log.read_text().count("\n")
+    ctx_bad = _ctx(repo, evidence, src_root=str(decoy))  # wrong expected root
+    row_bad = run_one_neuter(ctx_bad, entry_bad)
+    assert row_bad["verdict"] == "ERROR"
+    assert row_bad["error_reason"] == "pathcheck"
+    assert log.read_text().count("\n") == before_lines  # no NEW log line
+
+
+# ──────────────────────────────── e. resume ──────────────────────────────
+
+
+def test_proof_e_should_skip_rules(tmp_path):
+    entry = _entry(
+        id="e-resume",
+        file="guarded.py",
+        edits=[Edit(old="    return x + 1", new="    return x + 2")],
+        tests=["test_guarded.py::test_a"],
+    )
+    good_row = {
+        "verdict": "RED",
+        "restored_clean": True,
+        "sha": "shaX",
+        "harness_version": "1",
+        "neuter_hash": compute_neuter_hash(entry),
+    }
+    assert should_skip(entry, good_row, sha="shaX", harness_version="1") is True
+    assert should_skip(entry, good_row, sha="shaY", harness_version="1") is False
+    assert should_skip(entry, good_row, sha="shaX", harness_version="2") is False
+    assert (
+        should_skip(
+            entry, {**good_row, "verdict": "ERROR"}, sha="shaX", harness_version="1"
+        )
+        is False
+    )
+    assert (
+        should_skip(
+            entry,
+            {**good_row, "restored_clean": False},
+            sha="shaX",
+            harness_version="1",
+        )
+        is False
+    )
+
+    changed = _entry(
+        id="e-resume",
+        file="guarded.py",
+        edits=[Edit(old="    return x + 1", new="    return x + 3")],
+        tests=["test_guarded.py::test_a"],
+    )
+    assert should_skip(changed, good_row, sha="shaX", harness_version="1") is False
+
+    # Review round 3 should-fix: a row produced under a DIFFERENT DB mode
+    # (fake vs real Postgres) must never satisfy a resume in the other
+    # mode -- the two modes exercise different code paths entirely.
+    fake_row = {**good_row, "fake_db": True}
+    assert (
+        should_skip(entry, fake_row, sha="shaX", harness_version="1", fake_db=True)
+        is True
+    )
+    assert (
+        should_skip(entry, fake_row, sha="shaX", harness_version="1", fake_db=False)
+        is False
+    )
+    real_row = {**good_row, "fake_db": False}
+    assert (
+        should_skip(entry, real_row, sha="shaX", harness_version="1", fake_db=True)
+        is False
+    )
+
+
+def test_proof_e_resume_reruns_exactly_the_edited_one(tmp_path):
+    repo = _init_repo(tmp_path)
+    evidence = _ev(tmp_path)
+    spec_dict = {
+        "schema": 3,
+        "sha": _sha(repo),
+        "scope_files": ["test_guarded.py"],
+        "guard_tests": [
+            {"id": "test_guarded.py::test_a", "row": "G1"},
+            {"id": "test_guarded.py::test_b", "row": "G2"},
+        ],
+        "neuters": [
+            {
+                "id": "e1",
+                "file": "guarded.py",
+                "edits": [{"old": "    return x + 1", "new": "    return x + 2"}],
+                "tests": ["test_guarded.py::test_a"],
+                "engines": ["mock"],
+                "guard": "G1",
+            },
+            {
+                "id": "e2",
+                "file": "guarded.py",
+                "edits": [{"old": "    return x * 2", "new": "    return x * 3"}],
+                "tests": ["test_guarded.py::test_b"],
+                "engines": ["mock"],
+                "guard": "G2",
+            },
+        ],
+    }
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(spec_dict))
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
+
+    run_pool(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=evidence,
+        workers=1,
+        python=PYTHON,
+        fake_db=True,
+        lock_path=tmp_path / "pool.lock",
+        **FIXTURE_POOL_KWARGS,
+    )
+    rows_by_id = {
+        json.loads(line)["id"]: json.loads(line)
+        for line in (evidence / "neuter_results.jsonl").read_text().splitlines()
+    }
+    assert set(rows_by_id) == {"e1", "e2"}
+    e1_first_finished = rows_by_id["e1"]["finished_at"]
+
+    # bump e1's edit -> its neuter_hash changes -> it must re-run; e2 must be skipped.
+    spec_dict["neuters"][0]["edits"][0]["new"] = "    return x + 20"
+    # `old` still matches once in guarded.py's committed tree.
+    spec_path.write_text(json.dumps(spec_dict))
+    spec2 = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
+    run_pool(
+        spec2,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=evidence,
+        workers=1,
+        python=PYTHON,
+        fake_db=True,
+        resume=True,
+        lock_path=tmp_path / "pool.lock",
+        **FIXTURE_POOL_KWARGS,
+    )
+    rows_by_id_2 = {
+        json.loads(line)["id"]: json.loads(line)
+        for line in (evidence / "neuter_results.jsonl").read_text().splitlines()
+    }
+    assert rows_by_id_2["e1"]["finished_at"] != e1_first_finished  # re-ran
+    assert (
+        rows_by_id_2["e2"]["finished_at"] == rows_by_id["e2"]["finished_at"]
+    )  # skipped
+
+
+# ──────────────────────────────── f. DB leak ─────────────────────────────
+
+
+def test_proof_f_db_leak(tmp_path):
+    repo = _init_repo(tmp_path)
+    evidence = _ev(tmp_path)
+    pg_handle = start_container(
+        "selfproof", 1, fake=True, fake_dir=evidence / "fake_pg"
+    )
+    entry = _entry(
+        id="f-db-leak",
+        file="test_guarded.py",
+        edits=[
+            Edit(
+                old="def test_a():\n    assert guard_a(1) == 2",
+                new=(
+                    "def test_a():\n"
+                    "    import json, os\n"
+                    "    p = os.environ['NEUTER_FAKE_PG_STATE']\n"
+                    "    state = json.loads(open(p).read())\n"
+                    "    state['schemata'].append('leaked_schema')\n"
+                    "    open(p, 'w').write(json.dumps(state))\n"
+                    "    assert guard_a(1) == 2"
+                ),
+            )
+        ],
+        tests=["test_guarded.py::test_a"],
+        engines=["postgres"],
+    )
+    row = run_one_neuter(_ctx(repo, evidence, pg_handle=pg_handle), entry)
+    assert row["verdict"] == "ERROR"
+    assert row["error_reason"] == "db_leak"
+    assert row["db_leak"] is True
+
+
+# ──────────────────────────────── g. closure ─────────────────────────────
+
+
+def test_proof_g_unmapped_guard_test_id_exits_3(tmp_path):
+    repo = _init_repo(tmp_path)
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "sha": _sha(repo),
+                "scope_files": ["test_guarded.py"],
+                "guard_tests": [
+                    {"id": "test_guarded.py::test_a", "row": "G1"},
+                    {
+                        "id": "test_guarded.py::test_b",
+                        "row": "G2",
+                    },  # not in any neuter's `tests`
+                ],
+                "neuters": [
+                    {
+                        "id": "g1",
+                        "file": "guarded.py",
+                        "edits": [
+                            {"old": "    return x + 1", "new": "    return x + 2"}
+                        ],
+                        "tests": ["test_guarded.py::test_a"],
+                        "engines": ["mock"],
+                    }
+                ],
+            }
+        )
+    )
+    with pytest.raises(SpecLoadError) as excinfo:
+        load_neuter_spec(
+            spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+        )
+    assert excinfo.value.reason == "closure"
+
+
+def test_proof_g_entry_without_row_exits_3(tmp_path):
+    repo = _init_repo(tmp_path)
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "sha": _sha(repo),
+                "scope_files": ["test_guarded.py"],
+                "guard_tests": [{"id": "test_guarded.py::test_a"}],  # no `row`
+                "neuters": [
+                    {
+                        "id": "g2",
+                        "file": "guarded.py",
+                        "edits": [
+                            {"old": "    return x + 1", "new": "    return x + 2"}
+                        ],
+                        "tests": ["test_guarded.py::test_a"],
+                        "engines": ["mock"],
+                    }
+                ],
+            }
+        )
+    )
+    with pytest.raises(SpecLoadError) as excinfo:
+        load_neuter_spec(
+            spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+        )
+    assert excinfo.value.reason == "guard_tests_row"
+
+
+def test_proof_g_reviewer_guard_tests_diff_is_report_only(tmp_path):
+    repo = _init_repo(tmp_path)
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "sha": _sha(repo),
+                "scope_files": ["test_guarded.py"],
+                "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G1"}],
+                "neuters": [
+                    {
+                        "id": "g3",
+                        "file": "guarded.py",
+                        "edits": [
+                            {"old": "    return x + 1", "new": "    return x + 2"}
+                        ],
+                        "tests": ["test_guarded.py::test_a"],
+                        "engines": ["mock"],
+                        "guard": "G1",
+                    }
+                ],
+            }
+        )
+    )
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
+    reviewer_guard_tests = [
+        GuardTestEntry(id="test_guarded.py::test_a", row="G1"),
+        GuardTestEntry(id="test_guarded.py::test_b", row="G2"),
+    ]
+    evidence = _ev(tmp_path)
+    (evidence / "neuter_results.jsonl").write_text("")
+    text = generate_report(evidence, spec, reviewer_guard_tests=reviewer_guard_tests)
+    # Both independent lists must print, not just their diff -- "print only
+    # one list" is exactly the self-neuter this guards: the diff line alone
+    # still mentions test_b (it's the symmetric difference), so asserting on
+    # "test_b" anywhere in the report is vacuous against that neuter. The
+    # REVIEWER'S OWN list line, with its own count, must be there too.
+    assert "builder (1):" in text
+    assert "reviewer (2):" in text
+    assert "test_guarded.py::test_b" in text  # the diff is visible, not fatal
+
+
+# ──────────────────────────────── h. settings ────────────────────────────
+
+
+def test_proof_h_nondurable_settings_violation(tmp_path):
+    repo = _init_repo(tmp_path)
+    evidence = _ev(tmp_path)
+    pg_handle = start_container(
+        "selfproof", 1, fake=True, fake_dir=evidence / "fake_pg"
+    )
+    state_path = pg_handle.fake_state_path
+    state = json.loads(state_path.read_text())
+    state["settings"]["fsync"] = "on"  # simulate a container that ignored -c fsync=off
+    state_path.write_text(json.dumps(state))
+
+    entry = _entry(
+        id="h-settings",
+        file="guarded.py",
+        edits=[Edit(old="    return x + 1", new="    return x + 1  # noop")],
+        tests=["test_guarded.py::test_a"],
+        engines=["postgres"],
+    )
+    row = run_one_neuter(_ctx(repo, evidence, pg_handle=pg_handle), entry)
+    assert row["verdict"] == "ERROR"
+    assert row["error_reason"] == "pg_settings"
+    assert row["pg_settings"]["fsync"] == "on"
+
+
+# ───────────────────────────── i. fixture raise ──────────────────────────
+
+
+def test_proof_i_fixture_crash_is_error_never_red(tmp_path):
+    repo = _init_repo(tmp_path)
+    entry = _entry(
+        id="i-fixture-raise",
+        file="guarded.py",
+        edits=[Edit(old="    return 41", new="    raise RuntimeError('boom')")],
+        tests=["test_guarded.py::test_uses_seed"],
+    )
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
+    assert row["verdict"] == "ERROR"
+    assert row["error_reason"] == "setup_or_teardown"
+
+
+# ────────────────────────────────── j. hang ──────────────────────────────
+
+
+def test_proof_j_timeout(tmp_path):
+    repo = _init_repo(tmp_path)
+    entry = _entry(
+        id="j-hang",
+        file="test_guarded.py",
+        edits=[Edit(old="    slow(0.01)", new="    slow(5)")],
+        tests=["test_guarded.py::test_uses_slow"],
+    )
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path), timeout_s=2), entry)
+    assert row["verdict"] == "ERROR"
+    assert row["error_reason"] == "timeout"
+    assert row["timeout"] is True
+
+
+# ───────────────────────── k. syntax error (SF-B) ────────────────────────
+
+
+def test_proof_k_syntax_error_short_circuits(tmp_path):
+    repo = _init_repo(tmp_path)
+    entry = _entry(
+        id="k-syntax",
+        file="guarded.py",
+        edits=[
+            Edit(old="def guard_a(x: int) -> int:", new="def guard_a(x: int -> int:")
+        ],
+        tests=["test_guarded.py::test_a"],
+    )
+    evidence = _ev(tmp_path)
+    row = run_one_neuter(_ctx(repo, evidence), entry)
+    assert row["verdict"] == "ERROR"
+    assert row["error_reason"] == "nocompile"
+    assert row["error_reasons"] == ["nocompile"]
+    assert row["tests_collected"] is None
+    # SF-4: the run never starts at all -- pytest is never invoked, so no
+    # junit file exists (classify()'s own nocompile short-circuit would
+    # mask a gate bypass in pool.py's "if not nocompile:" guard on its
+    # OWN, since it forces this same verdict from the `nocompile` flag
+    # regardless of whether pytest actually ran -- this is the guard that
+    # catches THAT bypass specifically).
+    assert not (evidence / "junit").exists()
+
+
+# ──────────────────────────── l. precedence (SF-B) ───────────────────────
+
+
+def test_proof_l_collection_error_precedence(tmp_path):
+    repo = _init_repo(tmp_path)
+    entry = _entry(
+        id="l-precedence",
+        file="guarded.py",
+        edits=[
+            Edit(
+                old="def guard_a(x: int) -> int:",
+                new="def guard_a_renamed(x: int) -> int:",
+            )
+        ],
+        tests=["test_guarded.py::test_a", "test_guarded.py::test_b"],
+    )
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
+    assert row["verdict"] == "ERROR"
+    assert row["error_reason"] == "collected"
+    reasons = row["error_reasons"]
+    assert (
+        reasons.index("collected")
+        < reasons.index("missing")
+        < reasons.index("exit_code")
+    )
+
+
+# ───────────────────────────── m. heavy cap (BL-1) ───────────────────────
+
+
+def test_proof_m_pool_refuses_while_hold_shared_running(tmp_path):
+    repo = _init_repo(tmp_path)
+    lock_path = tmp_path / "pool.lock"
+    child = subprocess.Popen(
+        [PYTHON, "-m", "scripts.neuter.runner", "hold-shared", "--", "sleep", "2"],
+        env={**os.environ, "AUDITTRACE_NEUTER_LOCK": str(lock_path)},
+    )
+    try:
+        time.sleep(0.4)  # let the child acquire LOCK_SH
+        spec_path = tmp_path / "neuters.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "schema": 3,
+                    "sha": _sha(repo),
+                    "scope_files": ["test_guarded.py"],
+                    "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+                    "neuters": [
+                        {
+                            "id": "m1",
+                            "file": "guarded.py",
+                            "edits": [
+                                {"old": "    return x + 1", "new": "    return x + 2"}
+                            ],
+                            "tests": ["test_guarded.py::test_a"],
+                            "engines": ["mock"],
+                        }
+                    ],
+                }
+            )
+        )
+        spec = load_neuter_spec(
+            spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+        )
+        exit_code = run_pool(
+            spec,
+            repo_dir=repo,
+            parent_worktree_dir=tmp_path,
+            evidence_dir=_ev(tmp_path),
+            workers=1,
+            python=PYTHON,
+            fake_db=True,
+            lock_path=lock_path,
+            **FIXTURE_POOL_KWARGS,
+        )
+        assert exit_code == 8
+        assert (
+            _run_git(repo, "worktree", "list").stdout.count("\n") == 1
+        )  # no worker worktree created
+    finally:
+        child.wait(timeout=10)
+
+    # after the child exits, the pool starts.
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
+    exit_code = run_pool(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=_ev(tmp_path, "ev2"),
+        workers=1,
+        python=PYTHON,
+        fake_db=True,
+        lock_path=lock_path,
+        **FIXTURE_POOL_KWARGS,
+    )
+    assert exit_code != 8
+
+
+def test_proof_m_sf2_isolated_lock_path_survives_an_outer_shared_default_lock(
+    tmp_path, monkeypatch
+):
+    """SF-2: every harness test uses ``tmp_path`` for its OWN lock, so an
+    outer ``make test``-shaped ``hold-shared`` holding the real, shared
+    default lock path must never affect it."""
+    monkeypatch.setenv("AUDITTRACE_NEUTER_LOCK", str(tmp_path / "outer-default.lock"))
+    outer_fd = lockmod.open_lock_file(lockmod.resolve_lock_path())
+    lockmod.try_flock(outer_fd, fcntl.LOCK_SH)  # simulates `make test`'s hold-shared
+    try:
+        repo = _init_repo(tmp_path)
+        spec_path = tmp_path / "neuters.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "schema": 3,
+                    "sha": _sha(repo),
+                    "scope_files": ["test_guarded.py"],
+                    "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+                    "neuters": [
+                        {
+                            "id": "sf2",
+                            "file": "guarded.py",
+                            "edits": [
+                                {"old": "    return x + 1", "new": "    return x + 2"}
+                            ],
+                            "tests": ["test_guarded.py::test_a"],
+                            "engines": ["mock"],
+                        }
+                    ],
+                }
+            )
+        )
+        spec = load_neuter_spec(
+            spec_path,
+            repo_dir=repo,
+            python=PYTHON,
+            # collect is ALSO chokepoint-gated (review round 2) -- its own
+            # isolated lock, never the outer/default one, same SF-2 rule.
+            lock_path=tmp_path / "isolated-collect.lock",
+        )
+        exit_code = run_pool(
+            spec,
+            repo_dir=repo,
+            parent_worktree_dir=tmp_path,
+            evidence_dir=_ev(tmp_path),
+            workers=1,
+            python=PYTHON,
+            fake_db=True,
+            lock_path=tmp_path / "isolated-pool.lock",  # NEVER the default/outer path
+            **FIXTURE_POOL_KWARGS,
+        )
+        assert exit_code != 8
+    finally:
+        os.close(outer_fd)
+
+
+# ───────────────────────── n. call exception (SF-A) ──────────────────────
+
+
+def test_proof_n_call_exception_never_red(tmp_path):
+    repo = _init_repo(tmp_path)
+    entry = _entry(
+        id="n-call-exception",
+        file="guarded.py",
+        edits=[
+            Edit(
+                old='def raiser() -> None:\n    """Called from a test body. Proof n\'s self-neuter makes this raise\n    ``RuntimeError`` to prove a non-assertion call-phase exception\n    classifies ``ERROR call_exception``, never ``RED``."""\n    return None',
+                new="def raiser() -> None:\n    raise RuntimeError('boom')",
+            )
+        ],
+        tests=["test_guarded.py::test_uses_raiser"],
+    )
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
+    assert row["verdict"] == "ERROR"
+    assert row["error_reason"] == "call_exception"
+    assert row["failure_types"] == ["RuntimeError"]
+
+
+def test_proof_n_sibling_assert_flip_is_red(tmp_path):
+    repo = _init_repo(tmp_path)
+    entry = _entry(
+        id="n-assert-flip",
+        file="guarded.py",
+        edits=[Edit(old="    return x + 1", new="    return x + 2")],
+        tests=["test_guarded.py::test_a"],
+    )
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
+    assert row["verdict"] == "RED"
+    assert row["failure_types"] == ["AssertionError"]
+
+
+def test_proof_n_sibling_raises_removed_is_red_failed(tmp_path):
+    repo = _init_repo(tmp_path)
+    entry = _entry(
+        id="n-raises-removed",
+        file="guarded.py",
+        edits=[Edit(old='    raise ValueError("boom")', new="    return None")],
+        tests=["test_guarded.py::test_maybe_raise_shape"],
+    )
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
+    assert row["verdict"] == "RED"
+    assert row["failure_types"] == ["Failed"]
+
+
+# ─────── review round 2, structural fix item 4: self-proofs on the ───────
+# ─────── PRODUCT LAYOUT (src/), not just the root-layout fixture ────────
+
+FIXTURE_SRC_DIR = Path(__file__).parent / "neuter_fixture_src"
+
+
+def _init_src_repo(tmp_path: Path) -> Path:
+    """The SAME toy module/tests as ``neuter_fixture/``, but laid out like
+    the product (``src/guarded.py``, tests at the repo root importing it
+    via ``PYTHONPATH=<repo>/src``) -- the shape review round 2 found blind:
+    the root-layout fixture always had SOMETHING importable at the repo
+    root, so a missing/blind PYTHONPATH silently still found a module
+    (just possibly a stale one); under src/, a blind PYTHONPATH finds
+    NOTHING at the repo root and falls back to the interpreter's own
+    editable install instead -- the exact defect class blockers 1/2/5
+    were about."""
+    repo = tmp_path / "repo_src"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    shutil.copy(FIXTURE_SRC_DIR / "src" / "guarded.py", repo / "src" / "guarded.py")
+    shutil.copy(FIXTURE_SRC_DIR / "test_guarded.py", repo / "test_guarded.py")
+    shutil.copy(FIXTURE_SRC_DIR / "data.txt", repo / "data.txt")
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "neuter@test.invalid")
+    _run_git(repo, "config", "user.name", "neuter")
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "init")
+    return repo
+
+
+def test_proof_src_layout_targeted_run_reddens(tmp_path):
+    """Baseline sanity on the product layout: a straightforward, correctly-
+    mapped neuter under ``src/`` still reads RED through the chokepoint."""
+    repo = _init_src_repo(tmp_path)
+    entry = _entry(
+        id="src-a",
+        file="src/guarded.py",
+        edits=[Edit(old="    return x + 1", new="    return x + 2")],
+        tests=["test_guarded.py::test_a"],
+    )
+    ctx = _ctx(repo, _ev(tmp_path), src_root=str(repo / "src"))
+    row = run_one_neuter(ctx, entry)
+    assert row["verdict"] == "RED"
+    assert row["failure_types"] == ["AssertionError"]
+
+
+def test_proof_src_layout_drift_sees_the_edit(tmp_path):
+    """The exact review round 2 regression, reproduced on the product
+    layout: a wrong-mapping neuter (breaks ``guard_b``, mapped only to
+    ``test_a``) under ``src/`` must have its drift sample MEASURE
+    ``test_b``'s real failure -- a blind ``PYTHONPATH`` would import the
+    UNEDITED module from the venv's editable install instead and report a
+    false, empty ``unmapped_red``."""
+    repo = _init_src_repo(tmp_path)
+    spec_dict = {
+        "schema": 3,
+        "sha": _sha(repo),
+        "scope_files": ["test_guarded.py"],
+        "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+        "neuters": [
+            {
+                "id": "src-x6",
+                "file": "src/guarded.py",
+                "edits": [{"old": "    return x * 2", "new": "    return x * 3"}],
+                "tests": ["test_guarded.py::test_a"],
+                "engines": ["mock"],
+                "guard": "G",
+            }
+        ],
+    }
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(spec_dict))
+    evidence = _ev(tmp_path)
+    spec = load_neuter_spec(
+        spec_path,
+        repo_dir=repo,
+        python=PYTHON,
+        lock_path=tmp_path / "collect.lock",
+    )
+    exit_code = run_pool(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=evidence,
+        workers=1,
+        python=PYTHON,
+        fake_db=True,
+        lock_path=tmp_path / "pool.lock",
+        pathcheck_module="guarded",
+        # DEFAULT src_root_relative="src" -- the product's OWN layout, NOT
+        # the root-layout fixture's override to "".
+        sample=1.0,
+    )
+    assert exit_code == EXIT_DRIFT_UNACKNOWLEDGED
+    rows = {
+        json.loads(line)["id"]: json.loads(line)
+        for line in (evidence / "neuter_results.jsonl").read_text().splitlines()
+    }
+    row = rows["src-x6"]
+    assert row["verdict"] == "GREEN"
+    assert row["drift_sampled"] is True
+    assert any("test_b" in u for u in row["unmapped_red"])
+
+
+def test_proof_src_layout_arbitrate_gives_drift_not_a_blind_green(tmp_path):
+    """The SAME src-layout X6 neuter, checked through ``arbitrate`` (the
+    authoritative tie-break) instead of the sampled drift pass -- must
+    ALSO see the edit and report DRIFT, never an authoritative GREEN."""
+    from scripts.neuter.runner import main as runner_main
+
+    repo = _init_src_repo(tmp_path)
+    spec_dict = {
+        "schema": 3,
+        "sha": _sha(repo),
+        "scope_files": ["test_guarded.py"],
+        "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+        "neuters": [
+            {
+                "id": "src-x6-arb",
+                "file": "src/guarded.py",
+                "edits": [{"old": "    return x * 2", "new": "    return x * 3"}],
+                "tests": ["test_guarded.py::test_a"],
+                "engines": ["mock"],
+                "guard": "G",
+            }
+        ],
+    }
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(spec_dict))
+    evidence = _ev(tmp_path)
+    rc = runner_main(
+        [
+            "run",
+            "--sha",
+            _sha(repo),
+            "--neuters",
+            str(spec_path),
+            "--evidence",
+            str(evidence),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--workers",
+            "1",
+            "--no-db",
+            "--pathcheck-module",
+            "guarded",
+            "--sample",
+            "0",
+            "--lock-path",
+            str(tmp_path / "pool.lock"),
+            "--ack-drift",
+        ]
+    )
+    assert rc == 2  # GREEN on the targeted (wrong) mapping
+    rc = runner_main(
+        [
+            "arbitrate",
+            "--ids",
+            "src-x6-arb",
+            "--evidence",
+            str(evidence),
+            "--neuters",
+            str(spec_path),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--lock-path",
+            str(tmp_path / "arb.lock"),
+        ]
+    )
+    assert rc == 0
+    arb_rows = [
+        json.loads(line)
+        for line in (evidence / "arbitration.jsonl").read_text().splitlines()
+    ]
+    assert arb_rows[0]["harness_verdict"] == "GREEN"
+    assert arb_rows[0]["authoritative_verdict"] == "DRIFT"
+    assert any("test_b" in u for u in arb_rows[0]["unmapped_red"])

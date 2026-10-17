@@ -1,8 +1,10 @@
 """ADR-048 PR-B4 — verdict consumer.
 
-Consumes the ``audittrace.scan.verdicts`` queue (declared by PR-B2.5
-topology Job, bound to the same-named exchange via routing key
-``scan.verdict.*``). On each message:
+Consumes the ``audittrace.scan.verdicts`` queue (also declared by the
+PR-B2.5 topology Job, bound to the same-named exchange via routing
+key ``scan.verdict.*``; #393 — this consumer self-declares the queue
+idempotently too, so a cold boot no longer depends on winning a race
+against the bootstrap Job). On each message:
 
     1. Parse the JSON ``Verdict`` (cross-repo contract).
     2. Map ``VerdictKind`` → closed-set ``scan_status`` value
@@ -15,6 +17,12 @@ topology Job, bound to the same-named exchange via routing key
          URI (content-control promoted the bytes; memory-server
          re-points the manifest at the new location so
          ``/memory/index`` can find it).
+       - On clean: ``indexed_at_ms`` reset to NULL — the SPEC #387
+         Phase 1 (WU-1) auto-index outbox marker — and an
+         ``IndexRequestEnvelope`` is enqueued onto ``index_queue`` so
+         ``IndexWorker`` picks the object up with zero operator touch
+         (closes GAP-1: previously nothing triggered indexing after a
+         clean verdict at all).
 
 Discipline:
 
@@ -42,6 +50,8 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import update
 
 from audittrace.db.models import MemoryItem
+from audittrace.services.index_routing import collection_for_key
+from audittrace.services.index_worker import IndexRequestEnvelope
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -65,6 +75,27 @@ _VERDICT_TO_SCAN_STATUS: dict[str, str] = {
 }
 
 
+def _episodic_bare_key(
+    *,
+    prefix: str,
+    scan_id: str,
+    quarantine_key: str,
+) -> str:
+    """Bucket-relative form of the post-promotion episodic key.
+
+    Pattern: ``{prefix}{scan_id}/{filename}``. The filename is the last
+    path component of the quarantine URI (``s3://memory-shared/
+    quarantine/<user>/<scan_id>/<filename>``). This is the SAME key
+    ``minio_client.get_object(bucket, key)`` / ``_index_pdf_objects``
+    expect — SPEC #387 (WU-1) uses it to build the ``IndexRequestEnvelope``
+    enqueued on a clean verdict, so the outbox and the manifest's stored
+    ``s3://`` URI (see :func:`_episodic_uri`) can never disagree on what
+    the filename actually is.
+    """
+    filename = quarantine_key.rsplit("/", 1)[-1] or "object.bin"
+    return f"{prefix}{scan_id}/{filename}"
+
+
 def _episodic_uri(
     *,
     bucket: str,
@@ -74,12 +105,13 @@ def _episodic_uri(
 ) -> str:
     """Mirror of content-control's ``ScanWorker._episodic_uri``.
 
-    Pattern: ``s3://{bucket}/{prefix}{scan_id}/{filename}``. The
-    filename is the last path component of the quarantine URI
-    (``s3://memory-shared/quarantine/<user>/<scan_id>/<filename>``).
+    Pattern: ``s3://{bucket}/{prefix}{scan_id}/{filename}`` — the full
+    manifest URI, built from :func:`_episodic_bare_key`.
     """
-    filename = quarantine_key.rsplit("/", 1)[-1] or "object.bin"
-    return f"s3://{bucket}/{prefix}{scan_id}/{filename}"
+    bare = _episodic_bare_key(
+        prefix=prefix, scan_id=scan_id, quarantine_key=quarantine_key
+    )
+    return f"s3://{bucket}/{bare}"
 
 
 class ScanVerdictConsumer:
@@ -94,6 +126,7 @@ class ScanVerdictConsumer:
         prefetch_count: int = 16,
         episodic_bucket: str = "memory-shared",
         episodic_prefix: str = "episodic/papers/",
+        index_queue: asyncio.Queue[IndexRequestEnvelope] | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
@@ -101,26 +134,41 @@ class ScanVerdictConsumer:
         self._prefetch_count = prefetch_count
         self._episodic_bucket = episodic_bucket
         self._episodic_prefix = episodic_prefix
+        # SPEC #387 Phase 1 (WU-1) — the auto-index outbox queue. ``None``
+        # (the default) keeps this consumer usable standalone (existing
+        # tests, and any caller that doesn't wire the index pipeline) —
+        # the clean-verdict branch below simply skips enqueueing.
+        self._index_queue = index_queue
         self._connection: Any = None
         self._channel: Any = None
         self._queue: Any = None
 
+    # #393 — canonical queue-declare args. MUST match the
+    # ``job-amqp-topology-bootstrap`` Job byte-for-byte
+    # (``charts/audittrace/templates/rabbitmq/job-amqp-topology-bootstrap.yaml``,
+    # the ``audittrace.scan.verdicts`` PUT body: ``{"auto_delete":false,
+    # "durable":true,"arguments":{"x-queue-type":"quorum"}}``) — that
+    # Job is the single source of truth for the topology. A mismatch
+    # makes RabbitMQ raise ``ChannelPreconditionFailed`` on declare.
+    _CANONICAL_QUEUE_ARGUMENTS: dict[str, str] = {"x-queue-type": "quorum"}
+
     # 2026-05-14 B4b — fresh-install race budget. The chart's
     # `job-amqp-topology-bootstrap` Job is a post-install hook, so on
     # a fresh kind cluster memory-server can come up BEFORE the
-    # `audittrace.scan.verdicts` queue exists. ``get_queue`` does a
-    # passive declare that raises ``ChannelNotFoundEntity`` if the
-    # queue isn't there yet, killing the channel. Pre-fix that meant
-    # the consumer stayed detached and verdict messages piled up with
-    # ``consumers=0``. Cumulative max wait: 1+2+4+8+16 = 31 s of
-    # backoff — well past the ~11 s gap observed in CI between
-    # memory-server starting and the bootstrap Job declaring queues.
+    # `audittrace.scan.verdicts` queue exists. Pre-#393, ``get_queue``
+    # did a passive declare that raised ``ChannelNotFoundEntity`` if the
+    # queue wasn't there yet, killing the channel; the consumer stayed
+    # detached and verdict messages piled up with ``consumers=0`` until
+    # the retry budget below happened to outlast the bootstrap Job.
     #
-    # RESIDUAL GAP (#393): the supervised ``run()`` self-heals
-    # connection-level errors, but a cold-boot queue-declaration race
-    # that OUTLASTS this queue-retry budget still raises RuntimeError and
-    # kills the consumer (no supervised retry for queue-not-found). Rare
-    # (the bootstrap Job normally wins), tracked as a follow-up.
+    # #393 FIX: switched to idempotent active ``declare_queue`` (mirrors
+    # the exchange fix in ``ScanAmqpClient.ensure_connected``, PR-B10).
+    # The retry loop below is now a guard against transient AMQP errors
+    # while (re)opening the channel/declaring the queue, not the primary
+    # mechanism for waiting out a not-yet-created queue — the consumer
+    # declares the queue itself, so whichever side (this consumer or the
+    # bootstrap Job) runs first wins and the other adopts the existing
+    # queue (I2).
     _QUEUE_MAX_ATTEMPTS: int = 6
 
     # #384 WS3 — INITIAL-connect resilience. ``connect_robust`` was
@@ -179,10 +227,7 @@ class ScanVerdictConsumer:
         import asyncio  # noqa: PLC0415
 
         import aio_pika  # noqa: PLC0415 — avoid import on disabled paths
-        from aio_pika.exceptions import (  # noqa: PLC0415
-            AMQPError,
-            ChannelNotFoundEntity,
-        )
+        from aio_pika.exceptions import AMQPError  # noqa: PLC0415
 
         # (C) connection-level retry — a cold-reboot RabbitMQ is not
         # AMQP-ready yet and ``connect_robust`` raises a connection-level
@@ -191,20 +236,29 @@ class ScanVerdictConsumer:
         last_exc: Exception | None = None
         for attempt in range(self._QUEUE_MAX_ATTEMPTS):
             try:
-                # ``get_queue`` does a passive declare; a closed
-                # channel can't be reused, so we open a fresh one
-                # on every retry attempt.
+                # A closed channel can't be reused, so open a fresh one on
+                # every retry attempt.
                 self._channel = await self._connection.channel()
                 await self._channel.set_qos(prefetch_count=self._prefetch_count)
-                self._queue = await self._channel.get_queue(self._queue_name)
+                # #393 — idempotent ACTIVE declare (was passive
+                # ``get_queue``, which required the bootstrap Job to have
+                # already declared the queue). RabbitMQ no-ops if the
+                # queue already exists with matching arguments, so this
+                # composes safely with the bootstrap Job regardless of
+                # which side runs first (I2).
+                self._queue = await self._channel.declare_queue(
+                    self._queue_name,
+                    durable=True,
+                    arguments=self._CANONICAL_QUEUE_ARGUMENTS,
+                )
                 break
-            except ChannelNotFoundEntity as exc:
+            except (ConnectionError, OSError, TimeoutError, AMQPError) as exc:
                 last_exc = exc
                 if attempt == self._QUEUE_MAX_ATTEMPTS - 1:
                     break
                 delay = 2**attempt
                 logger.warning(
-                    "scan_verdict_consumer.queue_not_found_retry",
+                    "scan_verdict_consumer.queue_declare_retry",
                     extra={
                         "attempt": attempt + 1,
                         "max_attempts": self._QUEUE_MAX_ATTEMPTS,
@@ -216,8 +270,8 @@ class ScanVerdictConsumer:
                 await asyncio.sleep(delay)
         if self._queue is None:
             raise RuntimeError(
-                f"scan_verdict_consumer: queue {self._queue_name!r} not found "
-                f"after {self._QUEUE_MAX_ATTEMPTS} attempts "
+                f"scan_verdict_consumer: queue {self._queue_name!r} declare "
+                f"failed after {self._QUEUE_MAX_ATTEMPTS} attempts "
                 f"(last error: {last_exc})"
             ) from last_exc
         logger.info(
@@ -247,17 +301,31 @@ class ScanVerdictConsumer:
                     extra={"scan_id": scan_id},
                 )
                 return
+            # Captured BEFORE commit — SPEC #387 (WU-1) needs these to
+            # build the IndexRequestEnvelope, and an expired ORM attribute
+            # read after commit (session-config-dependent) is a footgun
+            # this sidesteps entirely.
+            row_user_id = row.created_by_user_id
+            row_trace_id = row.trace_id or ""
+
             updates: dict[str, Any] = {
                 "scan_status": scan_status,
                 "modified_at_ms": _now_ms(),
             }
+            index_bare_key: str | None = None
             if kind == "clean":
-                updates["key"] = _episodic_uri(
-                    bucket=self._episodic_bucket,
+                index_bare_key = _episodic_bare_key(
                     prefix=self._episodic_prefix,
                     scan_id=scan_id,
                     quarantine_key=row.key,
                 )
+                updates["key"] = f"s3://{self._episodic_bucket}/{index_bare_key}"
+                # SPEC #387 Phase 1 (WU-1) — the auto-index outbox marker.
+                # Explicit reset (not just "already NULL by default") so a
+                # duplicate clean-verdict re-delivery for an
+                # already-indexed row is idempotently re-queued rather
+                # than silently trusting a stale timestamp.
+                updates["indexed_at_ms"] = None
             await session.execute(
                 update(MemoryItem).where(MemoryItem.id == scan_id).values(**updates)
             )
@@ -269,6 +337,25 @@ class ScanVerdictConsumer:
                     "verdict": kind,
                     "scan_status": scan_status,
                 },
+            )
+
+        # Enqueue OUTSIDE the session block — the outbox row is already
+        # durably NULL-marked, so an enqueue failure (or a process crash
+        # right here) is exactly the case IndexJanitor's grace-window
+        # re-drive exists for (mirrors ScanRequestPublisher's shape).
+        if (
+            kind == "clean"
+            and index_bare_key is not None
+            and self._index_queue is not None
+        ):
+            await self._index_queue.put(
+                IndexRequestEnvelope(
+                    scan_id=scan_id,
+                    key=index_bare_key,
+                    collection=collection_for_key(index_bare_key),
+                    user_id=row_user_id,
+                    trace_id=row_trace_id,
+                )
             )
 
     async def _process_one(self, message: Any) -> None:

@@ -89,6 +89,26 @@ memoryServer:
     # explicitly --set image.tag=latest should also flip pullPolicy back
     # to Always — same 2026-04-18 trap.
     pullPolicy: IfNotPresent
+  # -- FLEET-ROUTE (Phase 1) — model-field routing for the chat path --------
+  # Rendered as AUDITTRACE_MODEL_ROUTES (JSON object) via the
+  # audittrace.modelRoutes helper (templates/_helpers.tpl) — see
+  # templates/memory-server/deployment.yaml. Prefix-matched against the
+  # request `model` field, first match wins; no match / empty model falls
+  # back to AUDITTRACE_LLAMA_URL. Empty map (the default) byte-preserves
+  # today's single-upstream behaviour — safe to ship dark on every target.
+  # An explicit entry here always wins over any chart-computed default
+  # (Sprig `merge`: dst keys win over src).
+  #
+  # FLEET-ROUTE-ENABLE (2026-08-06): the preferred way to light up Mistral
+  # is `--set externalLLM.mistral.enabled=true` (see the `externalLLM`
+  # block below) — it routes through the in-cluster `-llm-mistral`
+  # ExternalName Service + no-mTLS DestinationRule, mirroring how
+  # AUDITTRACE_LLAMA_URL/_EMBED_URL/_SUMMARIZER_URL are wired, so the call
+  # stays inside the mesh boundary. Setting `modelRoutes.mistral` directly
+  # to a raw `host.docker.internal:11438` URL (as this comment used to
+  # suggest) bypasses that boundary — the ExternalName Service exists so
+  # nothing has to.
+  modelRoutes: {}
   summariser:
     # When true, a post-install/post-upgrade Helm hook provisions a
     # dedicated, minimum-privilege `audittrace_summariser` role with
@@ -172,6 +192,13 @@ memoryServer:
     AUDITTRACE_AUTH_ENABLED: "true"
     AUDITTRACE_AUTH_REQUIRED: "true"
     AUDITTRACE_MEMORY_MODE: "tools"
+    # WU-5 (2026-09-10) — sources trailer ON. Appends the deterministic
+    # "Sources consultées" citation block to /v1 answers (flag-gated code
+    # already merged: #328 + the #301/#303 truncation fix). Additive to the
+    # /v1 RESPONSE CONTENT only when finish_reason==stop — the audit row's
+    # interactions.answer stays clean (B5). Default is "off"; the console
+    # turns it on here so recalled sources are visible to the user.
+    AUDITTRACE_RESPONSE_SOURCES: "trailer"
     AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS: "10"
     AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS: "900"
     AUDITTRACE_TOKEN_CACHE_TTL_SECONDS: "300"
@@ -239,6 +266,14 @@ memoryServer:
     AUDITTRACE_SCAN_PUBLISHER_DRAIN_INTERVAL_MS: "100"
     AUDITTRACE_SCAN_JANITOR_INTERVAL_SECONDS: "30"
     AUDITTRACE_SCAN_JANITOR_GRACE_SECONDS: "60"
+    # ── WU-6 (Sovereign-Attach EPIC, Part A) — session-memory GC janitor ──
+    # Bounded hard-DELETE sweep of the ephemeral ``session`` layer past
+    # its retention window. Same two-knob shape as the scan/index janitors
+    # above; unlike them this is NOT gated by scan_pipeline_enabled — the
+    # session layer has nothing to do with the scan/index outbox.
+    AUDITTRACE_SESSION_GC_ENABLED: "true"
+    AUDITTRACE_SESSION_GC_INTERVAL_SECONDS: "300"
+    AUDITTRACE_SESSION_RETENTION_HOURS: "24"
     OTEL_SERVICE_NAME: "audittrace-server"
     OTEL_SEMCONV_STABILITY_OPT_IN: "http/dup"
     # OTEL_RESOURCE_ATTRIBUTES is templated in
@@ -325,6 +360,24 @@ externalLLM:
   summarizer:
     name: llm-summarizer
     port: 11437
+  # FLEET-ROUTE-ENABLE (2026-08-06, #229 follow-up) — addressable upstream
+  # for the host `:11438` Mistral llama-server (the local sovereign fleet's
+  # workhorse — project_local_sovereign_fleet_opencode). Mirrors chat/embed/
+  # summarizer above exactly, gated by its own `enabled` flag so this stays
+  # additive/default-safe: `enabled: false` (the default) renders NO
+  # `-llm-mistral` Service, NO DestinationRule entry, and
+  # AUDITTRACE_MODEL_ROUTES stays `{}` — byte-identical to pre-FLEET-ROUTE-
+  # ENABLE behaviour for every model. Set `enabled: true` (e.g. `--set
+  # externalLLM.mistral.enabled=true`) to render the `-llm-mistral`
+  # ExternalName Service + no-mTLS DestinationRule and default
+  # AUDITTRACE_MODEL_ROUTES to route `mistral*` models to it through the
+  # mesh (audittrace.modelRoutes helper, templates/_helpers.tpl). Qwen
+  # intentionally has no equivalent block — it stays the default
+  # fall-through upstream (AUDITTRACE_LLAMA_URL), never a modelRoutes entry.
+  mistral:
+    name: llm-mistral
+    port: 11438
+    enabled: false
 
 # -- LLM stub (in-cluster, wiring/integration tests only) ---------------------
 # An in-cluster OpenAI-compatible stub that serves deterministic canned
@@ -364,6 +417,20 @@ istio:
       - "localhost"
     credentialName: audittrace-tls
     port: 443
+    # workloadSelector label on the ingress-gateway pod (verified live via
+    # `kubectl get pod -n audittrace -l istio=audittrace-gateway`). Used by
+    # the EnvoyFilter below to target the gateway's HTTP connection manager.
+    workloadSelectorLabel: audittrace-gateway
+    # Envoy's stream_idle_timeout on the gateway HTTP connection manager.
+    # Envoy defaults this to 300s and a VirtualService `timeout:` does NOT
+    # override it. The memory tool-loop's non-streaming reasoning turns can
+    # sit silent for minutes, so the gateway must tolerate idle streams up
+    # to the same ceiling as the /v1/chat/completions route timeout (1800s).
+    # 2026-08-12: applied live as a manual EnvoyFilter after the audited
+    # /v1 path dropped long reasoning builds with a Transport error at the
+    # Envoy default 300s; this value codifies that live fix into the chart
+    # (feedback_no_more_drifts).
+    streamIdleTimeout: "1800s"
   mtls:
     mode: STRICT
   defaultDenyAll: true
@@ -527,7 +594,18 @@ redis:
     # repo) at pinned NodePort 30921.
     enabled: true
     image:
-      repository: bitnamilegacy/redis-exporter
+      # MIRRORED to ghcr.io 2026-09-26. `bitnamilegacy` is an
+      # explicit sunset holding org — the likeliest next casualty
+      # after MinIO closed on BOTH public registries in a
+      # fortnight. Mirrored while still pullable, not after.
+      # MULTI-ARCH (linux/amd64, linux/arm64) — copied
+      # registry-to-registry with `docker buildx imagetools create`,
+      # which preserves the upstream index. Verified on the mirror.
+      registry: ghcr.io
+      repository: lfdesousa/audittrace-redis-exporter
+      # Tag MUST be pinned here: the subchart otherwise supplies its
+      # own default tag, which does not exist in our mirror.
+      tag: 1.62.0-debian-12-r2-frozen-sep26
 
 # -- RabbitMQ (ADR-057, ADR-048 scan-control broker) ───────────────────
 # Bitnami subchart wiring for the AMQP broker that carries scan
@@ -586,8 +664,36 @@ rabbitmq:
 minio:
   enabled: true
   image:
-    repository: minio/minio
-    tag: latest
+    # MIRRORED 2026-09-26 to ghcr.io. History: repinned 2026-09-12 off
+    # Docker Hub after it removed anonymous pull for the MinIO org
+    # (finding-minio-dockerhub-anon-pull-removed-20260912.md); quay.io
+    # then closed the same way (finding-minio-quay-anon-pull-removed-
+    # 20260926.md) — BOTH public registries now 401 anonymously, even
+    # for `:latest`. Repinning to a third public registry is not a fix;
+    # mirroring is. Same pattern as audittrace-postgresql / -redis /
+    # -rabbitmq. Pin exact dated tags, never `:latest`.
+    #
+    # PACKAGE IS PRIVATE, like the other mirrors: CI reaches it because
+    # GITHUB_TOKEN has packages:read AND the package's "Manage Actions
+    # access" allowlist includes this repo. A NEW mirror is unreachable
+    # from CI until that allowlist entry is added — the push is only
+    # half the job.
+    #
+    # SINGLE-ARCH (linux/amd64). Upstream was a multi-arch index; the
+    # mirror was retagged from the local amd64 copy, which is all that
+    # could be obtained once upstream closed. GHA runners and the
+    # laptop are amd64, so this holds today — an arm64 target would
+    # need the arm64 layer re-mirrored, and upstream can no longer
+    # supply it.
+    repository: ghcr.io/lfdesousa/audittrace-minio
+    tag: RELEASE.2025-04-22T22-12-26Z-frozen-sep26
+  mcImage:
+    # Bucket-init Job (templates/minio/job-bucket-init.yaml) client
+    # image. `mc` has its own release-tag scheme (not aligned with the
+    # server's dated tags) — pinned independently, same rule applies.
+    # Mirrored to ghcr.io 2026-09-26 for the reason above.
+    repository: ghcr.io/lfdesousa/audittrace-mc
+    tag: RELEASE.2025-04-16T18-13-26Z-frozen-sep26
   auth:
     rootUser: minioadmin
     rootPassword: ""
@@ -654,18 +760,73 @@ keycloak:
   # webui will be served from (including the operator's own
   # `audittrace.allaboutdata.eu:30952` if applicable). See Phase B.9
   # in the 2026-05-03 stabilisation tail PR for context.
+  #
+  # OIDC-REDIRECT-URI-DRIFT (M3-WU-1, 2026-08-27): RFC 9700 + ADR-042 §3
+  # forbid redirect-URI wildcards — `redirectUris`/`webOrigins` below are
+  # EXACT-match only, no trailing `/*`. The `webui/serve.py` local dev
+  # harness (plain HTTP, localhost-only) is a genuinely different risk
+  # class from the mesh-served `.local` entries, so it lives in the
+  # separate `devRedirectUris`/`devWebOrigins` keys — a distinct, clearly-
+  # marked dev profile per the portability invariant ("a second target is
+  # a profile behind config, not a rewrite"). The realm template concats
+  # both lists so the laptop reference/dev default is unchanged (the
+  # ADR-044 evidence-capture flow through `webui/serve.py` keeps working);
+  # a stricter deployment profile can override `devRedirectUris: []` /
+  # `devWebOrigins: []` to drop the dev entries entirely.
   webui:
     redirectUris:
       - "https://audittrace.local/oauth2/callback"
-      - "https://audittrace.local/*"
       - "https://audittrace.local:30952/oauth2/callback"
-      - "https://audittrace.local:30952/*"
-      - "http://localhost:8765/*"
+    devRedirectUris:
+      - "http://localhost:8765/"
     webOrigins:
       - "https://audittrace.local"
       - "https://audittrace.local:30952"
+    devWebOrigins:
       - "http://localhost:8765"
-    postLogoutRedirectUri: "https://audittrace.local/*"
+    postLogoutRedirectUri: "https://audittrace.local/oauth2/callback"
+  # `audittrace-librechat` Keycloak client config (M3-WU-1) — the M3
+  # LibreChat console's browser-facing public PKCE client. WU-1 scope
+  # only: this client authenticates the browser session; the RFC 8693
+  # token-exchange confidential client the BFF uses to mint the
+  # `aud=audittrace-server` token is WU-2's scope, not this one. Callback
+  # path follows LibreChat's own convention (`/oauth/openid/callback`,
+  # ADR-042 §9) under a `/librechat` prefix on the same `.local` host
+  # pattern as `webui` above, so a future Istio route can disambiguate the
+  # two consoles; WU-3 (compose + `librechat.yaml`) owns standing that
+  # route up. `devRedirectUris`/`devWebOrigins` mirror LibreChat's
+  # upstream default dev port (3080) the same way `webui`'s do for 8765 —
+  # same dev-profile separation, same OIDC-REDIRECT-URI-DRIFT discipline.
+  # M3-WU-3d (D5) — points at the D4 dedicated host root
+  # (`console.librechat.host`), NOT the retired `/librechat` subpath.
+  # These are LITERAL strings (values.yaml is not itself a Helm template)
+  # kept in sync with `console.librechat.host`'s default by convention —
+  # same implicit coupling already accepted for `console.librechat.
+  # frontDoorHost` above; an operator overriding `console.librechat.host`
+  # must override these too.
+  librechat:
+    redirectUris:
+      - "https://librechat.audittrace.local/oauth/openid/callback"
+    devRedirectUris:
+      - "http://localhost:3080/oauth/openid/callback"
+    webOrigins:
+      - "https://librechat.audittrace.local"
+    devWebOrigins:
+      - "http://localhost:3080"
+  # ACL WU-2c — the dedicated, E2E-only `audittrace-acl-e2e` device-flow
+  # client (the only sanctioned path to the ACL write routes for two
+  # human subjects until the WU-4 console shim exists). SUNSET MECHANISM:
+  # flip `enabled` to false after WU-4 — the realm template then omits
+  # the client and the scopes hook Job deletes it (verify-then-delete).
+  # Also delete the dev-realm copy (keycloak/realm-audittrace.json); the
+  # two-realm parity guards redden until it is.
+  aclE2eClient:
+    enabled: true
+    # ACL WU-2c-A0 (Addendum F §3 / F1 §5): read-only, GET-only shape
+    # capture of the live client's representation into the hook Job's
+    # log — off by default, flipped on for one deploy by the re-enable
+    # runbook so the real Keycloak layout lands in the evidence.
+    shapeCapture: false
   resources:
     requests:
       cpu: 500m
@@ -687,8 +848,11 @@ chromadb:
   #     kubectl exec <chromadb-pod> -- cat /config.yaml
   persistPath: /data
   image:
-    repository: chromadb/chroma
-    tag: "1.5.7"
+    # MIRRORED to ghcr.io 2026-09-26 — see the MinIO finding.
+    # MULTI-ARCH (linux/amd64, linux/arm64), copied
+    # registry-to-registry via `imagetools create`. Verified.
+    repository: ghcr.io/lfdesousa/audittrace-chroma
+    tag: "1.5.7-frozen-sep26"
   port: 8000
   persistence:
     size: 10Gi
@@ -701,6 +865,253 @@ chromadb:
       cpu: 1000m
       memory: 2Gi
 
+# -- M3-WU-3b — LibreChat console on k3s (BFF + LibreChat + MongoDB) ---------
+# Gated on `console.enabled` (default false — a plain `helm upgrade` never
+# brings these resources up). Supersedes the docker-compose `console`
+# profile (WU-3, #310) for production: LibreChat runs behind the BFF in the
+# same mesh as everything else, and the user's OIDC access token forwards
+# automatically (D2) instead of being pasted per-user.
+console:
+  enabled: false
+
+  # M3-WU-D2-5E (2026-09-02) — DHCP-proof front-door DNS. Supersedes the
+  # removed `console.librechat.frontDoorHostAlias` static-IP pin. The
+  # 2026-09-01 incident: an overnight DHCP renewal moved the host LAN IP
+  # (192.168.1.231 -> 10.12.40.59); the pod's `hostAliases` entry pinned
+  # to the OLD IP went dead (hostAliases override CoreDNS), and
+  # LibreChat's own one-shot (no-retry) OIDC discovery fetch failed
+  # permanently for the process life — HARD DOWN login
+  # (`Unknown authentication strategy "openid"`). `frontDoorNodeName`
+  # feeds a chart-templated `coredns-custom` overlay
+  # (templates/dns/configmap-coredns-frontdoor.yaml) that rewrites the
+  # front-door hostnames to this NODE NAME instead of an IP — k3s's
+  # built-in CoreDNS already tracks the node name -> its CURRENT IP via
+  # NodeHosts (reloaded every 15s), so resolution self-heals on any DHCP
+  # change with NO pod restart. Left empty by default so
+  # `console.enabled=true` still helm-lints/renders cleanly with no live
+  # `kubectl get nodes` compute step at template time (portability
+  # invariant — [[project_portability_invariant]]: a live lookup here is
+  # exactly the non-reproducible pattern `frontDoorHostAlias` was
+  # originally rejected for; see values-laptop.yaml for the laptop
+  # reference-target value). A cloud target sets its own node name OR
+  # routes these hosts at the Istio ingress gateway's in-cluster Service
+  # DNS name instead — still a NAME, never an IP.
+  frontDoorNodeName: ""
+  # The parallel public domain name the SAME target answers to alongside
+  # `console.librechat.frontDoorHost` (`audittrace.local`) — self-signed
+  # on the laptop, a real Let's Encrypt cert on the cloud rig (see
+  # CLAUDE.md). Included in the coredns-custom rewrite overlay too so an
+  # operator testing against either name gets the DHCP-proof fix; a
+  # target that serves a genuinely different second domain overrides
+  # this in its own values-<target>.yaml.
+  frontDoorCloudHost: "audittrace.allaboutdata.eu"
+
+  # ── D1 — the BFF sidecar (bff/, RFC 8693 token-exchange) ────────────────
+  bff:
+    # M3-WU-3c (D1) — where the RFC 8693 exchange-client secret comes from.
+    # "vault": WU-3b production posture (unchanged) — sourced via Vault
+    # Agent from kv/audittrace/librechat/bff-secret whenever vault.enabled
+    # is also true (audittrace.vaultAnnotations.librechatBff). "values":
+    # ALWAYS reads the k8s Secret populated by
+    # secrets.console.bffExchangeClientSecret below — even when
+    # vault.enabled=true cluster-wide — so a test deploy can pass the
+    # secret as a value with no Vault root token (the WU-3c unblock). See
+    # audittrace.console.bff.useVault in _helpers.tpl for the single
+    # source of truth this toggle feeds.
+    secretSource: vault
+    image:
+      # M3-WU-D2-5C (2026-09-02) — published to Docker Hub by
+      # .github/workflows/publish.yml (Part B, console-hardening-b-bff-in-
+      # publish) same as memoryServer.image. Supersedes the
+      # `localhost:5000/audittrace/librechat-bff` local-registry, tag-only
+      # pin that let the stale `wu3b` image run in production — that
+      # posture is GONE, `wu3b` dies with it.
+      repository: docker.io/lfds/audittrace-librechat-bff
+      # Explicit release version, not the AppVersion-tracking empty-string
+      # convenience memoryServer.image.tag uses — the digest below is
+      # pinned to THIS specific published version, so tag and digest must
+      # move together on every bump (mirrors console.librechat.image
+      # below, not memoryServer).
+      tag: "1.29.5"
+      # Phase-E re-pin (2026-10-15, release v1.29.5) — the published INDEX
+      # digest for docker.io/lfds/audittrace-librechat-bff:1.29.5, confirmed
+      # live on Docker Hub 2026-10-15 via TWO independent manifest reads
+      # (registry-1.docker.io HEAD with an OCI-index Accept header, and
+      # `docker buildx imagetools inspect`; both returned this digest with
+      # media type `application/vnd.oci.image.index.v1+json` — the index
+      # digest, never a child-manifest digest — never fabricated or copied
+      # on trust). Bumped from `1.29.4` so the BFF tracks the released
+      # version. Mirrors the console.librechat.image digest-pin pattern
+      # below. Tag and digest move together on every bump, never
+      # hand-edited without re-verifying against the registry. When set,
+      # the rendered image ref becomes `<repository>:<tag>@<digest>`
+      # (deployment-bff.yaml).
+      digest: "sha256:fe16703c6a031672cd92ab8a0c66857e642622f5a5d3cf0550e40a569eb2c6fb"
+      pullPolicy: IfNotPresent
+    replicaCount: 1
+    port: 8766
+    serviceAccount:
+      create: true
+      name: audittrace-librechat-bff
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    # RFC 8693 token-exchange identity — matches the WU-2b confidential
+    # client + the `audittrace-librechat` target profile declared in
+    # realm-audittrace.json. `exchangeClientSecret` below is Vault-sourced
+    # ONLY when vault.enabled=true (D4); the plaintext fallback
+    # (secrets.console.bffExchangeClientSecret) exists for laptop
+    # vault.enabled=false dev installs only — never committed with a real
+    # value.
+    exchangeClientId: audittrace-librechat-bff
+    exchangeAudience: audittrace-librechat
+
+  # ── D2 — LibreChat: the sovereign fork (M3-WU-D2-4 cutover) ─────────────
+  # M3-WU-D2-4 (2026-08-31) supersedes the D1 "stock image, no source edit"
+  # posture: the Souvenirs Day-2 code layer (adapter D2-2, panel + agent-
+  # write→sovereign D2-3, context-reads→sovereign D2-3c) is built, merged,
+  # and certified in `lfds/LibreChat main @ c879b74` (WU-3 composer repoint
+  # folded in), and the fork image is pushed to Docker Hub. This is our fork,
+  # not upstream — the sovereign memory adapter
+  # (`api/server/services/AuditTraceMemory/config.js`) lives inside it,
+  # reading the three env vars rendered below. Re-pinned to `768de61` at the
+  # Phase-E re-pin (2026-09-18, spec 2026-09-18-SPEC-e2e-deploy-and-mongo-
+  # audit.md) — `c879b74` (2026-09-10) predates every one of the fork's
+  # seven chokepoint shims (PRs #5-#14: conversations, presets, prompts,
+  # chat-projects, files, conversation-tags, tool-favorites, confirmed via
+  # `git log --oneline c879b74..768de61` on `lfds/LibreChat`), so it could
+  # not serve the sovereign path this WU activates. Frozen at `768de61`;
+  # any further fork code change is a new tag + digest, never an in-place
+  # mutation of this pin. Re-pinned from `c879b74` via this Phase-E step —
+  # the digest was verified against Docker Hub at that time.
+  librechat:
+    image:
+      repository: docker.io/lfds/audittrace-librechat
+      tag: "768de61"
+      # Phase-E re-pin (2026-09-18) — pinned so the deploy is reproducible
+      # with no live `docker pull ... && docker inspect` compute step. This
+      # is the pushed INDEX digest for
+      # docker.io/lfds/audittrace-librechat:768de61, confirmed live on
+      # Docker Hub 2026-09-18 via TWO independent manifest reads
+      # (registry-1.docker.io GET and HEAD, Accept negotiated for the OCI
+      # index; both returned `Docker-Content-Digest` and a
+      # `content-type: application/vnd.oci.image.index.v1+json` body — the
+      # manifest-list/index digest, never a child-manifest digest — never
+      # fabricated or copied from an operator-supplied value on trust).
+      # Bumped from `c879b74` to activate the fork's seven merged
+      # chokepoint shims (fork PRs #5-#14) against the chart's
+      # already-`"sovereign"` `memoryBackend` flag below — see this WU's
+      # build record for the blast-radius note. A future bump moves it,
+      # like any pinned digest (operator verifies against the registry,
+      # never fabricated). When set, the rendered image ref becomes
+      # `<repository>:<tag>@<digest>`.
+      digest: "sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
+    # M3-WU-D2-4 — the fork's sovereign-backend switch. The fork's
+    # config.js reads AUDITTRACE_MEMORY_BACKEND and selects the sovereign
+    # one-brain path ONLY when it is exactly "sovereign" — any other value
+    # (unset, "mongo", a typo) fails CLOSED to LibreChat's own Mongo store,
+    # never the other way round. This value renders VERBATIM into the env
+    # var below (never coerced to "sovereign"), so an operator can flip it
+    # back to "mongo" and the fork reverts, no chart-code change needed.
+    memoryBackend: "sovereign"
+    # M3-WU-D2-4 — timeout for the panel's memory CRUD calls to the BFF
+    # (milliseconds). Panel memory CRUD via the BFF is fast; the observed
+    # ~150-180s latency belongs to the CHAT recall-tool-loop over `/v1`,
+    # NOT the BFF, so 15s is ample headroom here.
+    bffTimeoutMs: 15000
+    replicaCount: 1
+    port: 3080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+    # D2 — OIDC token-forwarding config. `openidScope` MUST carry
+    # `offline_access` (refresh token — the #1 stale-token risk mitigation)
+    # alongside the standard `profile`/`email` scopes the D3 realm reconcile
+    # adds to `audittrace-librechat`.
+    openidScope: "openid profile email offline_access"
+    # k8s equivalent of the compose profile's `extra_hosts:
+    # audittrace.local:host-gateway`: LibreChat's own server-side OIDC
+    # calls (token exchange, JWKS) need to resolve `audittrace.local` to
+    # something reachable from inside the cluster — Keycloak's discovery
+    # document always carries KC_HOSTNAME_URL-derived (external
+    # front-door) endpoint URLs regardless of which network path fetched
+    # it. M3-WU-D2-5E (2026-09-02): resolved via the `coredns-custom`
+    # overlay + `console.frontDoorNodeName` above, NOT a pod hostAliases
+    # entry — the removed `frontDoorHostAlias` static-IP pin was the
+    # 2026-09-01 incident's root cause (see console.frontDoorNodeName's
+    # comment for the full story).
+    frontDoorHost: "audittrace.local"
+    # M3-WU-3d (D4) — the BROWSER-facing host LibreChat is served at, at
+    # the ROOT path (no subpath). The earlier `/librechat` prefix fought
+    # LibreChat's own base-href/API routing (blank page; `/api/config`
+    # resolved to HTML instead of JSON) — confirmed live on k3s
+    # 2026-08-29. A dedicated host with NO prefix rewrite is what
+    # LibreChat expects. Distinct from `frontDoorHost` above (which stays
+    # the shared `audittrace.local` host LibreChat's own BACKEND OIDC
+    # calls reach Keycloak/the front door through — D3). The operator adds
+    # one `/etc/hosts` line pointing this host at the gateway IP, the same
+    # one-time pattern already required for `audittrace.local`. Committed
+    # in `values-laptop.yaml` for the laptop reference target; a cloud
+    # profile gets its own `values-<target>.yaml` value, never a hardcode
+    # in the templates (portability invariant).
+    host: "librechat.audittrace.local"
+    # M3-WU-3d (D3) — LibreChat's Node backend refuses to complete OIDC
+    # discovery over plain HTTP, and the default trust store does not
+    # include the laptop target's self-signed front-door cert. The
+    # preferred/default path (false) mounts the cluster CA as a trust
+    # anchor (`NODE_EXTRA_CA_CERTS`, see configmap-ca-trust.yaml) so
+    # Node validates the front door's certificate normally. Flipping this
+    # to `true` is a laptop-only quick path that instead disables Node's
+    # TLS certificate validation outright (`NODE_TLS_REJECT_UNAUTHORIZED=0`)
+    # — never set true against anything but a throwaway/dev cluster.
+    insecureTLS: false
+    # M3-WU-D2-5H (2026-09-02) — bounds for the OIDC discovery readiness
+    # gate (the `wait-for-oidc-discovery` initContainer in
+    # deployment-librechat.yaml). LibreChat's own `openid` passport
+    # strategy is configured via a ONE-SHOT, NO-RETRY fetch of the
+    # OPENID_ISSUER discovery URL at process start: if Keycloak (or the
+    # Istio gateway in front of it) is not yet serving the front door on a
+    # boot storm, the strategy is never registered for the process life
+    # and every login fails with `Unknown authentication strategy
+    # "openid"` — even though the pod itself looks healthy (2/2, /health
+    # green). Confirmed live on the 2026-09-01 PM reboot: Part E's DNS fix
+    # (frontDoorNodeName) was intact and the host IP had NOT even changed,
+    # yet the race still fired because the librechat pod won the race
+    # against Keycloak's readiness. This gate complements — does NOT
+    # replace — Part E: E makes the discovery URL resolvable, this makes
+    # WHEN it's fetched safe. `intervalSeconds` = poll cadence;
+    # `timeoutSeconds` = generous enough to cover a cold Keycloak +
+    # Istio-gateway warm-up on this laptop box before the initContainer
+    # gives up and exits non-zero, surfacing a loud `Init:CrashLoopBackOff`
+    # instead of a silent unregistered-strategy hard-down.
+    oidcWait:
+      timeoutSeconds: 300
+      intervalSeconds: 5
+
+  # ── D1 — MongoDB (LibreChat's own store; pinned, no external port) ──────
+  mongodb:
+    image:
+      repository: mongo
+      tag: "7"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    persistence:
+      size: 5Gi
+      storageClass: local-path
+
 # -- Tests (helm test) -------------------------------------------------------
 # Chart-managed `helm test` hook. Runs the RLS integration suite inside
 # the cluster via the real Vault Agent + Istio mTLS path. Image built
@@ -711,9 +1122,28 @@ chromadb:
 tests:
   enabled: true
   image:
-    repository: localhost:5000/audittrace/tests
-    tag: latest
-    pullPolicy: Always
+    # M3-WU-D2-5F (2026-09-02) — the LAST `localhost:5000` reference in
+    # the chart, killed. Was `localhost:5000/audittrace/tests:latest`
+    # with `pullPolicy: Always` — a local-registry, MUTABLE-`:latest`
+    # ref that only ever resolved against the laptop's dev registry (the
+    # D2-5C review surfaced it as the chart's one remaining
+    # non-reproducible image). Published by
+    # .github/workflows/publish.yml's new `audittrace-tests` job
+    # (mirrors the BFF job D2-5B added), same repository namespace as
+    # the other console/runtime images.
+    repository: docker.io/lfds/audittrace-tests
+    # Explicit release version, tag+digest move together on every bump —
+    # mirrors console.bff.image / console.librechat.image above, not
+    # memoryServer's AppVersion-tracking empty-string convenience.
+    tag: "1.29.5"
+    # Phase-E re-pin (2026-10-15, release v1.29.5): the published INDEX
+    # digest for docker.io/lfds/audittrace-tests:1.29.5, confirmed live on
+    # Docker Hub 2026-10-15 via TWO independent manifest reads (registry
+    # HEAD with an OCI-index Accept header, and `docker buildx imagetools
+    # inspect`), never fabricated. Bumped from `1.29.4`. Tag+digest move
+    # together on every bump.
+    digest: "sha256:97cd0419b2f1d6f5530d3554eddef29fe7c9d8174daf4f7c4b28a2e9465685f8"
+    pullPolicy: IfNotPresent
   resources:
     requests:
       cpu: 100m
@@ -774,6 +1204,27 @@ secrets:
     contentControlPassword: ""
   keycloak:
     adminPassword: "admin"
+  # ── M3-WU-3b — LibreChat console secrets (vault.enabled=false fallback) ──
+  # When vault.enabled=true these are sourced instead via Vault Agent (D4,
+  # audittrace.vaultAnnotations.librechatBff) from
+  # kv/audittrace/librechat/bff-secret — the operator retrieves the
+  # Keycloak-generated confidential-client secret for
+  # audittrace-librechat-bff (kcadm / admin console; it is NOT operator-
+  # chosen, so unlike the other secrets.* fields above there is no
+  # `secrets/*.txt` seed file for it) and `vault kv put`s it manually, same
+  # posture as `secrets.keycloak.adminPassword` above. LibreChat's own
+  # session/credential-encryption material (creds/JWT/session secrets) has
+  # NO literal dev default here (unlike the docker-compose console profile,
+  # which ships laptop-only literal defaults) — left blank so a chart
+  # render never carries so much as a placeholder secret; an operator MUST
+  # supply real values before `console.enabled=true` goes live.
+  console:
+    bffExchangeClientSecret: ""
+    credsKey: ""
+    credsIv: ""
+    jwtSecret: ""
+    jwtRefreshSecret: ""
+    openidSessionSecret: ""
   # ── ADR-048 PR-B2 — Docker Hub Pro pull credentials ────────────────
   # Used to render `audittrace-dockerhub-pull` Secret of type
   # kubernetes.io/dockerconfigjson so the cluster can pull

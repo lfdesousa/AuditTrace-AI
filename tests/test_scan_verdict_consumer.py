@@ -1,9 +1,14 @@
 """Tests for services/scan_verdict_consumer.py — ADR-048 PR-B4
-verdict-side memory_items.scan_status updater."""
+verdict-side memory_items.scan_status updater.
+
+Also covers SPEC #387 Phase 1 (WU-1) — the auto-index outbox enqueue on a
+clean verdict (``TestAutoIndexOutbox`` below)."""
 
 from __future__ import annotations
 
+import asyncio
 import sys
+from collections.abc import Awaitable, Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,8 +16,10 @@ import pytest
 
 from audittrace.db.postgres import InMemoryPostgresFactory
 from audittrace.routes.memory_upload import manifest as manifest_mod
+from audittrace.services.index_worker import IndexRequestEnvelope
 from audittrace.services.scan_verdict_consumer import (
     ScanVerdictConsumer,
+    _episodic_bare_key,
     _episodic_uri,
 )
 
@@ -32,17 +39,48 @@ def _settings(url: str = "amqp://x:y@audittrace-rabbitmq:5672/") -> MagicMock:
 def _aio_pika_mock() -> MagicMock:
     """Build a MagicMock for the lazy ``import aio_pika`` site.
 
-    `_ensure_connected` also does ``from aio_pika.exceptions import
-    ChannelNotFoundEntity`` — the mocked-package path can't satisfy
-    that submodule import on its own. Bind the REAL exceptions
-    module so test code can raise the genuine exception class via
-    ``ch.get_queue.side_effect=ChannelNotFoundEntity(...)``."""
+    Test code sometimes needs to raise a genuine ``aio_pika.exceptions``
+    class (e.g. ``ChannelNotFoundEntity`` / ``AMQPError``) as a mock
+    side effect, but the mocked ``aio_pika`` package can't satisfy
+    ``from aio_pika.exceptions import …`` submodule imports on its
+    own. Bind the REAL exceptions module so those imports resolve."""
     import aio_pika as _real_aio_pika  # noqa: PLC0415
 
     aio_pika = MagicMock()
     aio_pika.exceptions = _real_aio_pika.exceptions
     sys.modules.setdefault("aio_pika.exceptions", _real_aio_pika.exceptions)
     return aio_pika
+
+
+async def _poll_until(
+    condition: Callable[[], Awaitable[bool]],
+    *,
+    timeout: float = 5.0,
+    interval: float = 0.01,
+) -> None:
+    """Poll an async ``condition`` until it returns ``True``, raising
+    ``AssertionError`` once ``timeout`` elapses.
+
+    Deterministic replacement for a fixed-duration ``asyncio.sleep(N)``
+    race window (the #254/#357 flake class): the caller proceeds the
+    instant the observable side-effect lands instead of gambling on a
+    wall-clock budget that a loaded CI host can blow through.
+
+    FALSIFIABILITY: if the awaited side-effect never happens (e.g. the
+    consumer's DB-write were neutered), this raises ``AssertionError``
+    after ``timeout`` seconds — it never returns while the condition is
+    still false, so it cannot mask a genuine regression.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if await condition():
+            return
+        if loop.time() >= deadline:
+            raise AssertionError(
+                f"condition not met within {timeout}s (polled every {interval}s)"
+            )
+        await asyncio.sleep(interval)
 
 
 async def _seed_pending(factory, scan_id: str, *, user_id: str = "alice") -> None:
@@ -84,6 +122,36 @@ class TestEpisodicUri:
         )
 
 
+class TestEpisodicBareKey:
+    """SPEC #387 (WU-1) — the bucket-relative form ``_episodic_uri`` is
+    now built FROM, and that the auto-index enqueue uses directly."""
+
+    def test_basic_layout(self) -> None:
+        assert (
+            _episodic_bare_key(
+                prefix="episodic/papers/",
+                scan_id="sid-1",
+                quarantine_key="s3://memory-shared/quarantine/alice/sid-1/foo.pdf",
+            )
+            == "episodic/papers/sid-1/foo.pdf"
+        )
+
+    def test_episodic_uri_is_built_from_bare_key(self) -> None:
+        # Falsifiability: _episodic_uri must be exactly
+        # f"s3://{bucket}/{bare_key}" — not an independently maintained
+        # string, so the two can never drift apart.
+        bare = _episodic_bare_key(
+            prefix="p/", scan_id="s", quarantine_key="s3://b/quarantine/u/s/f.pdf"
+        )
+        uri = _episodic_uri(
+            bucket="b",
+            prefix="p/",
+            scan_id="s",
+            quarantine_key="s3://b/quarantine/u/s/f.pdf",
+        )
+        assert uri == f"s3://b/{bare}"
+
+
 class TestApplyVerdict:
     async def test_clean_promotes_key_and_sets_scanned_clean(self) -> None:
         _f = InMemoryPostgresFactory()
@@ -112,6 +180,8 @@ class TestApplyVerdict:
         assert row.scan_status == "scanned_clean"
         # Promoted to episodic/papers/<scan_id>/<filename>.
         assert row.key == "s3://memory-shared/episodic/papers/scan-1/paper.pdf"
+        # SPEC #387 (WU-1) — the auto-index outbox marker.
+        assert row.indexed_at_ms is None
 
     async def test_rejected_sets_rejected_malware_and_keeps_quarantine_key(
         self,
@@ -200,6 +270,119 @@ class TestApplyVerdict:
             assert await manifest_mod.get_by_scan_id(session, "ghost") is None
 
 
+class TestAutoIndexOutbox:
+    """SPEC #387 Phase 1 (WU-1) — a clean verdict resets the outbox marker
+    AND enqueues an ``IndexRequestEnvelope`` with the deterministic
+    collection route, closing GAP-1 (nothing previously triggered
+    indexing after a clean verdict)."""
+
+    async def test_clean_verdict_enqueues_envelope_with_ai_research_papers(
+        self,
+    ) -> None:
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-idx-1", user_id="bob")
+        index_queue: asyncio.Queue[IndexRequestEnvelope] = asyncio.Queue()
+        consumer = ScanVerdictConsumer(
+            settings=_settings(),
+            session_factory=factory,
+            episodic_bucket="memory-shared",
+            episodic_prefix="episodic/papers/",
+            index_queue=index_queue,
+        )
+
+        await consumer._apply_verdict(
+            {"scan_id": "scan-idx-1", "kind": "clean", "scanner": "clamav"}
+        )
+
+        assert index_queue.qsize() == 1
+        env = index_queue.get_nowait()
+        assert env.scan_id == "scan-idx-1"
+        assert env.key == "episodic/papers/scan-idx-1/paper.pdf"
+        # RED PROOF: a .pdf key must route to ai_research_papers, not the
+        # .md-only default — this is the WU-1 half of GAP-2's closure.
+        assert env.collection == "ai_research_papers"
+        assert env.user_id == "bob"
+        assert env.trace_id == "trace-abc"
+
+    async def test_reset_of_already_set_indexed_at_ms_on_reverdict(self) -> None:
+        # Idempotent outbox reset: a duplicate clean verdict for an
+        # already-indexed row must re-arm the marker (and re-enqueue),
+        # rather than trusting a stale timestamp from before this
+        # delivery.
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-idx-2")
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-idx-2")
+            assert row is not None
+            row.indexed_at_ms = 42
+            await session.commit()
+
+        consumer = ScanVerdictConsumer(settings=_settings(), session_factory=factory)
+        await consumer._apply_verdict(
+            {"scan_id": "scan-idx-2", "kind": "clean", "scanner": "clamav"}
+        )
+
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-idx-2")
+        assert row is not None
+        assert row.indexed_at_ms is None
+
+    async def test_rejected_verdict_does_not_enqueue(self) -> None:
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-idx-3")
+        index_queue: asyncio.Queue[IndexRequestEnvelope] = asyncio.Queue()
+        consumer = ScanVerdictConsumer(
+            settings=_settings(), session_factory=factory, index_queue=index_queue
+        )
+
+        await consumer._apply_verdict(
+            {"scan_id": "scan-idx-3", "kind": "rejected", "scanner": "clamav"}
+        )
+
+        assert index_queue.empty()
+
+    async def test_scan_failed_verdict_does_not_enqueue(self) -> None:
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-idx-4")
+        index_queue: asyncio.Queue[IndexRequestEnvelope] = asyncio.Queue()
+        consumer = ScanVerdictConsumer(
+            settings=_settings(), session_factory=factory, index_queue=index_queue
+        )
+
+        await consumer._apply_verdict(
+            {"scan_id": "scan-idx-4", "kind": "scan_failed", "scanner": "clamav"}
+        )
+
+        assert index_queue.empty()
+
+    async def test_no_index_queue_configured_does_not_raise(self) -> None:
+        # index_queue defaults to None — a consumer used standalone
+        # (existing tests, or the index pipeline disabled) must not
+        # crash on a clean verdict.
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-idx-5")
+        consumer = ScanVerdictConsumer(settings=_settings(), session_factory=factory)
+
+        await consumer._apply_verdict(
+            {"scan_id": "scan-idx-5", "kind": "clean", "scanner": "clamav"}
+        )
+
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-idx-5")
+        assert row is not None
+        assert row.scan_status == "scanned_clean"
+
+
 class TestEnsureConnected:
     def _patch_aio_pika(self) -> tuple[Any, Any, Any, Any]:
         aio_pika = _aio_pika_mock()
@@ -207,7 +390,7 @@ class TestEnsureConnected:
         channel = AsyncMock()
         queue = AsyncMock()
         channel.set_qos = AsyncMock()
-        channel.get_queue = AsyncMock(return_value=queue)
+        channel.declare_queue = AsyncMock(return_value=queue)
         channel.close = AsyncMock()
         connection.channel = AsyncMock(return_value=channel)
         connection.close = AsyncMock()
@@ -225,7 +408,11 @@ class TestEnsureConnected:
             await consumer._ensure_connected()
         aio_pika.connect_robust.assert_awaited_once()
         ch.set_qos.assert_awaited_once()
-        ch.get_queue.assert_awaited_once_with("audittrace.scan.verdicts")
+        ch.declare_queue.assert_awaited_once_with(
+            "audittrace.scan.verdicts",
+            durable=True,
+            arguments={"x-queue-type": "quorum"},
+        )
 
     async def test_missing_url_raises(self) -> None:
         consumer = ScanVerdictConsumer(
@@ -235,50 +422,90 @@ class TestEnsureConnected:
         with pytest.raises(RuntimeError, match="scan_amqp_url is required"):
             await consumer._ensure_connected()
 
-    async def test_queue_not_found_retries_then_succeeds(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """B4b race: chart's topology-bootstrap Job declares queues
-        as a post-install hook. On fresh kind installs the consumer
-        beats the bootstrap; ``get_queue`` raises
-        ``ChannelNotFoundEntity``. The retry loop should wait + retry
-        until the bootstrap completes, instead of crashing the task
-        and leaving the queue with ``consumers=0``."""
-        from aio_pika.exceptions import ChannelNotFoundEntity
-
-        # Avoid 1+2+4+8+16 s of real sleep in the unit run.
-        monkeypatch.setattr("asyncio.sleep", AsyncMock())
-
-        aio_pika, conn, ch, queue = self._patch_aio_pika()
-        ch.get_queue = AsyncMock(
-            side_effect=[ChannelNotFoundEntity("not_found"), queue]
-        )
+    async def test_declare_args_pin_canonical_bootstrap_job_topology(self) -> None:
+        """#393 — guards against silent arg drift vs the canonical
+        declaration in ``job-amqp-topology-bootstrap.yaml``
+        (``{"auto_delete":false,"durable":true,"arguments":
+        {"x-queue-type":"quorum"}}``). A mismatch here would make
+        RabbitMQ raise ``ChannelPreconditionFailed`` in production —
+        this test pins the args so drift is caught in CI, not at a
+        live broker."""
+        aio_pika, _conn, ch, _q = self._patch_aio_pika()
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanVerdictConsumer(
                 settings=_settings(),
                 session_factory=await _make_factory(),
             )
             await consumer._ensure_connected()
-        # Two channel-opens, two get_queue calls — first failed,
+        _name, kwargs = ch.declare_queue.await_args
+        assert kwargs["durable"] is True
+        assert kwargs["arguments"] == {"x-queue-type": "quorum"}
+
+    async def test_attaches_via_active_declare_when_queue_absent(self) -> None:
+        """FALSIFIABILITY (#393): simulate "queue does not pre-exist" by
+        making the PASSIVE lookup (``get_queue``) raise
+        ``ChannelNotFoundEntity`` — exactly what a genuinely-absent
+        queue does. The consumer must still attach because it declares
+        the queue itself via the ACTIVE ``declare_queue`` path, which
+        never touches ``get_queue`` at all.
+
+        RED PROOF: reverting ``scan_verdict_consumer.py`` to the old
+        passive ``self._channel.get_queue(self._queue_name)`` call
+        makes this test fail — ``get_queue``'s side effect
+        (``ChannelNotFoundEntity``) propagates, the bounded retry
+        exhausts, and ``_ensure_connected`` raises ``RuntimeError``
+        instead of attaching. This is the exact regression #393 fixes."""
+        from aio_pika.exceptions import ChannelNotFoundEntity
+
+        aio_pika, _conn, ch, queue = self._patch_aio_pika()
+        ch.get_queue = AsyncMock(side_effect=ChannelNotFoundEntity("not_found"))
+        with patch.dict(sys.modules, {"aio_pika": aio_pika}):
+            consumer = ScanVerdictConsumer(
+                settings=_settings(),
+                session_factory=await _make_factory(),
+            )
+            await consumer._ensure_connected()
+        assert consumer._queue is queue
+        ch.declare_queue.assert_awaited_once()
+        ch.get_queue.assert_not_called()
+
+    async def test_queue_declare_retries_transient_error_then_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The retry loop is now a guard against transient AMQP errors
+        while (re)declaring — not the primary "wait for the queue to
+        exist" mechanism (that's the active declare itself)."""
+        from aio_pika.exceptions import AMQPError
+
+        # Avoid 1+2+4+8+16 s of real sleep in the unit run.
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        aio_pika, conn, ch, queue = self._patch_aio_pika()
+        ch.declare_queue = AsyncMock(side_effect=[AMQPError("transient"), queue])
+        with patch.dict(sys.modules, {"aio_pika": aio_pika}):
+            consumer = ScanVerdictConsumer(
+                settings=_settings(),
+                session_factory=await _make_factory(),
+            )
+            await consumer._ensure_connected()
+        # Two channel-opens, two declare_queue calls — first failed,
         # second succeeded.
-        assert ch.get_queue.await_count == 2
+        assert ch.declare_queue.await_count == 2
         assert conn.channel.await_count == 2
 
-    async def test_queue_not_found_exhausts_attempts_and_raises(
+    async def test_queue_declare_exhausts_attempts_and_raises(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Bounded budget: the consumer must give up rather than
-        spin forever. If the queue genuinely never gets created
-        (e.g. topology bootstrap Job crashed or chart is misconfigured),
-        the consumer surfaces that as a RuntimeError naming the queue
-        so logs point operators directly at the broken
-        ``job-amqp-topology-bootstrap`` rather than the consumer."""
-        from aio_pika.exceptions import ChannelNotFoundEntity
+        spin forever against a persistently-failing declare (e.g. a
+        genuine arg mismatch / broker misconfiguration), surfacing a
+        RuntimeError naming the queue."""
+        from aio_pika.exceptions import AMQPError
 
         monkeypatch.setattr("asyncio.sleep", AsyncMock())
 
         aio_pika, conn, ch, queue = self._patch_aio_pika()
-        ch.get_queue = AsyncMock(side_effect=ChannelNotFoundEntity("not_found"))
+        ch.declare_queue = AsyncMock(side_effect=AMQPError("still failing"))
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanVerdictConsumer(
                 settings=_settings(),
@@ -286,10 +513,10 @@ class TestEnsureConnected:
             )
             with pytest.raises(
                 RuntimeError,
-                match=r"audittrace\.scan\.verdicts.*not found after \d+ attempts",
+                match=r"audittrace\.scan\.verdicts.*declare failed after \d+ attempts",
             ):
                 await consumer._ensure_connected()
-        assert ch.get_queue.await_count == consumer._QUEUE_MAX_ATTEMPTS
+        assert ch.declare_queue.await_count == consumer._QUEUE_MAX_ATTEMPTS
 
 
 class TestConnectLevelRetry:
@@ -524,20 +751,32 @@ class TestRunLoop:
 
         queue = MagicMock()
         queue.iterator = MagicMock(return_value=_FakeIter())
-        channel.get_queue = AsyncMock(return_value=queue)
+        channel.declare_queue = AsyncMock(return_value=queue)
 
         _f = InMemoryPostgresFactory()
         await _f.create_schema()
         factory = _f.get_session_factory()
         await _seed_pending(factory, "scan-run")
+
+        async def _row_scanned_clean() -> bool:
+            async with factory() as session:
+                row = await manifest_mod.get_by_scan_id(session, "scan-run")
+            return row is not None and row.scan_status == "scanned_clean"
+
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanVerdictConsumer(
                 settings=_settings(),
                 session_factory=factory,
             )
             task = _asyncio.create_task(consumer.run())
-            # Yield to let the loop pull the one message.
-            await _asyncio.sleep(0.05)
+            # Deterministic wait: poll until the run loop has pulled the
+            # one queued message, processed it, and committed
+            # scanned_clean — load-independent (was a fixed
+            # asyncio.sleep(0.05) race window that could lose under host
+            # contention, the #254/#357 flake class; nearly bit v1.24.0's
+            # release gate). Times out (AssertionError) — never passes
+            # vacuously — if the consumer never reaches the write.
+            await _poll_until(_row_scanned_clean)
             task.cancel()
             with pytest.raises(_asyncio.CancelledError):
                 await task
@@ -593,7 +832,7 @@ class TestRunLoop:
 
         queue = MagicMock()
         queue.iterator = MagicMock(return_value=_FakeIter())
-        channel.get_queue = AsyncMock(return_value=queue)
+        channel.declare_queue = AsyncMock(return_value=queue)
 
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             with patch(
@@ -637,7 +876,7 @@ class TestAclose:
         channel = AsyncMock()
         queue = AsyncMock()
         channel.set_qos = AsyncMock()
-        channel.get_queue = AsyncMock(return_value=queue)
+        channel.declare_queue = AsyncMock(return_value=queue)
         channel.close = AsyncMock()
         connection.channel = AsyncMock(return_value=channel)
         connection.close = AsyncMock()

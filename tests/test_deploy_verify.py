@@ -15,6 +15,7 @@ tripped).
 from __future__ import annotations
 
 import json
+import logging
 import ssl
 import subprocess
 from pathlib import Path
@@ -66,6 +67,19 @@ class _KubeDispatcher:
     """Routes verify._run calls to canned CompletedProcess by command-token match.
 
     (Command args, NOT URLs — token substring matching is fine here.)
+
+    Any unstubbed call naming ``librechat-bff`` (the D5 probe's Deployment
+    lookup / pod-list reads) defaults to ``returncode=1`` — "no BFF
+    Deployment in this namespace" — rather than this class's normal
+    default-success behaviour. Every pre-existing fixture in this module
+    predates D5 and models no console workloads at all, so without this
+    the BFF Deployment would look "present" by accident (the generic
+    default-success fallback) and the probe would go on to call
+    ``registry.resolve(..., repo_path="bff")`` — which most of those
+    fixtures' OWN ``registry.resolve`` stub (a 2-positional-arg lambda)
+    cannot accept, raising ``TypeError`` instead of exercising anything
+    about the test at hand. Tests that DO want to exercise the BFF probe
+    add their own ``librechat-bff`` rule, checked first.
     """
 
     def __init__(self, rules, default=None):
@@ -79,6 +93,11 @@ class _KubeDispatcher:
         for needle, result in self.rules:
             if needle in joined:
                 return result
+        if "librechat-bff" in joined:
+            return _proc(
+                returncode=1,
+                stderr='Error from server (NotFound): deployments.apps "...librechat-bff" not found',
+            )
         return self.default
 
 
@@ -559,6 +578,81 @@ def test_health_version_fail_wrong_version(tmp_path, monkeypatch):
     assert res.status == FAIL and "does NOT match" in res.detail
 
 
+# ── --skip-version-check (#412 digest-only mode) ─────────────────────────────
+
+
+def test_health_version_skipped_when_flag_set(tmp_path, monkeypatch):
+    """A version mismatch that WOULD fail is reported SKIPPED, not FAIL, under
+    the flag -- and the probe never even queries the front door (unconditional
+    skip, fixed literal reason)."""
+    http = _FakeHttp({("GET", "/health"): (200, {"status": "ok", "version": "1.2.3"})})
+    monkeypatch.setattr(verify, "_http_request", http)
+    res = VerifyRunner(_cfg(tmp_path, skip_version_check=True)).probe_health_version()
+    assert res.status == verify.SKIPPED
+    assert res.detail == verify.SKIP_VERSION_CHECK_REASON
+    assert http.calls == []
+
+
+def test_health_version_not_skipped_by_default(tmp_path, monkeypatch):
+    """Default (flag unset) is byte-for-byte unchanged: same mismatch still FAILs."""
+    http = _FakeHttp({("GET", "/health"): (200, {"status": "ok", "version": "1.2.3"})})
+    monkeypatch.setattr(verify, "_http_request", http)
+    res = VerifyRunner(_cfg(tmp_path)).probe_health_version()
+    assert res.status == FAIL
+
+
+# ── _record log level by status (#412-nit) ───────────────────────────────────
+# ``VerifyRunner._record`` (verify.py:~778) maps status -> logging level. Each
+# test below drives a REAL probe (never calls ``_record`` directly) so the
+# assertion proves the level a live verify run would actually emit, not a
+# level some other call site chose to pass in.
+
+
+def test_record_logs_skipped_at_warning(tmp_path, monkeypatch, caplog):
+    """SKIPPED (health-version under --skip-version-check) logs at WARNING --
+    visible without alarming an ERROR-level dashboard for an intentional skip.
+
+    NEUTER PROOF: reverting ``_record`` to the two-way
+    ``logging.INFO if status == PASS else logging.ERROR`` ternary collapses
+    SKIPPED onto ERROR and turns this assertion RED.
+    """
+    http = _FakeHttp({("GET", "/health"): (200, {"status": "ok", "version": "1.2.3"})})
+    monkeypatch.setattr(verify, "_http_request", http)
+    with caplog.at_level(logging.INFO, logger="audittrace.deploy.verify"):
+        res = VerifyRunner(
+            _cfg(tmp_path, skip_version_check=True)
+        ).probe_health_version()
+    assert res.status == verify.SKIPPED
+    records = [r for r in caplog.records if "health-version" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+
+
+def test_record_logs_pass_at_info(tmp_path, monkeypatch, caplog):
+    """Regression control: PASS still logs at INFO (unchanged)."""
+    http = _FakeHttp({("GET", "/health"): (200, {"status": "ok", "version": "9.9.9"})})
+    monkeypatch.setattr(verify, "_http_request", http)
+    with caplog.at_level(logging.INFO, logger="audittrace.deploy.verify"):
+        res = VerifyRunner(_cfg(tmp_path)).probe_health_version()
+    assert res.status == PASS
+    records = [r for r in caplog.records if "health-version" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+
+
+def test_record_logs_fail_at_error(tmp_path, monkeypatch, caplog):
+    """Regression control: FAIL still logs at ERROR (unchanged) -- a real
+    failure must stay loud."""
+    http = _FakeHttp({("GET", "/health"): (503, {})})
+    monkeypatch.setattr(verify, "_http_request", http)
+    with caplog.at_level(logging.INFO, logger="audittrace.deploy.verify"):
+        res = VerifyRunner(_cfg(tmp_path)).probe_health_version()
+    assert res.status == FAIL
+    records = [r for r in caplog.records if "health-version" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+
+
 # ── probe 5: recall-e2e (PASS + FAIL) ────────────────────────────────────────
 
 
@@ -632,8 +726,8 @@ def test_recall_e2e_fail_recall_not_recorded(tmp_path, monkeypatch):
 # call back to FAST_PROBE_TIMEOUT (neutering the calibration) turns it red.
 
 
-def test_verify_config_default_e2e_timeout_is_120s(tmp_path):
-    assert _cfg(tmp_path).e2e_timeout == 120 == verify.E2E_CHAT_TIMEOUT_DEFAULT
+def test_verify_config_default_e2e_timeout_is_400s(tmp_path):
+    assert _cfg(tmp_path).e2e_timeout == 400 == verify.E2E_CHAT_TIMEOUT_DEFAULT
 
 
 def test_recall_e2e_chat_probe_uses_the_configured_e2e_timeout(tmp_path, monkeypatch):
@@ -653,15 +747,15 @@ def test_recall_e2e_chat_probe_uses_the_configured_e2e_timeout(tmp_path, monkeyp
     )
 
 
-def test_recall_e2e_default_run_uses_120s_for_the_chat_call_only(tmp_path, monkeypatch):
-    # No e2e_timeout override — the calibrated DEFAULT (120s) must reach the
+def test_recall_e2e_default_run_uses_400s_for_the_chat_call_only(tmp_path, monkeypatch):
+    # No e2e_timeout override — the calibrated DEFAULT (400s) must reach the
     # chat call, and only the chat call.
     monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
     spy = _TimeoutSpy(_recall_routes())
     monkeypatch.setattr(verify, "_http_request", spy)
     VerifyRunner(_cfg(tmp_path)).probe_recall_e2e()
     chat_timeout = next(t for m, p, t in spy.timeouts if p == "/v1/chat/completions")
-    assert chat_timeout == verify.E2E_CHAT_TIMEOUT_DEFAULT == 120
+    assert chat_timeout == verify.E2E_CHAT_TIMEOUT_DEFAULT == 400
     other_timeouts = [t for m, p, t in spy.timeouts if p != "/v1/chat/completions"]
     assert other_timeouts and all(
         t == verify.FAST_PROBE_TIMEOUT for t in other_timeouts
@@ -769,15 +863,29 @@ def _istiod_ready_deployment():
 
 
 def _healthy_kube_rules():
-    """The full read-only cluster read set for an all-green deploy (all nine probes).
+    """The full read-only cluster read set for an all-green deploy (all
+    eleven probes).
 
-    The istiod-specific ``get deployment istiod`` rule MUST precede the generic
-    ``get deployment`` rule (first-match-wins), and ``imageID`` MUST precede
-    ``get pods`` (the digest read is also a ``get pods`` command).
+    The istiod-specific ``get deployment istiod`` AND the BFF-specific
+    ``get deployment ...librechat-bff`` rules MUST precede the generic
+    ``get deployment`` rule (first-match-wins), and ``imageID`` MUST
+    precede ``get pods`` (the digest read is also a ``get pods`` command).
+    No console workload is modelled here (consistent with the common
+    laptop ``console.enabled=false`` posture) — D5's probe reports PASS
+    with ``{"bff": "absent"}`` and never calls ``registry.resolve`` a
+    second time, so these fixtures' own single-arg ``registry.resolve``
+    stubs stay untouched.
     """
     return [
         ("imageID", _proc(0, "repo@sha256:pub")),
         ("get deployment istiod", _istiod_ready_deployment()),
+        (
+            "get deployment audittrace-librechat-bff",
+            _proc(
+                returncode=1,
+                stderr='Error from server (NotFound): deployments.apps "audittrace-librechat-bff" not found',
+            ),
+        ),
         ("get endpoints", _proc(0, "10.42.0.9")),
         ("get pods", _pods_json(_mesh_healthy_pods())),
         ("helm status", _proc(0, json.dumps({"info": {"status": "deployed"}}))),
@@ -830,6 +938,89 @@ def test_verdict_fail_when_single_probe_fails(tmp_path, monkeypatch):
 
 def test_verdict_is_fail_with_no_results(tmp_path):
     assert VerifyRunner(_cfg(tmp_path)).verdict == FAIL
+
+
+# ── --skip-version-check (#412): run()-level, non-vacuous ────────────────────
+
+
+def _digest_only_runner(
+    tmp_path, monkeypatch, *, version="0.0.1", rules=None, **cfg_kw
+):
+    monkeypatch.setattr(registry, "resolve", lambda v, reg: _hub_ref("sha256:pub"))
+    monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
+    monkeypatch.setattr(
+        verify,
+        "_run",
+        _KubeDispatcher(rules=rules if rules is not None else _healthy_kube_rules()),
+    )
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (200, {"status": "ok", "version": version}),
+                **_recall_routes(),
+            }
+        ),
+    )
+    return VerifyRunner(_cfg(tmp_path, **cfg_kw))
+
+
+def test_skip_version_check_flag_turns_a_version_fail_into_a_pass_verdict(
+    tmp_path, monkeypatch
+):
+    """Digest matches and health-version WOULD fail (running version != target)
+    -- with the flag, health-version is SKIPPED (not FAILed) and the overall
+    verdict is PASS. Neuter (count SKIPPED as a fail) -> this test goes RED."""
+    r = _digest_only_runner(
+        tmp_path, monkeypatch, version="0.0.1", skip_version_check=True
+    )
+    report = r.run()
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert statuses["health-version"] == verify.SKIPPED
+    assert statuses["digest-matches-published"] == PASS
+    assert report["verdict"] == PASS
+
+
+def test_without_the_flag_the_same_scenario_fails(tmp_path, monkeypatch):
+    """Proves the flag -- not a vacuous pass -- is what changes the outcome:
+    identical inputs, flag unset, health-version FAILs and the verdict FAILs."""
+    r = _digest_only_runner(
+        tmp_path, monkeypatch, version="0.0.1", skip_version_check=False
+    )
+    report = r.run()
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert statuses["health-version"] == FAIL
+    assert report["verdict"] == FAIL
+
+
+def test_skip_version_check_does_not_weaken_the_digest_anchor(tmp_path, monkeypatch):
+    """--skip-version-check must NOT skip digest-matches-published: a live digest
+    mismatch STILL fails the verdict even with the flag set. Neuter (skip-version
+    also skips digest) -> this test goes RED."""
+    rules = _healthy_kube_rules()
+    rules[0] = ("imageID", _proc(0, "repo@sha256:DIFFERENT"))
+    r = _digest_only_runner(
+        tmp_path, monkeypatch, version="9.9.9", rules=rules, skip_version_check=True
+    )
+    report = r.run()
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert statuses["health-version"] == verify.SKIPPED
+    assert statuses["digest-matches-published"] == FAIL
+    assert report["verdict"] == FAIL
+
+
+def test_skip_version_check_preserves_the_fixed_nine_probe_order(tmp_path, monkeypatch):
+    """Determinism contract: all 10 identifiers, fixed order, health-version
+    present with SKIPPED status -- the flag never changes probe count or order."""
+    r = _digest_only_runner(
+        tmp_path, monkeypatch, version="9.9.9", skip_version_check=True
+    )
+    report = r.run()
+    assert [p["name"] for p in report["probes"]] == list(verify.PROBES)
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert statuses["health-version"] == verify.SKIPPED
+    assert report["verdict"] == PASS
 
 
 def test_report_declares_independence_derived_from_sources(tmp_path, monkeypatch):
@@ -998,6 +1189,46 @@ def test_cli_insecure_flag_sets_config(tmp_path):
     assert verify.config_from_args(args2).insecure is False
 
 
+def test_cli_skip_version_check_flag_sets_config(tmp_path):
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+            "--front-door",
+            "https://audittrace.example",
+            "--skip-version-check",
+        ]
+    )
+    assert verify.config_from_args(args).skip_version_check is True
+    # and the default (flag omitted) is False
+    args2 = verify.build_parser().parse_args(
+        ["--target-version", "v9.9.9", "--front-door", "https://audittrace.example"]
+    )
+    assert verify.config_from_args(args2).skip_version_check is False
+
+
+def test_cli_scan_dlq_threshold_flag_sets_config(tmp_path):
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+            "--front-door",
+            "https://audittrace.example",
+            "--scan-dlq-threshold",
+            "25",
+        ]
+    )
+    assert verify.config_from_args(args).scan_dlq_threshold == 25
+    # and the default (flag omitted) is the calibrated constant
+    args2 = verify.build_parser().parse_args(
+        ["--target-version", "v9.9.9", "--front-door", "https://audittrace.example"]
+    )
+    assert (
+        verify.config_from_args(args2).scan_dlq_threshold
+        == verify.SCAN_DLQ_DEFAULT_THRESHOLD
+    )
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 
@@ -1060,7 +1291,7 @@ def test_config_from_args_maps_and_normalizes(tmp_path):
 # ── e2e-timeout calibration: CLI flag + env var wiring ────────────────────────
 # Portability invariant (SPEC §2): a different target/model can tune the
 # recall-e2e chat-probe timeout WITHOUT a code change, via --e2e-timeout or
-# AUDITTRACE_VERIFY_E2E_TIMEOUT. Precedence: flag > env var > 120s default.
+# AUDITTRACE_VERIFY_E2E_TIMEOUT. Precedence: flag > env var > 400s default.
 
 
 def _args(monkeypatch, extra=None):
@@ -1074,9 +1305,9 @@ def _args(monkeypatch, extra=None):
     ]
 
 
-def test_e2e_timeout_default_unset_env_falls_back_to_120(monkeypatch):
+def test_e2e_timeout_default_unset_env_falls_back_to_400(monkeypatch):
     monkeypatch.delenv(verify.E2E_TIMEOUT_ENV_VAR, raising=False)
-    assert verify._e2e_timeout_default() == 120 == verify.E2E_CHAT_TIMEOUT_DEFAULT
+    assert verify._e2e_timeout_default() == 400 == verify.E2E_CHAT_TIMEOUT_DEFAULT
 
 
 def test_e2e_timeout_default_honors_the_env_var(monkeypatch):
@@ -1089,9 +1320,9 @@ def test_e2e_timeout_default_invalid_env_var_falls_back_fail_closed(monkeypatch)
     assert verify._e2e_timeout_default() == verify.E2E_CHAT_TIMEOUT_DEFAULT
 
 
-def test_cli_e2e_timeout_defaults_to_120_without_flag_or_env(monkeypatch):
+def test_cli_e2e_timeout_defaults_to_400_without_flag_or_env(monkeypatch):
     args = verify.build_parser().parse_args(_args(monkeypatch))
-    assert verify.config_from_args(args).e2e_timeout == 120
+    assert verify.config_from_args(args).e2e_timeout == 400
 
 
 def test_cli_e2e_timeout_flag_overrides_the_default(monkeypatch):
@@ -1125,6 +1356,115 @@ def test_cli_e2e_timeout_flag_wins_over_env_var(monkeypatch):
         ]
     )
     assert verify.config_from_args(args).e2e_timeout == 12
+
+
+# ── front-door resolution: env var + CLI flag + hardcoded fallback ──────────
+# Precedence: explicit --front-door arg > AUDITTRACE_FRONT_DOOR env var >
+# DEFAULT_FRONT_DOOR constant. Falsifiable: neutering the resolution (returning
+# a neutral value) must turn the fallback test RED.
+
+
+def test_front_door_default_unset_env_falls_back_to_hardcoded(monkeypatch):
+    monkeypatch.delenv(verify.FRONT_DOOR_ENV_VAR, raising=False)
+    assert verify._front_door_default() == verify.DEFAULT_FRONT_DOOR
+
+
+def test_front_door_default_honors_the_env_var(monkeypatch):
+    monkeypatch.setenv(verify.FRONT_DOOR_ENV_VAR, "https://env.example.com")
+    assert verify._front_door_default() == "https://env.example.com"
+
+
+def test_front_door_default_empty_env_falls_back(monkeypatch):
+    monkeypatch.setenv(verify.FRONT_DOOR_ENV_VAR, "")
+    assert verify._front_door_default() == verify.DEFAULT_FRONT_DOOR
+
+
+def test_cli_front_door_flag_overrides_env_var(monkeypatch):
+    monkeypatch.setenv(verify.FRONT_DOOR_ENV_VAR, "https://env.example.com")
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+            "--front-door",
+            "https://flag.example.com",
+        ]
+    )
+    assert verify.config_from_args(args).front_door == "https://flag.example.com"
+
+
+def test_cli_front_door_omission_honors_env_var(monkeypatch):
+    monkeypatch.setenv(verify.FRONT_DOOR_ENV_VAR, "https://env.example.com")
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+        ]
+    )
+    assert verify.config_from_args(args).front_door == "https://env.example.com"
+
+
+def test_cli_front_door_omission_uses_hardcoded_fallback(monkeypatch):
+    """Proves the hardcoded fallback is actually exercised, not skipped."""
+    monkeypatch.delenv(verify.FRONT_DOOR_ENV_VAR, raising=False)
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+        ]
+    )
+    assert verify.config_from_args(args).front_door == verify.DEFAULT_FRONT_DOOR
+
+
+def test_front_door_resolution_neutered_fallback_goes_red(monkeypatch):
+    """Neuter the shared resolver to return '' so the config front_door is ''
+    instead of the hardcoded DEFAULT_FRONT_DOOR. ``config_from_args`` delegates
+    the front-door default to ``scripts.deploy.frontdoor.resolve_front_door``
+    (imported into verify), so THAT is the seam to neuter — a different expected
+    value would mean the test is vacuous.
+
+    The _normalize_front_door stub avoids a ValueError on empty string so the
+    assertion itself is what proves the test is non-vacuous.
+    """
+    monkeypatch.delenv(verify.FRONT_DOOR_ENV_VAR, raising=False)
+    monkeypatch.setattr(verify, "resolve_front_door", lambda *a, **k: "")
+    # Stub the normalizer so empty string does not raise ValueError — the
+    # assertion below is what proves the test is non-vacuous.
+    monkeypatch.setattr(verify, "_normalize_front_door", lambda u: u)
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+        ]
+    )
+    # With the neutered resolver returning '', this MUST be '' — a different
+    # expected value would mean the test is vacuous.
+    assert verify.config_from_args(args).front_door == ""
+
+
+def test_cli_front_door_empty_string_falls_back_to_hardcoded(monkeypatch):
+    """Regression (hand-merge 2026-08-08 REJECT): ``--front-door ""`` must NOT
+    be treated as an explicitly-set value. It flows through
+    ``resolve_front_door``, which treats an empty string as falsy → falls
+    through to env/fallback. The buggy ternary form
+    (``args.front_door if args.front_door is not None else ...``) passed '' to
+    the normalizer and raised ``ValueError`` on the empty URL. With no env set,
+    an empty flag resolves to the hardcoded fallback.
+    """
+    monkeypatch.delenv(verify.FRONT_DOOR_ENV_VAR, raising=False)
+    args = verify.build_parser().parse_args(
+        ["--target-version", "v9.9.9", "--front-door", ""]
+    )
+    assert verify.config_from_args(args).front_door == verify.DEFAULT_FRONT_DOOR
+
+
+def test_cli_front_door_empty_string_honors_env(monkeypatch):
+    """Companion to the regression above: an empty ``--front-door`` with the
+    env var set falls through to the env value (not a crash, not '')."""
+    monkeypatch.setenv(verify.FRONT_DOOR_ENV_VAR, "https://env.example.com")
+    args = verify.build_parser().parse_args(
+        ["--target-version", "v9.9.9", "--front-door", ""]
+    )
+    assert verify.config_from_args(args).front_door == "https://env.example.com"
 
 
 # ── low-level indirections (executed once for coverage honesty) ──────────────
@@ -1615,6 +1955,425 @@ def test_no_unhealthy_upstream_fail_closed_logs_unreadable(tmp_path, monkeypatch
     assert res.status == FAIL and "could not read memory-server logs" in res.detail
 
 
+# ── probe 10: scan-dlq-depth (spec 2026-08-23, closes the SCAN-URI-BUG loop gap) ─
+#
+# Reads front-door /health `components.scan_dlq_depth` /
+# `components.dead_lettered_index_count` -- FAILs on a numeric depth above the
+# configured threshold (a flood), SKIPs (never FAILs) on absent/"unknown" (a
+# telemetry hiccup, or an older image predating #387 P2b). Each branch is
+# proven falsifiable per the SPEC: dropping the threshold comparison turns the
+# above-threshold FAIL test RED; removing either degrade branch turns the
+# corresponding SKIP test RED.
+
+
+def _health_with_components(**components):
+    return {"status": "ok", "version": "9.9.9", "components": components}
+
+
+def test_scan_dlq_depth_pass_below_threshold(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(
+                        scan_dlq_depth="3", dead_lettered_index_count="1"
+                    ),
+                )
+            }
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == PASS
+    assert res.evidence["scan_dlq_depth"] == "3"
+    assert res.evidence["dead_lettered_index_count"] == "1"
+
+
+def test_scan_dlq_depth_fail_above_threshold(tmp_path, monkeypatch):
+    """NEUTER PROOF: drop the ``depth > threshold`` comparison (e.g. always
+    PASS regardless of depth) and this test goes RED -- a flood must trip
+    certification, closing the SCAN-URI-BUG loop gap."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(
+                        scan_dlq_depth="42", dead_lettered_index_count="7"
+                    ),
+                )
+            }
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == FAIL
+    assert "42" in res.detail and "exceeds threshold" in res.detail
+    assert res.evidence["scan_dlq_depth"] == "42"
+    assert res.evidence["dead_lettered_index_count"] == "7"
+
+
+def test_scan_dlq_depth_skip_absent(tmp_path, monkeypatch):
+    """NEUTER PROOF: remove the absent-field SKIP branch (e.g. treat a missing
+    field as depth=0) and this test goes RED -- an older image predating
+    #387 P2b must not FAIL certification on a field it never emits."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp({("GET", "/health"): (200, {"status": "ok", "version": "9.9.9"})}),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == verify.SKIPPED
+    assert "absent" in res.detail
+    assert res.evidence["scan_dlq_depth"] is None
+    assert res.evidence["dead_lettered_index_count"] is None
+
+
+def test_scan_dlq_depth_skip_unknown(tmp_path, monkeypatch):
+    """NEUTER PROOF: remove the dedicated ``"unknown"``-value SKIP branch and
+    this test goes RED.
+
+    Isolating, not merely status-checking (memory-server lesson
+    ``lesson-vacuous-neuter-overlapping-guards-20260823``): removing the
+    ``"unknown"`` branch does NOT change ``res.status`` -- the generic
+    non-numeric fallback below it also SKIPs on ``int("unknown")`` raising
+    ``ValueError``, and its message even embeds the string ``"unknown"`` via
+    ``repr(depth_raw)``, so a naive ``"unknown" in res.detail`` assertion
+    would stay green under that neuter (the exact overlapping-guard failure
+    the lesson warns about). Asserting the DEDICATED branch's distinguishing
+    phrase, absent from the fallback message, is what actually isolates it.
+    """
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(
+                        scan_dlq_depth="unknown", dead_lettered_index_count="unknown"
+                    ),
+                )
+            }
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == verify.SKIPPED
+    # unique to the dedicated "unknown" branch -- the fallback's message says
+    # "is not numeric", never "best-effort telemetry degraded"
+    assert "best-effort telemetry degraded" in res.detail
+    assert res.evidence["scan_dlq_depth"] == "unknown"
+
+
+def test_scan_dlq_depth_skip_non_numeric_garbage(tmp_path, monkeypatch):
+    """A malformed (non-"unknown", non-numeric) value degrades to SKIP too --
+    the probe must never crash the run on an unexpected telemetry shape."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(scan_dlq_depth="not-a-number"),
+                )
+            }
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == verify.SKIPPED
+    assert "not numeric" in res.detail
+
+
+def test_scan_dlq_depth_fail_health_http_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify, "_http_request", _FakeHttp({("GET", "/health"): (503, {})})
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == FAIL and "503" in res.detail
+
+
+def test_scan_dlq_depth_reports_both_values_on_pass(tmp_path, monkeypatch):
+    """SPEC: report both values ALWAYS (visibility at certify), not only on
+    FAIL -- the evidence carries exactly the two telemetry fields + the
+    threshold used, even on a clean PASS."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(
+                        scan_dlq_depth="0", dead_lettered_index_count="0"
+                    ),
+                )
+            }
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == PASS
+    assert set(res.evidence) == {
+        "scan_dlq_depth",
+        "dead_lettered_index_count",
+        "scan_dlq_threshold",
+    }
+
+
+def test_scan_dlq_depth_threshold_is_configurable(tmp_path, monkeypatch):
+    """A depth that PASSes under the default threshold FAILs under a stricter
+    configured one -- proves the threshold is actually read from config
+    (--scan-dlq-threshold), not hardcoded."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {("GET", "/health"): (200, _health_with_components(scan_dlq_depth="5"))}
+        ),
+    )
+    default_res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert default_res.status == PASS
+    strict_res = VerifyRunner(
+        _cfg(tmp_path, scan_dlq_threshold=3)
+    ).probe_scan_dlq_depth()
+    assert strict_res.status == FAIL
+
+
+def test_scan_dlq_depth_default_threshold_is_ten(tmp_path):
+    assert verify.SCAN_DLQ_DEFAULT_THRESHOLD == 10
+    assert _cfg(tmp_path).scan_dlq_threshold == 10
+
+
+# ── probe 11: first-party-images-match-published (D5) ───────────────────────
+
+
+def _bff_ref(digest="sha256:pub-bff"):
+    return registry.ImageRef(
+        "docker.io/lfds/audittrace-librechat-bff", "9.9.9", digest, "hub"
+    )
+
+
+def test_bff_probe_skipped_under_local_registry(tmp_path, monkeypatch):
+    res = VerifyRunner(
+        _cfg(tmp_path, registry="local")
+    ).probe_first_party_images_match_published()
+    assert res.status == PASS
+    assert res.evidence == {"bff": "skipped", "reason": "registry local"}
+
+
+def test_bff_probe_pass_absent_when_deployment_not_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify,
+        "_run",
+        lambda cmd: _proc(
+            returncode=1,
+            stderr='Error from server (NotFound): deployments.apps "x" not found',
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == PASS
+    assert res.evidence == {"bff": "absent"}
+
+
+def test_bff_probe_fail_unreadable_cluster_not_absent(tmp_path, monkeypatch):
+    """A kubectl failure that does NOT say NotFound (an unreachable
+    cluster, an RBAC error, ...) must FAIL fail-closed — never be silently
+    read as "absent" PASS. Falsifiable: drop the `None` branch (treat
+    anything non-zero as absent) and this goes RED (flips to PASS)."""
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(returncode=1, stderr="boom"))
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == FAIL
+    assert res.evidence == {"bff": "unreadable"}
+
+
+def test_bff_probe_fail_digest_resolution_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, "{}"))
+
+    def boom(v, reg, *, repo_path=None):
+        raise registry.DigestResolutionError("HTTP 404")
+
+    monkeypatch.setattr(registry, "resolve", boom)
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == FAIL and "could not resolve" in res.detail
+
+
+def test_bff_probe_fail_no_live_digest(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, "{}"))
+    monkeypatch.setattr(
+        registry, "resolve", lambda v, reg, *, repo_path=None: _bff_ref()
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == FAIL and "no live pod digest" in res.detail
+
+
+def test_bff_probe_fail_digest_mismatch(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def _run_stub(cmd):
+        calls["n"] += 1
+        if "librechat-bff" in " ".join(cmd) and "imageID" in " ".join(cmd):
+            return _proc(0, "repo@sha256:LIVE")
+        return _proc(0, "{}")
+
+    monkeypatch.setattr(verify, "_run", _run_stub)
+    monkeypatch.setattr(
+        registry,
+        "resolve",
+        lambda v, reg, *, repo_path=None: _bff_ref("sha256:PUBLISHED"),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == FAIL and "does NOT match" in res.detail
+
+
+def test_bff_probe_pass_digest_matches(tmp_path, monkeypatch):
+    def _run_stub(cmd):
+        if "librechat-bff" in " ".join(cmd) and "imageID" in " ".join(cmd):
+            return _proc(0, "repo@sha256:pub-bff")
+        return _proc(0, "{}")
+
+    monkeypatch.setattr(verify, "_run", _run_stub)
+    monkeypatch.setattr(
+        registry, "resolve", lambda v, reg, *, repo_path=None: _bff_ref()
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == PASS
+    assert res.evidence == {
+        "published_digest": "sha256:pub-bff",
+        "live_digest": "sha256:pub-bff",
+    }
+
+
+def test_live_bff_digest_none_on_kubectl_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(returncode=1))
+    assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() is None
+
+
+def test_live_bff_digest_none_when_no_sha_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, "repo:tag"))
+    assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() is None
+
+
+def test_live_bff_digest_requires_all_pods_to_agree(tmp_path, monkeypatch):
+    """Should-fix (fix round 1): two BFF pods, ONE stale — must be
+    unreadable (`None`), never the first (possibly stale) token. Paired
+    with the single-pod happy path already covered by the probe-level PASS
+    test above, so the CONTRAST proves the all-agree requirement, not just
+    "a digest was returned"."""
+    monkeypatch.setattr(
+        verify, "_run", lambda cmd: _proc(0, "repo@sha256:fresh repo@sha256:STALE")
+    )
+    assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() is None
+
+
+def test_live_bff_digest_agrees_when_all_pods_match(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify, "_run", lambda cmd: _proc(0, "repo@sha256:same repo@sha256:same")
+    )
+    assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() == "sha256:same"
+
+
+def test_resolve_accepts_bff_repo_path_byte_identical_default_call(
+    tmp_path, monkeypatch
+):
+    """The pre-existing `registry.resolve(version, registry)` 2-positional
+    call shape stays BYTE-IDENTICAL — `repo_path` is keyword-only with a
+    default, so the memory-server probe (digest-matches-published) never
+    needed to change."""
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, "repo@sha256:pub"))
+    monkeypatch.setattr(registry, "resolve", lambda v, reg: _hub_ref("sha256:pub"))
+    res = VerifyRunner(_cfg(tmp_path)).probe_digest_matches_published()
+    assert res.status == PASS
+
+
+def test_bff_probe_calls_resolve_with_repo_path_bff_not_default(tmp_path, monkeypatch):
+    """V-2 (fix round 1, non-vacuous by construction): the `registry.resolve`
+    stub BRANCHES on `repo_path` — a DIFFERENT published digest for `"bff"`
+    than for the default (`"memory-server"`) — so dropping the
+    `repo_path="bff"` plumbing from the probe (comparing the live BFF
+    digest against the WRONG published digest) is caught by a genuine
+    PASS/FAIL flip, never by a stub that returns the same value either way.
+
+    Falsifiable: drop `repo_path="bff"` from the probe's `registry.resolve`
+    call and this goes RED — the probe would resolve the memory-server
+    digest instead, which the live BFF pod (correctly running the BFF
+    digest) does not match.
+    """
+    calls: list[str] = []
+
+    def _resolve_stub(v, reg, *, repo_path="memory-server"):
+        calls.append(repo_path)
+        digest = (
+            "sha256:bff-digest" if repo_path == "bff" else "sha256:memory-server-digest"
+        )
+        return registry.ImageRef(
+            "docker.io/lfds/audittrace-librechat-bff", v, digest, reg
+        )
+
+    monkeypatch.setattr(registry, "resolve", _resolve_stub)
+
+    def _run_stub(cmd):
+        joined = " ".join(cmd)
+        if "librechat-bff" in joined and "imageID" in joined:
+            return _proc(0, "repo@sha256:bff-digest")
+        return _proc(0, "{}")
+
+    monkeypatch.setattr(verify, "_run", _run_stub)
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == PASS
+    assert "bff" in calls
+
+
+# ── probe 10: run()-level, additive over the other nine ──────────────────────
+
+
+def test_verdict_scan_dlq_flood_fails_certification_other_probes_unaffected(
+    tmp_path, monkeypatch
+):
+    """The falsifiable acceptance scenario from the SPEC: an otherwise-healthy
+    deploy whose scan DLQ has flooded FAILs certification -- closing the
+    SCAN-URI-BUG loop gap -- while every OTHER probe stays PASS (additive,
+    never changing the other nine probes' verdicts)."""
+    r = _all_pass_runner(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(
+                        scan_dlq_depth="99", dead_lettered_index_count="12"
+                    ),
+                ),
+                **_recall_routes(),
+            }
+        ),
+    )
+    report = r.run()
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert report["verdict"] == FAIL
+    assert statuses["scan-dlq-depth"] == FAIL
+    for name in verify.PROBES:
+        if name != "scan-dlq-depth":
+            assert statuses[name] == PASS
+
+
+def test_verdict_scan_dlq_absent_field_does_not_block_certification(
+    tmp_path, monkeypatch
+):
+    """A deploy on an image predating #387 P2b (no scan_dlq_depth field in
+    /health) still certifies PASS: the new probe reports SKIPPED, not a
+    regression on existing deploys' verdicts."""
+    report = _all_pass_runner(tmp_path, monkeypatch).run()
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert statuses["scan-dlq-depth"] == verify.SKIPPED
+    assert report["verdict"] == PASS
+    assert [p["name"] for p in report["probes"]] == list(verify.PROBES)
+
+
 # ── CodeQL fix: no raw log content leaks into the verify report ───────────────
 #
 # py/clear-text-logging-of-sensitive-data. memory-server / istiod logs can carry
@@ -1761,12 +2520,12 @@ def test_degraded_mesh_flips_verdict_to_fail(
     r = _all_pass_runner(tmp_path, monkeypatch)
     rules = _healthy_kube_rules()
     if broken_probe == "istiod-api-reachable":
-        rules[2] = ("get endpoints", _proc(0, ""))  # istiod has no endpoints
+        rules[3] = ("get endpoints", _proc(0, ""))  # istiod has no endpoints
     elif broken_probe == "sidecars-have-certs":
         # memory-server proxy not ready → cert-starved data plane
         bad = _mesh_healthy_pods()
         bad[-1]["status"]["containerStatuses"][1]["ready"] = False
-        rules[3] = ("get pods", _pods_json(bad))
+        rules[4] = ("get pods", _pods_json(bad))
     elif broken_probe == "vault-secret-rendered":
         bad = _mesh_healthy_pods()
         bad[-1]["status"]["containerStatuses"][0]["lastState"] = {
@@ -1778,7 +2537,7 @@ def test_degraded_mesh_flips_verdict_to_fail(
             for c in bad[-1]["status"]["containerStatuses"]
             if c["name"] != "vault-agent"
         ]
-        rules[3] = ("get pods", _pods_json(bad))
+        rules[4] = ("get pods", _pods_json(bad))
     monkeypatch.setattr(verify, "_run", _KubeDispatcher(rules=rules))
     if broken_probe == "no-unhealthy-upstream":
         monkeypatch.setattr(
@@ -1792,7 +2551,7 @@ def test_degraded_mesh_flips_verdict_to_fail(
             ),
         )
         # override the memory-server log read to carry the 503 signature
-        rules[6] = ("logs", _proc(0, "no healthy upstream"))
+        rules[7] = ("logs", _proc(0, "no healthy upstream"))
         monkeypatch.setattr(verify, "_run", _KubeDispatcher(rules=rules))
 
     report = r.run()
@@ -1914,6 +2673,6 @@ def test_kubectl_hang_or_missing_fails_closed_and_still_emits_report(
     assert statuses["istiod-api-reachable"] == FAIL
     assert statuses["sidecars-have-certs"] == FAIL
     assert statuses["vault-secret-rendered"] == FAIL
-    # the verdict is complete (all nine probes ran) and a bundle was written
+    # the verdict is complete (all ten probes ran) and a bundle was written
     assert [p["name"] for p in report["probes"]] == list(verify.PROBES)
     assert list((tmp_path / "runs").glob("verify-v9.9.9-*.json"))

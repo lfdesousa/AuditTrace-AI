@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Tracked, installable pre-push hook (#397, marker
+# ADR049-PRBODY-AUTOENFORCE-20260803).
+#
+# Install with `make install-hooks` (also wired into `make install`).
+# The installer copies THIS tracked file to
+# `$(git rev-parse --git-path hooks)/pre-push` — see
+# `scripts/install-git-hooks.sh` for why this is a plain copy into the
+# default hooks directory rather than a `core.hooksPath` repoint:
+# pre-commit 4.x hard-refuses `pre-commit install` whenever
+# `core.hooksPath` is set ("Cowardly refusing to install hooks with
+# `core.hooksPath` set"), which would break the `pre-commit`/`commit-msg`
+# hooks `make install` already manages. Composing via the one hook slot
+# (`pre-push`) pre-commit does not touch avoids that conflict entirely.
+#
+# This hook composes TWO concerns so it can fully replace the historical
+# untracked, local-only `.git/hooks/pre-push` (gitleaks secret scan —
+# see the `project_gitleaks_hooks_portable` memory) without losing that
+# protection:
+#
+#   1. gitleaks secret-scan on the content being pushed (unchanged
+#      behaviour from the old untracked hook — now tracked + portable).
+#   2. The ADR-049 PR-body evidence gate (#397):
+#        - PR_BODY set to a path, body FAILS the gate  -> BLOCK the push
+#          (exit non-zero), printing the CI-identical `::error::` lines
+#          (scripts/adr049_evidence_check.py IS the single source of
+#          truth — this hook never re-implements the rule).
+#        - PR_BODY set to a path, body PASSES           -> allow.
+#        - PR_BODY unset, pushing a feature branch       -> allow, print
+#          a NON-blocking reminder.
+#        - PR_BODY unset, pushing main/master            -> allow, silent.
+#        - PR_BODY=none (case-insensitive)                -> allow,
+#          silent — an explicit, acknowledged skip.
+#
+# The actual decision logic lives in
+# `scripts/hooks/prepush_pr_body_gate.py` (unit-tested in
+# `tests/test_prepush_pr_body_gate.py` WITHOUT invoking
+# a real `git push` — see that module's docstring). This shell wrapper
+# only does the I/O git's pre-push protocol requires: read the pushed
+# ref off stdin and hand it to the Python helper.
+#
+# PR bodies live OUTSIDE this repo (normally
+# ~/work/audittrace-private/pr-bodies/<file>.md in the private sibling
+# repo) — PR_BODY is an absolute path into that private tree. Nothing
+# here reads or writes a PR-body file inside this public repo.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# --- 1. gitleaks secret scan (unchanged from the prior untracked hook) -----
+if command -v gitleaks &> /dev/null; then
+    gitleaks protect --staged --config ~/.config/gitleaks/gitleaks.toml --verbose
+else
+    echo "gitleaks not installed — skipping leak scan"
+fi
+
+# --- 2. ADR-049 PR-body gate (#397) -----------------------------------------
+# git's pre-push protocol pipes one line per pushed ref to stdin:
+#   <local ref> <local sha1> <remote ref> <remote sha1>
+# We only need the destination remote ref off the first line (multi-ref
+# pushes are rare in this repo's single-feature-branch workflow).
+remote_ref=""
+while read -r _local_ref _local_sha remote_ref_field _remote_sha; do
+    remote_ref="$remote_ref_field"
+    break
+done
+
+exec python3 "$REPO_ROOT/scripts/hooks/prepush_pr_body_gate.py" "$remote_ref"

@@ -5,7 +5,7 @@ meta {
 }
 
 post {
-  url: {{baseUrl}}/memory/index?collections=decisions&file=episodic/{{exampleAdrFile}}
+  url: {{baseUrl}}/memory/index?collections=decisions&file={{indexFileKey}}
   body: none
   auth: bearer
 }
@@ -16,7 +16,7 @@ auth:bearer {
 
 query {
   collections: decisions
-  file: episodic/{{exampleAdrFile}}
+  file: {{indexFileKey}}
 }
 
 tests {
@@ -44,15 +44,28 @@ docs {
   the right scope to call /memory/index. Today: 200, evidence at
   ~/work/audittrace-evidence/20260515-v1.0.22-e2e/.
 
-  Pre-req: the file must already be in MinIO. Use the sibling
-  bru ``upload-pdf.bru`` (despite the name it accepts .md too) OR
-  ``audittrace-login``-then-curl POST /memory/upload?layer=episodic
-  to land the file under episodic/.
+  Pre-req: the file must already be in MinIO. Use the sibling bru
+  ``seed-file.bru`` or ``upload-pdf.bru`` (despite the name it accepts
+  .md too) to land the file.
 
-  Authorization: ``memory:episodic:write`` — gated on the FILE's
-  MinIO prefix, not the target collection. ``memory:decisions:write``
-  is in the issued token (cluster.bru env, v1.0.22+) but not
-  runtime-required for this call today — see the doc on
-  ``index-single-file.bru`` for the forward-looking enforcement
+  ``indexFileKey`` (added ADR-062 Phase B / #426, 2026-08-05) is the
+  FULL ``?file=`` key exactly as returned by ``POST /memory/upload``'s
+  ``key`` response field — since WU-B5, ``/memory/upload`` writes to
+  the caller's PRIVATE tier and returns
+  ``"{jwt.sub}/{layer}/{filename}"``, not the legacy
+  ``"{layer}/{filename}"`` shape. Passing the private-tier key through
+  unchanged is exactly the deploy-helper round-trip contract
+  (``scripts/deploy/memory.py::log_deploy_record``) and the fleet
+  self-log → decisions fold path #426 restores. The env default
+  (``episodic/{{exampleAdrFile}}``-shaped) preserves the legacy
+  corpus/shared-tier demo for callers who seeded a file directly under
+  ``episodic/`` in the shared bucket rather than via ``/memory/upload``.
+
+  Authorization: ``memory:episodic:write`` (or ``memory:procedural:write``
+  for a procedural key) — gated on the RESOLVED layer, matching
+  ``indexFileKey``'s layer segment, not the target collection.
+  ``memory:decisions:write`` is in the issued token (cluster.bru env,
+  v1.0.22+) but not runtime-required for this call today — see the doc
+  on ``index-single-file.bru`` for the forward-looking enforcement
   story.
 }

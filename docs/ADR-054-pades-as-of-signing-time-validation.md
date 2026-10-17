@@ -172,3 +172,9 @@ return ("signed_valid", count)
 - **`signed_revoked` 10th class** — distinct from `signed_expired`; needs LTV consumption to validate retroactively. Future ADR.
 - **TSA timestamp validation context split** — pyhanko's `validate_pdf_signature` accepts a separate `ts_validation_context` for TSA chain validation. v1 of this ADR uses the same trust roots for both signer + TSA. Refining is a small follow-up if a customer's TSA chain doesn't overlap with our signer trust roots.
 - **Auto-detection of best-available signing time** (e.g. prefer TSA when present, fall back to signer-asserted). v1 uses signer-asserted unconditionally; future iteration can plumb the preference through.
+
+## Addendum (2026-10, #460 / GitHub #366): `check_failed` is narrowed; the retry splits the same way
+
+- The §1 table row for `check_failed` ("pyhanko raised; validation crashed") is narrowed to "the document could not be validated". "Our code crashed" moves to the new `check_error` class (ADR-052 addendum).
+- The as-of-signing-time retry now splits its exceptions by type: a document-failure type keeps the `signed_untrusted` outcome above; any other exception is `check_error`.
+- Both validation calls use pyhanko's native `async_validate_pdf_signature` and are awaited on the request loop. The synchronous `validate_pdf_signature` wraps the same coroutine in `asyncio.run`, which raises inside a running loop; that made every signed PDF read `check_failed` from the day `_index_pdf_objects` became `async def`.

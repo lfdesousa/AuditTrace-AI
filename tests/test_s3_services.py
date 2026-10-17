@@ -53,13 +53,27 @@ def _mock_get_response(content: str) -> MagicMock:
 
 class TestS3EpisodicService:
     def _make_service(self, objects: dict[str, str]) -> S3EpisodicService:
-        """Create service with mocked MinIO client."""
+        """Create service with mocked MinIO client.
+
+        ADR-062 Phase B: ``load()``/``search()`` now query BOTH tiers
+        (private + corpus), so ``list_objects``/``get_object`` are called
+        twice per operation — once per tier. The mock's ``return_value`` /
+        ``side_effect`` is prefix-agnostic (same fixed payload regardless of
+        which bucket/prefix is queried), so the private-tier query returns
+        the identical fixture rows as the corpus-tier query; the dedupe-by-
+        filename merge in ``_merged_rows`` then collapses them back down to
+        one row per file — the doc-count assertions below are unaffected.
+        """
         client = MagicMock()
         client.list_objects.return_value = [_mock_s3_object(name) for name in objects]
         client.get_object.side_effect = lambda bucket, name: _mock_get_response(
             objects[name]
         )
-        return S3EpisodicService(minio_client=client, bucket="memory-shared")
+        return S3EpisodicService(
+            minio_client=client,
+            bucket="memory-shared",
+            private_bucket="memory-private",
+        )
 
     async def test_load_returns_adr_documents(self):
         svc = self._make_service(
@@ -120,16 +134,20 @@ class TestS3EpisodicService:
         docs1 = await svc.load(user)
         docs2 = await svc.load(user)
         assert docs1 == docs2
-        # list_objects should only be called once (cached)
-        assert svc._client.list_objects.call_count == 1
+        # ADR-062 Phase B: one list_objects call per tier (private + corpus)
+        # on the first (cold-cache) load; the second load is served entirely
+        # from cache, so the count does not grow.
+        assert svc._client.list_objects.call_count == 2
 
     async def test_shared_content_no_user_prefix(self):
-        """Shared bucket: list_objects uses 'episodic/' prefix, not user_id."""
+        """Corpus tier: list_objects uses 'episodic/' prefix, not user_id —
+        checked on the LAST call, which is the corpus-tier query (private
+        tier is queried first — see ``_merged_rows``)."""
         svc = self._make_service({})
         await svc.load(_make_user(user_id="kc-john-001"))
         call_args = svc._client.list_objects.call_args
         assert call_args[0] == ("memory-shared",)
-        # Should NOT contain user_id — shared content has no per-user prefix
+        # Should NOT contain user_id — corpus content has no per-user prefix
         assert "kc-john" not in str(call_args)
 
 
@@ -143,7 +161,11 @@ class TestS3ProceduralService:
         client.get_object.side_effect = lambda bucket, name: _mock_get_response(
             objects[name]
         )
-        return S3ProceduralService(minio_client=client, bucket="memory-shared")
+        return S3ProceduralService(
+            minio_client=client,
+            bucket="memory-shared",
+            private_bucket="memory-private",
+        )
 
     async def test_load_returns_skill_documents(self):
         svc = self._make_service(
@@ -199,7 +221,9 @@ class TestS3ProceduralService:
         user = _make_user()
         await svc.load(user)
         await svc.load(user)
-        assert svc._client.list_objects.call_count == 1
+        # ADR-062 Phase B: one list_objects call per tier on the cold-cache
+        # first load; the second load is served entirely from cache.
+        assert svc._client.list_objects.call_count == 2
 
 
 # ── _create_minio_client (dependencies.py) ────────────────────────────────────
@@ -221,6 +245,7 @@ class TestCreateObjectStorageProvider:
         # AWS branch defaults — irrelevant unless backend == "aws"
         settings.aws_region = ""
         settings.aws_bucket = ""
+        settings.aws_private_bucket = ""
         settings.aws_endpoint_url = ""
         settings.aws_use_irsa = True
         settings.aws_access_key_id = ""
@@ -281,7 +306,20 @@ class TestCreateObjectStorageProvider:
         settings = self._base_settings(backend="aws")
         settings.aws_region = "eu-central-2"
         settings.aws_bucket = ""  # missing
+        settings.aws_private_bucket = "audittrace-private"
         with pytest.raises(RuntimeError, match="AUDITTRACE_AWS_REGION"):
+            _create_object_storage_provider(settings)
+
+    def test_aws_raises_when_private_bucket_missing(self):
+        """ADR-062 Phase B (WU-B1): parity with the shared-bucket guard —
+        region and shared bucket both set, only the private bucket missing."""
+        from audittrace.dependencies import _create_object_storage_provider
+
+        settings = self._base_settings(backend="aws")
+        settings.aws_region = "eu-central-2"
+        settings.aws_bucket = "audittrace-shared"
+        settings.aws_private_bucket = ""  # missing
+        with pytest.raises(RuntimeError, match="AUDITTRACE_AWS_PRIVATE_BUCKET"):
             _create_object_storage_provider(settings)
 
     def test_unknown_backend_raises(self):

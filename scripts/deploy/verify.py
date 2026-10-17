@@ -13,9 +13,11 @@ the verdict. The deployer decides "it deployed"; this
 runner decides, separately and on evidence it gathered itself, "it works". FAIL
 blocks "done": *up* means complete AND working, not "helm exited 0".
 
-Nine deploy-health probes — five CORE + four MESH-HEALTH (#384 WS2) — each
-PASS/FAIL with captured evidence (failures-are-findings, every check declares the
-evidence it stands on):
+Eleven deploy-health probes — five CORE + four MESH-HEALTH (#384 WS2) + one
+AUDIT-RELIABILITY (scan-DLQ depth, spec 2026-08-23) + one FIRST-PARTY-IMAGE
+(the BFF, D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-
+guard.md) — each PASS/FAIL/SKIPPED with captured evidence (failures-are-
+findings, every check declares the evidence it stands on):
 
 * **pods-ready**             — every expected app component has ≥1 Ready pod.
 * **digest-matches-published** — the LIVE memory-server pod digest == the intended
@@ -26,13 +28,17 @@ evidence it stands on):
   (``maxSurge=0`` / ``maxUnavailable=1``). Catches a WS1 regression or a stray
   live ``kubectl patch``.
 * **health-version**         — front-door ``GET /health`` reports ``status=ok`` and
-  ``version`` == the intended target version.
+  ``version`` == the intended target version. ``--skip-version-check`` (#412)
+  turns this probe advisory (reported ``SKIPPED``, never a FAIL) for a
+  dev-tagged build (image tag isn't a release ``vX.Y.Z``) that can only be
+  certified on ``digest-matches-published`` alone; every other probe, INCLUDING
+  the digest anchor, is unaffected and still gates normally.
 * **recall-e2e**             — a REAL front-door recall through the audit plane:
   ``POST /v1/chat/completions`` (scoped JWT, real model) that triggers a
   ``recall_*``, then ``GET /interactions/{id}/tool-calls`` asserting a recall row
   was recorded. Memory + auth alone is not E2E. The chat call alone uses a
   calibrated, configurable client timeout (``--e2e-timeout`` /
-  ``AUDITTRACE_VERIFY_E2E_TIMEOUT``, default 120s — see
+  ``AUDITTRACE_VERIFY_E2E_TIMEOUT``, default 400s — see
   :data:`E2E_CHAT_TIMEOUT_DEFAULT`); every other probe keeps the short,
   unwidened fast-probe timeout (:data:`FAST_PROBE_TIMEOUT`).
 
@@ -56,6 +62,24 @@ gate's result — the same independence contract the core probes hold):
   CrashLoop — captures container statuses, NEVER secret values.
 * **no-unhealthy-upstream**  — front-door ``/health`` == 200 ``status=ok`` AND no
   "no healthy upstream" 503 signature in the memory-server log window.
+* **scan-dlq-depth**         — front-door ``GET /health`` ``components.scan_dlq_depth``
+  and ``components.dead_lettered_index_count`` (#387 P2b). Both values are ALWAYS
+  captured as evidence, whatever the verdict. FAILs when ``scan_dlq_depth`` is
+  NUMERIC and exceeds ``--scan-dlq-threshold`` (default
+  :data:`SCAN_DLQ_DEFAULT_THRESHOLD`) — closes the SCAN-URI-BUG loop gap: a future
+  regression that re-floods the scan DLQ now trips certification instead of
+  passing silently. SKIPS (never FAILs) when the field is ABSENT (an older image
+  predating #387 P2b) or ``"unknown"`` (the health handler's own best-effort
+  telemetry degraded, same pattern as ``async_persist_dlq_depth``) — certify must
+  not be brittle against a telemetry-field hiccup.
+* **first-party-images-match-published** — the LIVE BFF pod digest == the
+  published digest for ``--target-version`` on the registry (D5). PASS
+  with ``{"bff": "absent"}`` when no BFF Deployment exists (the common
+  laptop posture); PASS with ``{"bff": "skipped", ...}`` under
+  ``--registry local`` (the BFF is hub-only, S3b). The deploy runner's own
+  D3 check (``scripts/deploy/runner/images.py``) compares render-vs-chart
+  and chart-vs-live; THIS probe is the only one that ties the BFF to what
+  was actually PUBLISHED, independently re-derived.
 
 **Method discipline:** front door + read-only ``kubectl``/``helm`` only. NO
 ``kubectl exec``, NO root creds, NO scope-skip. Deterministic: no wall-clock
@@ -82,9 +106,41 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 from scripts.deploy import mesh, registry
+from scripts.deploy.frontdoor import (
+    DEFAULT_FRONT_DOOR as _DEFAULT_FRONT_DOOR,
+)
+from scripts.deploy.frontdoor import (
+    FRONT_DOOR_ENV_VAR as _FRONT_DOOR_ENV_VAR,
+)
+from scripts.deploy.frontdoor import (
+    resolve_front_door,
+)
 from scripts.deploy.runner import extract_digest, normalize_version
 
 logger = logging.getLogger("audittrace.deploy.verify")
+
+# Re-export DEFAULT_FRONT_DOOR for backward compatibility (external code may
+# import it from verify; tests assert verify.DEFAULT_FRONT_DOOR == the shared
+# module's value). The noqa silences ruff's "unused import" because the name
+# is re-exported at the module level, not used in the function body.
+DEFAULT_FRONT_DOOR = _DEFAULT_FRONT_DOOR  # noqa: F401
+# Re-export the env-var NAME too (external code / tests reference
+# verify.FRONT_DOOR_ENV_VAR). The precedence lives ONCE in
+# scripts.deploy.frontdoor; these are backward-compat aliases.
+FRONT_DOOR_ENV_VAR = _FRONT_DOOR_ENV_VAR  # noqa: F401
+
+
+def _front_door_default() -> str:
+    """Thin backward-compat wrapper over the shared resolver (SPEC #401).
+
+    The precedence (explicit > AUDITTRACE_FRONT_DOOR env > hardcoded fallback)
+    is defined ONCE in :func:`scripts.deploy.frontdoor.resolve_front_door`;
+    this no-arg wrapper is kept so external callers / tests can reference
+    ``verify._front_door_default`` and so the CLI-omission path resolves the
+    env/fallback default through a single seam.
+    """
+    return resolve_front_door()
+
 
 # Independence is NOT a self-attested boolean. It is proven two ways: (1) the
 # report exposes the FULL enumerated list of evidence sources this runner
@@ -101,8 +157,8 @@ INDEPENDENCE_NOTE = (
     "runner's report is never read and its success claims never move this verdict"
 )
 
-DEFAULT_FRONT_DOOR = "https://audittrace.allaboutdata.eu"
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "audittrace" / "tokens.json"
+
 
 # Every in-cluster app component that must have a Ready pod for the deploy to be
 # "up", matched by EXACT LABEL (never a pod-NAME substring — a rogue/old pod
@@ -141,6 +197,32 @@ EXPECTED_MAX_UNAVAILABLE = "1"
 
 PASS = "PASS"
 FAIL = "FAIL"
+# A probe that was deliberately not evaluated -- health-version under
+# --skip-version-check (#412), or scan-dlq-depth when its telemetry field is
+# absent/"unknown" (spec 2026-08-23). Distinct from FAIL: it carries no
+# evidence about whether the underlying condition holds, so it must never move
+# the verdict either way. Distinct from PASS: it must never manufacture a
+# green result the runner did not actually check.
+SKIPPED = "SKIPPED"
+
+# The fixed advisory reason recorded on health-version when --skip-version-check
+# is set. A literal, not a computed string: the probe is skipped UNCONDITIONALLY
+# (it never even queries the front door) so the reason can never depend on an
+# outcome that was never observed.
+SKIP_VERSION_CHECK_REASON = "skipped (--skip-version-check)"
+
+# The per-status log level for ``_record`` (#412-nit). SKIPPED maps to WARNING,
+# not INFO or ERROR: an intentional skip is worth surfacing ("heads up, a check
+# was skipped") without alarming an ERROR-level dashboard/log query as if the
+# run had failed. Falsifiable: neuter this map back to a two-way PASS/else
+# ternary (SKIPPED collapses onto ERROR) and the SKIPPED-logs-at-WARNING test
+# goes RED. FAIL and any unrecognised status fall through the ``.get`` default
+# to ERROR — a real failure must stay loud.
+_LOG_LEVEL_BY_STATUS: dict[str, int] = {
+    PASS: logging.INFO,
+    SKIPPED: logging.WARNING,
+    FAIL: logging.ERROR,
+}
 
 # ── #384 WS2 mesh-health probe constants ─────────────────────────────────────
 # The mesh probes RE-DERIVE their signal from INDEPENDENT read-only cluster reads
@@ -209,19 +291,45 @@ FAST_PROBE_TIMEOUT = 30
 # Client-side HTTP timeout (seconds) for the recall-e2e CHAT probe
 # (``POST /v1/chat/completions``) ONLY. Calibrated, not arbitrary: the v1.17.0
 # deploy-verify FAIL recorded a real backend SUCCESS at 30.577s against the old
-# fixed 30s budget (interaction 806, Tempo trace 3c826281...), and the
-# 2026-07-20 v1.10.0 run observed 59s for max_tokens=2000 on a reasoning model.
-# 120s is ~2x the worst observed 59s — generous enough to cover a reasoning
-# model spending time in <think> on an architect-shaped prompt, while still a
-# REAL gate: a response past 120s is a genuine FAIL worth surfacing, not
-# something this bound papers over. Configurable via ``--e2e-timeout`` / the
-# ``AUDITTRACE_VERIFY_E2E_TIMEOUT`` env var so a different target/model can be
-# tuned without a code change (portability invariant).
-E2E_CHAT_TIMEOUT_DEFAULT = 120
+# fixed 30s budget (interaction 806, Tempo trace 3c826281...), which is why
+# this became a dedicated, configurable bound in the first place. It was then
+# set to 120s on 2026-07-20 (v1.10.0), ~2x the then-worst-observed 59s for
+# max_tokens=2000 on a REASONING chat model.
+#
+# That calibration went stale with the permanent swap to the dense
+# **Qwen3.8-27B + MTP** chat model (`project_chat_model_q4_27b`): its
+# recall-tool-loop latency on the reference laptop runs ~150-181s, over the
+# 120s bound. The v1.25.0 deploy-verify run (2026-08-31) FAILed the
+# recall-e2e probe on exactly this — the backend audit trail proves the turn
+# SUCCEEDED end-to-end (interaction id=3823, duration_ms=181118, 3 recorded
+# tool calls), it just overran the stale client-side bound. 400s is ~2x that
+# worst-observed 181s (362), rounded up for run-to-run variance headroom —
+# the SAME "~2x worst observed" principle as the original 120s, NOT a number
+# chosen merely to make the FAIL go away. A response past 400s is still a
+# genuine FAIL worth surfacing, not something this bound papers over.
+# Configurable via ``--e2e-timeout`` / the ``AUDITTRACE_VERIFY_E2E_TIMEOUT``
+# env var so a different target/model can be tuned without a code change
+# (portability invariant).
+E2E_CHAT_TIMEOUT_DEFAULT = 400
 E2E_TIMEOUT_ENV_VAR = "AUDITTRACE_VERIFY_E2E_TIMEOUT"
 
-# The nine probe identifiers — fixed order (determinism contract). The four
-# mesh-health probes are APPENDED so the core five keep their indices.
+# The scan-dlq-depth probe's FAIL threshold (spec 2026-08-23, closes the
+# SCAN-URI-BUG loop gap). A small default: normal steady-state depth for the
+# janitor's scan DLQ is near-zero (a handful of genuinely-poison objects at
+# most), so anything above a low single-to-double-digit count is already a
+# flood signature, not noise. Deliberately NOT zero — a transient blip (one
+# object briefly dead-lettered mid-retry) must not trip certification; only a
+# sustained flood should. Configurable via ``--scan-dlq-threshold`` so a
+# different target/workload can recalibrate without a code change (portability
+# invariant), same posture as E2E_CHAT_TIMEOUT_DEFAULT above.
+SCAN_DLQ_DEFAULT_THRESHOLD = 10
+
+# The eleven probe identifiers — fixed order (determinism contract). The
+# four mesh-health probes are APPENDED so the core five keep their indices;
+# scan-dlq-depth is APPENDED after that (spec 2026-08-23); first-party-
+# images-match-published (D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-
+# stale-override-guard.md) is APPENDED last for the same reason — every
+# earlier index stays stable.
 PROBES = (
     "pods-ready",
     "digest-matches-published",
@@ -232,7 +340,20 @@ PROBES = (
     "sidecars-have-certs",
     "vault-secret-rendered",
     "no-unhealthy-upstream",
+    "scan-dlq-depth",
+    "first-party-images-match-published",
 )
+
+# The BFF Deployment this probe reads — mirrors the chart's own naming
+# (``templates/console/deployment-bff.yaml``) and the deploy runner's
+# ``_CONSOLE_COMPONENT_SELECTORS["bff"]`` selector/container pair
+# (``scripts/deploy/runner/config.py``), duplicated here rather than
+# imported — this runner NEVER imports from the deploy runner package
+# (independence contract: two separately-derived readings of the same
+# cluster, not one shared code path).
+BFF_DEPLOYMENT_SUFFIX = "librechat-bff"
+BFF_CONTAINER = "bff"
+BFF_COMPONENT_SELECTOR = "app.kubernetes.io/component=librechat-bff"
 
 
 # ── external-effect indirections (monkeypatched in tests) ────────────────────
@@ -368,7 +489,7 @@ class VerifyConfig:
     namespace: str = "audittrace"
     release: str = "audittrace"
     registry: str = "hub"
-    front_door: str = DEFAULT_FRONT_DOOR
+    front_door: str | None = None
     token_file: Path = DEFAULT_TOKEN_FILE
     model: str = "audittrace-chat"
     interactions_limit: int = 5
@@ -379,6 +500,24 @@ class VerifyConfig:
     # E2E_CHAT_TIMEOUT_DEFAULT for the calibration rationale. Every other probe
     # (fast HTTP + kubectl/helm) is untouched by this field.
     e2e_timeout: int = E2E_CHAT_TIMEOUT_DEFAULT
+    # STRICT by default: health-version gates normally. --skip-version-check
+    # (#412) is an explicit opt-in for a dev-tagged build (image tag isn't a
+    # release vX.Y.Z) that verifies on digest-matches-published alone — see
+    # SKIP_VERSION_CHECK_REASON. Additive, backward-compatible: default False
+    # leaves every existing caller's behaviour byte-for-byte unchanged.
+    skip_version_check: bool = False
+    # The scan-dlq-depth probe's FAIL threshold — see SCAN_DLQ_DEFAULT_THRESHOLD
+    # for the calibration rationale. Additive: default leaves every existing
+    # caller's behaviour byte-for-byte unchanged.
+    scan_dlq_threshold: int = SCAN_DLQ_DEFAULT_THRESHOLD
+
+    def __post_init__(self) -> None:
+        # Resolve None → the environment-dynamic default (env var > fallback).
+        # When constructed via config_from_args the value is already resolved,
+        # but direct construction (tests) may pass None — this ensures a real
+        # URL is always present without callers having to remember to resolve.
+        if self.front_door is None:
+            object.__setattr__(self, "front_door", resolve_front_door())
 
     @property
     def deployment(self) -> str:
@@ -393,7 +532,7 @@ class VerifyConfig:
 @dataclass
 class ProbeResult:
     name: str
-    status: str  # PASS | FAIL
+    status: str  # PASS | FAIL | SKIPPED
     detail: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
     checked_at: str = ""
@@ -660,7 +799,7 @@ def sanitized_finding(finding: mesh.Finding) -> dict[str, Any]:
 
 
 class VerifyRunner:
-    """Runs the five deploy-health probes and emits an independent PASS/FAIL verdict."""
+    """Runs the ten deploy-health probes and emits an independent PASS/FAIL verdict."""
 
     def __init__(self, cfg: VerifyConfig) -> None:
         self.cfg = cfg
@@ -690,6 +829,11 @@ class VerifyRunner:
             "cluster-api:kubectl:istiod-deployment",
             "cluster-api:kubectl:istiod-endpoints",
             "cluster-api:kubectl:memory-server-logs",
+            # ── D5 (spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-
+            # guard.md) ──
+            "cluster-api:kubectl:bff-deployment",
+            "cluster-api:kubectl:bff-pod-imageID",
+            f"registry:{self.cfg.registry}:bff-published-digest",
         ]
 
     @property
@@ -713,7 +857,7 @@ class VerifyRunner:
             checked_at=_now_iso(),
         )
         self.results.append(rec)
-        level = logging.INFO if status == PASS else logging.ERROR
+        level = _LOG_LEVEL_BY_STATUS.get(status, logging.ERROR)
         logger.log(level, "[%s] %s — %s", name, status, detail)
         return rec
 
@@ -1001,6 +1145,17 @@ class VerifyRunner:
     # -- probe 4: health-version --
 
     def probe_health_version(self) -> ProbeResult:
+        if self.cfg.skip_version_check:
+            # Unconditional skip -- the probe never even queries the front door,
+            # so the reported reason is a fixed literal, never an observed
+            # outcome (#412). digest-matches-published (probe 2) and every
+            # other probe are untouched and still gate normally.
+            return self._record(
+                PROBES[3],
+                SKIPPED,
+                SKIP_VERSION_CHECK_REASON,
+                {"target_version": self.cfg.image_tag},
+            )
         status_code, body = self._front_get("/health", token=None)
         if status_code != 200 or not isinstance(body, dict):
             return self._record(
@@ -1291,14 +1446,247 @@ class VerifyRunner:
             {"log_window": MESH_LOG_WINDOW},
         )
 
+    # -- probe 10: scan-dlq-depth (spec 2026-08-23, closes the SCAN-URI-BUG loop gap) --
+
+    def probe_scan_dlq_depth(self) -> ProbeResult:
+        """Front-door ``/health`` scan-DLQ depth — trips certification on a flood.
+
+        Reads ``/health`` the same read-only, front-door way probes 4 and 9
+        already do (no direct AMQP/RabbitMQ management API, no kubectl-exec
+        bypass). Both ``scan_dlq_depth`` and ``dead_lettered_index_count`` are
+        recorded as evidence on EVERY outcome (visibility at certify), not just
+        on FAIL. Degrades gracefully rather than failing on a telemetry
+        hiccup: the field is ABSENT on an older image (pre-#387 P2b) or
+        ``"unknown"`` when the health handler's own best-effort Redis read
+        degraded (``routes/health.py``'s ``except Exception: "unknown"``
+        pattern) — neither is evidence of a flood, so the probe SKIPS rather
+        than FAILing. Only a genuinely NUMERIC depth above
+        :attr:`VerifyConfig.scan_dlq_threshold` FAILs.
+        """
+        status_code, body = self._front_get("/health", token=None)
+        if status_code != 200 or not isinstance(body, dict):
+            return self._record(
+                PROBES[9],
+                FAIL,
+                f"front-door /health returned HTTP {status_code} (expected 200 + JSON)",
+                {"http_status": status_code},
+            )
+        components = body.get("components")
+        components = components if isinstance(components, dict) else {}
+        depth_raw = components.get("scan_dlq_depth")
+        dead_lettered_raw = components.get("dead_lettered_index_count")
+        evidence: dict[str, Any] = {
+            "scan_dlq_depth": depth_raw,
+            "dead_lettered_index_count": dead_lettered_raw,
+            "scan_dlq_threshold": self.cfg.scan_dlq_threshold,
+        }
+        if depth_raw is None:
+            return self._record(
+                PROBES[9],
+                SKIPPED,
+                "scan_dlq_depth absent from /health components (older image, "
+                "predates #387 P2b) — degrading gracefully, not a certification"
+                "-blocking finding",
+                evidence,
+            )
+        if depth_raw == "unknown":
+            return self._record(
+                PROBES[9],
+                SKIPPED,
+                'scan_dlq_depth="unknown" (best-effort telemetry degraded) — '
+                "degrading gracefully, not a certification-blocking finding",
+                evidence,
+            )
+        try:
+            depth = int(str(depth_raw))
+        except ValueError:
+            return self._record(
+                PROBES[9],
+                SKIPPED,
+                f"scan_dlq_depth={depth_raw!r} is not numeric — degrading "
+                "gracefully, not a certification-blocking finding",
+                evidence,
+            )
+        if depth > self.cfg.scan_dlq_threshold:
+            return self._record(
+                PROBES[9],
+                FAIL,
+                f"scan_dlq_depth={depth} exceeds threshold "
+                f"{self.cfg.scan_dlq_threshold} (scan-DLQ flood)",
+                evidence,
+            )
+        return self._record(
+            PROBES[9],
+            PASS,
+            f"scan_dlq_depth={depth} within threshold {self.cfg.scan_dlq_threshold}",
+            evidence,
+        )
+
+    # -- probe 11: first-party-images-match-published (D5) --
+
+    def _bff_deployment_name(self) -> str:
+        return f"{self.cfg.release}-{BFF_DEPLOYMENT_SUFFIX}"
+
+    def _bff_deployment_exists(self) -> bool | None:
+        """Whether the BFF Deployment is present in this namespace — the
+        PASS-with-``absent`` gate (D5): ``console.enabled=false`` is the
+        common laptop posture, and that must never FAIL this probe.
+
+        Returns ``True``/``False`` when determinable, or ``None`` when the
+        read failed for a reason OTHER than "not found" (a genuinely
+        unreachable cluster, an RBAC error, ...) — kept DISTINCT from
+        ``False`` so the probe FAILs fail-closed on an unreadable cluster
+        rather than silently reporting the unrelated-but-similar-looking
+        ``absent`` PASS (proven by
+        ``test_hostile_deploy_report_cannot_move_the_verdict``: EVERY probe
+        must FAIL when every cluster read fails, this one included)."""
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "deployment",
+                self._bff_deployment_name(),
+                "-n",
+                self.cfg.namespace,
+                "-o",
+                "json",
+            ]
+        )
+        if proc.returncode == 0:
+            return True
+        if "NotFound" in proc.stderr:
+            return False
+        return None
+
+    def _live_bff_digest(self) -> str | None:
+        """The live BFF digest, requiring EVERY matching pod to agree
+        (fix-round should-fix) — never just the first token. Two pods, one
+        stale, used to PASS on the first (possibly stale) one; now any
+        disagreement is ``None`` (unreadable), mirroring the deploy
+        runner's own S1 all-pods-agree rule
+        (``scripts.deploy.runner.images._live_row_digest``)."""
+        jsonpath = (
+            '{.items[*].status.containerStatuses[?(@.name=="'
+            + BFF_CONTAINER
+            + '")].imageID}'
+        )
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "pods",
+                "-l",
+                BFF_COMPONENT_SELECTOR,
+                "-n",
+                self.cfg.namespace,
+                "-o",
+                f"jsonpath={jsonpath}",
+            ]
+        )
+        if proc.returncode != 0:
+            return None
+        digests = {
+            digest
+            for token in proc.stdout.split()
+            for digest in (extract_digest(token),)
+            if digest
+        }
+        if len(digests) == 1:
+            return next(iter(digests))
+        return None
+
+    def probe_first_party_images_match_published(self) -> ProbeResult:
+        """The BFF's live pod digest matches the published ``--target-version``
+        digest on the registry (D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-
+        stale-override-guard.md) — ties the console BFF to the registry, the
+        one check NEITHER the deploy runner's render-level D3 nor a chart-
+        file read can give: a wrong CHART pin would move both sides of D3
+        together (Addendum A A1) but can never fool a THIRD, independent
+        read of what was actually published.
+
+        Scoped to ``--registry hub`` (S3b): the BFF is published to Docker
+        Hub only (``publish.yml``, spec F8), so under ``--registry local``
+        this probe reports PASS with ``{"bff": "skipped", "reason":
+        "registry local"}`` rather than ever resolving or FAILing. PASS
+        with ``{"bff": "absent"}`` when no BFF Deployment exists in the
+        namespace (``console.enabled=false``, the common laptop posture) —
+        absence is not a finding. FAILs when the Deployment EXISTS but no
+        live pod digest is readable, when the registry cannot resolve the
+        published digest, or when the two digests disagree.
+        """
+        if self.cfg.registry != "hub":
+            return self._record(
+                PROBES[10],
+                PASS,
+                f"skipped (registry={self.cfg.registry!r}); the BFF is published to hub only",
+                {"bff": "skipped", "reason": "registry local"},
+            )
+        exists = self._bff_deployment_exists()
+        if exists is None:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                "could not determine whether a BFF Deployment exists (unreadable cluster read)",
+                {"bff": "unreadable"},
+            )
+        if not exists:
+            return self._record(
+                PROBES[10],
+                PASS,
+                "no BFF Deployment in this namespace — nothing to certify",
+                {"bff": "absent"},
+            )
+        try:
+            ref = registry.resolve(
+                self.cfg.image_tag, self.cfg.registry, repo_path="bff"
+            )
+        except registry.DigestResolutionError as exc:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                f"could not resolve the published BFF digest for {self.cfg.image_tag}: {exc}",
+                {"error": str(exc)},
+            )
+        live = self._live_bff_digest()
+        if live is None:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                "BFF Deployment exists but no live pod digest is readable",
+                {"published_digest": ref.digest, "live_digest": None},
+            )
+        if live != ref.digest:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                "live BFF digest does NOT match the published digest (running an unpublished image)",
+                {"published_digest": ref.digest, "live_digest": live},
+            )
+        return self._record(
+            PROBES[10],
+            PASS,
+            "live BFF digest matches the published digest",
+            {"published_digest": ref.digest, "live_digest": live},
+        )
+
     # -- orchestration + verdict --
 
     @property
     def verdict(self) -> str:
-        """PASS iff every probe passed; ANY FAIL → FAIL (the mandate-to-fail)."""
-        if not self.results:
+        """PASS iff every COUNTED probe passed; ANY FAIL → FAIL (the mandate-to-fail).
+
+        SKIPPED probes (health-version under ``--skip-version-check``, #412; or
+        scan-dlq-depth when its telemetry field is absent/"unknown", spec
+        2026-08-23) are EXCLUDED from the tally — they carry
+        no evidence either way, so they can neither manufacture a PASS nor block
+        one. A result set with no counted probes (empty, or every probe SKIPPED)
+        is fail-closed FAIL: a verdict must stand on at least one probe that was
+        actually evaluated.
+        """
+        counted = [r for r in self.results if r.status != SKIPPED]
+        if not counted:
             return FAIL
-        return PASS if all(r.passed for r in self.results) else FAIL
+        return PASS if all(r.passed for r in counted) else FAIL
 
     def run(self) -> dict[str, Any]:
         self.probe_pods_ready()
@@ -1311,6 +1699,10 @@ class VerifyRunner:
         self.probe_sidecars_have_certs()
         self.probe_vault_secret_rendered()
         self.probe_no_unhealthy_upstream()
+        # ── scan-dlq-depth (spec 2026-08-23, closes the SCAN-URI-BUG loop gap) ──
+        self.probe_scan_dlq_depth()
+        # ── first-party-images-match-published (D5) ──
+        self.probe_first_party_images_match_published()
         return self.write_report()
 
     def build_report(self) -> dict[str, Any]:
@@ -1323,6 +1715,7 @@ class VerifyRunner:
             "registry": self.cfg.registry,
             "front_door": self.cfg.front_door,
             "insecure_tls": self.cfg.insecure,
+            "skip_version_check": self.cfg.skip_version_check,
             # ── the independence contract: DERIVED + transparent ──
             "evidence_sources": self.evidence_sources(),
             "reads_deploy_report": self.reads_deploy_report,
@@ -1392,7 +1785,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--namespace", default="audittrace")
     parser.add_argument("--release", default="audittrace")
     parser.add_argument("--registry", choices=("hub", "local"), default="hub")
-    parser.add_argument("--front-door", default=DEFAULT_FRONT_DOOR)
+    parser.add_argument("--front-door", default=None)
     parser.add_argument("--token-file", type=Path, default=DEFAULT_TOKEN_FILE)
     parser.add_argument(
         "--model", default="audittrace-chat", help="chat model for the recall E2E"
@@ -1414,9 +1807,35 @@ def build_parser() -> argparse.ArgumentParser:
             "(POST /v1/chat/completions) ONLY -- every other probe (health, "
             "kubectl, helm) keeps its own short, unwidened timeout. Default "
             f"{E2E_CHAT_TIMEOUT_DEFAULT}s, calibrated to ~2x the worst observed "
-            "real-model latency (59s, 2026-07-20 v1.10.0 run); a response past "
-            "the bound is still a genuine FAIL. Portable across targets/models "
-            f"via this flag or the {E2E_TIMEOUT_ENV_VAR} env var."
+            "real-model latency (181s, 2026-08-31 v1.25.0 run, dense "
+            "Qwen3.8-27B+MTP); a response past the bound is still a genuine "
+            "FAIL. Portable across targets/models via this flag or the "
+            f"{E2E_TIMEOUT_ENV_VAR} env var."
+        ),
+    )
+    parser.add_argument(
+        "--skip-version-check",
+        action="store_true",
+        help=(
+            "treat health-version as advisory (reported SKIPPED, never a FAIL) "
+            "instead of gating the verdict -- for a dev-tagged build (image tag "
+            "isn't a release vX.Y.Z) that can only be certified on "
+            "digest-matches-published alone. Default is STRICT: health-version "
+            "gates normally. Every other probe, INCLUDING digest-matches-"
+            "published, is unaffected."
+        ),
+    )
+    parser.add_argument(
+        "--scan-dlq-threshold",
+        type=int,
+        default=SCAN_DLQ_DEFAULT_THRESHOLD,
+        help=(
+            "FAIL threshold for the scan-dlq-depth probe's front-door "
+            "/health components.scan_dlq_depth reading -- a numeric depth "
+            "above this trips certification (a scan-DLQ flood); the field "
+            f'being absent or "unknown" always SKIPS, never FAILs. Default '
+            f"{SCAN_DLQ_DEFAULT_THRESHOLD}, portable across targets/workloads "
+            "via this flag."
         ),
     )
     parser.add_argument("--out-dir", type=Path, default=VerifyConfig.out_dir)
@@ -1429,12 +1848,14 @@ def config_from_args(args: argparse.Namespace) -> VerifyConfig:
         namespace=args.namespace,
         release=args.release,
         registry=args.registry,
-        front_door=_normalize_front_door(args.front_door),
+        front_door=_normalize_front_door(resolve_front_door(args.front_door)),
         token_file=args.token_file,
         model=args.model,
         insecure=args.insecure,
         out_dir=args.out_dir,
         e2e_timeout=args.e2e_timeout,
+        skip_version_check=args.skip_version_check,
+        scan_dlq_threshold=args.scan_dlq_threshold,
     )
 
 

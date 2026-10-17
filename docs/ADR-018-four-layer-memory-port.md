@@ -4,7 +4,8 @@ Date: 2026-04-10
 
 ## Status
 
-Accepted
+Accepted. Superseded / extended by ADR-062 (five-layer memory model — four
+per-user isolated layers plus one shared corpus, 2026-08-04).
 
 ## Context
 

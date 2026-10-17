@@ -47,6 +47,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Full history kept (harmless). No step currently needs it: the test
+          # that used origin/main was removed; a depth-1 checkout has no
+          # origin/main.
+          fetch-depth: 0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v6
@@ -95,6 +100,12 @@ jobs:
       - name: Format check
         run: ruff format --check src/ tests/
 
+      - name: Type check (make typecheck — same target as local; #366)
+        # Until #366 only the pre-commit mirrors-mypy hook ran mypy, so a
+        # call-shape drift against a typed library (trust_store.py, pyhanko
+        # 0.36) reached main. Same make target as the local gate.
+        run: make typecheck
+
       - name: Security-lint (offline semgrep gate — same make target as local + pre-commit; #382)
         # WS1 of the local deterministic CI-Agent (ADR-059). Runs the SAME
         # make target, vendored rules, and flags as the local
@@ -117,52 +128,24 @@ jobs:
               print("postgres reachable on :5432 — RLS tests will run")
           PY
 
-      - name: Tests + project-wide coverage gate (with junit-xml for skip audit)
-        run: |
-          pytest tests/ -v \
-            --cov=src \
-            --cov=scripts/deploy \
-            --cov-report=term-missing \
-            --cov-report=xml \
-            --cov-report=html:htmlcov \
-            --cov-fail-under=90 \
-            --junit-xml=junit.xml
-
-      - name: Fail if any test was silently skipped
-        # Zero-tolerance on skips in CI (directive 2026-04-18): a skip is
-        # a missing assertion in disguise. If a test depends on an
-        # environmental resource, CI provisions it (see the postgres
-        # service above). Otherwise the test is broken and should be
-        # fixed or deleted — never skipped.
-        run: |
-          python - <<'PY'
-          import xml.etree.ElementTree as ET, sys
-          root = ET.parse("junit.xml").getroot()
-          # junit's <testsuite> carries skipped="N"; roll them up.
-          total = 0
-          skipped = []
-          for ts in root.iter("testsuite"):
-              total += int(ts.get("skipped", "0"))
-          # For names + reasons, inspect <skipped> children on testcases.
-          for tc in root.iter("testcase"):
-              for skip in tc.findall("skipped"):
-                  skipped.append(
-                      f"{tc.get('classname')}.{tc.get('name')} — "
-                      f"{skip.get('message','<no reason>')}"
-                  )
-          if total:
-              print("::error::%d skipped test(s) — skips are forbidden in CI." % total)
-              for s in skipped[:20]:
-                  print(f"  - {s}")
-              sys.exit(1)
-          print("No skipped tests. Good.")
-          PY
-
-      - name: Per-file coverage gate (each component >= 90%)
-        # Mirrors `make test` locally: project-wide --cov-fail-under hides
-        # individual file regressions. This step parses coverage.xml and
-        # fails if ANY non-trivial source file is below 90%.
-        run: python scripts/check-per-file-coverage.py
+      - name: Tests + coverage + skip + per-file gate (scripts/ci/run-tests.sh — same script `make test` calls; SPEC 2026-10-11-test-parity-scripted-enforcement + ADDENDUM A1)
+        # One script now owns the pytest invocation (the --cov set, the
+        # reports, --cov-fail-under, --junit-xml), the zero-skip check, and
+        # the per-file coverage gate, so CI and `make test` run IDENTICAL
+        # gates instead of two hand-typed command lines that could (and
+        # did — PR #380 / CI run 37878027812) drift apart. It also forces
+        # the CI shape (no reachable kubectl, bogus KUBECONFIG) even here,
+        # where that's already true, so the SAME invariant holds in both
+        # places. tests/test_ci_make_test_parity.py pins this ENTIRE job
+        # mapping (every key of every step, including this one's `run:`)
+        # against an exact committed golden — an added `continue-on-error`,
+        # `if:` condition, masking suffix, or a dropped/reordered step is a
+        # golden diff, not something a scanner has to notice. A SEPARATE,
+        # explicitly-labelled heuristic (its own docstring says so) scans
+        # every OTHER job across every workflow file for a bare
+        # `pytest`/`py.test` mention outside this script, against an exact
+        # exemption list; it can miss calls, by design.
+        run: bash scripts/ci/run-tests.sh
 
       - name: Upload coverage XML
         if: always()

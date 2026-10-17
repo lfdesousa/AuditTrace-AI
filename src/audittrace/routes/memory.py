@@ -30,7 +30,6 @@ content itself lives in S3 (episodic/procedural) or ChromaDB
 import asyncio
 import contextlib
 import hashlib
-import io
 import logging
 import time
 from collections.abc import Callable
@@ -39,6 +38,7 @@ from typing import Any, Literal
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Body,
     Depends,
     File,
@@ -66,6 +66,7 @@ from audittrace.dependencies import (
     get_postgres_factory,
     get_procedural_service,
     get_semantic_service,
+    get_session_memory_service,
 )
 from audittrace.identity import UserContext
 from audittrace.models import (
@@ -82,13 +83,50 @@ from audittrace.models import (
 # working unchanged.
 from audittrace.routes import memory_pdf as _pdf  # noqa: E402
 from audittrace.routes import memory_scan as _scan  # noqa: E402
+from audittrace.routes.memory_md_manifest import _flush_md_manifest
+from audittrace.routes.memory_promote import (
+    promote_session_to_durable as _promote_session_to_durable,
+)
+from audittrace.routes.memory_semantic_documents import (
+    dedupe_semantic_chunks,
+    group_semantic_chunks_by_document,
+)
 from audittrace.services.embedder import embed_via_nomic
+from audittrace.services.episodic import EpisodicService
+from audittrace.services.index_routing import collection_for_key
 from audittrace.services.layer_listing import list_layer_objects
-from audittrace.services.memory_manifest import ManifestEntry
+from audittrace.services.memory_audit import (
+    MemoryOp,
+    emit_memory_audit_event,
+    schedule_read_audit,
+)
+from audittrace.services.memory_manifest import (
+    ManifestAuthorizationError,
+    ManifestEntry,
+    authorize_write,
+)
+from audittrace.services.pagination import sort_and_paginate as _core_sort_and_paginate
+from audittrace.services.procedural import ProceduralService
+from audittrace.services.recall_telemetry import (
+    classify_recall_source_from_request,
+    emit_recall_telemetry,
+)
+from audittrace.services.session_memory import SessionMemoryService
+from audittrace.services.write_telemetry import emit_chunks_indexed, emit_memory_write
 
 _PDF_WARNING_CODES = _pdf._PDF_WARNING_CODES
 _SIGNATURE_STATUS_CODES = _pdf._SIGNATURE_STATUS_CODES
 _SCAN_STATUS_CODES = _scan._SCAN_STATUS_CODES
+# Re-export, not a copy — a live reference to the SAME frozenset object
+# memory_scan.py owns. `TestEventClassValues` (tests/test_memory_routes.py)
+# imports `_EVENT_CLASS_VALUES` from HERE, so this is the site that must
+# actually see any new value (registering canonically in memory_scan.py
+# alone, without this re-export resolving to the SAME object, was ACL
+# WU-1's F1 defect in new clothes). Because this binds the object itself
+# rather than duplicating its members, `acl_authz` (Sovereign
+# Authorization Layer EPIC, ACL 2b-core-B) is visible here automatically
+# the moment memory_scan.py's frozenset includes it — no separate edit
+# needed at this line, and the pinning test is what proves it.
 _EVENT_CLASS_VALUES = _scan._EVENT_CLASS_VALUES
 _PDFA_PART_RE = _pdf._PDFA_PART_RE
 _PDFA_CONFORMANCE_RE = _pdf._PDFA_CONFORMANCE_RE
@@ -152,6 +190,12 @@ class MemoryLayer(StrEnum):
 
     episodic = "episodic"
     procedural = "procedural"
+    # WU-1 (Sovereign-Attach EPIC) — per-user EPHEMERAL layer, Postgres-
+    # backed (services/session_memory.py), gated by memory:session:write.
+    # Distinct from episodic/procedural: no S3 tier, no corpus/promote
+    # path in this WU (WU-4), no /memory/index single-file support (see
+    # the dispatch guard below) — write-path + isolation only.
+    session = "session"
 
 
 def _chunk_text(
@@ -175,6 +219,33 @@ def _doc_id(collection: str, source: str, chunk_idx: int) -> str:
     """Generate a deterministic document ID."""
     raw = f"{collection}:{source}:{chunk_idx}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# WU-1 (SPEC-2026-09-17-memory-retrieval-and-learning-loop-telemetry, closes
+# D15 item 2 — whole-document read). A generous safety cap on how many
+# chunks ``_iter_document_chunk_ids`` will ever probe for one document: real
+# build records/specs folded by ``_index_md_objects`` at
+# ``CHUNK_SIZE=1500`` have not been observed needing more than a few dozen
+# chunks, so this cap exists to bound worst-case work (a malformed/huge
+# title should not make a single read loop indefinitely), not because any
+# real document is expected to approach it.
+_MAX_DOCUMENT_CHUNKS = 500
+
+
+def _iter_document_chunk_ids(collection: str, title: str) -> list[str]:
+    """The deterministic chunk-id SEQUENCE for one folded document.
+
+    ``_doc_id`` is a pure function of ``(collection, source, chunk_idx)`` —
+    the SAME formula ``_index_md_objects`` uses to name each chunk it
+    writes. Given just the document's ``title`` (== the original
+    filename), chunk 0's id — the front-matter chunk — is directly
+    computable with no hash-guessing, closing the WU-1 obstacle: "front
+    matter (chunk 0) is reachable only via the deterministic ``_doc_id``
+    hash — a real obstacle to the Layer-2 build-record verification every
+    reviewer performs." See ``read_semantic``'s ``whole_document`` mode,
+    the documented consumer of this sequence.
+    """
+    return [_doc_id(collection, title, i) for i in range(_MAX_DOCUMENT_CHUNKS)]
 
 
 def _get_minio_client() -> Any:
@@ -280,6 +351,265 @@ def _require_admin(user: UserContext, action: str) -> None:
     )
 
 
+# ── ADR-062 Phase B (WU-B5) — corpus-write promote gate ─────────────────────
+#
+# The granular ``memory:corpus:<collection>:{read,write}`` scopes are a
+# CLOSED, drift-guarded set (``tests/test_chart_drift_guards.py::
+# TestCorpusScopeGovernance``) declared for exactly the three ChromaDB
+# recall collections (``decisions``/``skills``/``semantic`` — ADR-062 §4,
+# WU-A2/A3). They do NOT exist for the episodic/procedural S3 layers —
+# adding new entries to that frozenset is explicitly out of scope for this
+# PR (it would fail the drift guard). Consequently the promote-to-corpus
+# mechanism this section wires is meaningful ONLY for ``/memory/semantic``;
+# episodic/procedural writes stay private-only (see
+# ``_reject_corpus_promotion_for`` below).
+
+
+def _has_corpus_scope(user: UserContext, collection: str, action: str) -> bool:
+    """``True`` iff *user* holds ``memory:corpus:<collection>:<action>``
+    (or an admin bypass). Boolean twin of ``_require_corpus_scope`` for
+    call sites that need to silently FILTER (list endpoints) rather than
+    reject the whole request (single-doc read/write)."""
+    required = f"memory:corpus:{collection}:{action}"
+    return user.is_admin or "audittrace:admin" in user.scopes or required in user.scopes
+
+
+def _require_corpus_scope(user: UserContext, collection: str, action: str) -> None:
+    """Raise 403 unless *user* holds ``memory:corpus:<collection>:<action>``.
+
+    Mirrors ``_require_layer_write``'s shape (admin bypass +
+    ``audittrace:admin`` bypass + exact-scope match). ``action`` is
+    ``"read"`` or ``"write"``. Falsifiable: a token without the scope
+    (and without admin) is refused; a token WITH the scope (or admin) is
+    let through — see ``TestSemanticCorpusPromoteGate`` /
+    ``TestSemanticCorpusReadGate`` in ``tests/test_memory_routes.py``.
+    """
+    if _has_corpus_scope(user, collection, action):
+        return
+    required = f"memory:corpus:{collection}:{action}"
+    raise HTTPException(
+        status_code=403,
+        detail=f"Required scope: {required} (or audittrace:admin)",
+    )
+
+
+def _corpus_write_authorized(user: UserContext, collection: str | None) -> bool:
+    """``True`` iff *user* may overwrite/demote an EXISTING **corpus**-tier
+    manifest row — the ``caller_can_write_shared`` authorization
+    ``MemoryManifestService.record_create``/``record_update`` require to
+    touch such a row (SPEC security-memory-manifest-tier-authz,
+    2026-08-30).
+
+    ``collection`` is one of the three ADR-062 §4 corpus-scoped ChromaDB
+    collections (``decisions``/``skills``/``semantic``) for ``/memory/
+    semantic`` writes — delegates to ``_has_corpus_scope`` for the exact
+    per-collection grant (or admin). ``None`` is passed for the episodic/
+    procedural layers, which have NO ``memory:corpus:<layer>:write`` scope
+    declared at all (the module note above ``_has_corpus_scope`` — the
+    closed scope set is exactly the three collections above); for those
+    layers only an admin (``audittrace:admin`` or ``is_admin``) can ever
+    satisfy this — matching that no ordinary caller can hold a shared-
+    write grant that does not exist.
+    """
+    if collection is None:
+        return user.is_admin or "audittrace:admin" in user.scopes
+    return _has_corpus_scope(user, collection, "write")
+
+
+def _raise_manifest_authorization_as_403(
+    exc: ManifestAuthorizationError,
+) -> HTTPException:
+    """Map :class:`ManifestAuthorizationError` to the route-layer HTTP 403
+    every other authorization failure in this file uses — never let it
+    fall through to the generic 500 handler (SPEC security-memory-
+    manifest-tier-authz, 2026-08-30, invariant #4: fail-closed, RAISE, not
+    a silent overwrite AND not an opaque 500)."""
+    return HTTPException(status_code=403, detail=str(exc))
+
+
+def _resolve_requested_tier(payload: dict[str, Any] | None, promote: str | None) -> str:
+    """Resolve the caller's requested write tier from an optional JSON
+    body ``"tier"`` field and/or an optional ``?promote=`` query param
+    (ADR-062 Phase B, WU-B5 — "explicit tier=corpus / ?promote=corpus").
+
+    Returns ``"private"`` (the D2 default — no explicit request, or an
+    explicit request for ``"private"``) or ``"corpus"`` (either signal
+    asking for it). Raises 400 on a garbage value or a body/query
+    conflict (e.g. ``{"tier": "private"}`` with ``?promote=corpus``) so a
+    caller never silently gets a different tier than the one they asked
+    for.
+    """
+    body_tier = payload.get("tier") if payload is not None else None
+    if body_tier is not None and promote is not None and body_tier != promote:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"conflicting tier request: body tier={body_tier!r} vs "
+                f"?promote={promote!r}"
+            ),
+        )
+    requested = body_tier if body_tier is not None else promote
+    if requested is None or requested == "private":
+        return "private"
+    if requested == "corpus":
+        return "corpus"
+    raise HTTPException(
+        status_code=400,
+        detail=f"invalid tier {requested!r}; expected 'private' or 'corpus'",
+    )
+
+
+def _manifest_visible(entry: ManifestEntry, user: UserContext) -> bool:
+    """ADR-062 Phase B (WU-B4) — owner-or-corpus predicate for a SINGLE
+    manifest entry, used by the ``read_*`` routes to decide whether the
+    manifest metadata block is safe to return alongside a resolved
+    read. Same shape as ``MemoryManifestService.list_for_layer``'s
+    per-row filter and ``ChromaSemanticService._tier_authorized``.
+
+    Defense-in-depth against the pre-existing ``(layer, key)``
+    global-uniqueness manifest model (migration 009 — "operator-global,
+    not per-user"): a private-tier filename collision across two
+    different callers shares ONE manifest row, so without this check a
+    caller whose OWN content-read already resolved correctly (via the
+    private-tier-first S3/Chroma lookup) could still see a stranger's
+    ``created_by_user_id`` in the ``manifest`` block. This does not fix
+    that collision (out of WU-B4/B5 scope — flagged as a known
+    follow-up), it just stops the row's authorship metadata leaking
+    when it isn't the caller's own."""
+    if user.is_admin:
+        return True
+    return entry.created_by_user_id == user.user_id or entry.tier == "corpus"
+
+
+_SEMANTIC_METADATA_SECURITY_KEYS = frozenset({"tier", "user_id"})
+
+
+def _sanitize_semantic_metadata(metadata: Any) -> Any:
+    """ADR-062 Phase B (WU-B5 review fix, 2026-08-04) — strip
+    caller-supplied ``tier``/``user_id`` keys from a semantic-document
+    ``metadata`` payload before it reaches the service layer.
+
+    ``tier`` and ``user_id`` are TOKEN-DERIVED / route-authorized
+    values (ADR-027 §1), never caller-supplied — see
+    ``ChromaSemanticService.upsert``'s docstring for the exploit this
+    closes: a writer holding only ``memory:semantic:write`` could
+    smuggle ``metadata={"tier": "corpus"}`` past the top-level promote
+    gate (``_resolve_requested_tier`` only ever inspected the top-level
+    body/query signal, never nested ``metadata``), and the forged tag
+    was then trusted downstream by ``_tier_authorized`` on every
+    subsequent read. This strip is belt-and-suspenders on top of the
+    service layer's own unconditional stamp — it protects any
+    ``SemanticService`` implementation (including a future/alternate
+    one) that hasn't been hardened the same way, and applies in BOTH
+    ``create_semantic`` (POST) and ``update_semantic`` (PUT) — a scope
+    gate on one write path is worthless if the sibling path reaches the
+    same sink unguarded.
+
+    Non-dict input (the existing 400 validation elsewhere handles a
+    malformed ``metadata``) passes through unchanged."""
+    if not isinstance(metadata, dict):
+        return metadata
+    return {
+        k: v for k, v in metadata.items() if k not in _SEMANTIC_METADATA_SECURITY_KEYS
+    }
+
+
+def _reject_corpus_promotion_for(layer: str, tier: str) -> None:
+    """400 (not 403) if *tier* asks for corpus on a layer that has no
+    corpus-write scope declared (episodic/procedural — see the module
+    note above). This is a "not supported", not a "not authorized"
+    response: no scope, held by anyone, could ever satisfy this request,
+    so a 403 would misleadingly suggest a missing grant would fix it."""
+    if tier == "corpus":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"corpus promotion is not supported for the {layer!r} layer; "
+                "only /memory/semantic collections support corpus promotion "
+                "(ADR-062 Phase B, WU-B5)"
+            ),
+        )
+
+
+async def _emit_write_audit(
+    *,
+    user: UserContext,
+    op: MemoryOp,
+    layer: str,
+    collection: str | None = None,
+    key: str | None = None,
+    detail_extra: dict[str, Any] | None = None,
+) -> None:
+    """Fail-closed wrapper around :func:`emit_memory_audit_event` for every
+    WRITE/DELETE call site (ADR-062 §5, WU-A4).
+
+    See ``services/memory_audit.py``'s module docstring for the full
+    read=fail-open / write=fail-closed rationale. This wrapper converts an
+    audit-store failure into an explicit ``HTTPException(500)`` rather than
+    letting a bare exception fall through to the app-wide catch-all
+    handler — the caller gets a precise, on-brand error (matching every
+    other 5xx in this file) instead of a generic unhandled-exception
+    envelope, and the failure is deterministically visible to
+    ``TestClient`` (Starlette's ``ServerErrorMiddleware`` always re-raises
+    after an unhandled exception, which ``TestClient`` in turn re-raises
+    into the caller's test — an explicit ``HTTPException`` is the
+    established pattern this file already uses everywhere else a service
+    call can fail, e.g. ``_require_admin``'s 403, the 502s below)."""
+    try:
+        await emit_memory_audit_event(
+            user=user,
+            op=op,
+            layer=layer,
+            collection=collection,
+            key=key,
+            detail_extra=detail_extra,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"memory audit-write failed — mutation not confirmed audited: {exc}"
+            ),
+        ) from exc
+
+
+async def _write_layer_private(
+    layer: MemoryLayer, user: UserContext, filename: str, content: str
+) -> None:
+    """Dispatch to the target layer's PRIVATE-tier write, normalizing
+    its exceptions to the same 400/502 shape every other CRUD route in
+    this file uses.
+
+    Episodic/procedural (ADR-062 Phase B, WU-B5): shared by
+    ``upload_memory_file``'s legacy non-PDF branch so a plain
+    /memory/upload gets WU-B2's private-tier routing + cache
+    invalidation + filename validation for free, instead of hand-rolling
+    a raw S3 ``put_object`` that used to land unconditionally in the
+    shared/corpus bucket regardless of who uploaded (the leak this WU
+    closes — see ``upload_memory_file``'s docstring).
+
+    Session (WU-1, Sovereign-Attach EPIC): dispatches to the Postgres-
+    backed ``SessionMemoryService`` instead — there is no S3 tier for
+    this layer (see ``services/session_memory.py``'s module docstring).
+    """
+    service: EpisodicService | ProceduralService | SessionMemoryService
+    if layer == MemoryLayer.session:
+        service = get_session_memory_service()
+    elif layer == MemoryLayer.episodic:
+        service = get_episodic_service()
+    else:
+        service = get_procedural_service()
+    try:
+        await service.write(user, filename, content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.error("Memory-layer write failed (layer=%s): %s", layer.value, exc)
+        raise HTTPException(
+            status_code=502, detail="Memory-layer write failed"
+        ) from exc
+
+
 @router.post("/upload")
 async def upload_memory_file(
     # ``Request[Any]`` would satisfy pre-commit mypy 1.8 (which can't
@@ -292,6 +622,14 @@ async def upload_memory_file(
     file: UploadFile = File(...),
     layer: MemoryLayer = Query(...),
     filename: str | None = Query(None),
+    promote: str | None = Query(
+        None,
+        description=(
+            "Set to 'corpus' to request a corpus-tier write. Neither "
+            "episodic nor procedural has a corpus-write scope declared "
+            "(ADR-062 §4) — any corpus request here returns 400."
+        ),
+    ),
     # NOT auth-only: the real gate is the dynamic per-layer
     # ``_require_layer_write`` below. The static ``scopes=[]`` only keeps
     # OAuth2 declared in the OpenAPI spec (same pattern as /memory/index);
@@ -310,22 +648,43 @@ async def upload_memory_file(
       with ``scan_status='pending_scan'``, and an AMQP scan-request is
       enqueued. The response is **HTTP 202** with a ``scan_id`` and
       poll URL. Promotion to ``episodic/papers/`` happens
-      asynchronously in content-control once the verdict is clean.
+      asynchronously in content-control once the verdict is clean. This
+      branch is UNCHANGED by ADR-062 Phase B — the async quarantine →
+      verdict → promotion pipeline is ADR-048's content-control
+      concern, out of WU-B4/WU-B5's scope.
 
-    * **Non-PDF uploads** (markdown skills, ADRs, plain text)
-      keep the existing synchronous path: PUT to
-      ``{layer}/{filename}`` and return HTTP 200 with the
-      direct-write summary.
+    * **Non-PDF uploads** (markdown skills, ADRs, plain text): ADR-062
+      Phase B (WU-B5) — writes to the caller's PRIVATE tier via the
+      episodic/procedural service's own ``write()`` (already wired to
+      the private bucket by WU-B2), closing a leak where every non-PDF
+      upload used to land unconditionally in the shared/corpus bucket
+      regardless of who uploaded it. Neither layer has a declared
+      corpus-write scope (ADR-062 §4's frozenset is exactly
+      decisions/skills/semantic), so ``?promote=corpus`` is rejected
+      with 400 rather than silently accepted or silently ignored.
+
+    * **``layer=session`` uploads** (WU-1, Sovereign-Attach EPIC): a
+      THIRD case of the non-PDF branch — writes to the Postgres-backed,
+      per-user, EPHEMERAL session layer instead of S3
+      (``services/session_memory.py``). PDF content is refused for this
+      layer (400) rather than routed into the quarantine pipeline above:
+      that pipeline promotes a clean verdict into ``episodic/papers/``
+      (DURABLE) regardless of the ``layer`` query param — silently
+      letting it through would let a token holding ONLY
+      ``memory:session:write`` (nothing durable) land content durably
+      anyway, defeating this WU's least-privilege wall.
 
     Authorization (per-layer): the caller's JWT must carry
     ``memory:<layer>:write`` matching the ``layer`` query parameter
     (or ``audittrace:admin``). A token with ``memory:procedural:write``
-    cannot upload to ``layer=episodic`` and vice-versa. This is enforced
-    by ``_require_layer_write`` on the first line below — the endpoint is
-    **not** auth-only despite the static ``scopes=[]`` on the OAuth2
-    declaration (which exists only so the spec lists the security scheme;
-    the effective scope is dynamic in the ``layer`` parameter, so it
-    cannot be declared statically — same contract as ``/memory/index``).
+    cannot upload to ``layer=episodic`` and vice-versa; a token with
+    ONLY ``memory:session:write`` cannot upload to any durable layer.
+    This is enforced by ``_require_layer_write`` on the first line below
+    — the endpoint is **not** auth-only despite the static ``scopes=[]``
+    on the OAuth2 declaration (which exists only so the spec lists the
+    security scheme; the effective scope is dynamic in the ``layer``
+    parameter, so it cannot be declared statically — same contract as
+    ``/memory/index``).
     """
     _require_layer_write(user, layer)
     settings = get_settings()
@@ -343,6 +702,23 @@ async def upload_memory_file(
 
     claimed_ct = file.content_type or ""
     if is_pdf_upload(claimed_content_type=claimed_ct, content=content):
+        if layer == MemoryLayer.session:
+            # WU-1 — see the docstring's third bullet: the quarantine →
+            # verdict → promotion pipeline below has no ephemeral-tier
+            # concept (``handle_pdf_upload`` never even receives
+            # ``layer``), so it would land clean-verdict PDFs durably
+            # regardless of the caller's declared layer. Fail closed
+            # until a PDF-aware session pipeline ships (deferred, out of
+            # WU-1 scope) rather than silently widen a
+            # memory:session:write-only token's reach.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "PDF upload to layer=session is not supported — the "
+                    "PDF ingestion pipeline has no ephemeral tier yet; "
+                    "session uploads must be plain text"
+                ),
+            )
         from audittrace.dependencies import (  # noqa: PLC0415
             get_postgres_factory,
         )
@@ -369,48 +745,119 @@ async def upload_memory_file(
         return body
 
     # ── Legacy synchronous path (markdown, etc.) ────────────────
-    # ADR-006 — effective bucket switches between MinIO (default) and
-    # AWS S3 based on AUDITTRACE_OBJECT_STORAGE_BACKEND. The minio
-    # variable name in settings is kept for backwards compatibility.
-    bucket = (
-        settings.aws_bucket
-        if settings.object_storage_backend == "aws"
-        else settings.minio_shared_bucket
-    )
-    key = f"{layer.value}/{target_filename}"
-
+    # ADR-062 Phase B (WU-B5): defaults to the caller's PRIVATE tier.
+    # See the docstring above + `_write_layer_private` for the leak this
+    # closes. ``?promote=corpus`` has no declared scope for any of these
+    # three layers, so it is rejected outright (fail-closed) rather than
+    # silently downgraded to private or silently ignored.
+    tier = _resolve_requested_tier(None, promote)
+    _reject_corpus_promotion_for(layer.value, tier)
     try:
-        minio_client.put_object(
-            bucket,
-            key,
-            io.BytesIO(content),
-            length=len(content),
-        )
-    except Exception as exc:
-        logger.error("MinIO upload failed: %s", exc)
+        text_content = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise HTTPException(
-            status_code=502, detail="Object storage write failed"
+            status_code=400,
+            detail="non-PDF /memory/upload content must be UTF-8 text",
         ) from exc
 
+    await _write_layer_private(layer, user, target_filename, text_content)
+
+    # M2 — write-telemetry counter (layer label, no PII).
+    emit_memory_write(layer=layer.value)
+
+    if layer == MemoryLayer.session:
+        # WU-1 — no S3 bucket backs this layer (Postgres-only; see
+        # services/session_memory.py), so the response omits the
+        # ``bucket`` field the S3-backed branch below returns rather
+        # than report a bucket name the bytes never touched. Frozen
+        # invariant (traceability, feedback_traceability_requirement):
+        # write the usual audit row, token-derived identity, awaited
+        # inline (fail-closed — see services/memory_audit.py).
+        await _emit_write_audit(
+            user=user,
+            op="write",
+            layer=MemoryLayer.session.value,
+            key=target_filename,
+            detail_extra={"tier": "private"},
+        )
+        key = f"{user.user_id}/{layer.value}/{target_filename}"
+        logger.info(
+            "Uploaded %s (%d bytes) to session memory (tier=private, ephemeral) key=%s",
+            target_filename,
+            len(content),
+            key,
+        )
+        return {
+            "status": "uploaded",
+            "layer": MemoryLayer.session.value,
+            "key": key,
+            "size_bytes": len(content),
+            "tier": "private",
+        }
+
+    private_bucket = (
+        settings.aws_private_bucket
+        if settings.object_storage_backend == "aws"
+        else settings.minio_private_bucket
+    )
+    key = f"{user.user_id}/{layer.value}/{target_filename}"
+
     logger.info(
-        "Uploaded %s (%d bytes) to s3://%s/%s",
+        "Uploaded %s (%d bytes) to s3://%s/%s (tier=private)",
         target_filename,
         len(content),
-        bucket,
+        private_bucket,
         key,
     )
 
-    # Backlog #15, R3: /memory/upload writes S3 directly, so it must invalidate
-    # the shared listing cache or the new object stays invisible to the list
-    # (fleet-wide, since the cache is shared) until the TTL expires.
-    _invalidate_layer_list_cache(layer.value)
-
     return {
         "status": "uploaded",
-        "bucket": bucket,
+        "bucket": private_bucket,
         "key": key,
         "size_bytes": len(content),
+        "tier": "private",
     }
+
+
+# ── POST /memory/promote ────────────────────────────────────────────────────
+
+
+@router.post("/promote")
+async def promote_memory(
+    payload: dict[str, Any] = Body(
+        ..., description="{filename, target_layer?, collection?, title?}"
+    ),
+    # NOT auth-only: the real gate is
+    # ``memory_promote._require_durable_write_scope`` below, dynamic in
+    # the (validated) ``target_layer`` body field — same pattern as
+    # ``upload_memory_file``'s static ``scopes=[]`` + dynamic
+    # ``_require_layer_write``, since a single decorator can't express
+    # "memory:episodic:write OR memory:semantic:write" as an AND-only
+    # FastAPI ``Security(..., scopes=[...])`` declaration.
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=[]),
+    user: UserContext = Depends(require_user),
+) -> dict[str, Any]:
+    """Promote (COPY, never move) the caller's own ephemeral ``session``
+    document into a durable memory layer — WU-4 of the Sovereign-Attach
+    EPIC's explicit "keep this" action.
+
+    Body: ``{"filename": <session doc reference>, "target_layer":
+    <"episodic"|"semantic", default "episodic">, "collection": <optional,
+    semantic only>, "title": <optional>}``. ``target_layer`` outside the
+    durable set (``session``/``conversational``/anything unknown) is
+    rejected 422 — never silently coerced.
+
+    Authorization: the caller's JWT must carry
+    ``memory:<target_layer>:write`` (or ``audittrace:admin``) — a token
+    holding ONLY ``memory:session:write`` (everything WU-1/2/3 grant by
+    default) gets 403 here. Ownership of the session doc is enforced by
+    ``SessionMemoryService.read_own`` (404 if not the caller's own).
+
+    The implementation lives in ``audittrace.routes.memory_promote`` —
+    see that module's docstring for the full step-by-step + why the
+    logic is split out of this (already >3000 LOC) file.
+    """
+    return await _promote_session_to_durable(payload, user)
 
 
 # ── POST /memory/index ──────────────────────────────────────────────────────
@@ -484,21 +931,72 @@ async def _index_md_objects(
     col_name: str,
     category: str,
     user_id: str,
+    tier: str,
+    user: UserContext,
+    outcomes: list[bool] | None = None,
+    manifest_service: Any | None = None,
+    caller_can_write_shared: bool = False,
 ) -> int:
     """Stream-index ``.md`` files into *collection*.
 
     Per-file: read → chunk → add → drop. Avoids holding the cross-corpus
     document list in memory.
+
+    *outcomes* (#430 v3) — when supplied, every object in *objects*
+    appends exactly one ``bool`` here: ``True`` once the object clears
+    both the extension check AND the MinIO read (i.e. it was actually
+    ACCEPTED for processing — independent of how many chunks the
+    content happens to yield), ``False`` when the object is rejected
+    on extension mismatch or the read fails. This is the per-object
+    OUTCOME signal the ``/memory/index`` handler uses to distinguish a
+    genuine routing/read rejection from a benign empty-content file —
+    unconditionally available (unlike ``?details``), so the handler's
+    loud-422 guard never depends on an opt-in query flag.
+
+    *manifest_service* (ADR-059 WU-1c, 2026-08-08) — when supplied, every
+    chunk written to ChromaDB also gets a manifest row via
+    ``memory_md_manifest._flush_md_manifest`` (best-effort, mirrors
+    ``_flush_pdf_manifest`` for the PDF path, ADR-056). This is the
+    durable fix for the fleet-recall discovery-cap bug: a manifest row
+    makes the fold visible through ``list_semantic``'s UNCAPPED,
+    ``created_at_ms``-ordered manifest scan instead of relying solely on
+    the capped, non-recency-ordered ``col.get()`` discovery fallback. See
+    the module docstring on ``memory_md_manifest`` for the full story.
+
+    *caller_can_write_shared* — threaded straight through to
+    ``memory_md_manifest._flush_md_manifest``'s ``record_create`` call
+    (the manifest-layer guard, DEFENSE-IN-DEPTH behind *user* below).
+
+    *user* (SPEC security-memory-write-authorization-choke, 2026-08-30 —
+    SUPERSEDES relying on the manifest-layer guard alone) — the PRIMARY
+    enforcement. Before EACH file's ``_upsert_in_batches`` ChromaDB write,
+    every chunk's destination key is checked via
+    ``authorize_write(manifest_service, user, ...)``: content-address
+    collisions are attacker-computable (the doc id is a deterministic hash
+    of collection+filename+chunk index — "corpus is discoverable by
+    design"), so a caller whose SOURCE object is legitimately private-tier
+    can still target an EXISTING corpus-tier ChromaDB row by choosing a
+    colliding filename. This is the exact vulnerability three independent
+    reviews found: the manifest-layer guard alone fires only AFTER the
+    ChromaDB write already landed, and the flush helper used to swallow
+    the resulting error (WARNING + 200). Raises before any byte of THIS
+    file's chunks reaches ChromaDB — never a partial write.
     """
     total = 0
     for obj in objects:
         if not obj["filename"].endswith(".md"):
+            if outcomes is not None:
+                outcomes.append(False)
             continue
         raw = await asyncio.to_thread(
             _read_minio_object, minio_client, bucket, obj["key"]
         )
         if raw is None:
+            if outcomes is not None:
+                outcomes.append(False)
             continue
+        if outcomes is not None:
+            outcomes.append(True)
         content = raw.decode("utf-8", errors="replace")
         chunks = _chunk_text(content)
         if not chunks:
@@ -523,6 +1021,25 @@ async def _index_md_objects(
                 # documents", so the model read it as "this does not exist"
                 # (#374). Do not introduce a second ownership key.
                 "user_id": user_id,
+                # ADR-059 fleet-recall gap (WU-1, 2026-08-07): stamp the
+                # ALREADY-resolved (`index_memory`'s token-derived, ADR-027
+                # §1 tenancy) tier onto every chunk. Before this fix, no
+                # `tier` key was ever written here — the backoffice
+                # discovery-merge builder (`_merge_semantic_with_chroma`)
+                # defaults an untagged row's surfaced tier to `"corpus"`
+                # (its `meta.get("tier", "corpus")`), and `list_semantic`'s
+                # `_filter_corpus_read_gate` then drops any corpus-tagged
+                # item the caller lacks `memory:corpus:<collection>:read`
+                # for. So a caller's OWN genuinely-private single-file fold
+                # (e.g. the ADR-059 fleet helper's `log_deploy_record`) was
+                # silently misclassified as corpus and gated out, even
+                # though it was never meant to require a corpus scope at
+                # all. This is metadata accuracy, not a scope/tenancy
+                # decision — `tier` is the SAME value the caller's
+                # ``POST /memory/upload``/``?file=`` key prefix already
+                # resolved (private vs corpus), just not previously
+                # propagated into ChromaDB.
+                "tier": tier,
             }
             for i in range(len(chunks))
         ]
@@ -530,8 +1047,40 @@ async def _index_md_objects(
             skill_name = obj["filename"].replace("SKILL-", "").replace(".md", "")
             for m in metadatas:
                 m["skill"] = skill_name
+        # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+        # PRIMARY pre-write choke, BEFORE the ChromaDB upsert two lines
+        # below. Every chunk this file would land at is checked; the first
+        # unauthorized one aborts the WHOLE file's upsert (never a partial
+        # write). ``manifest_service is None`` only ever happens in a unit
+        # test that deliberately omits it to exercise something else — see
+        # ``_flush_md_manifest``'s own None-skip contract; production
+        # always resolves a real manifest service.
+        if manifest_service is not None:
+            for doc_id in ids:
+                await authorize_write(
+                    manifest_service,
+                    user,
+                    "semantic",
+                    _semantic_key(col_name, doc_id),
+                    requested_tier=tier,
+                )
         await _upsert_in_batches(collection, ids, chunks, metadatas)
         total += len(chunks)
+        # ADR-059 WU-1c — thread the manifest write (see this function's
+        # docstring + the memory_md_manifest module docstring). Runs after
+        # the ChromaDB upsert, same ordering as the PDF path
+        # (_flush_pdf_manifest is called once the chunks/pages are
+        # committed) — the manifest is a durable INDEX onto ChromaDB
+        # content, not a precondition for it.
+        await _flush_md_manifest(
+            manifest_service,
+            keys=[_semantic_key(col_name, doc_id) for doc_id in ids],
+            filename=obj["filename"],
+            sizes_bytes=[len(c.encode("utf-8")) for c in chunks],
+            user_id=user_id,
+            tier=tier,
+            caller_can_write_shared=caller_can_write_shared,
+        )
     return total
 
 
@@ -609,11 +1158,35 @@ async def index_memory(
       static ``scopes=[]`` keeps OAuth2 declared in the OpenAPI
       spec; the prose contract lives here.
     """
+    # ADR-062 Phase B (#426) — tier disambiguation anchored on the TOKEN
+    # sub, never the caller-supplied key (ADR-027 §1: tenancy is
+    # token-derived, NEVER caller-supplied). ``tier``/``layer_for_scope``
+    # are set here and consumed further down for bucket selection, object
+    # dispatch, cache invalidation, and the write-audit ``detail_extra``.
+    # Bulk mode always stays "corpus" (admin cross-user shared rebuild;
+    # ``layer_for_scope`` stays ``None`` — bulk indexes both layers).
+    tier: str = "corpus"
+    layer_for_scope: MemoryLayer | None = None
     if file is None:
         _require_admin(user, "bulk /memory/index rebuild")
     else:
+        # A private-tier key from POST /memory/upload has shape
+        # "{jwt.sub}/{layer}/{filename}" (memory.py:635). The legacy
+        # corpus/shared key shape is "{layer}/{filename}". Testing the
+        # TOKEN prefix first means a foreign sub can never take the
+        # private branch: "{other_sub}/episodic/x.md" does not start
+        # with this caller's token prefix, so it falls to the corpus
+        # branch below, where "{other_sub}" is not a valid MemoryLayer
+        # -> 400. Cross-user private read is impossible by construction.
+        token_prefix = f"{user.user_id}/"
         try:
-            layer_str, _ = file.split("/", 1)
+            if file.startswith(token_prefix):
+                tier = "private"
+                remainder = file[len(token_prefix) :]
+                layer_str = remainder.split("/", 1)[0]
+            else:
+                tier = "corpus"
+                layer_str = file.split("/", 1)[0]
             layer_for_scope = MemoryLayer(layer_str)
         except (KeyError, ValueError):
             raise HTTPException(
@@ -627,7 +1200,19 @@ async def index_memory(
     target_collections = (
         [c.strip() for c in collections.split(",") if c.strip()]
         if collections
-        else list(_DEFAULT_COLLECTIONS)
+        # SPEC #387 (WU-4, GAP-2 closure) — single-file mode with no
+        # explicit ``?collections=`` auto-routes by content type
+        # instead of falling through to the bulk-mode 3-collection
+        # default (which is ``.md``-only and either 400s here on the
+        # "requires exactly one collection" check below, or — for a
+        # caller who *did* pick one of those three — silently accepts
+        # 0 chunks for a PDF). A promoted PDF's default index now
+        # lands in ``ai_research_papers``, not a no-op.
+        else (
+            [collection_for_key(file)]
+            if file is not None
+            else list(_DEFAULT_COLLECTIONS)
+        )
     )
 
     unknown = [c for c in target_collections if c not in _KNOWN_COLLECTIONS]
@@ -640,17 +1225,59 @@ async def index_memory(
             ),
         )
 
+    # SPEC security-memory-manifest-tier-authz (2026-08-30) — close the
+    # index-route gate: ``_require_layer_write``/the single-file-mode check
+    # above only enforces BASE ``memory:<layer>:write``, regardless of the
+    # tier the ``?file=`` key resolved to. Before this, a base-scope caller
+    # could ``POST /memory/index?file=<corpus-prefixed-key>`` (tier resolved
+    # "corpus" above) and reach the manifest choke unauthorized — the
+    # manifest-level guard (``upsert_pdf_metadata``/``_flush_md_manifest``)
+    # is a best-effort SWALLOW there (never blows up the index call), so on
+    # its own it degrades a hijack attempt into "silent no-op", not the
+    # explicit 403 a caller deserves. Bulk mode is unaffected (`tier` stays
+    # "corpus" but ``_require_admin`` already ran above, and admin always
+    # satisfies ``_corpus_write_authorized``). Fail-closed: refuse rather
+    # than allow when this is ambiguous.
+    if tier == "corpus":
+        unauthorized_collections = [
+            c for c in target_collections if not _corpus_write_authorized(user, c)
+        ]
+        if unauthorized_collections:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Required scope: memory:corpus:<collection>:write (or "
+                    "audittrace:admin) to index into an existing corpus-tier "
+                    f"target — missing for: {sorted(unauthorized_collections)!r}"
+                ),
+            )
+
     settings = get_settings()
     # ADR-006 — effective bucket switches between MinIO (default) and
     # AWS S3 based on AUDITTRACE_OBJECT_STORAGE_BACKEND. The minio
     # variable name in settings is kept for backwards compatibility.
-    bucket = (
+    shared_bucket = (
         settings.aws_bucket
         if settings.object_storage_backend == "aws"
         else settings.minio_shared_bucket
     )
+    # ADR-062 Phase B (#426) — private bucket mirrors the write side
+    # (memory.py:630-634). Bulk mode never selects it (tier stays
+    # "corpus" — admin cross-user shared-corpus rebuild); single-file
+    # mode selects it only when the tier disambiguation above resolved
+    # ``tier == "private"``.
+    private_bucket = (
+        settings.aws_private_bucket
+        if settings.object_storage_backend == "aws"
+        else settings.minio_private_bucket
+    )
+    bucket = private_bucket if tier == "private" else shared_bucket
     minio_client = _get_minio_client()
     chroma_client = get_chromadb()
+    # ADR-059 WU-1c — resolved once and threaded into BOTH the .md path
+    # (_index_md_objects) and the PDF path (already consumed it) so every
+    # indexer in this call writes to the same manifest instance.
+    manifest_service = get_memory_manifest_service()
 
     start = time.time()
     # One ingestion timestamp per /memory/index call — every chunk
@@ -660,6 +1287,28 @@ async def index_memory(
     ingestion_ts_ms = int(start * 1000)
     results: dict[str, int] = {}
     total_chunks = 0
+    # #430 v3 (REVIEW REJECT #2 2026-08-07 fix) — the discriminator for the
+    # loud-422 guard below. v2 gated on ``objects_attempted == 0``, which
+    # only measured "was the layer ROUTED to an indexer call" — it did NOT
+    # measure whether the routed object was actually ACCEPTED, so a
+    # single-file extension mismatch (routed to ``_index_md_objects`` but
+    # rejected there on the ``.md`` suffix check) or a corrupted-PDF
+    # exception (routed to ``_index_pdf_objects`` but flushed ``ok=False``)
+    # both wrongly stayed 200. ``object_outcomes`` instead accumulates the
+    # ACTUAL per-object outcome — one ``bool`` per object dispatched to
+    # either indexer, appended by the indexer itself: ``True`` once the
+    # object clears extension/read (md) or reaches the pipeline's
+    # ``ok=True`` flush (pdf) — regardless of how many chunks it yields —
+    # ``False`` on any rejection/skip/failure (extension mismatch, read
+    # failure, bomb-defense reject, encryption, corrupted-PDF exception).
+    # This is ALWAYS available (unlike ``details_log``, which is opt-in via
+    # ``?details``) and answers the principled question "was the object
+    # actually processed vs rejected/skipped" rather than "did processing
+    # yield chunks" — a text-free/image-free PDF page is legitimately
+    # processed (``ok=True``) with 0 chunks to embed (memory_pdf/pipeline.py
+    # "truly empty page — benign, no warning"), so ``total_chunks == 0``
+    # alone conflates that benign case with a genuine rejection.
+    object_outcomes: list[bool] = []
     # Tier-C #24 (ADR-056) — when ?details=true, every PDF processed
     # appends one outcome row here for inclusion in the response.
     # Allocated unconditionally to keep the call sites uniform; only
@@ -679,18 +1328,35 @@ async def index_memory(
                     "(single-file mode is per-collection)."
                 ),
             )
+        # Dispatch on the RESOLVED layer (``layer_for_scope``), not on the
+        # raw key's prefix (#426): a private key's first segment is the
+        # token sub, not a layer, so a ``file.startswith("episodic/")``
+        # test would silently miss every private-tier object. The FULL
+        # key (incl. sub prefix for private keys) is kept as ``"key"`` so
+        # ``minio_client.get_object(bucket, key)`` resolves either tier.
         single_obj: dict[str, str] = {
             "key": file,
             "filename": file.rsplit("/", 1)[-1],
         }
-        if file.startswith("episodic/"):
+        if layer_for_scope == MemoryLayer.episodic:
             episodic_objects = [single_obj]
-        elif file.startswith("procedural/"):
+        elif layer_for_scope == MemoryLayer.procedural:
             procedural_objects = [single_obj]
         else:
+            # WU-1 (Sovereign-Attach EPIC) made this branch REACHABLE:
+            # ``layer_for_scope`` can now resolve to ``MemoryLayer.session``
+            # too (validated above by ``MemoryLayer(layer_str)``), and the
+            # session layer is Postgres-backed (services/session_memory.py)
+            # — it has no MinIO/S3 object for this ChromaDB-embedding
+            # pipeline to walk. Fail closed with a 400 ("not supported",
+            # never silently 0-chunk) rather than extending this dispatch
+            # to a storage backend /memory/index does not speak.
             raise HTTPException(
                 status_code=400,
-                detail="file= must start with 'episodic/' or 'procedural/'",
+                detail=(
+                    "single-file /memory/index supports only "
+                    "episodic/ and procedural/ layers"
+                ),
             )
     else:
         episodic_objects = _list_objects_from_minio(minio_client, bucket, "episodic/")
@@ -720,74 +1386,119 @@ async def index_memory(
         )
 
         chunk_count = 0
-        if col_name in ("decisions", "semantic"):
-            chunk_count += await _index_md_objects(
-                collection,
-                minio_client,
-                bucket,
-                episodic_objects,
-                col_name,
-                category="episodic",
-                user_id=user.user_id,
-            )
-        if col_name in ("skills", "semantic"):
-            chunk_count += await _index_md_objects(
-                collection,
-                minio_client,
-                bucket,
-                procedural_objects,
-                col_name,
-                category="procedural",
-                user_id=user.user_id,
-            )
-        if col_name == "ai_research_papers":
-            # Tier-B item #22 + tier-C items #23/#24 (ADR-056): thread
-            # the manifest service AND the per-document details
-            # accumulator AND the dry-run flag. The manifest service
-            # writes Postgres rows (skipped under dry_run); the details
-            # accumulator collects per-doc outcomes for the
-            # ?details=true response shape.
-            manifest_service = get_memory_manifest_service()
-            chunk_count += await _index_pdf_objects(
-                collection,
-                minio_client,
-                bucket,
-                episodic_objects,
-                col_name,
-                category="episodic",
-                layer_prefix="episodic/",
-                user_id=user.user_id,
-                ingestion_ts_ms=ingestion_ts_ms,
-                manifest_service=manifest_service,
-                details_log=details_log,
-                dry_run=dry_run,
-            )
-            chunk_count += await _index_pdf_objects(
-                collection,
-                minio_client,
-                bucket,
-                procedural_objects,
-                col_name,
-                category="procedural",
-                layer_prefix="procedural/",
-                user_id=user.user_id,
-                ingestion_ts_ms=ingestion_ts_ms,
-                manifest_service=manifest_service,
-                details_log=details_log,
-                dry_run=dry_run,
-            )
+        # SPEC security-memory-write-authorization-choke (2026-08-30) —
+        # SUPERSEDES the manifest-only fix. ``col_caller_can_write_shared``
+        # (the manifest-layer DEFENSE-IN-DEPTH guard, unchanged) is still
+        # threaded through; PRIMARY enforcement is now ``user`` itself,
+        # threaded into ``_index_md_objects``/``_index_pdf_objects`` so
+        # EACH file's ``authorize_write`` pre-write choke runs before its
+        # ChromaDB upsert — not only before the (best-effort, no-longer-
+        # swallowing) manifest write after it.
+        col_caller_can_write_shared = _corpus_write_authorized(user, col_name)
+        # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+        # PRE-WRITE choke (``authorize_write``, called inside
+        # ``_index_md_objects``/``_index_pdf_objects`` below) raises
+        # ManifestAuthorizationError; map it to 403 HERE at the route, since
+        # the index helpers are route-agnostic (also called by the
+        # non-HTTP auto-index worker) and must not raise HTTPException
+        # themselves.
+        try:
+            if col_name in ("decisions", "semantic"):
+                chunk_count += await _index_md_objects(
+                    collection,
+                    minio_client,
+                    bucket,
+                    episodic_objects,
+                    col_name,
+                    category="episodic",
+                    user_id=user.user_id,
+                    tier=tier,
+                    user=user,
+                    outcomes=object_outcomes,
+                    manifest_service=manifest_service,
+                    caller_can_write_shared=col_caller_can_write_shared,
+                )
+            if col_name in ("skills", "semantic"):
+                chunk_count += await _index_md_objects(
+                    collection,
+                    minio_client,
+                    bucket,
+                    procedural_objects,
+                    col_name,
+                    category="procedural",
+                    user_id=user.user_id,
+                    tier=tier,
+                    user=user,
+                    outcomes=object_outcomes,
+                    manifest_service=manifest_service,
+                    caller_can_write_shared=col_caller_can_write_shared,
+                )
+            if col_name == "ai_research_papers":
+                # Tier-B item #22 + tier-C items #23/#24 (ADR-056): thread
+                # the manifest service AND the per-document details
+                # accumulator AND the dry-run flag. The manifest service
+                # writes Postgres rows (skipped under dry_run); the details
+                # accumulator collects per-doc outcomes for the
+                # ?details=true response shape. ``outcomes`` (#430 v3) is the
+                # separate, ALWAYS-populated per-object ok/reject signal the
+                # loud-422 guard below reads. (ADR-059 WU-1c: ``manifest_service``
+                # is now resolved once, above the ``for col_name`` loop, and
+                # shared with the ``.md`` path too — no longer re-fetched here.)
+                chunk_count += await _index_pdf_objects(
+                    collection,
+                    minio_client,
+                    bucket,
+                    episodic_objects,
+                    col_name,
+                    category="episodic",
+                    layer_prefix="episodic/",
+                    user_id=user.user_id,
+                    ingestion_ts_ms=ingestion_ts_ms,
+                    user=user,
+                    manifest_service=manifest_service,
+                    details_log=details_log,
+                    dry_run=dry_run,
+                    outcomes=object_outcomes,
+                    caller_can_write_shared=col_caller_can_write_shared,
+                )
+                chunk_count += await _index_pdf_objects(
+                    collection,
+                    minio_client,
+                    bucket,
+                    procedural_objects,
+                    col_name,
+                    category="procedural",
+                    layer_prefix="procedural/",
+                    user_id=user.user_id,
+                    ingestion_ts_ms=ingestion_ts_ms,
+                    user=user,
+                    manifest_service=manifest_service,
+                    details_log=details_log,
+                    dry_run=dry_run,
+                    outcomes=object_outcomes,
+                    caller_can_write_shared=col_caller_can_write_shared,
+                )
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
 
         results[col_name] = chunk_count
         total_chunks += chunk_count
+        # M2 — emit per-collection chunk-indexed counter (no PII).
+        if chunk_count > 0:
+            emit_chunks_indexed(collection=col_name, chunk_count=chunk_count)
         logger.info("Indexed %s: %d chunks", col_name, chunk_count)
 
     # Backlog #15, R3: after a real (non-dry-run) index seed, invalidate the
     # shared listing caches so any objects the seed run touched are re-read
     # fresh on the next list. Skipped for dry-run (no side effects).
     if not dry_run:
-        if file is None or file.startswith("episodic/"):
+        # #426: keyed off the RESOLVED layer (``layer_for_scope``), not the
+        # raw key prefix — a private key's first segment is the token sub,
+        # so ``file.startswith("episodic/")`` would never match and a
+        # private-tier index would fail to self-heal the list cache.
+        if file is None or layer_for_scope == MemoryLayer.episodic:
             _invalidate_layer_list_cache(MemoryLayer.episodic.value)
-        if file is None or file.startswith("procedural/"):
+        if file is None or layer_for_scope == MemoryLayer.procedural:
             _invalidate_layer_list_cache(MemoryLayer.procedural.value)
 
     duration = time.time() - start
@@ -801,6 +1512,67 @@ async def index_memory(
         response["dry_run"] = True
     if details:
         response["documents"] = details_log
+    # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
+    # closed). One event per /memory/index call, naming every target
+    # collection touched; single-file mode additionally names the key.
+    await _emit_write_audit(
+        user=user,
+        op="write",
+        layer="semantic",
+        collection=",".join(target_collections),
+        key=file,
+        detail_extra={
+            "mode": "single_file" if single_file_mode else "bulk",
+            "dry_run": dry_run,
+            "total_chunks": total_chunks,
+            # ADR-062 Phase B (#426) — additive-only field (audit schema
+            # frozen at 1.17.0): "private" or "corpus", per the tier
+            # resolution above.
+            "tier": tier,
+        },
+    )
+    # #430 — a single-file index whose object was never actually accepted by
+    # an indexer is a silent failure wearing a 200: the caller believes the
+    # object landed and it was not. The write ATTEMPT is still audited above
+    # (ADR-058 — the attempt, with ``total_chunks: 0``, is already in
+    # ``detail_extra``) before this loud fail.
+    #
+    # v3 (REVIEW REJECT #2 2026-08-07): gate on ``any(object_outcomes)``, NOT
+    # ``objects_attempted == 0`` (v2) or ``total_chunks == 0`` (v1). v2's
+    # ``objects_attempted`` only proved the object's LAYER was routed to an
+    # indexer call — it said nothing about whether the indexer then ACCEPTED
+    # the object, so an extension mismatch (``.pdf`` key indexed into a
+    # ``.md``-only collection, rejected inside ``_index_md_objects``) or a
+    # corrupted-PDF parse exception (rejected inside ``_index_pdf_objects``,
+    # flushed ``ok=False``) both wrongly stayed 200 under v2 — reopening
+    # #430. ``object_outcomes`` is populated by the indexers themselves with
+    # the ACTUAL per-object outcome (True = accepted/processed, independent
+    # of resulting chunk count; False = rejected/skipped/failed), so
+    # ``not any(object_outcomes)`` is true both when the object was routed
+    # but rejected AND when it was never routed at all (empty list). A
+    # text-free/image-free PDF page still appends True (the pipeline reaches
+    # its ``ok=True`` flush even with 0 chunks written) — benign, stays 200.
+    # Bulk mode is exempt (an admin whole-collection rebuild legitimately
+    # attempts 0 objects when nothing matches) and dry-run is exempt (no
+    # write intended) — both keep returning 200.
+    if single_file_mode and not dry_run and not any(object_outcomes):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"single-file index of file={file!r} into "
+                f"collections={target_collections!r} wrote 0 chunks — "
+                "the object was NOT indexed (it was not accepted by any "
+                "indexer for this collection). Plausible causes: the "
+                "object's layer prefix does not match the target "
+                "collection's ingestion routing (e.g. a procedural/ or "
+                "episodic/ key indexed into a collection that only "
+                "accepts the other layer), the object's file extension "
+                "does not match what this collection ingests (e.g. a "
+                ".pdf key indexed into a .md-only collection), the file "
+                "could not be read from object storage, or the file "
+                "could not be parsed (e.g. a corrupted/unreadable PDF)."
+            ),
+        )
     return response
 
 
@@ -840,12 +1612,49 @@ def _validate_filename_or_400(filename: str, layer: str) -> None:
         )
 
 
+def _strip_known_key_prefixes(raw: str, layer: str, user_id: str) -> str:
+    """WU-1 (2026-09-17, closes D15 item 4 — "the key-shape trap").
+
+    ``POST /memory/upload``'s response ``key`` (and ``POST
+    /memory/index``'s ``?file=`` param) use the FULL, sub-prefixed shape
+    ``"{user_id}/{layer}/{name}"``; the read/update/delete routes have
+    always taken the BARE ``name``. Pasting the upload key into a read
+    route used to 404 with no hint (a live 404 on 2026-09-15). Rather than
+    only documenting the trap, this makes the READ routes tolerant of
+    either shape: a caller-supplied value starting with the caller's own
+    ``"{user_id}/{layer}/"`` or the bare ``"{layer}/"`` prefix has that
+    prefix stripped before the bare-filename validation/lookup runs; a
+    value that matches neither prefix is passed through unchanged (the
+    pre-WU-1 behaviour), so an already-bare filename is never altered.
+
+    Scoped to the READ path only (write/update/delete routes are
+    deliberately left unchanged in this WU — widening the MUTATION
+    surface's key parsing is a separate, higher-stakes decision than
+    making a read more forgiving).
+    """
+    sub_prefix = f"{user_id}/{layer}/"
+    layer_prefix = f"{layer}/"
+    if raw.startswith(sub_prefix):
+        return raw[len(sub_prefix) :]
+    if raw.startswith(layer_prefix):
+        return raw[len(layer_prefix) :]
+    return raw
+
+
 # ── /memory/episodic ────────────────────────────────────────────────────────
 
 
 @router.post("/episodic")
 async def create_episodic(
     payload: dict[str, Any] = Body(..., description="{filename, content, title?}"),
+    promote: str | None = Query(
+        None,
+        description=(
+            "Set to 'corpus' to request a corpus-tier write. Episodic has no "
+            "corpus-write scope declared (ADR-062 §4) — any corpus request "
+            "here returns 400, not a partial/soft acceptance."
+        ),
+    ),
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
@@ -853,6 +1662,13 @@ async def create_episodic(
 
     Idempotent on the manifest: re-creating a soft-deleted item revives
     it (clearing ``deleted_at_ms``) and bumps ``modified_at_ms``.
+
+    ADR-062 Phase B (WU-B5): every write lands in the caller's PRIVATE
+    tier (``tier="private"``, owner=caller) — ``service.write`` already
+    only ever targets the private bucket (WU-B2); this just stamps the
+    manifest row to match. Episodic has no corpus-write scope in the
+    ADR-062 §4 catalogue, so a ``tier=corpus``/``?promote=corpus``
+    request is rejected (400) rather than silently downgraded.
     """
     filename = payload.get("filename")
     content = payload.get("content")
@@ -862,22 +1678,42 @@ async def create_episodic(
             detail="filename and content are required string fields",
         )
     _validate_filename_or_400(filename, "episodic")
+    tier = _resolve_requested_tier(payload, promote)
+    _reject_corpus_promotion_for("episodic", tier)
     title = payload.get("title")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, checked BEFORE any content lands (S3 write below).
+    # Supersedes relying on record_create's own guard alone, which only
+    # fires AFTER the content write on other paths (this route never had
+    # that ordering bug, but every content-write entry point now calls
+    # the same choke uniformly per the ratified spec).
+    try:
+        await authorize_write(manifest, user, "episodic", filename, requested_tier=tier)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = await manifest.record_create(
-        layer="episodic",
-        key=filename,
-        title=title,
-        size_bytes=len(content.encode("utf-8")),
-        user_id=user.user_id,
-    )
+    try:
+        entry: ManifestEntry = await manifest.record_create(
+            layer="episodic",
+            key=filename,
+            title=title,
+            size_bytes=len(content.encode("utf-8")),
+            user_id=user.user_id,
+            tier=tier,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
+    # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
+    # closed: see services/memory_audit.py module docstring).
+    await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
     return entry.to_dict()
 
 
@@ -912,6 +1748,11 @@ def _sort_and_paginate(
     ``key`` sort coalesces to ``""``, so no comparison ever touches ``None``
     (backlog #15, R5). Ties break on the object ``key`` ascending regardless
     of ``order`` (stable secondary sort) so paging is deterministic.
+
+    The sort/slice mechanic itself is the shared
+    :func:`audittrace.services.pagination.sort_and_paginate` core (backlog
+    #15 R2b / #375) — only the field-name-to-key-function mapping below is
+    specific to this endpoint's manifest-row shape.
     """
 
     def _int_key(field: str) -> Callable[[dict[str, Any]], Any]:
@@ -932,14 +1773,14 @@ def _sort_and_paginate(
     else:
         primary = _int_key(_SORT_FIELD_MS.get(sort, "created_at_ms"))
 
-    # Stable secondary sort (key ascending) first, then the primary sort —
-    # Python's sort is stable, so equal-primary items keep the key-asc order.
-    ordered = sorted(items, key=lambda item: str(item.get("key") or ""))
-    ordered = sorted(ordered, key=primary, reverse=(order != "asc"))
-
-    total = len(ordered)
-    page = ordered[offset : offset + limit]
-    return page, total
+    return _core_sort_and_paginate(
+        items,
+        key_fn=primary,
+        tiebreak_fn=_str_key,
+        reverse=(order != "asc"),
+        limit=limit,
+        offset=offset,
+    )
 
 
 async def _merge_layer_items_with_s3(
@@ -965,12 +1806,23 @@ async def _merge_layer_items_with_s3(
     resurrect on every list as "discovered" because the S3 object
     is still there — we'd be papering over the operator's delete
     intent.
+
+    ADR-062 Phase B (WU-B4): ``visible_entries`` is already
+    owner-or-corpus scoped by the caller (``list_episodic``/
+    ``list_procedural`` pass ``caller=user`` to ``list_for_layer``).
+    ``all_known`` (used only to build ``known_keys`` for the dedup
+    check below) is scoped the same way — a key only visible via
+    another caller's private manifest row is treated as "not yet
+    known" here, but the discovery loop's own per-user
+    ``service.load(user)`` call (already private∪corpus-scoped since
+    WU-B2) never surfaces that other caller's content either, so no
+    leak results: the key just correctly doesn't appear at all.
     """
     items: list[dict[str, Any]] = [e.to_dict() for e in visible_entries]
 
     manifest = get_memory_manifest_service()
     all_known: list[ManifestEntry] = await manifest.list_for_layer(
-        layer, include_deleted=True
+        layer, include_deleted=True, caller=user
     )
     known_keys = {e.key for e in all_known}
 
@@ -1017,6 +1869,10 @@ async def _merge_layer_items_with_s3(
                 "deleted_at_ms": None,
                 "deleted_by_user_id": None,
                 "discovered": True,
+                # ADR-062 Phase B (WU-B4) — surface tier on discovered
+                # rows too; `service.load(user)` (WU-B2) already stamps
+                # `metadata["tier"]` on every returned Document.
+                "tier": doc.metadata.get("tier", "corpus"),
             }
         )
     return items
@@ -1041,6 +1897,9 @@ async def list_episodic(
     offset: int = Query(0, ge=0, description="Zero-based pagination offset."),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:read"]),
     user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
     """List ADRs / decision records. Merges manifest rows with S3 objects so
     content uploaded via /memory/upload or seeded via index-chromadb surfaces
@@ -1049,25 +1908,56 @@ async def list_episodic(
     ``include_deleted=true`` returns soft-deleted manifest rows; it has no
     effect on discovered entries (they have no soft-delete state).
     ``sort``/``order``/``limit``/``offset`` page the merged set (backlog #15,
-    R5); ``total`` is the full pre-limit count."""
+    R5); ``total`` is the full pre-limit count.
+
+    ADR-062 Phase B (WU-B4): manifest-tracked rows are scoped to the
+    caller's own private tier ∪ corpus (``list_for_layer(caller=user)``)
+    — a non-admin caller never sees another user's private manifest
+    row. No corpus-read scope gate applies to this layer (episodic has
+    no declared ``memory:corpus:episodic:read`` — the ADR-062 §4
+    frozenset covers only decisions/skills/semantic); corpus content
+    stays visible to any ``memory:episodic:read`` holder, same as
+    before this PR."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
-        "episodic", include_deleted=include_deleted
+        "episodic", include_deleted=include_deleted, caller=user
     )
     items = await _merge_layer_items_with_s3("episodic", entries, user)
     page, total = _sort_and_paginate(
         items, sort=sort, order=order, limit=limit, offset=offset
     )
+    # ADR-062 §5 (WU-A4) — read path, fail-open background emit (see
+    # services/memory_audit.py module docstring).
+    schedule_read_audit(background_tasks, user=user, op="list", layer="episodic")
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request), "episodic", total, cache="n/a"
+    )
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
-@router.get("/episodic/{filename}")
+@router.get("/episodic/{filename:path}")
 async def read_episodic(
     filename: str,
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:read"]),
     user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
-    """Read ADR content + manifest metadata."""
+    """Read ADR content + manifest metadata.
+
+    ADR-062 Phase B (WU-B4): the content itself was already resolved
+    private-first-then-corpus by ``service.read`` (WU-B2), so a 404
+    here means genuinely missing (not a cross-user disclosure). The
+    manifest metadata block is additionally scoped by
+    ``_manifest_visible`` — see its docstring for why.
+
+    WU-1 (2026-09-17, closes D15 item 4): the path parameter is
+    ``{filename:path}`` (accepts embedded ``/``) and
+    ``_strip_known_key_prefixes`` normalizes an upload/index-shaped key
+    (``"{user_id}/episodic/{name}"`` or ``"episodic/{name}"``) down to the
+    bare filename BEFORE validation — see that helper's docstring."""
+    filename = _strip_known_key_prefixes(filename, "episodic", user.user_id)
     _validate_filename_or_400(filename, "episodic")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
@@ -1075,6 +1965,14 @@ async def read_episodic(
     if doc is None:
         raise HTTPException(status_code=404, detail="ADR not found")
     entry: ManifestEntry | None = await manifest.get("episodic", filename)
+    if entry is not None and not _manifest_visible(entry, user):
+        entry = None
+    schedule_read_audit(
+        background_tasks, user=user, op="read", layer="episodic", key=filename
+    )
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request), "episodic", 1, cache="n/a"
+    )
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -1101,6 +1999,12 @@ async def update_episodic(
     title = payload.get("title")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the S3 write below.
+    try:
+        await authorize_write(manifest, user, "episodic", filename)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
@@ -1114,6 +2018,7 @@ async def update_episodic(
             size_bytes=len(content.encode("utf-8")),
             user_id=user.user_id,
             title=title,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(
@@ -1121,6 +2026,9 @@ async def update_episodic(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
+    await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
     return entry.to_dict()
 
 
@@ -1137,7 +2045,13 @@ async def delete_episodic(
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
-    """Soft-delete by default; ``?hard=true`` also purges the S3 object."""
+    """Soft-delete by default; ``?hard=true`` also purges the S3 object.
+
+    ADR-062 §6 (WU-A5): the manifest soft-delete is authoritative for
+    corpus content — ``?hard=true`` is NOT the default delete path (the
+    ``hard`` query param defaults to ``False`` and additionally requires
+    ``audittrace:admin``), and a hard purge is audited with
+    ``detail_extra={"hard": True}`` same as every other delete."""
     _validate_filename_or_400(filename, "episodic")
     if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
         raise HTTPException(
@@ -1146,17 +2060,37 @@ async def delete_episodic(
         )
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the soft-delete. Defense-in-depth ahead of
+    # record_delete's own guard (uniform enforcement point across every
+    # mutation, not just this route's create/update).
+    try:
+        await authorize_write(manifest, user, "episodic", filename)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         entry: ManifestEntry = await manifest.record_delete(
-            "episodic", filename, user.user_id
+            "episodic",
+            filename,
+            user.user_id,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete(user, filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await _emit_write_audit(
+        user=user,
+        op="delete",
+        layer="episodic",
+        key=filename,
+        detail_extra={"hard": hard},
+    )
     return entry.to_dict()
 
 
@@ -1166,10 +2100,22 @@ async def delete_episodic(
 @router.post("/procedural")
 async def create_procedural(
     payload: dict[str, Any] = Body(..., description="{filename, content, title?}"),
+    promote: str | None = Query(
+        None,
+        description=(
+            "Set to 'corpus' to request a corpus-tier write. Procedural has "
+            "no corpus-write scope declared (ADR-062 §4) — any corpus "
+            "request here returns 400."
+        ),
+    ),
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
-    """Create a SKILL document. Body shape mirrors POST /memory/episodic."""
+    """Create a SKILL document. Body shape mirrors POST /memory/episodic.
+
+    ADR-062 Phase B (WU-B5): default write is PRIVATE-tier, owner=caller;
+    see ``create_episodic``'s docstring for the corpus-promotion rejection
+    rationale (identical for procedural)."""
     filename = payload.get("filename")
     content = payload.get("content")
     if not isinstance(filename, str) or not isinstance(content, str):
@@ -1178,22 +2124,38 @@ async def create_procedural(
             detail="filename and content are required string fields",
         )
     _validate_filename_or_400(filename, "procedural")
+    tier = _resolve_requested_tier(payload, promote)
+    _reject_corpus_promotion_for("procedural", tier)
     title = payload.get("title")
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the S3 write below.
+    try:
+        await authorize_write(
+            manifest, user, "procedural", filename, requested_tier=tier
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = await manifest.record_create(
-        layer="procedural",
-        key=filename,
-        title=title,
-        size_bytes=len(content.encode("utf-8")),
-        user_id=user.user_id,
-    )
+    try:
+        entry: ManifestEntry = await manifest.record_create(
+            layer="procedural",
+            key=filename,
+            title=title,
+            size_bytes=len(content.encode("utf-8")),
+            user_id=user.user_id,
+            tier=tier,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
+    await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
     return entry.to_dict()
 
 
@@ -1216,27 +2178,45 @@ async def list_procedural(
     offset: int = Query(0, ge=0, description="Zero-based pagination offset."),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:read"]),
     user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
     """List SKILLs. Same merge-with-S3 + sort/paginate semantics as
     `/memory/episodic` so all ``.md`` items appear alongside
-    operator-created ones (backlog #15)."""
+    operator-created ones (backlog #15).
+
+    ADR-062 Phase B (WU-B4): same owner-or-corpus manifest scoping as
+    ``list_episodic`` — see its docstring."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
-        "procedural", include_deleted=include_deleted
+        "procedural", include_deleted=include_deleted, caller=user
     )
     items = await _merge_layer_items_with_s3("procedural", entries, user)
     page, total = _sort_and_paginate(
         items, sort=sort, order=order, limit=limit, offset=offset
     )
+    schedule_read_audit(background_tasks, user=user, op="list", layer="procedural")
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request), "procedural", total, cache="n/a"
+    )
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
-@router.get("/procedural/{filename}")
+@router.get("/procedural/{filename:path}")
 async def read_procedural(
     filename: str,
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:read"]),
     user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
+    """ADR-062 Phase B (WU-B4): same manifest-visibility scoping as
+    ``read_episodic`` — see its docstring. WU-1 (2026-09-17, D15 item 4):
+    same key-shape tolerance as ``read_episodic`` — see
+    ``_strip_known_key_prefixes``."""
+    filename = _strip_known_key_prefixes(filename, "procedural", user.user_id)
     _validate_filename_or_400(filename, "procedural")
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
@@ -1244,6 +2224,14 @@ async def read_procedural(
     if doc is None:
         raise HTTPException(status_code=404, detail="SKILL not found")
     entry: ManifestEntry | None = await manifest.get("procedural", filename)
+    if entry is not None and not _manifest_visible(entry, user):
+        entry = None
+    schedule_read_audit(
+        background_tasks, user=user, op="read", layer="procedural", key=filename
+    )
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request), "procedural", 1, cache="n/a"
+    )
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -1267,6 +2255,12 @@ async def update_procedural(
     title = payload.get("title")
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the S3 write below.
+    try:
+        await authorize_write(manifest, user, "procedural", filename)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
@@ -1280,6 +2274,7 @@ async def update_procedural(
             size_bytes=len(content.encode("utf-8")),
             user_id=user.user_id,
             title=title,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(
@@ -1287,6 +2282,9 @@ async def update_procedural(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
+    await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
     return entry.to_dict()
 
 
@@ -1297,6 +2295,8 @@ async def delete_procedural(
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
+    """Soft-delete by default; ``?hard=true`` also purges the S3 object
+    (ADR-062 §6 — same discipline as ``delete_episodic``)."""
     _validate_filename_or_400(filename, "procedural")
     if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
         raise HTTPException(
@@ -1305,17 +2305,35 @@ async def delete_procedural(
         )
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the soft-delete.
+    try:
+        await authorize_write(manifest, user, "procedural", filename)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         entry: ManifestEntry = await manifest.record_delete(
-            "procedural", filename, user.user_id
+            "procedural",
+            filename,
+            user.user_id,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete(user, filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await _emit_write_audit(
+        user=user,
+        op="delete",
+        layer="procedural",
+        key=filename,
+        detail_extra={"hard": hard},
+    )
     return entry.to_dict()
 
 
@@ -1335,13 +2353,32 @@ def _semantic_key(collection: str, document_id: str) -> str:
 @router.post("/semantic")
 async def create_semantic(
     payload: dict[str, Any] = Body(
-        ..., description="{collection, document_id, text, metadata?, title?}"
+        ...,
+        description="{collection, document_id, text, metadata?, title?, tier?}",
+    ),
+    promote: str | None = Query(
+        None,
+        description=(
+            "Set to 'corpus' to write into the shared corpus collection "
+            "instead of the caller's private tier. Requires "
+            "memory:corpus:<collection>:write (or audittrace:admin)."
+        ),
     ),
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Upsert a semantic-layer document. The collection's embedding
-    function (configured at chart install time) handles vectorisation."""
+    function (configured at chart install time) handles vectorisation.
+
+    ADR-062 Phase B (WU-B5): default write lands in the caller's PRIVATE
+    tier (``tier="private"``, owner=caller — ``ChromaSemanticService.
+    upsert``'s own default). An explicit ``"tier": "corpus"`` body field
+    or ``?promote=corpus`` query param routes the write to the shared
+    corpus collection instead, but ONLY if the caller holds
+    ``memory:corpus:<collection>:write`` (or ``audittrace:admin`` /
+    admin) — this is the scope gate WU-B3 wired the write TARGET for but
+    deliberately left unenforced (see ``ChromaSemanticService.upsert``'s
+    docstring)."""
     collection = payload.get("collection")
     document_id = payload.get("document_id")
     text = payload.get("text")
@@ -1354,27 +2391,131 @@ async def create_semantic(
             status_code=400,
             detail="collection, document_id and text are required strings",
         )
-    metadata = payload.get("metadata")
+    metadata = _sanitize_semantic_metadata(payload.get("metadata"))
     title = payload.get("title")
+    tier = _resolve_requested_tier(payload, promote)
+    if tier == "corpus":
+        _require_corpus_scope(user, collection, "write")
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the ChromaDB write below. Semantic already
+    # gated the "requested tier=corpus" case above via
+    # _require_corpus_scope; this ALSO covers overwriting an EXISTING
+    # corpus-tier row when the caller requested private (the exploit
+    # class three reviews found on the .md/PDF index paths — this route
+    # was never actually vulnerable to it, since service.upsert only
+    # targets the tier-specific physical collection, but the choke is
+    # applied uniformly per the ratified spec).
     try:
-        await service.upsert(user, collection, document_id, text, metadata)
+        await authorize_write(
+            manifest,
+            user,
+            "semantic",
+            _semantic_key(collection, document_id),
+            requested_tier=tier,
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
+    try:
+        await service.upsert(user, collection, document_id, text, metadata, tier=tier)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = await manifest.record_create(
+    try:
+        entry: ManifestEntry = await manifest.record_create(
+            layer="semantic",
+            key=_semantic_key(collection, document_id),
+            title=title,
+            size_bytes=len(text.encode("utf-8")),
+            user_id=user.user_id,
+            tier=tier,
+            caller_can_write_shared=_corpus_write_authorized(user, collection),
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
+    await _emit_write_audit(
+        user=user,
+        op="write",
         layer="semantic",
-        key=_semantic_key(collection, document_id),
-        title=title,
-        size_bytes=len(text.encode("utf-8")),
-        user_id=user.user_id,
+        collection=collection,
+        key=document_id,
     )
     return entry.to_dict()
+
+
+async def _discover_rows_for_caller(
+    col: Any, user: UserContext
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    """Fetch discovery candidate rows from one physical ChromaDB collection,
+    scoped so a caller's OWN rows always survive ``_SEMANTIC_DISCOVERY_LIMIT``.
+
+    ADR-059 fleet-recall gap (WU-1, 2026-08-07): the discovery scan used to
+    be a single UNFILTERED ``col.get(limit=_SEMANTIC_DISCOVERY_LIMIT)`` —
+    the owner-or-corpus predicate was applied only AFTER that raw slice was
+    taken. On a physical collection with more rows than the cap (the normal
+    case for a well-used collection like ``decisions_v2``), a caller's own
+    freshly-written private row can sort anywhere in ChromaDB's internal
+    `get()` order and simply never land inside the first `limit` rows — so
+    `list_semantic` (and therefore the fleet helper
+    ``scripts/deploy/memory.py::recall_deploy_lessons``, which reads this
+    endpoint) reported "0 lessons" for a caller's OWN just-folded decision
+    even though the row existed and was owned by them.
+
+    Fix: for a non-admin caller, run an ADDITIONAL flat-equality scan scoped
+    to ``where={"user_id": user.user_id}`` so every row the caller owns is a
+    candidate for the cap, not just whichever ones happened to land in an
+    unfiltered top-N slice; merge it (de-duplicated by id) with the original
+    unfiltered scan so existing corpus/shared visibility within the cap is
+    unchanged. Two separate flat-equality queries rather than one `$or`
+    clause — mirrors ``ChromaSemanticService.search``'s established
+    two-query pattern (`services/semantic.py`), because the in-repo
+    ChromaDB test double only supports flat-equality `where`
+    (`db/factory.py::MockCollection.get`). Admin keeps the single
+    unfiltered scan, unchanged — an admin's discovery view must stay
+    uncapped by ownership.
+    """
+    if user.is_admin:
+        res = await col.get(
+            limit=_SEMANTIC_DISCOVERY_LIMIT, include=["documents", "metadatas"]
+        )
+        return (
+            list(res.get("ids") or []),
+            list(res.get("documents") or []),
+            list(res.get("metadatas") or []),
+        )
+
+    own_res, general_res = (
+        await col.get(
+            where={"user_id": user.user_id},
+            limit=_SEMANTIC_DISCOVERY_LIMIT,
+            include=["documents", "metadatas"],
+        ),
+        await col.get(
+            limit=_SEMANTIC_DISCOVERY_LIMIT, include=["documents", "metadatas"]
+        ),
+    )
+    ids: list[str] = []
+    docs: list[str] = []
+    metas: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for res in (own_res, general_res):
+        res_ids = res.get("ids") or []
+        res_docs = res.get("documents") or []
+        res_metas = res.get("metadatas") or []
+        for i, doc_id in enumerate(res_ids):
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            ids.append(doc_id)
+            docs.append(res_docs[i] if i < len(res_docs) else "")
+            metas.append(res_metas[i] if i < len(res_metas) and res_metas[i] else {})
+    return ids, docs, metas
 
 
 async def _merge_semantic_with_chroma(
     visible_entries: list[ManifestEntry],
     collection: str | None,
+    user: UserContext,
 ) -> list[dict[str, Any]]:
     """Same shape as `_merge_layer_items_with_s3` for the semantic layer.
 
@@ -1384,12 +2525,36 @@ async def _merge_semantic_with_chroma(
     on collections that grow large; operators who need to browse a
     large semantic store can paginate via the manifest's offset/limit
     once they've created tracked rows for the items they care about.
+    ``_discover_rows_for_caller`` (above) additionally guarantees a
+    non-admin caller's OWN rows are never dropped by that cap (ADR-059
+    WU-1).
+
+    ADR-062 Phase B (§3 hole 2): the raw `col.get()` discovery scan below
+    used to enumerate EVERY row in every scanned collection with no
+    `where` at all — any caller with `memory:semantic:read` could list
+    another user's private vectors this way. A discovered row is now
+    included only if the caller is admin, the row is CORPUS-tier
+    (`metadata["tier"] == "corpus"`, deliberately unfiltered — D1), or
+    the row's `metadata["user_id"]` matches the caller — the same
+    predicate as `ChromaSemanticService._tier_authorized` (deliberately
+    not imported here: this function reads raw ChromaDB responses, not
+    through the service).
+
+    ADR-062 Phase B (WU-B4): ``visible_entries`` is now ALSO scoped by
+    the caller — ``list_semantic`` passes ``caller=user`` into
+    ``list_for_layer``, closing the gap this docstring used to flag as
+    deferred. ``all_known`` (dedup lookup only) is scoped the same way;
+    see ``_merge_layer_items_with_s3``'s docstring for why that's safe
+    (the discovery loop below has its own independent owner-or-corpus
+    check, so a key hidden from ``known_keys`` by the caller filter
+    still can't leak through as a "discovered" row for someone else's
+    private vector).
     """
     items: list[dict[str, Any]] = [e.to_dict() for e in visible_entries]
 
     manifest = get_memory_manifest_service()
     all_known: list[ManifestEntry] = await manifest.list_for_layer(
-        "semantic", include_deleted=True
+        "semantic", include_deleted=True, caller=user
     )
     known_keys = {e.key for e in all_known}
 
@@ -1418,22 +2583,25 @@ async def _merge_semantic_with_chroma(
                 name=col_name,
                 embedding_function=None,
             )
-            res = await col.get(
-                limit=_SEMANTIC_DISCOVERY_LIMIT,
-                include=["documents", "metadatas"],
-            )
+            ids, docs, metas = await _discover_rows_for_caller(col, user)
         except Exception as exc:
             logger.warning("ChromaDB get failed for collection %s: %s", col_name, exc)
             continue
-        ids = res.get("ids") or []
-        docs = res.get("documents") or []
-        metas = res.get("metadatas") or []
         for i, doc_id in enumerate(ids):
             key = _semantic_key(col_name, doc_id)
             if key in known_keys:
                 continue
             content = docs[i] if i < len(docs) else ""
             meta = metas[i] if i < len(metas) and metas[i] else {}
+            # ADR-062 Phase B (§3 hole 2) — close the raw-Chroma enumeration
+            # hole: skip a discovered row the caller does not own and that
+            # isn't corpus-tier. See the function docstring.
+            if not (
+                user.is_admin
+                or meta.get("tier") == "corpus"
+                or meta.get("user_id") == user.user_id
+            ):
+                continue
             title = meta.get("title") or meta.get("source") or doc_id
             items.append(
                 {
@@ -1444,14 +2612,72 @@ async def _merge_semantic_with_chroma(
                     "size_bytes": len((content or "").encode("utf-8")),
                     "created_at_ms": None,
                     "modified_at_ms": None,
-                    "created_by_user_id": None,
+                    # ADR-059 WU-1b — propagate the row's owner (the SAME
+                    # ``user_id`` key ``_index_md_objects`` stamps and this
+                    # function's own owner-or-corpus predicate above already
+                    # reads) instead of the previous hardcoded ``None``. This
+                    # is what lets ``_filter_corpus_read_gate``'s ownership
+                    # exemption recognise a discovered row as the caller's
+                    # own even when its ``tier`` reads (or mis-defaults to)
+                    # ``"corpus"``.
+                    "created_by_user_id": meta.get("user_id"),
                     "modified_by_user_id": None,
                     "deleted_at_ms": None,
                     "deleted_by_user_id": None,
                     "discovered": True,
+                    # ADR-062 Phase B (WU-B4) — surface tier; D3's corpus
+                    # read-scope gate is applied by the caller
+                    # (`list_semantic`) over the full merged item list.
+                    "tier": meta.get("tier", "corpus"),
                 }
             )
     return items
+
+
+def _filter_corpus_read_gate(
+    items: list[dict[str, Any]], user: UserContext
+) -> list[dict[str, Any]]:
+    """ADR-062 Phase B (WU-B4, D3) — drop corpus-tier semantic items the
+    caller isn't cleared to see through the BACKOFFICE list surface.
+
+    D3: "reading corpus content through /memory/{layer} requires the
+    granular memory:corpus:<collection>:read". Applied here (not inside
+    ``_merge_semantic_with_chroma``) so it uniformly covers BOTH
+    manifest-tracked and discovered rows in one pass, keyed off each
+    item's already-stamped ``tier``. Corpus recall via the LLM tool loop
+    (``recall_semantic``) is NOT affected — that path stays
+    deliberately unfiltered per D1; this gate is specific to the
+    ``/memory/semantic`` REST surface (the operator/curator-tier
+    backoffice), matching "Phase-A operator-tier corpus scoping".
+
+    ADR-059 WU-1b (2026-08-07) — OWNERSHIP EXEMPTION. A caller reading
+    their OWN content never needs a corpus scope: a row the caller wrote
+    is exempted from this gate regardless of what its ``tier`` reads.
+    This is the robust fix for the live fleet-recall gap — WU-1 (2026-08-07)
+    fixed the tier STAMP written at index time, but a caller's own row
+    must be visible independent of whether the tier stamp is honest,
+    missing (pre-WU-1 legacy rows), or mis-defaulted to ``"corpus"`` by
+    ``_merge_semantic_with_chroma``'s ``meta.get("tier", "corpus")``
+    fallback. Checked BEFORE the scope lookup so an owner never needs
+    ``memory:corpus:<collection>:read`` to see their own fold. Applies
+    uniformly to manifest-tracked items (``created_by_user_id`` is the
+    manifest's writer) and to discovered items (populated from the
+    ChromaDB row's ``user_id`` metadata by ``_merge_semantic_with_chroma``,
+    WU-1b) — the SAME ownership key ``ChromaSemanticService.search``
+    filters on (see ``_index_md_objects``'s docstring)."""
+    visible = []
+    for item in items:
+        if item.get("tier") != "corpus":
+            visible.append(item)
+            continue
+        if item.get("created_by_user_id") == user.user_id:
+            visible.append(item)
+            continue
+        key = item.get("key") or ""
+        collection = key.split("/", 1)[0] if "/" in key else key
+        if _has_corpus_scope(user, collection, "read"):
+            visible.append(item)
+    return visible
 
 
 # Cap per-collection discovery scan so the list endpoint stays snappy
@@ -1480,40 +2706,287 @@ async def list_semantic(
         description="Page size (max 500).",
     ),
     offset: int = Query(0, ge=0, description="Zero-based pagination offset."),
+    granularity: Literal["document", "chunk"] = Query(
+        "document",
+        description=(
+            "'document' (default, WU-1 2026-09-17 — closes D15): de-duplicate "
+            "chunk rows by their shared 'title' before sort/paginate, so "
+            "'limit' means N DOCUMENTS, not N chunks — a multi-chunk record "
+            "used to crowd smaller/older ones out of the same limit window. "
+            "'chunk' restores the pre-WU-1 raw per-ChromaDB-row view (one row "
+            "per physical id) for callers that walk rows individually, e.g. "
+            "scripts/curator/runner.py's intake."
+        ),
+    ),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:read"]),
+    user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
     """List semantic-layer items. Merges the manifest with ChromaDB
     discovery so pre-PR-A vectors (seeded via index-chromadb.py) surface
     alongside operator-created ones. Sort/paginate mirror the other layer
-    lists for consistency (backlog #15, R5)."""
+    lists for consistency (backlog #15, R5).
+
+    ADR-062 WU-A1: requires an authenticated user like every sibling
+    list/read handler (closes the CS-4 anomaly of a memory-list endpoint
+    with no identity at all, so a future audit event can attribute the
+    read).
+
+    ADR-062 Phase B (WU-B3): the ChromaDB-DISCOVERED rows (untracked in
+    the manifest) are filtered — non-admin sees only its own
+    private-tier rows plus corpus-tier rows (`_merge_semantic_with_chroma`
+    §3 hole 2).
+
+    ADR-062 Phase B (WU-B4): manifest-TRACKED rows (`entries` below) are
+    now ALSO owner-or-corpus scoped (`list_for_layer(caller=user)`) —
+    closes the gap the previous docstring flagged as deferred. On top
+    of ownership scoping, D3's operator/curator-tier gate additionally
+    drops any CORPUS-tier item (tracked or discovered) the caller
+    lacks ``memory:corpus:<collection>:read`` for
+    (`_filter_corpus_read_gate`).
+
+    WU-1 (2026-09-17, closes D15 — see ``routes/memory_semantic_documents``
+    module docstring for the full defect writeup): the merged chunk-level
+    ``items`` are de-duplicated (two discovery paths can otherwise surface
+    the SAME physical ChromaDB row under two differently-prefixed keys) and
+    then, by default, grouped by document (``title``) BEFORE
+    ``_sort_and_paginate`` runs — so ``limit``/``offset``/``total`` all
+    operate on documents, not chunks. The response always reports BOTH
+    ``total_documents`` and ``total_chunks`` regardless of ``granularity``,
+    so a caller can tell the two numbers apart (the exact confusion that
+    caused the D15 defect: 25 chunks silently meant 4 documents)."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
-        "semantic", include_deleted=include_deleted
+        "semantic", include_deleted=include_deleted, caller=user
     )
     if collection is not None:
         prefix = f"{collection}/"
         entries = [e for e in entries if e.key.startswith(prefix)]
-    items = await _merge_semantic_with_chroma(entries, collection)
+    items = await _merge_semantic_with_chroma(entries, collection, user)
+    items = _filter_corpus_read_gate(items, user)
+    chunk_items = dedupe_semantic_chunks(items)
+    total_chunks = len(chunk_items)
+    if granularity == "chunk":
+        view_items = chunk_items
+        total_documents = len(group_semantic_chunks_by_document(chunk_items))
+    else:
+        view_items = group_semantic_chunks_by_document(chunk_items)
+        total_documents = len(view_items)
     page, total = _sort_and_paginate(
-        items, sort=sort, order=order, limit=limit, offset=offset
+        view_items, sort=sort, order=order, limit=limit, offset=offset
     )
-    return {"items": page, "total": total, "limit": limit, "offset": offset}
+    schedule_read_audit(
+        background_tasks,
+        user=user,
+        op="list",
+        layer="semantic",
+        collection=collection,
+    )
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request),
+        collection or "semantic",
+        total,
+        cache="n/a",
+    )
+    return {
+        "items": page,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "granularity": granularity,
+        "total_documents": total_documents,
+        "total_chunks": total_chunks,
+    }
+
+
+async def _gather_whole_document(
+    service: Any,
+    user: UserContext,
+    collection: str,
+    document_id: str,
+    doc: Any,
+) -> tuple[list[str], list[Any]]:
+    """WU-1 (closes D15 item 2 — whole-document read). Reconstruct every
+    chunk of the document ``doc`` (already fetched at ``document_id``)
+    belongs to, via the deterministic ``_iter_document_chunk_ids``
+    sequence, so the caller gets chunk 0 (the front matter) regardless of
+    which chunk id it originally asked for.
+
+    Returns ``(chunk_keys, chunk_docs)`` in chunk-index order. Falls back
+    to the single already-fetched ``doc`` when it carries no
+    ``title``/``source`` metadata to reconstruct the sequence from (e.g. a
+    direct ``POST /memory/semantic`` write with no title) — a document we
+    genuinely cannot re-derive the sequence for is still returned, just as
+    itself rather than as an error.
+    """
+    title = doc.metadata.get("title") or doc.metadata.get("source")
+    if not isinstance(title, str) or not title:
+        return [document_id], [doc]
+    chunk_ids: list[str] = []
+    chunk_docs: list[Any] = []
+    for chunk_id in _iter_document_chunk_ids(collection, title):
+        candidate = (
+            doc
+            if chunk_id == document_id
+            else await service.get_document(user, collection, chunk_id)
+        )
+        if candidate is None:
+            break
+        chunk_ids.append(chunk_id)
+        chunk_docs.append(candidate)
+    if not chunk_ids:
+        # The deterministic sequence never reproduced the requested chunk
+        # (e.g. a legacy row whose title predates this hash scheme) —
+        # degrade to the single chunk we DID find rather than an empty
+        # "document".
+        return [document_id], [doc]
+    return chunk_ids, chunk_docs
+
+
+def _reassemble_chunk_sequence(
+    chunk_docs: list[Any], overlap: int = CHUNK_OVERLAP
+) -> str:
+    """WU-1 fix-round-2 (closes the round-1 F1 reject — ``?whole_document=
+    true`` duplicated every chunk overlap instead of reconstructing the
+    document). De-overlap and concatenate a CONTIGUOUS chunk sequence
+    (index 0..N, as produced by :func:`_gather_whole_document`) back into
+    the ORIGINAL text, BYTE-EXACT.
+
+    **Why dropping a flat ``overlap`` characters off every chunk after the
+    first is exact, not approximate.** ``_chunk_text`` advances by
+    ``CHUNK_SIZE - CHUNK_OVERLAP`` characters per chunk (``start = end -
+    overlap``), so consecutive full-size chunks share exactly their last/
+    first ``overlap`` characters. The one case that looks like it could
+    break this — the document's TAIL, where later chunks get truncated —
+    does not: whenever an earlier chunk ``i`` is itself shorter than
+    ``CHUNK_SIZE`` (i.e. truncated because it reached the end of the
+    text), the NEXT chunk ``i+1`` is provably no longer than the true
+    overlap between them (algebraically, chunk ``i+1``'s length equals
+    exactly that overlap — it is a pure suffix of chunk ``i``, contributing
+    zero new characters). Python slicing clamps ``chunk[overlap:]`` to
+    ``""`` whenever ``len(chunk) <= overlap``, which is precisely correct
+    in that case: dropping "more than the chunk has" removes all of it,
+    which is right because all of it was already covered by the previous
+    chunk. So the same one-line rule is exact whether or not the tail is
+    truncated — see the WU-1 fix-round-2 build record for the worked
+    numeric proof.
+
+    **Two known, documented limits** (properties of the chunking scheme
+    itself, not introduced here — both are non-goals for THIS fix):
+
+    * Assumes ``overlap`` (``CHUNK_OVERLAP`` at call time) matches the
+      value used when the document was ORIGINALLY chunked. If that
+      constant is ever changed, documents indexed under the old value
+      need re-indexing before a whole-document read of them stays exact
+      under the new value — this function has no way to detect a stale
+      value from the chunk content alone.
+    * Assumes the fetched chunk sequence is CONTIGUOUS, i.e. no physical
+      chunk was silently dropped by ``_chunk_text``'s ``if chunk.strip():``
+      guard (which happens only for a >= ``CHUNK_SIZE``-character run of
+      pure whitespace inside the source document — not observed in real
+      build records/specs). A skipped chunk would shift later chunks out
+      of arithmetic lockstep with their id index in a way this function
+      cannot detect from the fetched text alone.
+    Not defensive against an empty ``chunk_docs``: the sole caller
+    (``read_semantic``) only ever reaches this function after
+    :func:`_gather_whole_document` has run, which itself always returns
+    at least one doc (its own ``if not chunk_ids:`` fallback degrades to
+    ``[document_id], [doc]`` rather than an empty pair — see that
+    function's docstring) — an empty ``chunk_docs`` here would mean
+    :func:`_gather_whole_document`'s own invariant broke, which this
+    function is not positioned to guard against. (WU-1 fix-round-3, F16:
+    a prior ``if not chunk_docs: return ""`` here was unreachable — no
+    test could distinguish it from dead code — and has been removed
+    rather than kept as a guard that guards nothing.)
+    """
+    parts = [chunk_docs[0].page_content]
+    parts.extend(doc.page_content[overlap:] for doc in chunk_docs[1:])
+    return "".join(parts)
 
 
 @router.get("/semantic/{collection}/{document_id}")
 async def read_semantic(
     collection: str,
     document_id: str,
+    whole_document: bool = Query(
+        False,
+        description=(
+            "WU-1 (2026-09-17, closes D15 item 2): when true, reconstruct "
+            "and return EVERY chunk of this document (starting from chunk "
+            "0 / the front matter, via the deterministic chunk-id sequence "
+            "keyed off the document's title) instead of just the single "
+            "chunk at 'document_id' — the documented whole-document read "
+            "mode. 'content' becomes the chunks joined in order; "
+            "'metadata'/'manifest' describe chunk 0. Default false "
+            "preserves the pre-WU-1 single-chunk response."
+        ),
+    ),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:read"]),
     user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
+    """ADR-062 Phase B: ``service.get_document`` already applies the
+    owner-or-corpus predicate (WU-B3 §3 hole 1) — a cross-user private
+    doc is a 404, same as a genuine miss (no existence disclosure). On
+    top of that, D3 (WU-B4) requires ``memory:corpus:<collection>:read``
+    to read a CORPUS-tier doc through this backoffice route — a 403 (not
+    404: corpus existence isn't user-specific, so there's nothing to
+    hide by returning a miss instead)."""
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
     doc = await service.get_document(user, collection, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="semantic doc not found")
-    entry: ManifestEntry | None = await manifest.get(
-        "semantic", _semantic_key(collection, document_id)
+    if doc.metadata.get("tier") == "corpus":
+        _require_corpus_scope(user, collection, "read")
+
+    if whole_document:
+        chunk_ids, chunk_docs = await _gather_whole_document(
+            service, user, collection, document_id, doc
+        )
+        front_matter = chunk_docs[0]
+        entry = await manifest.get("semantic", _semantic_key(collection, chunk_ids[0]))
+        if entry is not None and not _manifest_visible(entry, user):
+            entry = None
+        schedule_read_audit(
+            background_tasks,
+            user=user,
+            op="read",
+            layer="semantic",
+            collection=collection,
+            key=document_id,
+        )
+        emit_recall_telemetry(
+            classify_recall_source_from_request(request),
+            collection,
+            len(chunk_docs),
+            cache="n/a",
+        )
+        return {
+            "content": _reassemble_chunk_sequence(chunk_docs),
+            "metadata": front_matter.metadata,
+            "manifest": entry.to_dict() if entry is not None else None,
+            "chunk_count": len(chunk_docs),
+            "chunk_keys": [_semantic_key(collection, cid) for cid in chunk_ids],
+        }
+
+    entry = await manifest.get("semantic", _semantic_key(collection, document_id))
+    if entry is not None and not _manifest_visible(entry, user):
+        entry = None
+    schedule_read_audit(
+        background_tasks,
+        user=user,
+        op="read",
+        layer="semantic",
+        collection=collection,
+        key=document_id,
+    )
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request), collection, 1, cache="n/a"
     )
     return {
         "content": doc.page_content,
@@ -1530,18 +3003,34 @@ async def update_semantic(
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
+    """ADR-062 Phase B (WU-B5 review fix, 2026-08-04): ``metadata`` is
+    sanitized the same way as ``create_semantic`` — a caller-supplied
+    ``tier``/``user_id`` in the body's ``metadata`` field is stripped
+    before it reaches the service, and ``ChromaSemanticService.upsert``
+    additionally stamps both unconditionally regardless. This route
+    does not accept a promote request at all (no ``tier``/``?promote=``
+    parsing) — every update stays private-tier, matching the pre-review
+    WU-B5 scope decision (updates were never in the promote-gate call
+    site list); the fix here closes the metadata-forgery bypass, not a
+    missing feature."""
     text = payload.get("text")
     if not isinstance(text, str):
         raise HTTPException(status_code=400, detail="text is a required string field")
-    metadata = payload.get("metadata")
+    metadata = _sanitize_semantic_metadata(payload.get("metadata"))
     title = payload.get("title")
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
+    key = _semantic_key(collection, document_id)
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the ChromaDB write below.
+    try:
+        await authorize_write(manifest, user, "semantic", key)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         await service.upsert(user, collection, document_id, text, metadata)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    key = _semantic_key(collection, document_id)
     try:
         entry: ManifestEntry = await manifest.record_update(
             layer="semantic",
@@ -1549,6 +3038,7 @@ async def update_semantic(
             size_bytes=len(text.encode("utf-8")),
             user_id=user.user_id,
             title=title,
+            caller_can_write_shared=_corpus_write_authorized(user, collection),
         )
     except LookupError as exc:
         raise HTTPException(
@@ -1557,6 +3047,15 @@ async def update_semantic(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
+    await _emit_write_audit(
+        user=user,
+        op="write",
+        layer="semantic",
+        collection=collection,
+        key=document_id,
+    )
     return entry.to_dict()
 
 
@@ -1568,6 +3067,10 @@ async def delete_semantic(
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
+    """Soft-delete by default; ``?hard=true`` also purges the Chroma
+    vector (ADR-062 §6 — same discipline as ``delete_episodic``). The
+    manifest tombstone alone is what ``search()``/``search_page()``
+    consult to keep a soft-deleted item out of recall (WU-A5)."""
     if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
         raise HTTPException(
             status_code=403,
@@ -1576,17 +3079,36 @@ async def delete_semantic(
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
     key = _semantic_key(collection, document_id)
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the soft-delete.
+    try:
+        await authorize_write(manifest, user, "semantic", key)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         entry: ManifestEntry = await manifest.record_delete(
-            "semantic", key, user.user_id
+            "semantic",
+            key,
+            user.user_id,
+            caller_can_write_shared=_corpus_write_authorized(user, collection),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete_document(user, collection, document_id)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await _emit_write_audit(
+        user=user,
+        op="delete",
+        layer="semantic",
+        collection=collection,
+        key=document_id,
+        detail_extra={"hard": hard},
+    )
     return entry.to_dict()
 
 

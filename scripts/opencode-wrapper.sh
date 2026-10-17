@@ -45,9 +45,14 @@ if ! "$LOGIN" --ensure 2>/dev/null; then
   "$LOGIN"
 fi
 
-BEARER="$("$LOGIN" --show)"
+# --show-unsafe is required here (not --show): this wrapper needs the REAL
+# Bearer value to write into the OpenCode provider config below, not the
+# redacted fingerprint --show now prints by default (TOKEN-GUARD, 2026-08-11).
+# Captured straight into a shell var and written to a config file — never
+# echoed to this script's own stdout/log.
+BEARER="$("$LOGIN" --show-unsafe)"
 if [[ -z "$BEARER" ]]; then
-  echo "error: audittrace-login --show returned empty — aborting" >&2
+  echo "error: audittrace-login --show-unsafe returned empty — aborting" >&2
   exit 3
 fi
 

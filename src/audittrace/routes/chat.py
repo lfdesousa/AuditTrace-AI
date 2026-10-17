@@ -16,6 +16,7 @@ ingestion API with the captured ``trace_id`` once the stream ends.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -42,6 +43,7 @@ from audittrace.db.models import InteractionRecord, ToolCall
 from audittrace.dependencies import get_context_builder, get_postgres_factory
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call, reset_langgraph_step
+from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
 from audittrace.routes._memory_tool_loop import (
     PendingToolCall,
     _execute_memory_tool,
@@ -54,6 +56,8 @@ from audittrace.routes._memory_tool_loop import (
     _tool_call_signatures,
     run_memory_tool_loop,
 )
+from audittrace.routes._model_route import resolve_chat_upstream, upstream_host
+from audittrace.routes._sources_trailer import build_sources_trailer
 from audittrace.services.context_builder import (
     ContextBuilderService,
     build_ambient_context,
@@ -271,6 +275,29 @@ def _compute_session_id(source: str, first_user_content: str, user_id: str) -> s
     return f"{source}-{today}-{h}"
 
 
+def _resolve_session_id(
+    request: Request, source: str, first_user_content: str, user_id: str
+) -> str:
+    """Resolve the ``session_id`` for this request (FLEET-ROUTE Gate #6).
+
+    Precedence:
+      1. ``X-Session-Id`` request header — lets a caller (an OpenCode fleet
+         agent, in particular) set its own run/session grouping explicitly,
+         so ``GET /interactions?session_id=<run>`` reconstructs exactly
+         that agent run across every turn and every routed engine
+         (per-agent-run reconstruction, SPEC "Telemetry accuracy" #3).
+         Trusted at face value — same honesty model as ``_resolve_project``
+         / ``_detect_source``; this is audit-correlation metadata, not a
+         security field.
+      2. The existing deterministic ``_compute_session_id(...)`` — BYTE-
+         FOR-BYTE the prior behaviour when the header is absent or blank.
+    """
+    header = request.headers.get("x-session-id")
+    if isinstance(header, str) and header.strip():
+        return header.strip()
+    return _compute_session_id(source, first_user_content, user_id)
+
+
 def _resolve_project(request: Request, payload: dict[str, Any]) -> str:
     """Resolve the project tag for this request (ADR-029).
 
@@ -421,6 +448,60 @@ async def _iter_with_idle_timeout(
             pending_next.cancel()
 
 
+async def _stream_upstream_with_keepalive_from_t0(
+    client: httpx.AsyncClient,
+    url: str,
+    json_payload: dict[str, Any],
+    keepalive_interval: float,
+) -> AsyncIterator[bytes | httpx.Response]:
+    """Race the upstream POST against an SSE keep-alive ticker from t=0.
+
+    llama.cpp withholds HTTP response headers until the FIRST TOKEN — i.e.
+    until prompt-eval completes. A bare
+    ``async with client.stream(...) as resp:`` therefore blocks with ZERO
+    bytes reaching the client from request-accept to first-token, and this
+    module's existing keep-alive loop (``_iter_with_idle_timeout``) only
+    starts once ``resp`` already exists — too late for a slow-first-token
+    model (dense/long-context, prompt-eval exceeding the client's own
+    body-read timeout), which disconnects before that loop ever runs.
+
+    This generator keeps the client fed from t=0: it sends the request in
+    the background (the same ``build_request`` + ``send(..., stream=True)``
+    steps ``client.stream()`` performs internally — see
+    ``httpx.AsyncClient.stream``) and races it against a
+    *keepalive_interval*-second ticker, yielding ``b": keep-alive\\n\\n"``
+    SSE comment frames on every tick that elapses before response headers
+    arrive.
+
+    The FINAL item yielded is always the resolved ``httpx.Response``.
+    Callers MUST exhaust the generator to obtain it, and own closing the
+    response themselves (e.g. ``contextlib.aclosing(resp)``) — this helper
+    only owns the send race, not the response lifetime, so the existing
+    ``_iter_with_idle_timeout`` body-read loop is unaffected.
+
+    Fast path (spec sub-decision #4): when headers arrive before the first
+    tick, NO keep-alive frame is yielded — behavior is byte-identical to a
+    bare ``client.send``.
+    """
+    request = client.build_request("POST", url, json=json_payload)
+    send_task: asyncio.Task[httpx.Response] = asyncio.ensure_future(
+        client.send(request, stream=True)
+    )
+    try:
+        while True:
+            done, _ = await asyncio.wait({send_task}, timeout=keepalive_interval)
+            if done:
+                break
+            yield b": keep-alive\n\n"
+        yield send_task.result()
+    except BaseException:
+        if not send_task.done():
+            send_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await send_task
+        raise
+
+
 def _current_trace_id_hex() -> str | None:
     """Return the active OpenTelemetry trace_id as a 32-char hex string.
 
@@ -565,6 +646,15 @@ async def _flush_pending_tool_calls(
                         started_at=rec.started_at,
                         duration_ms=rec.duration_ms,
                         granted_scope=rec.granted_scope,
+                        # ADR-063 Phase 2 Track B (migration 021): None on
+                        # every Phase 1 own-tool call — only
+                        # ``services.mcp_broker`` ever sets these.
+                        provenance=rec.provenance,
+                        phase=rec.phase,
+                        downstream_server=rec.downstream_server,
+                        downstream_tool=rec.downstream_tool,
+                        args_digest=rec.args_digest,
+                        result_digest=rec.result_digest,
                     )
                 )
             await db.commit()
@@ -637,13 +727,26 @@ async def _persist_or_enqueue(
 
 
 def _set_genai_request_attributes(
-    payload: dict[str, Any], query: str, session_id: str, source: str, user_id: str
+    payload: dict[str, Any],
+    query: str,
+    session_id: str,
+    source: str,
+    user_id: str,
+    chat_upstream: str = "",
 ) -> None:
     """Tag the current span with gen_ai.* request attributes for Langfuse.
 
     DESIGN §15 Phase 2: ``langfuse.user.id`` now carries the Keycloak
     ``sub`` claim (the real identity) and ``sovereign.source`` keeps the
     agent string for observability.
+
+    FLEET-ROUTE (SPEC invariant 6): ``chat_upstream`` — the resolved
+    base upstream URL for this request (``resolve_chat_upstream``
+    output) — is ADDITIVE: it surfaces which engine served the call
+    (``audittrace.upstream.host``) alongside the existing
+    ``gen_ai.request.model``, without displacing any pre-existing
+    attribute. Empty string is tolerated (defaults to "" so callers
+    that don't yet resolve an upstream keep working unchanged).
     """
     messages = payload.get("messages") or []
     telemetry.set_current_span_attributes(
@@ -662,6 +765,10 @@ def _set_genai_request_attributes(
             "sovereign.memory.project": payload.get("project") or "",
             "sovereign.source": source,
             "sovereign.user.id": user_id,
+            # FLEET-ROUTE additive attribute (SPEC invariant 6).
+            # upstream_host("") returns "" (no crash), so this is safe to
+            # call unconditionally even for callers that pass no upstream.
+            "audittrace.upstream.host": upstream_host(chat_upstream),
         }
     )
 
@@ -753,6 +860,7 @@ async def _build_memory_context_with_trace(
     session_id: str,
     source: str,
     user_context: UserContext,
+    chat_upstream: str = "",
 ) -> tuple[str, str | None]:
     """Build memory context inside a Langfuse span; return (context, trace_id).
 
@@ -765,9 +873,14 @@ async def _build_memory_context_with_trace(
 
     DESIGN §15 Phase 2: ``user_context`` is threaded into the context
     builder so every layer can apply per-user scoping.
+
+    FLEET-ROUTE: ``chat_upstream`` is the resolved upstream base URL for
+    this request (passed by the caller, which has already computed it
+    with ``resolve_chat_upstream`` — this function stays pure w.r.t.
+    routing, it only tags the span with the result).
     """
     _set_genai_request_attributes(
-        payload, query, session_id, source, user_context.user_id
+        payload, query, session_id, source, user_context.user_id, chat_upstream
     )
     memory_context = await context_builder.build_system_context(
         user_context,
@@ -1088,7 +1201,8 @@ async def _stream_memory_tool_loop(
     last_sigs: frozenset[tuple[str, str]] | None = None
 
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0),
+        limits=LLAMA_HTTPX_LIMITS,
     ) as client:
         for iteration in range(max_iterations):
             turn_payload = dict(loop_payload)
@@ -1096,7 +1210,20 @@ async def _stream_memory_tool_loop(
             turn_payload["stream"] = True
             turn = _StreamState()
 
-            async with client.stream("POST", llama_url, json=turn_payload) as resp:
+            resp: httpx.Response | None = None
+            async for item in _stream_upstream_with_keepalive_from_t0(
+                client, llama_url, turn_payload, keepalive
+            ):
+                if isinstance(item, bytes):
+                    yield item
+                    continue
+                resp = item
+                break
+            if resp is None:  # pragma: no cover - unreachable
+                raise RuntimeError(
+                    "keep-alive race helper exhausted without an upstream response"
+                )
+            async with contextlib.aclosing(resp):
                 if resp.status_code >= 400:
                     await resp.aread()
                     if _is_tool_parse_error_500(resp):
@@ -1225,17 +1352,25 @@ async def _stream_memory_tool_loop(
 @router.get("/models")
 @log_call(logger=logger)
 async def list_models(
+    model: str | None = None,
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:query"]),
 ) -> Any:
     """Proxy GET /v1/models to llama-server.
 
     OpenAI-compatible clients (OpenCode, Continue) call this to discover
-    available models before sending chat completions.
+    available models before sending chat completions. FLEET-ROUTE: an
+    optional ``?model=`` query param lets a caller ask which models a
+    SPECIFIC routed engine serves (e.g. ``?model=mistral`` to list the
+    Mistral upstream's models) — additive, defaults to the unrouted
+    ``llama_url`` behaviour so existing callers are unaffected.
     """
     settings = get_settings()
-    models_url = settings.llama_url.rstrip("/") + "/models"
+    upstream = resolve_chat_upstream(
+        model or "", settings.model_routes, settings.llama_url
+    )
+    models_url = upstream.rstrip("/") + "/models"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, limits=LLAMA_HTTPX_LIMITS) as client:
             response = await client.get(models_url)
             return response.json()
     except httpx.ConnectError as exc:
@@ -1257,6 +1392,7 @@ def _prepare_tools_mode_trace(
     session_id: str,
     source: str,
     user_context: UserContext,
+    chat_upstream: str = "",
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Set gen_ai.* request attributes on the active Langfuse span and
     return ``(tools_for_user, trace_id)``.
@@ -1278,9 +1414,13 @@ def _prepare_tools_mode_trace(
     span is the LLM reply, which ``_record_langfuse_output`` pushes via
     the ingestion API *after* the tool-call loop completes. Without this
     flag the tools list clobbers the real answer in the Langfuse UI.
+
+    FLEET-ROUTE: ``chat_upstream`` is the already-resolved upstream base
+    URL (see ``_build_memory_context_with_trace`` docstring — same
+    contract, this function stays pure w.r.t. routing).
     """
     _set_genai_request_attributes(
-        payload, query, session_id, source, user_context.user_id
+        payload, query, session_id, source, user_context.user_id, chat_upstream
     )
     tools_for_user = tools_visible_to(user_context)
     trace_id: str | None = None
@@ -1346,6 +1486,13 @@ async def _handle_tools_mode(
     requested_model = payload.get("model", "")
     is_stream = bool(payload.get("stream"))
 
+    # FLEET-ROUTE: resolve the upstream BEFORE opening the trace span so
+    # the resolved host can be tagged on it (SPEC invariant 6). Pure/
+    # synchronous — safe to compute ahead of the @_lf_observe call below.
+    resolved_upstream = resolve_chat_upstream(
+        requested_model, settings.model_routes, settings.llama_url
+    )
+
     # 1 — Open the parent Langfuse span, capture trace_id, and compute
     # which memory tools the caller is scoped for. Runs in a worker
     # thread so the synchronous @_lf_observe decorator doesn't block the
@@ -1357,6 +1504,7 @@ async def _handle_tools_mode(
         session_id,
         source,
         user,
+        resolved_upstream,
     )
 
     ambient = build_ambient_context(user, project, tools_for_user)
@@ -1370,7 +1518,7 @@ async def _handle_tools_mode(
     loop_payload["tools"] = augmented_tools
     loop_payload["stream"] = False  # loop is always non-streaming internally
 
-    llama_url = settings.llama_url.rstrip("/") + "/chat/completions"
+    llama_url = resolved_upstream.rstrip("/") + "/chat/completions"
 
     # ───────────────────── Streaming branch (#299) ──────────────────────
     # Stream the agentic loop turn-by-turn so content (including <think>)
@@ -1393,6 +1541,27 @@ async def _handle_tools_mode(
                     result=result,
                 ):
                     yield frame
+                # M3 slice 1 (spec §4.4): a deterministic, orchestrator-
+                # emitted sources trailer — flag-gated, default off, so
+                # this is a no-op for every existing streaming consumer.
+                # Only on a genuine final answer (``finish_reason=="stop"``)
+                # — an externally-forwarded tool_calls turn has no answer
+                # yet to cite sources for. Built from ``result.pending``,
+                # the SAME records flushed to the ``tool_calls`` audit
+                # table below — never a second, potentially divergent,
+                # read path, and never model-generated.
+                if (
+                    settings.response_sources == "trailer"
+                    and result.finish_reason == "stop"
+                ):
+                    trailer = build_sources_trailer(result.pending)
+                    if trailer is not None:
+                        yield _sse_content_frame(
+                            result.resp_id,
+                            result.created,
+                            result.model or requested_model,
+                            trailer,
+                        )
                 # Trailing frames: finish + synthetic usage + DONE.
                 yield _sse_finish_frame(
                     result.resp_id,
@@ -1499,6 +1668,12 @@ async def _handle_tools_mode(
                 return
 
             # Success persistence — record exactly the streamed answer.
+            # Gate #5 (request-model fidelity): the interactions row records
+            # the CLIENT-REQUESTED alias — the value FLEET-ROUTE routed on —
+            # NEVER the upstream's echoed ``result.model`` (llama.cpp echoes
+            # the full GGUF path). The resolved engine is asserted on the
+            # linked trace span (``audittrace.upstream.host``), not here
+            # (Option A, operator decision 2026-08-06 — no schema change).
             await _persist_or_enqueue(
                 persist_mode=persist_mode,
                 pending_tool_calls=result.pending,
@@ -1509,7 +1684,7 @@ async def _handle_tools_mode(
                 prompt_tokens=result.prompt_tokens,
                 completion_tokens=result.completion_tokens,
                 session_id=session_id,
-                model=result.model or requested_model,
+                model=requested_model,
                 user_id=user.user_id,
                 duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
             )
@@ -1521,7 +1696,7 @@ async def _handle_tools_mode(
                 finish_reason=result.finish_reason,
                 tool_calls=result.external_tool_calls or None,
                 session_id=session_id,
-                model=result.model or requested_model,
+                model=requested_model,
                 user_id=user.user_id,
                 input_messages=payload.get("messages"),
             )
@@ -1650,7 +1825,11 @@ async def _handle_tools_mode(
         )
     usage = final_body.get("usage") or {}
     finish_reason = first.get("finish_reason") or "stop"
-    response_model = final_body.get("model") or requested_model
+    # Gate #5 (request-model fidelity): the interactions row + Langfuse
+    # generation record the CLIENT-REQUESTED alias unconditionally — NEVER
+    # ``final_body["model"]`` (llama.cpp's echoed GGUF path). The resolved
+    # engine is asserted on the linked trace span, not a row column
+    # (Option A, operator decision 2026-08-06 — no schema change).
 
     # 4 — Persist interaction + flush audit rows. ADR-046: async branch
     # XADDs to audittrace:persist:stream when the caller opts in via
@@ -1667,7 +1846,7 @@ async def _handle_tools_mode(
         prompt_tokens=usage.get("prompt_tokens", 0),
         completion_tokens=usage.get("completion_tokens", 0),
         session_id=session_id,
-        model=response_model,
+        model=requested_model,
         user_id=user.user_id,
         duration_ms=int((time.perf_counter() - perf_start) * 1000),
     )
@@ -1683,7 +1862,7 @@ async def _handle_tools_mode(
         finish_reason=finish_reason,
         tool_calls=final_tool_calls or None,
         session_id=session_id,
-        model=response_model,
+        model=requested_model,
         user_id=user.user_id,
         input_messages=payload.get("messages"),
     )
@@ -1700,7 +1879,24 @@ async def _handle_tools_mode(
     except Exception:  # pragma: no cover - defensive attribute write
         pass
 
-    # 6 — Return the final body as JSON. The streaming case returned far
+    # 6 — M3 slice 1 (spec §4.4): append the deterministic sources trailer
+    # to the CLIENT-FACING body only — never to ``answer_text`` above, which
+    # is what got persisted + pushed to Langfuse. The trailer is a
+    # rendering of already-audited data (the ``tool_calls`` rows just
+    # flushed), not new audit data, so it stays out of the audit-record
+    # answer field. Flag-gated, default off (byte-identical for every
+    # existing consumer); only on a genuine final answer, mirroring the
+    # streaming branch's ``finish_reason == "stop"`` guard.
+    if settings.response_sources == "trailer" and finish_reason == "stop":
+        trailer = build_sources_trailer(pending)
+        if trailer is not None:
+            body_choices = final_body.get("choices") or []
+            if body_choices:
+                body_message = body_choices[0].get("message") or {}
+                body_message["content"] = (body_message.get("content") or "") + trailer
+                body_choices[0]["message"] = body_message
+
+    # 7 — Return the final body as JSON. The streaming case returned far
     # earlier via the per-turn streaming branch (#299); by here the request
     # is always non-streaming.
     return final_body
@@ -1781,7 +1977,7 @@ async def chat_completions(
         ),
         query or "",
     )
-    session_id = _compute_session_id(source, first_user, user.user_id)
+    session_id = _resolve_session_id(http_request, source, first_user, user.user_id)
 
     # ADR-025 Phase 4: branch on memory_mode. The inject path (default)
     # runs the pre-Phase-4 4-layer context build; the tools path runs
@@ -1799,6 +1995,15 @@ async def chat_completions(
             persist_mode=persist_mode,
         )
 
+    # FLEET-ROUTE: resolve the upstream from the request `model` BEFORE
+    # opening the trace span so the resolved host can be tagged on it
+    # (SPEC invariant 6). Pure/synchronous — safe to compute ahead of
+    # the @_lf_observe call below.
+    requested_model = payload.get("model", "")
+    resolved_upstream = resolve_chat_upstream(
+        requested_model, settings.model_routes, settings.llama_url
+    )
+
     # Build memory context inside an @observe span (off-loop because the
     # context builder hits ChromaDB and disk synchronously) and capture an
     # explicit trace_id for the post-stream Langfuse update.
@@ -1809,6 +2014,7 @@ async def chat_completions(
         session_id,
         source,
         user,
+        resolved_upstream,
     )
 
     # Augment messages list — every other message field is preserved verbatim.
@@ -1816,9 +2022,8 @@ async def chat_completions(
     proxy_payload = dict(payload)  # shallow copy of top-level keys
     proxy_payload["messages"] = augmented_messages
 
-    llama_url = settings.llama_url.rstrip("/") + "/chat/completions"
+    llama_url = resolved_upstream.rstrip("/") + "/chat/completions"
     project = payload["project"]  # ADR-029: set by _resolve_project on entry
-    requested_model = payload.get("model", "")
     is_stream = bool(payload.get("stream"))
 
     # ─────────────────────────── Streaming branch ───────────────────────────
@@ -1831,11 +2036,27 @@ async def chat_completions(
                 async with httpx.AsyncClient(
                     timeout=httpx.Timeout(
                         connect=10.0, read=None, write=30.0, pool=10.0
-                    )
+                    ),
+                    limits=LLAMA_HTTPX_LIMITS,
                 ) as client:
-                    async with client.stream(
-                        "POST", llama_url, json=proxy_payload
-                    ) as resp:
+                    resp: httpx.Response | None = None
+                    async for item in _stream_upstream_with_keepalive_from_t0(
+                        client,
+                        llama_url,
+                        proxy_payload,
+                        settings.sse_keepalive_interval,
+                    ):
+                        if isinstance(item, bytes):
+                            yield item
+                            continue
+                        resp = item
+                        break
+                    if resp is None:  # pragma: no cover - unreachable
+                        raise RuntimeError(
+                            "keep-alive race helper exhausted without an"
+                            " upstream response"
+                        )
+                    async with contextlib.aclosing(resp):
                         resp.raise_for_status()
                         async for line in _iter_with_idle_timeout(
                             resp,
@@ -1977,6 +2198,10 @@ async def chat_completions(
                 answer = text_answer
 
             # ADR-046: success-path persistence honours X-Persist-Mode.
+            # Gate #5 (request-model fidelity): record the CLIENT-REQUESTED
+            # alias unconditionally — never ``state.model`` (llama.cpp's
+            # echoed GGUF path). Resolved engine lives on the trace span
+            # (Option A, operator decision 2026-08-06).
             await _persist_or_enqueue(
                 persist_mode=persist_mode,
                 project=project,
@@ -1986,7 +2211,7 @@ async def chat_completions(
                 prompt_tokens=state.prompt_tokens,
                 completion_tokens=state.completion_tokens,
                 session_id=session_id,
-                model=state.model or requested_model,
+                model=requested_model,
                 user_id=user.user_id,
                 duration_ms=int((time.perf_counter() - perf_start) * 1000),
             )
@@ -2002,7 +2227,7 @@ async def chat_completions(
                     else None
                 ),
                 session_id=session_id,
-                model=state.model or requested_model,
+                model=requested_model,
                 user_id=user.user_id,
                 input_messages=payload.get("messages"),
             )
@@ -2029,6 +2254,9 @@ async def chat_completions(
             gen_span.set_attribute("langfuse.user.id", user.user_id)
             gen_span.set_attribute("user.id", user.user_id)
             gen_span.set_attribute("audittrace.memory_mode", "inject")
+            # FLEET-ROUTE (SPEC invariant 6) — additive; which engine
+            # actually served this generation.
+            gen_span.set_attribute("audittrace.upstream.host", upstream_host(llama_url))
             try:
                 gen_span.set_attribute(
                     "input.value",
@@ -2045,7 +2273,8 @@ async def chat_completions(
                     read=settings.llama_chunk_timeout,
                     write=30.0,
                     pool=10.0,
-                )
+                ),
+                limits=LLAMA_HTTPX_LIMITS,
             ) as client:
                 response = await client.post(llama_url, json=proxy_payload)
             body = response.json()
@@ -2125,7 +2354,8 @@ async def chat_completions(
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
             session_id=session_id,
-            model=body.get("model") or requested_model,
+            # Gate #5: request alias unconditionally, never body["model"].
+            model=requested_model,
             user_id=user.user_id,
             status="failed",
             failure_class=_map_error_code_to_failure_class(err_envelope.get("code")),
@@ -2147,6 +2377,11 @@ async def chat_completions(
         usage = body.get("usage") or {}
         finish_reason = (choices[0].get("finish_reason") if choices else None) or "stop"
         # ADR-046: success-path persistence honours X-Persist-Mode.
+        # Gate #5 (request-model fidelity): record the CLIENT-REQUESTED
+        # alias unconditionally — never ``body["model"]`` (llama.cpp's
+        # echoed GGUF path). Resolved engine lives on the trace span
+        # (``audittrace.upstream.host``, Option A, operator decision
+        # 2026-08-06 — no schema change).
         await _persist_or_enqueue(
             persist_mode=persist_mode,
             project=project,
@@ -2156,7 +2391,7 @@ async def chat_completions(
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
             session_id=session_id,
-            model=body.get("model") or requested_model,
+            model=requested_model,
             user_id=user.user_id,
             duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
         )
@@ -2168,7 +2403,7 @@ async def chat_completions(
             finish_reason=finish_reason,
             tool_calls=ns_tool_calls or None,
             session_id=session_id,
-            model=body.get("model") or requested_model,
+            model=requested_model,
             user_id=user.user_id,
             input_messages=payload.get("messages"),
         )

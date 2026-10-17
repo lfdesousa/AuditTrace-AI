@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audittrace-ai"
-version = "1.17.0"
+version = "1.29.5"
 description = "AuditTrace-AI: sovereign AI memory server with 4-tier memory architecture and OAuth2 authentication"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -44,7 +44,7 @@ dependencies = [
     "langfuse>=4.0.0,<5.0.0",
     "openai>=1.12.0",
     "alembic>=1.13.0",
-    "sqlalchemy>=2.0.25",
+    "sqlalchemy[asyncio]>=2.1.1,<3",
     # asyncpg = production async Postgres driver. psycopg2-binary kept for
     # Alembic + the sync RLS oracle test (out-of-band of the request loop).
     # aiosqlite = async SQLite for the in-memory test engine.
@@ -80,8 +80,12 @@ dependencies = [
     # etsi LOTL walker — pyhanko's [etsi] extra does NOT pull aiohttp
     # on its own, verified 2026-05-09 against pyhanko 0.35.1). Both
     # extras must be co-installed for EuLotlTrustStoreBuilder.
-    "pyhanko[etsi,async-http]>=0.35.1",
-    "pyhanko-certvalidator>=0.26.0",
+    # Bounded to the tested minor (#366): pyhanko's private ETSI helpers and
+    # its sync/async wrapper surface change between minors (0.36 added the
+    # `validation_time` argument that silently broke the Swiss TSL builder).
+    # Bump deliberately, with the AC6/AC9 guard tests, never by drift.
+    "pyhanko[etsi,async-http]>=0.37,<0.38",
+    "pyhanko-certvalidator>=0.32,<0.33",
     # pytesseract: tier-B item #1 — OCR for scanned pages. Python
     # binding only; the actual `tesseract` binary + language packs
     # (eng+deu+fra+ita) are installed via apt in the Dockerfile.
@@ -90,8 +94,28 @@ dependencies = [
     # crashing — keeps unit tests green on hosts that don't have
     # tesseract installed locally.
     "pytesseract>=0.3.10",
-    "opentelemetry-api>=1.27.0",
-    "opentelemetry-sdk>=1.27.0",
+    # ADR-063 Phase 1 — official MCP Python SDK. Only ``mcp.types`` is
+    # used (the Pydantic message shapes for the JSON-RPC 2.0 envelope);
+    # the SDK's own server/session-management transport is intentionally
+    # NOT used so the MCP endpoint can be a plain FastAPI route wired
+    # through the existing ``require_user`` auth dependency + RLS
+    # ContextVar binding (routes/mcp.py). Upper-bounded to the current
+    # major so a future SDK 2.x doesn't silently change message shapes
+    # under us.
+    "mcp>=1.9.0,<2.0.0",
+    # SEC-JWT-IN-LANGFUSE-SPAN S-C1 — bounded to the tested minor (not
+    # just a floor). ``ScrubbingSpanProcessor`` (telemetry.py) rewrites
+    # PRIVATE ReadableSpan/BoundedAttributes fields; a later SDK minor
+    # could rename them and the mechanism would fail OPEN, SILENTLY (no
+    # ``__slots__`` means a stale attribute name just creates a new,
+    # never-read one — nothing raises). An unbounded floor let the
+    # deployed image resolve a newer, untested minor than CI ever ran
+    # (the FINDING this spec traces to: langfuse 4.17 one day after
+    # release). Bump deliberately, together with requirements.txt, after
+    # re-running the startup self-test (telemetry._run_startup_scrub_self_test)
+    # against the new minor.
+    "opentelemetry-api>=1.45.0,<1.46.0",
+    "opentelemetry-sdk>=1.45.0,<1.46.0",
     "opentelemetry-exporter-otlp>=1.27.0",
     "opentelemetry-instrumentation-fastapi>=0.48b0",
     "opentelemetry-instrumentation-logging>=0.48b0",
@@ -171,6 +195,9 @@ python_functions = ["test_*"]
 asyncio_mode = "auto"
 addopts = "-v --cov=src --cov-report=term --cov-report=xml --cov-fail-under=90"
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "allow_cluster_tool(tool, reason): opt-in half of the hermetic cluster-tool guard (tests/conftest.py, SPEC 2026-10-11-SPEC-test-parity-scripted-enforcement.md R3) — must be paired with a matching entry in tests/hermetic_allowlist.py or the guard still fails the test.",
+]
 
 [tool.coverage.run]
 # `scripts/deploy` (the WS2 deterministic deploy runner) is measured alongside
@@ -178,8 +205,48 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # `source` AND to the `--cov=scripts/deploy` flag in `make test` / CI: config
 # `source` alone is filtered out by the CLI `--cov=src`, and `--cov` alone is
 # filtered out by config `source` — coverage.py measures a file only when it is
-# reachable via BOTH. No other `scripts/*` module is dragged into the gate.
-source = ["audittrace", "scripts/deploy"]
+# reachable via BOTH. `scripts/hooks` (#397, the pre-push hook's decision
+# logic package — `scripts/hooks/prepush_pr_body_gate.py`) joins it the same
+# way, so the new Python helper is subject to the same per-file gate as
+# everything else. `scripts/release` (#398, the deterministic release-cut
+# runner) joins the same way for the same reason. `scripts/curator`
+# (SDLC-ADR-002, the tier-aware Memory Curator runner) joins the same way too.
+# `scripts/network` (#443, the mesh network-switch resilience guard) joins the
+# same way: its `verify-clusterip-resilience.py` neuterable guard is a
+# host-networking operator tool, not shipped `src/`, but is a real
+# decision-logic module and gets the same ≥90% floor as everything else.
+# `scripts/replay_dead_lettered_index.py` (SPEC #387 P2a) joins the same way:
+# deliberately OFF-surface operator tooling (kept out of
+# `src/audittrace/services/**` so it never trips the ADR-049 heavy gate), but
+# it is real decision logic (scope selection, dry-run/apply, the reset
+# predicate) and gets the same ≥90% floor — a single-file entry, not a
+# directory, since this tool lives at the `scripts/` top level rather than a
+# dedicated subpackage. `scripts/backfill_pdf_signature_status.py` (#460, the
+# caller-owned `check_failed` re-classify backfill) joins the same way for the
+# same reason: real decision logic (ownership partition, dry-run/apply, the
+# chunk-owner invariant). No other `scripts/*` module is dragged into the gate.
+# `bff` (M3-WU-2, the LibreChat BFF sidecar — ADR-042 §5 Option A) joins the
+# same way for the same reason: a genuinely separate top-level deployable
+# (own image, own tests under `tests/bff/`), not under `src/audittrace/`, so
+# without this entry the report-generation filter (this `source` list) would
+# silently drop it from `coverage.xml` even though `--cov=bff` in `make test`
+# instruments it during the run — the per-file gate script
+# (`scripts/check-per-file-coverage.py`) only ever sees what's IN the XML.
+source = [
+    "audittrace",
+    "scripts/deploy",
+    "scripts/hooks",
+    "scripts/release",
+    "scripts/curator",
+    "scripts/network",
+    "scripts/replay_dead_lettered_index.py",
+    "scripts/backfill_pdf_signature_status.py",
+    # `scripts/neuter` (the fast neuter harness, SPEC v3) joins the same way:
+    # public SDLC tooling under the same ≥90% per-file gate as everything
+    # else, measured alongside `--cov=scripts/neuter` in `make test`/`test-cov`.
+    "scripts/neuter",
+    "bff",
+]
 branch = true
 omit = ["tests/*", "*/migrations/*"]
 # SQLAlchemy's asyncio layer bridges sync<->async with greenlet
@@ -219,6 +286,17 @@ select = [
 ]
 ignore = ["E501"]  # Line length handled by black
 
+[tool.ruff.lint.per-file-ignores]
+# scripts/ deliberately uses hyphenated CLI-style names (check-per-file-coverage.py,
+# check-no-skipped-tests.py, audittrace-login, index-chromadb.py, ...) — a repo-wide
+# convention `make lint` already scopes around (it only lints src/ + tests/). N999
+# (invalid module name) only matters for importable package modules; these are
+# standalone entrypoints, never `import`ed by name. Without this, the pre-commit
+# ruff hook (which lints staged scripts/ files too) fails on the PRE-EXISTING
+# convention the moment any scripts/*.py file is touched — TOKEN-GUARD hit this on
+# scripts/check-agent-def-token-guard.py + scripts/index-chromadb.py (2026-08-11).
+"scripts/*.py" = ["N999"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["audittrace"]
 
@@ -244,6 +322,19 @@ disable_error_code = ["misc", "type-arg"]
 [[tool.mypy.overrides]]
 module = "audittrace.auth"
 # FastAPI Request generic requires starlette stubs
+disable_error_code = ["type-arg"]
+
+[[tool.mypy.overrides]]
+module = "audittrace.routes.mcp"
+# FastAPI Request generic requires starlette stubs
+disable_error_code = ["type-arg"]
+
+[[tool.mypy.overrides]]
+module = "bff.app"
+# FastAPI Request generic requires starlette stubs — same class of finding
+# as audittrace.auth / audittrace.routes.mcp above, surfaced by the
+# pre-commit mypy hook's pinned v1.8.0 + additional_dependencies set
+# (which differs from this repo's own .venv mypy/stub versions).
 disable_error_code = ["type-arg"]
 
 [[tool.mypy.overrides]]

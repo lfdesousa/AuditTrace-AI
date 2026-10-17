@@ -40,6 +40,7 @@ from audittrace.identity import (
     get_token_cache,
     hash_token,
     is_admin_scope,
+    register_request_secret,
     sentinel_user_context,
 )
 from audittrace.logging_config import log_call
@@ -84,6 +85,22 @@ ALL_SCOPES: dict[str, str] = {
     "memory:procedural:write": "Create/update/delete procedural-layer documents",
     "memory:semantic:read": "Read semantic-layer (vector) documents",
     "memory:semantic:write": "Create/update/delete semantic-layer documents",
+    "memory:session:write": (
+        "Create documents in the per-user EPHEMERAL session memory layer "
+        "ONLY (WU-1, Sovereign-Attach EPIC) — NOT durable memory. Grants "
+        "no access to episodic, procedural, semantic, or corpus layers. "
+        "Promoting session content to a durable layer requires a "
+        "separate durable memory:<layer>:write scope via the explicit "
+        "promote action (deferred; WU-4)."
+    ),
+    "memory:session:read-own": (
+        "Read your own recently attached files/notes from the per-user "
+        "EPHEMERAL session memory layer (WU-5, Sovereign-Attach EPIC, "
+        "same-turn recall — recall_attachments). Read-own only, same "
+        "family as memory:conversational:read-own — grants no access to "
+        "another user's session uploads, and no access to episodic, "
+        "procedural, semantic, or corpus layers."
+    ),
     "memory:decisions:write": (
         "Create/update/delete documents in the ``decisions`` ChromaDB "
         "collection (ADR/decision records — vector-searchable via "
@@ -94,8 +111,178 @@ ALL_SCOPES: dict[str, str] = {
         "collection (SKILL/procedural records — vector-searchable via "
         "/memory/index single-file mode and recall_semantic)."
     ),
+    # ── ADR-062 §4 — Layer 5 (Shared Corpus) granular scopes ────────────
+    #
+    # Distinct from the per-user memory:<layer>:* scopes above: these
+    # govern the org-wide shared corpus, one read/write pair per recall
+    # collection so a papers-ingester can hold e.g. only
+    # memory:corpus:semantic:write while the Memory Curator holds
+    # decisions + skills write (SDLC-ADR-002). Write is operator/
+    # curator-tier — optional-only on operator clients, never granted
+    # (default or optional) to end-user clients or to the reserved SC-09
+    # audittrace-restricted client (WU-A3, project_restricted_client_sc09_reserved).
+    "memory:corpus:decisions:read": (
+        "Read the shared-corpus ``decisions`` collection (Layer 5, "
+        "ADR-062 §4) — distinct from the per-user memory:semantic:read."
+    ),
+    "memory:corpus:decisions:write": (
+        "Create/update/delete documents in the shared-corpus "
+        "``decisions`` collection (Layer 5, ADR-062 §4). Operator/"
+        "curator-tier; never granted by default."
+    ),
+    "memory:corpus:skills:read": (
+        "Read the shared-corpus ``skills`` collection (Layer 5, "
+        "ADR-062 §4) — distinct from the per-user memory:semantic:read."
+    ),
+    "memory:corpus:skills:write": (
+        "Create/update/delete documents in the shared-corpus "
+        "``skills`` collection (Layer 5, ADR-062 §4). Operator/"
+        "curator-tier; never granted by default."
+    ),
+    "memory:corpus:semantic:read": (
+        "Read the shared-corpus ``semantic`` collection (Layer 5, "
+        "ADR-062 §4) — distinct from the per-user memory:semantic:read."
+    ),
+    "memory:corpus:semantic:write": (
+        "Create/update/delete documents in the shared-corpus "
+        "``semantic`` collection (Layer 5, ADR-062 §4). Operator/"
+        "curator-tier; never granted by default."
+    ),
     "memory:conversational:read-own": (
         "Read your own past conversations from the conversational layer"
+    ),
+    "memory:conversations:read-own": (
+        "Read your own conversations + messages from the console-"
+        "conversations store (WU-1, MongoDB-elimination EPIC) — the "
+        "RLS-isolated, message-tree-shaped store backing LibreChat's "
+        "sidebar/history. Distinct from memory:conversational:read-own, "
+        "which reads the older per-session SUMMARY layer, not a message "
+        "tree."
+    ),
+    "memory:conversations:write": (
+        "Create/update/delete your own conversations + messages in the "
+        "console-conversations store (WU-1, MongoDB-elimination EPIC). "
+        "Grants no access to another user's conversations or messages "
+        "(RLS-enforced) and no access to any other memory layer."
+    ),
+    "memory:presets:read-own": (
+        "Read your own saved model/endpoint presets from the console-"
+        "presets store (Mongo-repl WU-presets, MongoDB-elimination "
+        "EPIC) — the RLS-isolated store backing LibreChat's saved "
+        "presets. Grants no access to another user's presets or to any "
+        "other memory layer."
+    ),
+    "memory:presets:write": (
+        "Create/update/delete your own presets in the console-presets "
+        "store (Mongo-repl WU-presets, MongoDB-elimination EPIC). "
+        "Grants no access to another user's presets (RLS-enforced) and "
+        "no access to any other memory layer."
+    ),
+    "memory:prompts:read-own": (
+        "Read your own saved prompt groups + versions from the "
+        "console-prompts store (Mongo-repl WU-prompts, MongoDB-"
+        "elimination EPIC) — the RLS-isolated store backing "
+        "LibreChat's saved prompts. Grants no access to another "
+        "user's prompts or to any other memory layer."
+    ),
+    "memory:prompts:write": (
+        "Create/update/delete your own prompt groups + versions in "
+        "the console-prompts store (Mongo-repl WU-prompts, MongoDB-"
+        "elimination EPIC). Grants no access to another user's "
+        "prompts (RLS-enforced) and no access to any other memory "
+        "layer."
+    ),
+    "memory:chat_projects:read-own": (
+        "Read your own first-class chat-projects from the console-"
+        "chat-projects store (Chat-Projects domain, MongoDB-elimination "
+        "EPIC) — the RLS-isolated store backing LibreChat's chat-project "
+        "groupings of conversations. Grants no access to another user's "
+        "chat-projects or to any other memory layer."
+    ),
+    "memory:chat_projects:write": (
+        "Create/update/delete your own chat-projects in the console-"
+        "chat-projects store (Chat-Projects domain, MongoDB-elimination "
+        "EPIC). Grants no access to another user's chat-projects "
+        "(RLS-enforced) and no access to any other memory layer."
+    ),
+    "memory:files:read-own": (
+        "Read your own file-metadata records (and batch-get-by-ids) "
+        "from the console-files store (Files-metadata domain, "
+        "MongoDB-elimination EPIC) — the RLS-isolated store backing "
+        "LibreChat's file records. METADATA ONLY: the file bytes stay "
+        "in object storage. Grants no access to another user's file "
+        "records or to any other memory layer."
+    ),
+    "memory:files:write": (
+        "Create/update/delete your own file-metadata records in the "
+        "console-files store (Files-metadata domain, MongoDB-"
+        "elimination EPIC). Grants no access to another user's file "
+        "records (RLS-enforced), no access to any other memory layer, "
+        "and no access to the file BYTES themselves (object storage is "
+        "a separate concern)."
+    ),
+    "memory:agents:read-own": (
+        "Read your own agents (and batch-get-by-ids) from the "
+        "console-agents store (Agents domain, MongoDB-elimination EPIC) "
+        "— the RLS-isolated store backing LibreChat's Agent records. "
+        "Own-agents-only: sharing/marketplace is out of scope. Grants "
+        "no access to another user's agents or to any other memory "
+        "layer."
+    ),
+    "memory:agents:write": (
+        "Create/update/delete your own agents in the console-agents "
+        "store (Agents domain, MongoDB-elimination EPIC). Grants no "
+        "access to another user's agents (RLS-enforced) and no access "
+        "to any other memory layer."
+    ),
+    "memory:conversation_tags:read-own": (
+        "Read your own conversation-tags from the "
+        "console-conversation-tags store (Conversation-Tags domain, "
+        "MongoDB-elimination EPIC) — the RLS-isolated store backing "
+        "LibreChat's conversationTag records. Own-tags-only: sharing/"
+        "marketplace is out of scope. Grants no access to another "
+        "user's conversation-tags or to any other memory layer."
+    ),
+    "memory:conversation_tags:write": (
+        "Create/update/delete your own conversation-tags in the "
+        "console-conversation-tags store (Conversation-Tags domain, "
+        "MongoDB-elimination EPIC). Grants no access to another user's "
+        "conversation-tags (RLS-enforced) and no access to any other "
+        "memory layer."
+    ),
+    "memory:tool_favorites:read-own": (
+        "Read your own tool-favorites from the console-tool-favorites "
+        "store (Tool-Favorites domain, MongoDB-elimination EPIC) — the "
+        "RLS-isolated store backing LibreChat's ToolFavorite records. "
+        "Own-favorites-only: sharing/marketplace is out of scope. "
+        "Grants no access to another user's tool-favorites or to any "
+        "other memory layer."
+    ),
+    "memory:tool_favorites:write": (
+        "Add/remove your own tool-favorites in the console-tool-"
+        "favorites store (Tool-Favorites domain, MongoDB-elimination "
+        "EPIC), subject to the MAX_TOOL_FAVORITES per-user cap. Grants "
+        "no access to another user's tool-favorites (RLS-enforced) and "
+        "no access to any other memory layer."
+    ),
+    "memory:acl:read-own": (
+        "Read effective permissions, accessible/public/sole-owned "
+        "resource ids from the console-ACL store (Sovereign "
+        "Authorization Layer EPIC, WU-1 — READ PATH ONLY) — the "
+        "RLS-isolated store backing LibreChat's AclEntry records. "
+        "Every answer is scoped to the CALLER's own resolved principal "
+        "set (self + public); group principals are disabled at the "
+        "schema level. This scope grants no write path (see "
+        "memory:acl:write) and no access to any other memory layer."
+    ),
+    "memory:acl:write": (
+        "Write ACL grants through the console-ACL routes (Sovereign "
+        "Authorization Layer EPIC, WU-2c): grant, revoke, modify, bulk "
+        "and expire-by-predicate on the CALLER's own resources. The "
+        "database (RLS, migration 032) decides who may write — a "
+        "non-owner is refused and the refusal is audited. Does not "
+        "open the read routes (memory:acl:read-own) and grants no "
+        "access to any other memory layer."
     ),
     "memory:upload:write": (
         "Upload bytes (PDFs, etc.) into the ingestion content-control "
@@ -132,10 +319,37 @@ ALL_SCOPES: dict[str, str] = {
 # resolvable at import time in normal env-var setups; tests that
 # override Settings can patch ``audittrace.auth.oauth2_scheme`` if
 # they need a different issuer URL in the spec.
-def _build_oauth2_scheme() -> OAuth2AuthorizationCodeBearer:
+class _RegisteringOAuth2Scheme(OAuth2AuthorizationCodeBearer):
+    """OAuth2 scheme that registers the bearer value before returning it.
+
+    SEC-JWT-IN-LANGFUSE-SPAN D3 — the request-credential registry's single
+    entry point. ``OAuth2AuthorizationCodeBearer.__call__`` is async and
+    extracts the raw bearer value from the ``Authorization`` header; this
+    subclass registers that value in the request-scoped ContextVar
+    (``audittrace.identity.register_request_secret``) BEFORE returning it
+    to the caller. Because ``Depends(oauth2_scheme)`` resolution happens
+    before the dependant function body runs, the value is registered
+    strictly earlier than any ``@log_call`` target — including
+    ``require_user`` itself — can observe it in the same task, so
+    ``logging_config.scrub_text`` can redact it by value equality from
+    every argument, return value, nested structure and exception message
+    for the rest of the request (G3).
+
+    No new header-reading path is introduced: this only renames the
+    existing extraction already performed by the base class's ``__call__``.
+    """
+
+    async def __call__(self, request: Request) -> str | None:
+        token = await super().__call__(request)
+        if token:
+            register_request_secret(token)
+        return token
+
+
+def _build_oauth2_scheme() -> _RegisteringOAuth2Scheme:
     settings = get_settings()
     base = settings.keycloak_issuer
-    return OAuth2AuthorizationCodeBearer(
+    return _RegisteringOAuth2Scheme(
         authorizationUrl=f"{base}/protocol/openid-connect/auth",
         tokenUrl=f"{base}/protocol/openid-connect/token",
         scopes=ALL_SCOPES,

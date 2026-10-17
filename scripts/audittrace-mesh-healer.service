@@ -4,6 +4,12 @@ Documentation=file:///home/lfdesousa/work/AuditTrace-AI/scripts/audittrace-mesh-
 # Triggered by audittrace-mesh-healer.path when the deploy runner writes a
 # request file. This is the ONE root-owned unit in the WS5 heal path.
 #
+# MESH_HEAL_DIR below is the single source of truth for the watched dir,
+# shared with audittrace-mesh-healer.path's DirectoryNotEmpty= and
+# scripts/deploy/mesh.py's mesh_heal_dir(). Its runner-writability across
+# reboots is guaranteed by scripts/audittrace-mesh-heal.tmpfiles.conf (#411
+# v2) — installed alongside this unit, NOT by this unit.
+#
 # Soft dependency on k3s.service (NOT Requires=) — same rule as
 # audittrace-vault-auto-unseal.service / audittrace-pod-reaper.service.
 # Requires= would cancel this unit's job if k3s's first start failed, and no

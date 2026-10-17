@@ -1,0 +1,93 @@
+# Retention windows — SSOT (single source of truth).
+#
+# SPEC 2026-08-22-SPEC-retention-per-signal-windows — RATIFIED 2026-08-22.
+# Operator ratified these per-signal windows (EU AI Act Art 12
+# contemporaneity; the audit horizon drives the numbers). This file is
+# version-controlled, canonical config for the ratified table — mirrors the
+# SPEC #441 dashboards-SSOT pattern (`charts/audittrace/files/grafana-dashboards/`):
+# the chart is where the deployment repo's canonical config lives, even
+# though this signal set is not templated into a Kubernetes resource.
+#
+# `scripts/retention-drift-check.py` parses THIS file plus (where reachable,
+# operator-attended) the sibling obs-stack repo's live configs, and fails
+# non-zero on ANY divergence from the windows declared here — so retention
+# cannot silently drift back to unconfigured defaults. Nothing here is
+# applied automatically: the obs-stack + MinIO/S3 bucket-lifecycle applies
+# stay operator-attended (see the SPEC's Out-of-scope section) and are
+# DRIVEN from this file, never hand-authored independently of it.
+#
+# Portability invariant: the window VALUES below are the same across the
+# laptop and cloud profiles (7d/30d/30d/no-expiry are audit-horizon
+# decisions, not environment-shaped) — what differs per profile is WHERE
+# the live config lives (laptop MinIO buckets vs cloud S3, laptop
+# filesystem-backed Loki vs cloud S3-chunks-backed Loki per ADR-027
+# direction). The `profiles` block below carries that per-target plumbing;
+# `signals[*].window` never varies by profile.
+
+profiles:
+  laptop:
+    minio_buckets: ["memory-private", "memory-shared"]
+  cloud:
+    # S3 bucket names are operator/Terraform-provisioned per ADR-027's cloud
+    # direction; the override lives outside this repo (see #296/#297). Left
+    # empty here deliberately — a real cloud value would be a config
+    # override, never a hardcoded name in core logic (portability invariant).
+    minio_buckets: []
+
+signals:
+  tempo_traces:
+    window: "7d"
+    source:
+      kind: obs_stack_yaml
+      # Relative to $OBS_STACK_DIR.
+      path: "tempo/tempo.yml"
+      pointer: ["compactor", "compaction", "block_retention"]
+    rationale: >-
+      Enough to debug the last week; corroborating witness only — the
+      memory layers + audit rows are the durable record (see
+      docs/ADR-028 §Retention).
+
+  loki_logs:
+    window: "30d"
+    source:
+      kind: obs_stack_yaml
+      path: "loki/loki-config.yml"
+      pointer: ["limits_config", "retention_period"]
+    rationale: >-
+      Audit-adjacent log horizon; kills the unbounded-disk risk of the
+      pre-ratification default (no compactor at all). Ships with an
+      S3(MinIO)-backed compactor per the ADR-027 cloud direction — that
+      apply is operator-attended.
+
+  prometheus_metrics:
+    window: "30d"
+    source:
+      kind: obs_stack_compose_flag
+      # Relative to $OBS_STACK_DIR.
+      path: "docker-compose.yml"
+      flag: "--storage.tsdb.retention.time"
+    rationale: "One month of trend; cheap to keep."
+
+  minio_memory_objects:
+    window: "no-expiry"
+    source:
+      kind: declared
+    rationale: >-
+      The durable record (episodic/procedural objects) — never
+      auto-delete. Explicit no-expiry lifecycle rule, not "no lifecycle
+      configured" (an explicit retain decision, per the SPEC's
+      codification intent).
+
+  chromadb_semantic:
+    window: "no-expiry"
+    source:
+      kind: declared
+    rationale: "Durable — the semantic memory layer."
+
+  postgres_audit_rows:
+    window: "no-expiry"
+    source:
+      kind: declared
+    rationale: >-
+      EU AI Act Art 12 durable audit trail; `interactions`/`tool_calls`
+      are append-only + hash-chained (ADR-058).

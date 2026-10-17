@@ -22,12 +22,13 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/lfdesousa/AuditTrace-AI/badges/test-count.json)](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)
 
 ## Features
 
 - 🧠 **4-Layer Memory Architecture** -- Episodic (ADRs), procedural (skills), conversational (PostgreSQL), semantic (ChromaDB). Layers 1+2 are **always** MinIO-backed (S3) — no filesystem fallback; tests use `Mock*` services.
 - 🛠️ **Memory-as-Tools** -- LLM calls `recall_decisions`, `recall_skills`, `recall_recent_sessions`, `recall_semantic` (snippet discovery) plus `read_decision`, `read_skill` (full-content fetch by filename) on demand instead of paying the 4-layer cost on every prompt (ADR-025). Dynamic registry, Redis-backed result cache, configurable iteration cap.
-- 📄 **Audit-Grade PDF Ingestion** -- **Tier-A** PAdES signature validation with the 9-class taxonomy (`signed_valid` / `signed_invalid` / `signed_untrusted` / `signed_expired` / `signed_tampered` / `none` / `check_skipped` / `check_unavailable` / `check_failed`); **tier-B** robustness (encrypted-PDF reject, attachment quarantine, AcroForm extraction, OCR coverage tracking, document-level manifest with SHA-256 + GIN-indexed `extraction_warnings`); **tier-C** document metadata + per-document audit granularity + corrupted-file taxonomy + dry-run + LTV + PDF/A + TOC-aware chunking + surgical reindex. ADR-050 / ADR-052 / ADR-054 / ADR-056.
+- 📄 **Audit-Grade PDF Ingestion** -- **Tier-A** PAdES signature validation with the 10-class taxonomy (`signed_valid` / `signed_invalid` / `signed_untrusted` / `signed_expired` / `signed_tampered` / `none` / `check_skipped` / `check_unavailable` / `check_failed` / `check_error`); **tier-B** robustness (encrypted-PDF reject, attachment quarantine, AcroForm extraction, OCR coverage tracking, document-level manifest with SHA-256 + GIN-indexed `extraction_warnings`); **tier-C** document metadata + per-document audit granularity + corrupted-file taxonomy + dry-run + LTV + PDF/A + TOC-aware chunking + surgical reindex. ADR-050 / ADR-052 / ADR-054 / ADR-056.
 - 🔐 **EU + Swiss Trust Store** -- Pluggable `TrustStoreProvider` / `TrustStoreBuilder` ABCs (S3-backed by default, Vault-future). EU LOTL walker via `pyhanko[etsi]` (ADR-052) + Swiss federal TSL fetcher (OFCOM/BAKOM, ADR-053) → composite ~897 EU + CH qualified-signature CAs. Refresh via `POST /system/trust-store/refresh` (`audittrace:admin`) or Helm post-install hook. As-of-signing-time retry with 5-min clock-skew tolerance (ADR-054) distinguishes `signed_expired` from `signed_untrusted`.
 - 👥 **Multi-user Identity** -- Keycloak-delegated OAuth2 + per-user `UserContext` plumbing + Postgres Row-Level Security + ChromaDB scoped wrapper. Non-superuser `audittrace_app` role means RLS actually bites at the DB layer (ADR-026). RLS-aware `app.current_user_id` ContextVar plumbed through background workers + CLIs (ADR-046).
 - 🔐 **External IdP Federation** -- Keycloak brokering to Google Workspace / Okta / EntraID for multi-tenant SSO (ADR-044). Multi-issuer JWT validation already in place (ADR-032 §2).
@@ -41,7 +42,7 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 - 🇪🇺 **GDPR-Compliant** -- Data never leaves your infrastructure.
 - 🔌 **OpenAI-Compatible** -- `/v1/chat/completions` API.
 - 🐳 **Two runtimes, one image** -- k3s + Istio + Helm chart for production ZTA; Docker Compose for development. Same image, same env-var contract.
-- ✅ **Comprehensive Test Suite** -- 2050 tests, 98% coverage, 90% per-file gate enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
+- ✅ **Comprehensive Test Suite** -- 98% coverage, 90% per-file gate enforced in CI (live suite size in the tests badge above; [latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
 
 ## Quick Start
 
@@ -130,7 +131,7 @@ The same script works for both runtimes — only the in-runtime shippers (OTel C
 # or
 make install
 
-# Run tests (90% per-file coverage enforced; full suite is 2050 tests / 98% total)
+# Run tests (90% per-file coverage enforced; see the tests badge for the live suite size)
 make test
 
 # Run RLS integration tests against an ephemeral docker postgres on :15432
@@ -399,7 +400,7 @@ The `audittrace-dev` client is the right choice for non-interactive scripts; see
 | ✅ Done | **Async Persistence (ADR-046)** | Background asyncio worker + scoped Postgres ContextVar so RLS bites on background writes. Caught by live test 2026-05-04 — InMemoryPostgresFactory had no RLS. |
 | ✅ Done | **Server-Side Embedding (ADR-047)** | Embeddings computed in-process via the bundled ONNX model; ChromaDB never sees the raw text. |
 | ✅ Done | **Test + Evidence + Reconstructibility Gate (ADR-049)** | Hard four-rule gate: unit + per-file ≥90% + E2E through public API on the deployed image + reconstruction artefacts (trace ID, audit row, ChromaDB / MinIO / Postgres query). Mechanical enforcement via pre-commit hook + CI evidence-check job + PR template. |
-| ✅ Done | **PDF tier-A signature validation** | PAdES audit-grade signature checks via pyhanko; 8-class taxonomy (`signed_valid/invalid/untrusted/tampered`, `none`, `check_*`); per-chunk + manifest `signature_status` column. |
+| ✅ Done | **PDF tier-A signature validation** | PAdES audit-grade signature checks via pyhanko; 10-class taxonomy (`signed_valid/invalid/untrusted/expired/tampered`, `none`, `check_*`); per-chunk + manifest `signature_status` column. |
 | ✅ Done | **PDF tier-B robustness (ADR-050)** | Encrypted-PDF reject (no password endpoint), embedded-attachment quarantine (PDF/A-3, ZUGFeRD), AcroForm field extraction, OCR-coverage tracking, document-level manifest (page_count, ocr_coverage_pct, attachment_count, form_field_count, extraction_warnings JSONB with GIN index, document_sha256). 16-code closed-set warnings enum pinned by `TestExtractionWarningCodes`. |
 | ✅ Done | **PAdES trust store + Swiss TSL (ADR-052 + ADR-053)** | Pluggable `TrustStoreProvider` / `TrustStoreBuilder` ABCs (S3 + Mock + composite). EU LOTL walker via `pyhanko[etsi]` ~~830~~ + Swiss federal TSL fetcher (OFCOM/BAKOM TSLO) → composite ~897 EU + CH qualified-signature CAs. `POST /system/trust-store/refresh` admin endpoint + Helm post-install hook. Live evidence: `main_signed.pdf` flipped from `check_unavailable` → `signed_invalid` → `signed_valid` after refresh ran. |
 | ✅ Done | **As-of-signing-time validation (ADR-054)** | 9th class `signed_expired`: signature chain validates as-of self-reported signing time but the cert is no longer valid at present. 5-min Kerberos-style clock-skew tolerance handles cert NotBefore that lags signing time by seconds. |

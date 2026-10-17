@@ -124,6 +124,15 @@ http://{{ .Release.Name }}-keycloak:8080/realms/audittrace/protocol/openid-conne
 {{- end }}
 
 {{/*
+Internal Keycloak token endpoint URL (M3-WU-3b — the BFF's RFC 8693
+token-exchange target). In-cluster, mirrors keycloakIssuer/keycloakJwksUrl
+above — never the external front door (D1).
+*/}}
+{{- define "audittrace.keycloakTokenUrl" -}}
+http://{{ .Release.Name }}-keycloak:8080/realms/audittrace/protocol/openid-connect/token
+{{- end }}
+
+{{/*
 Accepted token issuers for the memory-server JWT validator (JSON list).
 ALWAYS includes the issuer derived from keycloak.hostnameUrl — tokens
 carry iss=<hostnameUrl>/realms/audittrace — MERGED with the explicit
@@ -140,6 +149,35 @@ iss was not in externalIssuers. 2026-05-28 burn (cloud Tier-0 login).
 {{- end -}}
 {{- $extras | uniq | toJson -}}
 {{- end }}
+
+{{/*
+FLEET-ROUTE-ENABLE (2026-08-06, #229 follow-up) — computes
+AUDITTRACE_MODEL_ROUTES (rendered by templates/memory-server/deployment.yaml).
+
+Starts from the operator-provided memoryServer.modelRoutes map (default:
+{}), then — only when externalLLM.enabled AND externalLLM.mistral.enabled
+are both true — fills in a `mistral` key that routes through the
+in-cluster `<release>-llm-mistral` ExternalName Service on
+externalLLM.mistral.port, mirroring how AUDITTRACE_LLAMA_URL /
+_EMBED_URL / _SUMMARIZER_URL address their upstreams (NOT a
+host.docker.internal bypass). An operator-set
+memoryServer.modelRoutes.mistral value always wins over the computed
+default (Sprig `merge`: dst keys are never overwritten by src).
+
+With externalLLM.mistral.enabled=false (the default) this renders `{}`
+— byte-identical to pre-FLEET-ROUTE-ENABLE behaviour (G3
+additive/default-safe). Qwen has no equivalent branch: it is the
+default fall-through upstream (AUDITTRACE_LLAMA_URL) and must never get
+a redundant modelRoutes entry.
+*/}}
+{{- define "audittrace.modelRoutes" -}}
+{{- $routes := .Values.memoryServer.modelRoutes | default dict -}}
+{{- if and .Values.externalLLM.enabled .Values.externalLLM.mistral.enabled -}}
+{{- $mistralUrl := printf "http://%s-llm-mistral:%v/v1" .Release.Name .Values.externalLLM.mistral.port -}}
+{{- $routes = merge $routes (dict "mistral" $mistralUrl) -}}
+{{- end -}}
+{{- $routes | toJson -}}
+{{- end -}}
 
 {{/*
 Object-storage backend selector (ADR-006). Returns "minio" or "aws".
@@ -322,6 +360,88 @@ vault.hashicorp.com/agent-inject-template-env: |
   {{ "{{ with secret \"kv/data/audittrace/chromadb/main\" }}" }}
   export CHROMA_SERVER_AUTHN_CREDENTIALS='{{ "{{ .Data.data.token }}" }}'
   {{ "{{ end }}" }}
+{{- end }}
+
+{{/*
+Vault Agent Injector annotations — LibreChat BFF (M3-WU-3b, ADR-043 §4, D4).
+Emits export for AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET sourced from
+kv/audittrace/librechat/bff-secret.secret — the Keycloak-generated
+confidential-client secret for `audittrace-librechat-bff` (WU-2b), seeded
+manually by the operator (it is Keycloak-generated, not operator-chosen, so
+there is no secrets/*.txt file for it — same posture as the Keycloak admin
+password).
+*/}}
+{{- define "audittrace.vaultAnnotations.librechatBff" -}}
+vault.hashicorp.com/agent-inject: "true"
+vault.hashicorp.com/role: "librechat-bff"
+vault.hashicorp.com/agent-inject-status: "update"
+vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/librechat/bff-secret"
+vault.hashicorp.com/agent-inject-template-env: |
+  {{ "{{ with secret \"kv/data/audittrace/librechat/bff-secret\" }}" }}
+  export AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET='{{ "{{ .Data.data.secret }}" }}'
+  {{ "{{ end }}" }}
+{{- end }}
+
+{{/*
+M3-WU-3c (D1) — single source of truth for whether the BFF's RFC 8693
+exchange-client secret is sourced from Vault. Returns the literal string
+"true" only when BOTH the cluster-wide `vault.enabled` AND the BFF's own
+`console.bff.secretSource` opt in (default "vault" — WU-3b's production
+posture, byte-identical). `secretSource: values` ALWAYS falls through to
+the k8s Secret path below, even when vault.enabled=true cluster-wide — the
+unblock that lets a test deploy pass the exchange secret as a value with
+no Vault root token. Every branch that used to gate on `.Values.vault.enabled`
+directly (annotations, the /vault/secrets/env sourcing shell, the
+k8s-Secret env fallback, and secret-bff.yaml's render condition) now gates
+on this helper instead, so the two can never drift apart.
+*/}}
+{{- define "audittrace.console.bff.useVault" -}}
+{{- if and .Values.vault.enabled (eq .Values.console.bff.secretSource "vault") -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+M3-WU-3c (D3) — generate-if-absent + persist for one LibreChat session/
+creds-material Secret field (creds-key/creds-iv/jwt-secret/
+jwt-refresh-secret/openid-session-secret). Regenerating these on every
+`helm upgrade` silently invalidates every active session and any
+already-encrypted stored credential (spec D3) — so no field may be
+recomputed once it exists.
+
+Precedence:
+  1. an explicit non-empty `secrets.console.<field>` value (operator- or
+     external-secret-manager-supplied override — unchanged from WU-3b);
+  2. the value already present in the cluster's Secret, discovered via a
+     `lookup`-guarded read (`lookup` only sees a REAL cluster — under
+     `helm template`/`helm lint`, with no cluster connection, it always
+     returns an empty map, so those renders fall through to (3)
+     deterministically — expected, and why (1) exists for CI/guards);
+  3. a freshly generated value — hex of the exact byte length LibreChat's
+     AES-256-CBC creds fields require (sha256sum of a random seed, kept
+     full-length for the 32-byte key or truncated for the 16-byte IV), or
+     an opaque random string for the JWT/session fields. No `openssl` in
+     the operator's hands.
+
+Args (dict): explicit (string), existing (dict of already-base64 values
+keyed by Secret data-key, or empty), key (the Secret data key to look up
+in `existing`), kind ("hex64" | "hex32" | "alnum" — the generated shape).
+Returns a base64 string ready for a Secret's `data:` map — `existing`
+values are ALREADY base64 (as stored by the API server) and pass through
+untouched; explicit/generated values are base64-encoded here.
+*/}}
+{{- define "audittrace.console.persistedSecret" -}}
+{{- if .explicit -}}
+{{ .explicit | b64enc }}
+{{- else if hasKey .existing .key -}}
+{{ index .existing .key }}
+{{- else if eq .kind "hex64" -}}
+{{ sha256sum (randAlphaNum 40) | b64enc }}
+{{- else if eq .kind "hex32" -}}
+{{ (sha256sum (randAlphaNum 40) | trunc 32) | b64enc }}
+{{- else -}}
+{{ randAlphaNum 64 | b64enc }}
+{{- end -}}
 {{- end }}
 
 {{/*

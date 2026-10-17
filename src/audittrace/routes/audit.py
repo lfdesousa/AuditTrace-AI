@@ -124,8 +124,23 @@ async def list_interactions(
         None,
         description=(
             "Filter by event_class: 'interaction' | 'security' | 'assessment' "
-            "(ADR-048 / ADR-058). Pull a whole recorded self-assessment with "
-            "event_class=assessment & session_id=<assessment_id>."
+            "| 'memory_access' | 'acl_authz' (ADR-048 / ADR-058 / ADR-062 §5 / "
+            "the Sovereign Authorization Layer EPIC). Pull a whole recorded "
+            "self-assessment with event_class=assessment & "
+            "session_id=<assessment_id>; pull every /memory/* access with "
+            "event_class=memory_access; pull every sovereign ACL write "
+            "attempt (granted or denied) with event_class=acl_authz."
+        ),
+    ),
+    trace_id: str | None = Query(
+        None,
+        min_length=32,
+        max_length=32,
+        pattern=r"^[0-9a-f]{32}$",
+        description=(
+            "Filter by OpenTelemetry trace_id (32 lowercase hex). Narrows "
+            "*within* the caller's own RLS-scoped rows; composes with every "
+            "other filter."
         ),
     ),
     limit: int = Query(100, ge=1, le=1000, description="Max rows (1-1000)."),
@@ -162,6 +177,8 @@ async def list_interactions(
             stmt = stmt.where(InteractionRow.status == status)
         if event_class is not None:
             stmt = stmt.where(InteractionRow.event_class == event_class)
+        if trace_id is not None:
+            stmt = stmt.where(InteractionRow.trace_id == trace_id)
 
         total = (
             await db.execute(select(func.count()).select_from(stmt.subquery()))

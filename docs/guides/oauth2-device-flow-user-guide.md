@@ -67,11 +67,19 @@ loop catches the approval within 5 seconds and exits with:
 [audittrace-login] ✅ logged in — tokens saved to /home/<you>/.config/audittrace/tokens.json
 ```
 
-Verify:
+Verify (the redacted default is enough for "did it work?"):
 
 ```bash
-scripts/audittrace-login --show | cut -c1-80
-# → a base64-encoded JWT (three dot-separated segments)
+scripts/audittrace-login --show
+# → token_fingerprint=<8 hex chars> exp=<epoch seconds>
+```
+
+If you specifically want to see the raw JWT structure (three
+dot-separated base64 segments), use the explicit escape hatch — never
+teach this flag to an agent, it's for a human's own terminal:
+
+```bash
+scripts/audittrace-login --show-unsafe | cut -c1-80
 ```
 
 ---
@@ -174,7 +182,7 @@ For quick probes, Bruno collections, or wrapping the API from a
 shell script:
 
 ```bash
-BEARER=$(scripts/audittrace-login --show)      # silent refresh if near expiry
+BEARER=$(scripts/audittrace-login --show-unsafe)      # silent refresh if near expiry
 
 curl -sk https://localhost/v1/chat/completions \
   -H "Authorization: Bearer $BEARER" \
@@ -192,9 +200,11 @@ curl -sk https://localhost/v1/chat/completions \
   mkcert root isn't in curl's default CA bundle).
 - `X-Project: AuditTrace-AI` routes the interaction under the right
   project tag per [ADR-029](../ADR-029-audit-trail-completeness.md).
-- `scripts/audittrace-login --show` refreshes the access_token
-  transparently if it's within 60 seconds of expiry, so you can lean
-  on this in a long-running shell without worrying about expiry.
+- `scripts/audittrace-login --show`/`--show-unsafe`/`--ensure` all refresh
+  the access_token transparently if it's within 60 seconds of expiry, so
+  you can lean on this in a long-running shell without worrying about
+  expiry — `--show-unsafe` is used above because this scenario needs the
+  raw Bearer value for the `curl` call.
 
 ---
 
@@ -364,7 +374,7 @@ Expected:
 
 ```bash
 # 2. Fire a chat request, confirm 200 OK
-BEARER=$(scripts/audittrace-login --show)
+BEARER=$(scripts/audittrace-login --show-unsafe)
 curl -sk -X POST https://localhost/v1/chat/completions \
   -H "Authorization: Bearer $BEARER" \
   -H "Content-Type: application/json" \
@@ -400,7 +410,7 @@ hybrid recall, audit trail) is working as designed.
 | `401 Unauthorized` from OpenCode specifically, but direct `curl` with the same token works | Stale `options.apiKey` in the OpenCode config still carries an old token — `@ai-sdk/openai-compatible` builds Authorization from apiKey and that wins over any `headers.Authorization` we inject | `scripts/opencode-wrapper.sh` writes apiKey directly (fixed in commit `537ddd8`). On older wrapper, either re-run the wrapper or manually: `jq '.provider \|= with_entries(.value.options.apiKey = "<fresh-token>" \| .value.options.headers \|= del(.Authorization))' ~/.config/opencode/config.json` |
 | OpenCode 401 persists after wrapper rewrites the config | OpenCode cached the apiKey at session start and didn't re-read the config | Quit OpenCode fully and relaunch — the config is only read at startup |
 | Browser shows login page but "invalid username or password" | Password reset needed | Scenario 9 (admin reset) |
-| `scripts/audittrace-login --show` prints empty string | Token file exists but refresh failed | `cat ~/.config/audittrace/tokens.json \| jq` — check `refresh_expires_at`; if past, re-login per Scenario 6 |
+| `scripts/audittrace-login --ensure` exits non-zero (or `--show`/`--show-unsafe` errors to stderr instead of printing) | Token file exists but refresh failed | `jq '.refresh_expires_at' ~/.config/audittrace/tokens.json` — check against `date +%s`; if past, re-login per Scenario 6 |
 | Polling loop hangs past the `expires_in` window | Browser approval didn't reach Keycloak | Re-run `scripts/audittrace-login` (fresh device_code), try again |
 | `Not Found` on OpenID discovery (`.well-known/openid-configuration`) | Keycloak mid-restart | Wait 10-20s for Keycloak readiness; check `docker compose logs keycloak` for "Listening on" |
 

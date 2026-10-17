@@ -20,6 +20,7 @@ from audittrace.services.layer_cache import (
     RedisLayerCacheStore,
     get_layer_cache,
     layer_list_cache_key,
+    layer_list_cache_key_private,
     reset_layer_cache,
     set_layer_cache,
 )
@@ -48,6 +49,71 @@ class TestKeyScheme:
         )
         # Disjoint from token / tool-result namespaces.
         assert not layer_list_cache_key("episodic").startswith("sovereign:token:")
+
+
+class TestPrivateKeyScheme:
+    """ADR-062 Phase B (WU-B1) — the ``user_id`` dimension is a SECURITY
+    BOUNDARY, not a convenience. Without it, the fail-open Redis store
+    would serve one caller's private listing to another."""
+
+    def test_key_is_namespaced_per_layer_and_user(self) -> None:
+        assert (
+            layer_list_cache_key_private("episodic", "user-alice")
+            == "audittrace:layer-cache:episodic:private:user-alice:list"
+        )
+        assert (
+            layer_list_cache_key_private("procedural", "user-bob")
+            == "audittrace:layer-cache:procedural:private:user-bob:list"
+        )
+
+    def test_two_users_get_disjoint_keys(self) -> None:
+        alice_key = layer_list_cache_key_private("episodic", "user-alice")
+        bob_key = layer_list_cache_key_private("episodic", "user-bob")
+        assert alice_key != bob_key
+
+    def test_private_key_disjoint_from_shared_corpus_key(self) -> None:
+        """The private key must never collide with the layer's shared
+        (corpus) key — that WOULD be the leak this key exists to prevent."""
+        shared_key = layer_list_cache_key("episodic")
+        private_key = layer_list_cache_key_private("episodic", "user-alice")
+        assert shared_key != private_key
+
+    def test_cross_user_leak_via_stale_shared_key_is_the_bug_this_prevents(
+        self, store
+    ) -> None:
+        """Falsifiable isolation-safety-bar proof (ADR-062 Phase B §3).
+
+        NEUTER: simulate the bug where the private cache mistakenly used
+        the SHARED, non-user-keyed ``layer_list_cache_key`` for private
+        content — user A's write and user B's read collide on the SAME
+        key, so B's "own" private listing read returns A's private rows.
+        RESTORE: the real ``layer_list_cache_key_private(layer, user_id)``
+        keeps the two callers' cache entries disjoint.
+        """
+        alice_private_rows = [
+            {"file": "alice-secret.md", "content": "private", "tier": "private"}
+        ]
+        bob_private_rows = [
+            {"file": "bob-secret.md", "content": "private", "tier": "private"}
+        ]
+
+        # NEUTER — both users' private listings target the SAME shared key
+        # (what would happen if the user_id dimension were dropped).
+        buggy_shared_key = layer_list_cache_key("episodic")
+        store.set(buggy_shared_key, alice_private_rows, ttl_seconds=900)
+        # Bob's "own" private-listing read collides with Alice's write.
+        leaked = store.get(buggy_shared_key)
+        assert leaked == alice_private_rows  # the leak, proven RED
+
+        # RESTORE — the real per-user key scheme.
+        store.invalidate(buggy_shared_key)
+        alice_key = layer_list_cache_key_private("episodic", "user-alice")
+        bob_key = layer_list_cache_key_private("episodic", "user-bob")
+        store.set(alice_key, alice_private_rows, ttl_seconds=900)
+        store.set(bob_key, bob_private_rows, ttl_seconds=900)
+        assert store.get(alice_key) == alice_private_rows
+        assert store.get(bob_key) == bob_private_rows
+        assert store.get(alice_key) != store.get(bob_key)  # GREEN — isolated
 
 
 class TestRedisStore:

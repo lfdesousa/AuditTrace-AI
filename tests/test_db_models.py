@@ -186,6 +186,14 @@ class TestToolCallSchema:
             "started_at",
             "duration_ms",
             "granted_scope",
+            # Migration 021 (ADR-063 Phase 2 Track B) — broker provenance,
+            # all nullable/additive. NULL on every Phase 1 own-tool row.
+            "provenance",
+            "phase",
+            "downstream_server",
+            "downstream_tool",
+            "args_digest",
+            "result_digest",
         }
 
 

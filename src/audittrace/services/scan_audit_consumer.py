@@ -1,8 +1,10 @@
 """ADR-048 PR-B4 — security-audit consumer.
 
-Consumes the ``audittrace.scan.audit`` queue (declared by PR-B2.5
-topology Job, bound via routing key ``scan.audit.*``). On each
-message:
+Consumes the ``audittrace.scan.audit`` queue (also declared by the
+PR-B2.5 topology Job, bound via routing key ``scan.audit.*``; #393 —
+this consumer self-declares the queue idempotently too, so a cold
+boot no longer depends on winning a race against the bootstrap Job).
+On each message:
 
     1. Parse the JSON ``SecurityAuditRow`` (cross-repo contract).
     2. INSERT a row into the ``interactions`` table with
@@ -79,13 +81,27 @@ class ScanAuditConsumer:
         self._channel: Any = None
         self._queue: Any = None
 
+    # #393 — canonical queue-declare args. MUST match the
+    # ``job-amqp-topology-bootstrap`` Job byte-for-byte
+    # (``charts/audittrace/templates/rabbitmq/job-amqp-topology-bootstrap.yaml``,
+    # the ``audittrace.scan.audit`` PUT body: ``{"auto_delete":false,
+    # "durable":true,"arguments":{"x-queue-type":"quorum"}}``) — that
+    # Job is the single source of truth for the topology. A mismatch
+    # makes RabbitMQ raise ``ChannelPreconditionFailed`` on declare.
+    _CANONICAL_QUEUE_ARGUMENTS: dict[str, str] = {"x-queue-type": "quorum"}
+
     # 2026-05-14 B4b — see scan_verdict_consumer for the symmetric
     # rationale. Same fresh-install race; same retry budget.
     #
-    # RESIDUAL GAP (#393): as in ScanVerdictConsumer, a cold-boot
-    # queue-declaration race outlasting this budget still raises
-    # RuntimeError and kills the consumer (queue-not-found is not
-    # supervised in run()). Tracked as a follow-up.
+    # #393 FIX: switched from passive ``get_queue`` to idempotent
+    # active ``declare_queue`` (mirrors the exchange fix in
+    # ``ScanAmqpClient.ensure_connected``, PR-B10). The retry loop
+    # below is now a guard against transient AMQP errors while
+    # (re)opening the channel/declaring the queue, not the primary
+    # mechanism for waiting out a not-yet-created queue — the
+    # consumer declares the queue itself, so whichever side (this
+    # consumer or the chart's ``job-amqp-topology-bootstrap`` Job)
+    # runs first wins and the other adopts the existing queue.
     _QUEUE_MAX_ATTEMPTS: int = 6
 
     # #384 WS3 — INITIAL-connect resilience; see ScanVerdictConsumer for
@@ -138,10 +154,7 @@ class ScanAuditConsumer:
         import asyncio  # noqa: PLC0415
 
         import aio_pika  # noqa: PLC0415
-        from aio_pika.exceptions import (  # noqa: PLC0415
-            AMQPError,
-            ChannelNotFoundEntity,
-        )
+        from aio_pika.exceptions import AMQPError  # noqa: PLC0415
 
         # (C) connection-level retry — wait out a cold-reboot RabbitMQ
         # instead of dying (#384 WS3).
@@ -149,17 +162,29 @@ class ScanAuditConsumer:
         last_exc: Exception | None = None
         for attempt in range(self._QUEUE_MAX_ATTEMPTS):
             try:
+                # A closed channel can't be reused, so open a fresh one on
+                # every retry attempt.
                 self._channel = await self._connection.channel()
                 await self._channel.set_qos(prefetch_count=self._prefetch_count)
-                self._queue = await self._channel.get_queue(self._queue_name)
+                # #393 — idempotent ACTIVE declare (was passive
+                # ``get_queue``, which required the bootstrap Job to have
+                # already declared the queue). RabbitMQ no-ops if the
+                # queue already exists with matching arguments, so this
+                # composes safely with the bootstrap Job regardless of
+                # which side runs first (I2).
+                self._queue = await self._channel.declare_queue(
+                    self._queue_name,
+                    durable=True,
+                    arguments=self._CANONICAL_QUEUE_ARGUMENTS,
+                )
                 break
-            except ChannelNotFoundEntity as exc:
+            except (ConnectionError, OSError, TimeoutError, AMQPError) as exc:
                 last_exc = exc
                 if attempt == self._QUEUE_MAX_ATTEMPTS - 1:
                     break
                 delay = 2**attempt
                 logger.warning(
-                    "scan_audit_consumer.queue_not_found_retry",
+                    "scan_audit_consumer.queue_declare_retry",
                     extra={
                         "attempt": attempt + 1,
                         "max_attempts": self._QUEUE_MAX_ATTEMPTS,
@@ -171,8 +196,8 @@ class ScanAuditConsumer:
                 await asyncio.sleep(delay)
         if self._queue is None:
             raise RuntimeError(
-                f"scan_audit_consumer: queue {self._queue_name!r} not found "
-                f"after {self._QUEUE_MAX_ATTEMPTS} attempts "
+                f"scan_audit_consumer: queue {self._queue_name!r} declare "
+                f"failed after {self._QUEUE_MAX_ATTEMPTS} attempts "
                 f"(last error: {last_exc})"
             ) from last_exc
         logger.info(

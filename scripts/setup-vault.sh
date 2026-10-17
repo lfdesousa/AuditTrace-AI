@@ -280,13 +280,23 @@ fi
 # for the rotation procedure.
 echo "  ⊝ keycloak/admin — operator must seed manually (see runbook)"
 
+# M3-WU-3b (D4) — same posture as keycloak/admin above: the BFF's RFC 8693
+# token-exchange confidential-client secret is Keycloak-GENERATED at realm
+# import (audittrace-librechat-bff has no static `secret` field in
+# realm-audittrace.json), so there is no secrets/*.txt seed file for it.
+echo "  ⊝ librechat/bff-secret — operator must seed manually (see deploy runbook)"
+
 echo ""
 echo "✅ Vault configuration complete."
 echo ""
 echo "Next steps:"
 echo "  1. Set Keycloak admin password:"
 echo "     vault kv put ${KV_MOUNT}/audittrace/keycloak/admin password=<NEW_PW>"
-echo "  2. helm upgrade --set vault.enabled=true to engage Vault Agent"
+echo "  2. If console.enabled=true: set the LibreChat BFF's exchange secret"
+echo "     (retrieve via kcadm from the running audittrace-librechat-bff"
+echo "     client — see the deploy runbook):"
+echo "     vault kv put ${KV_MOUNT}/audittrace/librechat/bff-secret secret=<CLIENT_SECRET>"
+echo "  3. helm upgrade --set vault.enabled=true to engage Vault Agent"
 echo "     annotations on workloads."
-echo "  3. Rotate VAULT_TOKEN: revoke the root token and use a less-"
+echo "  4. Rotate VAULT_TOKEN: revoke the root token and use a less-"
 echo "     privileged operator token going forward."

@@ -30,6 +30,14 @@ Two public functions with DELIBERATELY ASYMMETRIC failure contracts:
   scheme/host checks — never a substring membership test on the raw URL string
   (the CodeQL ``py/incomplete-url-substring`` class that tripped WS2; the lesson
   "never substring-match URLs" is logged in the decisions layer).
+* Every outbound recall GET carries :func:`_fleet_headers` — a UNIVERSAL,
+  runtime-agnostic ``X-Agent-Role`` (``AUDITTRACE_AGENT_ROLE``, default
+  ``"fleet"``) that the server-side ``classify_recall_source_from_request``
+  classifier alone is enough to label ``source="fleet"`` for BOTH the local
+  OpenCode fleet AND the Sonnet cloud fleet, plus a runtime-honest
+  ``X-Source`` (``AUDITTRACE_AGENT_RUNTIME``-``AUDITTRACE_AGENT_ROLE``, e.g.
+  ``opencode-builder`` / ``sonnet-reviewer``) for the audit trail
+  (RECALL-METRIC-COVERAGE crux #4a, 2026-08-12).
 """
 
 from __future__ import annotations
@@ -46,15 +54,69 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 
+from scripts.deploy.build_record import (
+    PLACEHOLDER_CHECKED_FIELDS,
+    BuildRecordValidationError,  # noqa: F401 - re-exported for callers
+    patch_front_matter_fields,
+    validate_build_record,
+)
+from scripts.deploy.frontdoor import DEFAULT_FRONT_DOOR as _DEFAULT_FRONT_DOOR
+from scripts.deploy.frontdoor import resolve_front_door
+
 logger = logging.getLogger("audittrace.deploy.memory")
 
-DEFAULT_FRONT_DOOR = "https://audittrace.allaboutdata.eu"
+# Re-export DEFAULT_FRONT_DOOR for backward compatibility (external code may
+# import it from memory; tests assert memory.DEFAULT_FRONT_DOOR == the shared
+# module's value). The noqa silences ruff's "unused import" because the name
+# is re-exported at the module level, not used in the function body.
+DEFAULT_FRONT_DOOR = _DEFAULT_FRONT_DOOR  # noqa: F401
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "audittrace" / "tokens.json"
 
 # The decisions collection is where deploy lessons are indexed (the ``collections``
 # default of :func:`log_deploy_record`), so recall reads it back.
 DECISIONS_COLLECTION = "decisions"
+# WU-1 fix-round-3 (2026-09-17, F11 correction): this constant is
+# UNCHANGED by the D15 fix — every caller that omits ``limit`` (i.e. the
+# default fleet recall path) still gets only 25 rows. Post-fix those 25
+# rows are DOCUMENTS rather than chunks (a real improvement — no more
+# single-record crowding), but the corpus has hundreds of distinct
+# decisions-layer documents, so 25 is still a small slice.
+#
+# Deliberately NO recall@25 PERCENTAGE is pinned here (fix-round-2 stated
+# "~5.88%" and it was wrong by ~2x when a reviewer re-ran the same
+# committed harness the same day — that run measured 2.94% at k=25; a
+# THIRD run at fix-round-3, corpus grown to 4348 rows/777 docs, measured
+# 0.00% at k=25 both excl-today and incl-today). A
+# recency-ordered recall@k at a SMALL k is dominated by which handful of
+# documents happen to sit at the very front of the list at run time, so
+# it moves run-to-run as the corpus's most-recent few rows change — it
+# is reporting the corpus's momentary shape, not a stable property of
+# this fix. Re-run ``scripts/eval-recall-at-k.py`` for TODAY's number
+# (it prints a corpus pin so a re-run can tell whether the corpus it saw
+# matches); do not copy a percentage from this comment into a report.
+#
+# The operator raises the effective window per-dispatch today
+# (``limit=300`` pasted into every brief by hand, per the governing
+# spec's own framing) rather than this default being raised — left that
+# way deliberately, since a much larger default would make EVERY recall
+# (including throwaway ones) pull hundreds of manifest rows. Not fixed by
+# this WU — WU-2 (ranking) is the intended fix for "the right 25", not a
+# bigger 25.
 DEFAULT_RECALL_LIMIT = 25
+
+# ── build-outcome tagging (corpus-hygiene guard, 2026-08-21) ──────────────────
+# A build / review / deploy record MAY carry an explicit outcome so that recall
+# can QUARANTINE drift trajectories (a stalled or failed build) from being
+# recalled as if it were valid precedent — "gold to study, poison to recall".
+# The tag rides in the record FILENAME as an ``.outcome-<value>`` infix
+# (``2026-08-21-BUILD-456.outcome-stalled.md``) so it is visible in the recall
+# listing's ``title`` / ``key`` / ``source`` WITHOUT fetching content.
+BUILD_OUTCOMES = ("pass", "reject", "stalled", "failed")
+# Outcomes dropped from recall by default. ``pass`` is a precedent; ``reject`` is
+# a genuine lesson (the reviewer's mandate-to-fail verdict IS the value of the
+# loop); only the incomplete/aborted trajectories are quarantined.
+RECALL_QUARANTINED_OUTCOMES = frozenset({"stalled", "failed"})
+_OUTCOME_INFIX = ".outcome-"
 
 # Multipart field name MUST be ``file`` — the upload endpoint binds
 # ``file: UploadFile = File(...)``.
@@ -185,6 +247,57 @@ def _bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+# The fleet marker sent when no per-agent role is configured. NEVER
+# "backoffice" — a caller of this module is, BY DEFINITION, a fleet/agent
+# recall (never a human front-door read); see :func:`_fleet_headers`.
+_FLEET_DEFAULT_ROLE = "fleet"
+
+
+def _fleet_headers() -> dict[str, str]:
+    """Attribution headers stamped on EVERY outbound fleet recall GET.
+
+    RECALL-METRIC-COVERAGE crux #4a (2026-08-12, independent review of
+    ``ef49935``): the server-side classifier
+    ``audittrace.services.recall_telemetry.classify_recall_source_from_request``
+    labels a recall ``source="fleet"`` when the request carries an
+    ``X-Source`` header starting ``"opencode-"`` (case-insensitive) OR a
+    non-empty ``X-Agent-Role`` header — the SAME attribution
+    ``routes/chat.py::_detect_source`` keys on for ``interactions.source``
+    (SDLC-ADR-004 / #429-b). :func:`recall_deploy_lessons` never sent either
+    header, so a genuine fleet recall was indistinguishable from a human
+    front-door read and ``audittrace_recall_total{source="fleet"}`` read
+    persistent zero from real fleet traffic. This is the wiring that closes
+    that gap.
+
+    ``recall_deploy_lessons`` is the SHARED recall path for BOTH the local
+    OpenCode/Qwen fleet AND the Sonnet cloud fleet (the audittrace-builder /
+    audittrace-reviewer subagents call this exact helper too) — so the two
+    headers carry deliberately DIFFERENT jobs, never a hardcoded runtime:
+
+    * ``X-Agent-Role`` is the UNIVERSAL, runtime-agnostic fleet marker.
+      Always sent, non-empty (``AUDITTRACE_AGENT_ROLE``, e.g. ``builder``/
+      ``reviewer``/``deployer``/``verifier``; default ``"fleet"`` — never
+      ``"backoffice"``, since a caller of this module is BY DEFINITION a
+      fleet/agent recall, never a human front-door read). This is the
+      RELIABLE classification signal — the server counts ``source="fleet"``
+      for BOTH fleets off this header alone, with no per-runtime cardinality.
+    * ``X-Source`` stays RUNTIME-HONEST for the audit trail (``interactions
+      .source``-style granularity, not the metric label): ``"<runtime>-
+      <role>"`` where runtime comes from ``AUDITTRACE_AGENT_RUNTIME`` (e.g.
+      ``"opencode"`` for the local Qwen fleet, ``"sonnet"`` for the cloud
+      fleet). When the runtime is unset, ``X-Source`` degrades to the bare
+      role (or the plain ``"fleet"`` marker when neither env var is set) —
+      NEVER a hardcoded ``"opencode-"`` prefix, which would mislabel
+      Sonnet-fleet recalls as OpenCode.
+    """
+    role = (
+        os.environ.get("AUDITTRACE_AGENT_ROLE") or ""
+    ).strip() or _FLEET_DEFAULT_ROLE
+    runtime = (os.environ.get("AUDITTRACE_AGENT_RUNTIME") or "").strip()
+    x_source = f"{runtime}-{role}" if runtime else role
+    return {"X-Source": x_source, "X-Agent-Role": role}
+
+
 def _parse_json(body: bytes) -> Any:
     try:
         return json.loads(body)
@@ -211,6 +324,20 @@ def _multipart_body(
     return preamble + content + epilogue, f"multipart/form-data; boundary={boundary}"
 
 
+def _is_existing_file(candidate: str) -> bool:
+    """True iff ``candidate`` names an existing file.
+
+    A candidate too long (or otherwise un-stat-able) to probe — e.g. literal
+    record text raising ``OSError``/ENAMETOOLONG when its first path segment
+    exceeds 255 bytes — is NOT a file; return ``False`` so the caller treats
+    it as text rather than crashing.
+    """
+    try:
+        return Path(candidate).is_file()
+    except OSError:
+        return False
+
+
 def _record_bytes_and_name(
     path_or_text: str | Path, filename: str | None
 ) -> tuple[bytes, str]:
@@ -223,7 +350,7 @@ def _record_bytes_and_name(
     synchronous non-PDF path (HTTP 200) rather than the PDF scan flow.
     """
     if isinstance(path_or_text, Path) or (
-        isinstance(path_or_text, str) and Path(path_or_text).is_file()
+        isinstance(path_or_text, str) and _is_existing_file(path_or_text)
     ):
         p = Path(path_or_text)
         return p.read_bytes(), _ensure_md(filename or p.name)
@@ -237,17 +364,48 @@ def _ensure_md(name: str) -> str:
     return name if name.endswith(".md") else f"{name}.md"
 
 
+def _tag_outcome(leaf: str, outcome: str | None) -> str:
+    """Insert an ``.outcome-<value>`` infix before ``.md`` so recall can see it.
+
+    Idempotent: a leaf that already carries an outcome infix is returned
+    unchanged (never double-tags). ``outcome=None`` is a no-op (backward
+    compatible with every existing caller). An unknown ``outcome`` raises
+    :class:`ValueError` — the log path is RELIABLE, so a bad tag is loud, not
+    silently dropped.
+    """
+    if outcome is None:
+        return leaf
+    if outcome not in BUILD_OUTCOMES:
+        raise ValueError(f"outcome must be one of {BUILD_OUTCOMES}, got {outcome!r}")
+    if _OUTCOME_INFIX in leaf:
+        return leaf
+    stem = leaf[:-3] if leaf.endswith(".md") else leaf
+    return f"{stem}{_OUTCOME_INFIX}{outcome}.md"
+
+
+def _is_recall_quarantined(item: dict[str, Any]) -> bool:
+    """True if a recall item is tagged with a quarantined build outcome.
+
+    Keys on the recall-visible identity fields only (``title`` / ``key`` /
+    ``source`` / ``name``) — no content fetch. A legacy record with no outcome
+    infix is never quarantined, so the filter is non-regressive.
+    """
+    hay = " ".join(str(item.get(k, "")) for k in ("title", "key", "source", "name"))
+    return any(f"{_OUTCOME_INFIX}{o}" in hay for o in RECALL_QUARANTINED_OUTCOMES)
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 
 def recall_deploy_lessons(
-    query: str,
+    query: str = "",
     *,
-    front_door: str = DEFAULT_FRONT_DOOR,
+    front_door: str | None = None,
     token: str | None = None,
     insecure: bool = False,
     limit: int = DEFAULT_RECALL_LIMIT,
     timeout: int = 30,
+    include_quarantined: bool = False,
 ) -> list[dict[str, Any]]:
     """BEST-EFFORT recall of deploy lessons from the decisions layer.
 
@@ -262,10 +420,28 @@ def recall_deploy_lessons(
     server's job (and is the degraded part), so this helper does not fabricate
     client-side relevance — it returns the decisions-layer items as the server
     ordered them (most-recent-first), leaving selection to the agent that reads
-    them.
+    them. Defaults to ``""`` (ADR-059 WU-1b, 2026-08-07): a live fleet caller
+    invoked this keyword-only-after-``query`` — ``memory.recall_deploy_lessons(
+    front_door=..., insecure=...)`` — and hit ``TypeError: missing 1 required
+    positional argument: 'query'`` because the parameter had no default. Recall
+    is best-effort and ``query`` is logging-only (never used to filter/rank), so
+    a caller omitting it should degrade to "no intent recorded", not crash the
+    whole recall-before step of the ADR-059 loop.
+
+    **Granularity — deliberately unpinned (WU-1 fix-round-2, 2026-09-17,
+    F8).** ``GET /memory/semantic``'s default flipped from one row per
+    ChromaDB chunk to one row per DOCUMENT (the D15 fix this docstring's
+    own "recency echo chamber" framing describes). This helper reads
+    manifest rows — ``title``/``key``/timestamps — never per-chunk
+    ``content``, so it does NOT pass ``granularity=chunk`` to pin the old
+    view: it deliberately inherits the server's default, which means this
+    exact helper is the primary beneficiary of the fix (``limit=300`` now
+    surfaces up to 300 DISTINCT lessons instead of 300 chunks that used to
+    collapse to a handful of large build records). See
+    ``test_recall_deliberately_does_not_pin_granularity``.
     """
     try:
-        base = _normalize_front_door(front_door)
+        base = _normalize_front_door(resolve_front_door(front_door))
     except ValueError as exc:
         logger.warning("recall skipped — bad front-door URL: %s", exc)
         return []
@@ -279,11 +455,12 @@ def recall_deploy_lessons(
         {"collection": DECISIONS_COLLECTION, "limit": limit, "sort": "created_at"}
     )
     url = f"{base}/memory/semantic?{params}"
+    request_headers = {**_bearer(resolved), **_fleet_headers()}
     try:
         status, _headers, body = _http_request(
             "GET",
             url,
-            _bearer(resolved),
+            request_headers,
             timeout=timeout,
             context=ssl_context(insecure),
         )
@@ -307,20 +484,33 @@ def recall_deploy_lessons(
             query,
         )
         return []
+    dicts = [i for i in items if isinstance(i, dict)]
+    if not include_quarantined:
+        kept = [i for i in dicts if not _is_recall_quarantined(i)]
+        dropped = len(dicts) - len(kept)
+        if dropped:
+            logger.info(
+                "recall for %r quarantined %d stalled/failed build-record(s) "
+                "(study-objects, not precedent; pass include_quarantined=True to include them)",
+                query,
+                dropped,
+            )
+        dicts = kept
     logger.info(
-        "recall for %r returned %d decisions-layer lesson(s)", query, len(items)
+        "recall for %r returned %d decisions-layer lesson(s)", query, len(dicts)
     )
-    return [i for i in items if isinstance(i, dict)]
+    return dicts
 
 
 def log_deploy_record(
     path_or_text: str | Path,
     *,
-    front_door: str = DEFAULT_FRONT_DOOR,
+    front_door: str | None = None,
     token: str | None = None,
     layer: str = "episodic",
     collections: tuple[str, ...] = (DECISIONS_COLLECTION,),
     filename: str | None = None,
+    outcome: str | None = None,
     insecure: bool = False,
     timeout: int = 60,
 ) -> dict[str, Any]:
@@ -331,18 +521,26 @@ def log_deploy_record(
     ``POST /memory/index?file=<layer>/<name>&collections=...``. Returns
     ``{"status", "key", "index_status"}``.
 
+    ``outcome`` (one of :data:`BUILD_OUTCOMES`) tags the record filename with an
+    ``.outcome-<value>`` infix so recall can quarantine drift trajectories
+    (``stalled`` / ``failed``) from being recalled as precedent — see
+    :func:`recall_deploy_lessons`. A bad ``outcome`` raises :class:`ValueError`
+    (the log path is reliable, so a mistag is loud, not silent). ``None`` keeps
+    the historical, untagged filename (backward compatible).
+
     Logging is the ADR-059 contract, so — unlike recall — a failure here is LOUD:
     a missing token, a non-200 upload, or a non-200 index all raise
     :class:`DeployLogError` with the failing step and HTTP status. The LOG side of
     the memory server is reliable even while recall (#383) is degraded.
     """
-    base = _normalize_front_door(front_door)
+    base = _normalize_front_door(resolve_front_door(front_door))
     resolved = _resolve_token(token)
     if not resolved:
         raise DeployLogError(
             "auth", 0, "no scoped JWT available to log the deploy record"
         )
     content, leaf = _record_bytes_and_name(path_or_text, filename)
+    leaf = _tag_outcome(leaf, outcome)
 
     # -- upload (multipart, non-PDF synchronous path → HTTP 200) --
     up_params = urlencode({"layer": layer, "filename": leaf})
@@ -386,6 +584,128 @@ def log_deploy_record(
         "key": key,
         "index_status": ix_json if ix_json is not None else {"http_status": ix_status},
     }
+
+
+def _format_index_status(value: Any) -> str:
+    """Render an index result as a single flat scalar for the front-matter
+    ``index_status`` field.
+
+    ``log_deploy_record`` returns the parsed JSON body of ``POST
+    /memory/index`` — typically a dict carrying ``status``/``collections``/
+    ``total_chunks`` (or ``{"http_status": ...}`` on a non-JSON response).
+    YAML front-matter values are flat scalars, so a dict/list is collapsed to
+    one deterministic line (``json.dumps(..., sort_keys=True)``); anything
+    else is stringified as-is. Never the placeholder text — this is always
+    the REAL index result.
+    """
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
+def log_build_record(
+    path_or_text: str | Path,
+    *,
+    front_door: str | None = None,
+    token: str | None = None,
+    layer: str = "episodic",
+    collections: tuple[str, ...] = (DECISIONS_COLLECTION,),
+    filename: str | None = None,
+    outcome: str | None = None,
+    insecure: bool = False,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Layer-0-VALIDATING, SELF-POPULATING variant of :func:`log_deploy_record`
+    (SDLC-ADR-005 WU-1 + the 2026-08-29 auto-populate hardening, D1).
+
+    ADDITIVE, opt-in entry point for builder/reviewer records that MUST carry
+    the ADR-059 structured front-matter (``spec_ref``, ``spec_hash``,
+    ``recall_evidence``, ``log_key``, ``index_status``, ``branch``, ``commit``,
+    ``gates`` — see :mod:`scripts.deploy.build_record`).
+
+    **Two-phase upload (D1) — the caller cannot leave placeholders:**
+    ``log_key``/``index_status`` describe the record's OWN upload, so they can
+    only be known once the upload/index round-trip has actually happened. A
+    caller therefore writes them as a placeholder (e.g. ``"PENDING — filled
+    in by log_build_record..."``) — this function makes it mechanically
+    impossible for that placeholder to reach the SERVER-PERSISTED copy:
+
+    1. Validates the record BEFORE any network call, with the two
+       self-referential fields exempted from the placeholder-shape check
+       (:data:`~scripts.deploy.build_record.PLACEHOLDER_CHECKED_FIELDS`) —
+       every OTHER field must already be real; a malformed record never
+       reaches the memory server.
+    2. Phase 1: uploads + indexes the record AS GIVEN via
+       :func:`log_deploy_record`, learning the REAL server key and index
+       result.
+    3. Patches the record's ``log_key``/``index_status`` with those REAL
+       values (:func:`~scripts.deploy.build_record.patch_front_matter_fields`),
+       re-validates the patched text with the FULL (non-exempt) check, then
+       Phase 2: re-persists it under the SAME key (overwrite) via a second
+       :func:`log_deploy_record` call, so the canonical stored copy — and its
+       ChromaDB embedding — reflect reality, not the caller's placeholder.
+
+    Returns the Phase-2 result (the final, real ``key``/``index_status``).
+
+    ``log_deploy_record`` itself is left completely untouched: the deploy /
+    release / curator agents' records do NOT carry this schema, so this
+    validation + auto-populate logic is scoped to this dedicated opt-in
+    function rather than gating the shared helper every existing caller
+    depends on — the least-breaking, most fail-closed choice (see the WU-1
+    build-record's deviation notes).
+
+    Raises :class:`~scripts.deploy.build_record.BuildRecordValidationError` on
+    a missing/empty/(non-exempt-placeholder) required field (fail-closed, no
+    network call is made for the Phase-1 rejection case); otherwise raises
+    :class:`DeployLogError` exactly as :func:`log_deploy_record` does on an
+    upload/index failure (from either phase).
+    """
+    validate_build_record(
+        path_or_text, placeholder_exempt_fields=PLACEHOLDER_CHECKED_FIELDS
+    )
+
+    # -- phase 1: persist as given, to learn the REAL server key + index
+    #    result for the two self-referential fields --
+    phase1 = log_deploy_record(
+        path_or_text,
+        front_door=front_door,
+        token=token,
+        layer=layer,
+        collections=collections,
+        filename=filename,
+        outcome=outcome,
+        insecure=insecure,
+        timeout=timeout,
+    )
+
+    # -- patch log_key + index_status with the REAL phase-1 results, then
+    #    re-validate (full check, no exemption) and re-persist under the SAME
+    #    key so the canonical server copy never carries a placeholder --
+    patched_text = patch_front_matter_fields(
+        path_or_text,
+        {
+            "log_key": phase1["key"],
+            "index_status": _format_index_status(phase1["index_status"]),
+        },
+    )
+    validate_build_record(patched_text)
+    leaf = phase1["key"].rsplit("/", 1)[-1]
+    phase2 = log_deploy_record(
+        patched_text,
+        front_door=front_door,
+        token=token,
+        layer=layer,
+        collections=collections,
+        filename=leaf,
+        outcome=outcome,
+        insecure=insecure,
+        timeout=timeout,
+    )
+    logger.info(
+        "auto-populated build-record %s with real log_key/index_status (D1)",
+        phase2["key"],
+    )
+    return phase2
 
 
 def _err_detail(body: bytes) -> str:

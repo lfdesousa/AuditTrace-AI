@@ -16,12 +16,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Security
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Security
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.auth import require_user, validate_jwt
 from audittrace.identity import UserContext
 from audittrace.routes.memory_upload.manifest import get_by_scan_id
+from audittrace.services.memory_audit import schedule_read_audit
 
 router = APIRouter(prefix="/memory/upload", tags=["memory"])
 
@@ -47,6 +48,8 @@ async def get_upload_status(
     _auth: dict[str, Any] = Security(validate_jwt, scopes=[]),
     user: UserContext = Depends(require_user),
     session_factory: async_sessionmaker[AsyncSession] = Depends(_get_session_factory),
+    *,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     """Return the current scan_status of the named upload.
 
@@ -90,6 +93,20 @@ async def get_upload_status(
         # Don't reveal whether the scan_id exists for some other
         # tenant — return the same 404 shape.
         raise HTTPException(status_code=404, detail=f"scan_id not found: {scan_id}")
+
+    # ADR-062 §5 (WU-A4) — read path, fail-open background emit. Every
+    # scanned upload lands in ``layer="episodic"`` at insert time
+    # (``insert_pending_scan`` — PDFs promote to ``episodic/papers/``); the
+    # scan_id doubles as the "key", the caller-supplied handle for this
+    # upload's scan-status row.
+    schedule_read_audit(
+        background_tasks,
+        user=user,
+        op="read",
+        layer="episodic",
+        key=scan_id,
+        detail_extra={"endpoint": "upload_status"},
+    )
 
     # created_by_user_id is an authorization input, not part of the
     # response contract — drop it rather than widen the payload.

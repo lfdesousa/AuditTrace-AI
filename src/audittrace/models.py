@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _reject_project_pii(value: str | None) -> str | None:
@@ -438,3 +438,722 @@ class ConversationalDetailResponse(BaseModel):
     session: ConversationalSessionItem
     interactions: list[ConversationalDetailInteraction] = Field(default_factory=list)
     total: int = 0
+
+
+# ── Console-conversations (WU-1, MongoDB-elimination EPIC) ──────────────
+#
+# Deliberately carry NO ``user_sub``/``user_id`` field on any request
+# model below — the route layer stamps ``user_sub`` from the resolved
+# ``UserContext`` (token-derived), never from the request body
+# (feedback_never_trust_caller_metadata_for_security_fields). Pydantic's
+# default ``extra="ignore"`` means a hostile caller sending a
+# ``user_sub``/``user_id`` JSON key is silently dropped during parsing —
+# there is no field on these models it could bind to.
+
+
+class ConsoleConversationUpsertRequest(BaseModel):
+    """Request body for ``POST /console/conversations`` — create/update
+    the caller's own conversation (upsert by ``conversation_id``)."""
+
+    conversation_id: str = Field(..., min_length=1, max_length=255)
+    title: str | None = Field(default=None, max_length=512)
+    endpoint: str | None = Field(default=None, max_length=64)
+    model: str | None = Field(default=None, max_length=128)
+    is_temporary: bool = False
+    agent_id: str | None = Field(default=None, max_length=255)
+    chat_project_id: str | None = Field(default=None, max_length=255)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleConversationTitleUpdateRequest(BaseModel):
+    """Request body for ``PATCH /console/conversations/{conversation_id}``."""
+
+    title: str = Field(..., min_length=1, max_length=512)
+
+
+class ConsoleConversationItem(BaseModel):
+    """One conversation row, as returned by the console-conversations API."""
+
+    conversation_id: str
+    title: str
+    endpoint: str | None = None
+    model: str | None = None
+    is_temporary: bool = False
+    agent_id: str | None = None
+    chat_project_id: str | None = None
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleConversationListResponse(BaseModel):
+    """Response from ``GET /console/conversations`` — cursor-paginated,
+    newest-first."""
+
+    items: list[ConsoleConversationItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class ConsoleMessageUpsertRequest(BaseModel):
+    """Request body for
+    ``POST /console/conversations/{conversation_id}/messages`` —
+    create/update the caller's own message (upsert by ``message_id``)."""
+
+    message_id: str = Field(..., min_length=1, max_length=255)
+    parent_message_id: str | None = Field(default=None, max_length=255)
+    sender: str = Field(..., min_length=1, max_length=64)
+    text: str
+    is_created_by_user: bool
+    model: str | None = Field(default=None, max_length=128)
+    endpoint: str | None = Field(default=None, max_length=64)
+    token_count: int | None = None
+    error: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleMessageEditRequest(BaseModel):
+    """Request body for
+    ``PATCH /console/conversations/{conversation_id}/messages/{message_id}``.
+    Both fields optional — only the ones supplied are updated."""
+
+    text: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class ConsoleMessageItem(BaseModel):
+    """One message row, as returned by the console-conversations API."""
+
+    message_id: str
+    conversation_id: str
+    parent_message_id: str | None = None
+    sender: str
+    text: str
+    is_created_by_user: bool
+    model: str | None = None
+    endpoint: str | None = None
+    token_count: int | None = None
+    error: str | None = None
+    created_at_ms: int
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleMessageListResponse(BaseModel):
+    """Response from
+    ``GET /console/conversations/{conversation_id}/messages`` — the full
+    message tree, chronological (``created_at_ms`` ASC)."""
+
+    items: list[ConsoleMessageItem] = Field(default_factory=list)
+
+
+# ── Console-presets (WU-presets, MongoDB-elimination EPIC) ───────────────
+#
+# Deliberately carry NO ``user_sub``/``user_id`` field on the request
+# model below — same rationale as the console-conversations models
+# above (feedback_never_trust_caller_metadata_for_security_fields).
+
+
+class ConsolePresetUpsertRequest(BaseModel):
+    """Request body for ``POST /console/presets`` — create/update the
+    caller's own preset (upsert by ``preset_id``)."""
+
+    preset_id: str = Field(..., min_length=1, max_length=255)
+    title: str | None = Field(default=None, max_length=512)
+    data: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePresetItem(BaseModel):
+    """One preset row, as returned by the console-presets API."""
+
+    preset_id: str
+    title: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePresetListResponse(BaseModel):
+    """Response from ``GET /console/presets`` — cursor-paginated,
+    newest-first."""
+
+    items: list[ConsolePresetItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+# ── Console-prompts (Mongo-repl WU-prompts, MongoDB-elimination EPIC) ────
+#
+# Deliberately carry NO ``user_sub``/``user_id`` field on any request
+# model below — same rationale as the console-conversations/console-
+# presets models above (feedback_never_trust_caller_metadata_for_security_fields).
+# Model shape mirrors console-conversations' group+child-rows split
+# (group ~ ConsoleConversation, version ~ ConsoleMessage) — see
+# services/console_prompts.py's module docstring for the full
+# LibreChat-PromptGroup/Prompt design-note rationale.
+
+
+class ConsolePromptGroupUpsertRequest(BaseModel):
+    """Request body for ``POST /console/prompts`` — create/update the
+    caller's own prompt group (upsert by ``group_id``)."""
+
+    group_id: str = Field(..., min_length=1, max_length=255)
+    name: str = Field(..., min_length=1, max_length=512)
+    category: str | None = Field(default=None, max_length=128)
+    oneliner: str | None = Field(default=None, max_length=4096)
+    command: str | None = Field(default=None, max_length=128)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePromptVersionUpsertRequest(BaseModel):
+    """Request body for ``POST /console/prompts/{group_id}/versions`` —
+    create/update the caller's own prompt version (upsert by
+    ``prompt_id``) attached to ``group_id``."""
+
+    prompt_id: str = Field(..., min_length=1, max_length=255)
+    text: str = Field(..., min_length=1)
+    type: Literal["text", "chat"] = "text"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePromptSetProductionRequest(BaseModel):
+    """Request body for ``PATCH /console/prompts/{group_id}/production``
+    — mark ``prompt_id`` (an existing version of the group) as the
+    group's production version."""
+
+    prompt_id: str = Field(..., min_length=1, max_length=255)
+
+
+class ConsolePromptVersionItem(BaseModel):
+    """One prompt-version row, as returned by the console-prompts API."""
+
+    prompt_id: str
+    group_id: str
+    text: str
+    type: str
+    version: int
+    created_at_ms: int
+    updated_at_ms: int
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePromptGroupItem(BaseModel):
+    """One prompt-group row (summary shape, no versions), as returned
+    by the list-groups API."""
+
+    group_id: str
+    name: str
+    category: str
+    oneliner: str
+    command: str | None = None
+    production_prompt_id: str | None = None
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePromptGroupWithVersionsItem(ConsolePromptGroupItem):
+    """The full group shape, INCLUDING its version history — returned
+    by ``GET /console/prompts/{group_id}`` and
+    ``PATCH /console/prompts/{group_id}/production``."""
+
+    versions: list[ConsolePromptVersionItem] = Field(default_factory=list)
+
+
+class ConsolePromptGroupListResponse(BaseModel):
+    """Response from ``GET /console/prompts`` — cursor-paginated,
+    newest-first, summary shape (no versions per row)."""
+
+    items: list[ConsolePromptGroupItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+# ── Console-chat-projects (Chat-Projects domain, MongoDB-elimination EPIC) ─
+#
+# Deliberately carry NO ``user_sub``/``user_id`` field on the request
+# model below — same rationale as the console-conversations/console-
+# presets/console-prompts models above
+# (feedback_never_trust_caller_metadata_for_security_fields).
+
+
+class ConsoleChatProjectUpsertRequest(BaseModel):
+    """Request body for ``POST /console/chat-projects`` — create/update
+    the caller's own chat-project (upsert by ``chat_project_id``)."""
+
+    chat_project_id: str = Field(..., min_length=1, max_length=255)
+    name: str = Field(..., min_length=1, max_length=512)
+    description: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleChatProjectItem(BaseModel):
+    """One chat-project row, as returned by the console-chat-projects
+    API."""
+
+    chat_project_id: str
+    name: str
+    description: str
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleChatProjectListResponse(BaseModel):
+    """Response from ``GET /console/chat-projects`` — cursor-paginated,
+    newest-first."""
+
+    items: list[ConsoleChatProjectItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+# ── Console-files (Files-metadata domain, MongoDB-elimination EPIC) ───────
+#
+# METADATA ONLY — the file bytes stay in object storage
+# (feedback_storage_always_s3); this request model carries no byte
+# payload, only the record that references it.
+#
+# Deliberately carries NO ``user_sub``/``user_id`` field — same
+# rationale as every other console-* upsert request model above
+# (feedback_never_trust_caller_metadata_for_security_fields).
+
+
+class ConsoleFileUpsertRequest(BaseModel):
+    """Request body for ``POST /console/files`` — create/update the
+    caller's own file-metadata record (upsert by ``file_id``)."""
+
+    file_id: str = Field(..., min_length=1, max_length=255)
+    filename: str = Field(..., min_length=1, max_length=512)
+    type: str = Field(..., min_length=1, max_length=255)
+    bytes: int = Field(default=0, ge=0)
+    object_key: str | None = None
+    width: int | None = Field(default=None, ge=0)
+    height: int | None = Field(default=None, ge=0)
+    context: str | None = Field(default=None, max_length=128)
+    usage: dict[str, Any] = Field(default_factory=dict)
+    embedded: bool = False
+    temp_file_id: str | None = Field(default=None, max_length=255)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleFileItem(BaseModel):
+    """One file-metadata row, as returned by the console-files API."""
+
+    file_id: str
+    filename: str
+    type: str
+    bytes: int
+    object_key: str | None = None
+    width: int | None = None
+    height: int | None = None
+    context: str | None = None
+    usage: dict[str, Any] = Field(default_factory=dict)
+    embedded: bool = False
+    temp_file_id: str | None = None
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleFileListResponse(BaseModel):
+    """Response from ``GET /console/files`` — cursor-paginated,
+    newest-first."""
+
+    items: list[ConsoleFileItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class ConsoleFileBatchGetRequest(BaseModel):
+    """Request body for ``POST /console/files/batch-get`` — fetch the
+    caller's OWN file-metadata records for a batch of ``file_id``s in
+    one round trip (the fork resolves a conversation's attachments this
+    way). Capped at ``MAX_LIST_LIMIT`` (200) — same bound as the
+    cursor-paginated list route, so a hostile caller cannot force an
+    unbounded ``IN (...)`` query."""
+
+    file_ids: list[str] = Field(..., min_length=1, max_length=200)
+
+
+class ConsoleFileBatchGetResponse(BaseModel):
+    """Response from ``POST /console/files/batch-get``. ``items`` omits
+    any requested ``file_id`` that doesn't exist, is soft-deleted, or
+    belongs to another user — same not-found-vs-403 discipline as
+    ``GET /console/files/{file_id}`` (never leaks existence), just
+    batched: the caller cannot distinguish "not mine" from "never
+    existed" from the response shape alone."""
+
+    items: list[ConsoleFileItem] = Field(default_factory=list)
+
+
+# ── Console-agents (Agents domain, MongoDB-elimination EPIC) ──────────────
+#
+# Own-agents-only v1 — sharing/marketplace (a fork ``author``/global-agent
+# concept) is explicitly OUT OF SCOPE (disclosed in the ratified spec).
+# ``tools``/``model_parameters``/``artifacts`` are opaque jsonb blobs; this
+# store persists the agent record, it never executes or validates tools.
+#
+# Deliberately carries NO ``user_sub``/``user_id`` field on the request
+# model below — same rationale as every other console-* upsert request
+# model above (feedback_never_trust_caller_metadata_for_security_fields).
+
+
+class ConsoleAgentUpsertRequest(BaseModel):
+    """Request body for ``POST /console/agents`` — create/update the
+    caller's own agent (upsert by ``agent_id``)."""
+
+    agent_id: str = Field(..., min_length=1, max_length=255)
+    name: str = Field(..., min_length=1, max_length=512)
+    description: str | None = None
+    instructions: str | None = None
+    provider: str | None = Field(default=None, max_length=255)
+    model: str | None = Field(default=None, max_length=255)
+    model_parameters: dict[str, Any] = Field(default_factory=dict)
+    tools: list[Any] = Field(default_factory=list)
+    artifacts: dict[str, Any] = Field(default_factory=dict)
+    end_after_tools: bool = False
+    project_ids: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleAgentItem(BaseModel):
+    """One agent row, as returned by the console-agents API."""
+
+    agent_id: str
+    name: str
+    description: str
+    instructions: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    model_parameters: dict[str, Any] = Field(default_factory=dict)
+    tools: list[Any] = Field(default_factory=list)
+    artifacts: dict[str, Any] = Field(default_factory=dict)
+    end_after_tools: bool = False
+    project_ids: list[str] = Field(default_factory=list)
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleAgentListResponse(BaseModel):
+    """Response from ``GET /console/agents`` — cursor-paginated,
+    newest-first."""
+
+    items: list[ConsoleAgentItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class ConsoleAgentBatchGetRequest(BaseModel):
+    """Request body for ``POST /console/agents/batch-get`` — fetch the
+    caller's OWN agents for a batch of ``agent_id``s in one round trip.
+    Capped at ``MAX_LIST_LIMIT`` (200) — same bound as the
+    cursor-paginated list route, so a hostile caller cannot force an
+    unbounded ``IN (...)`` query."""
+
+    agent_ids: list[str] = Field(..., min_length=1, max_length=200)
+
+
+class ConsoleAgentBatchGetResponse(BaseModel):
+    """Response from ``POST /console/agents/batch-get``. ``items`` omits
+    any requested ``agent_id`` that doesn't exist, is soft-deleted, or
+    belongs to another user — same not-found-vs-403 discipline as
+    ``GET /console/agents/{agent_id}`` (never leaks existence), just
+    batched: the caller cannot distinguish "not mine" from "never
+    existed" from the response shape alone."""
+
+    items: list[ConsoleAgentItem] = Field(default_factory=list)
+
+
+# ── Console-conversation-tags (Conversation-Tags domain, MongoDB- ─────────
+# elimination EPIC) ────────────────────────────────────────────────────────
+#
+# Own-tags-only v1 — every row is owned by exactly one user_sub, same
+# discipline as every other console-* domain above. ``count``/``position``
+# are plain caller-maintained integers this store persists as-is.
+#
+# Deliberately carries NO ``user_sub``/``user_id`` field on the request
+# model below — same rationale as every other console-* upsert request
+# model above (feedback_never_trust_caller_metadata_for_security_fields).
+
+
+class ConsoleConversationTagUpsertRequest(BaseModel):
+    """Request body for ``POST /console/conversation-tags`` — create/
+    update the caller's own conversation-tag (upsert by ``tag``)."""
+
+    tag: str = Field(..., min_length=1, max_length=512)
+    description: str | None = None
+    count: int = Field(default=0, ge=0)
+    position: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleConversationTagItem(BaseModel):
+    """One conversation-tag row, as returned by the console-
+    conversation-tags API."""
+
+    tag: str
+    description: str
+    count: int
+    position: int
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleConversationTagListResponse(BaseModel):
+    """Response from ``GET /console/conversation-tags`` —
+    cursor-paginated, newest-first."""
+
+    items: list[ConsoleConversationTagItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+# ── Console-tool-favorites (Tool-Favorites domain, MongoDB- ───────────────
+# elimination EPIC) ────────────────────────────────────────────────────────
+#
+# Own-favorites-only v1 — every row is owned by exactly one user_sub, same
+# discipline as every other console-* domain above.
+#
+# Deliberately carries NO ``user_sub``/``user_id`` field on the request
+# model below — same rationale as every other console-* upsert request
+# model above (feedback_never_trust_caller_metadata_for_security_fields).
+
+# The SINGLE source of truth for the closed item_type vocabulary (mirrors
+# the fork's types/favorite.ts::FAVORITE_ITEM_TYPES Mongoose enum). The
+# service module deliberately carries no duplicate — a typo'd item_type
+# is rejected here with 422 before any service method runs.
+_TOOL_FAVORITE_ITEM_TYPE = Literal["builtin", "tool", "mcp", "skill"]
+
+
+class ConsoleToolFavoriteAddRequest(BaseModel):
+    """Request body for ``POST /console/tool-favorites`` — add (or
+    idempotently re-affirm) the caller's own tool-favorite."""
+
+    item_type: _TOOL_FAVORITE_ITEM_TYPE
+    item_id: str = Field(..., min_length=1, max_length=256)
+    tenant_id: str | None = Field(default=None, max_length=256)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleToolFavoriteItem(BaseModel):
+    """One tool-favorite row, as returned by the console-tool-favorites
+    API."""
+
+    item_type: str
+    item_id: str
+    tenant_id: str | None = None
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleToolFavoriteListResponse(BaseModel):
+    """Response from ``GET /console/tool-favorites`` — the caller's
+    ENTIRE favorites list (no pagination; bounded by
+    ``MAX_TOOL_FAVORITES``), oldest-first."""
+
+    items: list[ConsoleToolFavoriteItem] = Field(default_factory=list)
+
+
+# ── Console-ACL (Sovereign Authorization Layer EPIC, WU-1 — READ ─────────
+# PATH ONLY) ────────────────────────────────────────────────────────────
+#
+# Every response answers "what can/does the CALLER (token-derived) see" —
+# no request model here carries a principal_id/principal_type field a
+# caller could use to ask about a DIFFERENT principal
+# (feedback_never_trust_caller_metadata_for_security_fields, epic
+# invariant 5). The WRITE models (WU-2c, further down) are the only
+# request bodies in this module that forbid unknown keys — see below.
+
+
+class ConsoleAclEffectivePermissionsResponse(BaseModel):
+    """Response from ``GET /console/acl/{resource_type}/{resource_id}/
+    permissions`` — the CALLER's combined (bitwise-OR'd) effective
+    permission bitmask on the resource. ``0`` means no matching,
+    non-expired grant exists (deny-by-default)."""
+
+    perm_bits: int = Field(..., ge=0)
+
+
+class ConsoleAclHasPermissionResponse(BaseModel):
+    """Response from ``GET /console/acl/{resource_type}/{resource_id}/
+    has-permission``."""
+
+    has_permission: bool
+
+
+class ConsoleAclBatchPermissionsRequest(BaseModel):
+    """Request body for ``POST /console/acl/{resource_type}/
+    permissions/batch`` — bounded at 200 ids, same cap as every other
+    console-* batch route."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resource_ids: list[str] = Field(..., min_length=1, max_length=200)
+
+
+class ConsoleAclBatchPermissionsResponse(BaseModel):
+    """Response from the batch-permissions route. ``permissions`` omits
+    any ``resource_id`` with no matching, non-expired grant (never
+    present with value ``0``) — mirrors the service layer's ``Map``
+    semantics."""
+
+    permissions: dict[str, int] = Field(default_factory=dict)
+
+
+class ConsoleAclResourceIdsResponse(BaseModel):
+    """Response shape shared by the accessible/public/sole-owned
+    resource-id routes."""
+
+    resource_ids: list[str] = Field(default_factory=list)
+
+
+# ── Console-ACL WRITE routes (WU-2c-A) ───────────────────────────────────
+#
+# Every request model here is ``extra="forbid"`` (a hostile
+# ``user_sub``/``granted_by``/``trace_id`` key answers 422, never silently
+# ignored) and bounds every string to the 031 column width
+# (``resource_id`` 36, ``role_id`` 36, ``tenant_id`` 64; ``principal_id``
+# is a ``Text`` column bounded to 64 at the edge). The bounds are SHAPE,
+# not authority: the database (migrations 031/032) stays the control.
+
+ACL_PRINCIPAL_TYPES = Literal["user", "public", "role"]
+ACL_RESOURCE_TYPES = Literal[
+    "agent", "mcpServer", "promptGroup", "remoteAgent", "sharedLink", "skill"
+]
+_ACL_MAX_BITS = 15  # == services.console_acl.MAX_PERM_BITS (pinned by a test)
+_ACL_MAX_BATCH = 200
+# 031's ``expired_at_ms`` is a BIGINT: anything above its signed 64-bit
+# maximum is a database ``22000`` that would otherwise be AUDITED AS AN
+# AUTHORIZATION DENIAL. Shape is refused at the edge (422, no row).
+_ACL_MAX_MS = 2**63 - 1
+
+
+def _check_principal_shape(principal_type: str, principal_id: str | None) -> None:
+    """031's ``ck_console_acl_entries_public_principal_null`` at the edge:
+    a ``public`` principal has NO id; every other principal type needs
+    one. A shape defect, not an authorization event (422, no row); the
+    CHECK constraint stays the control."""
+    if principal_type == "public":
+        if principal_id is not None:
+            raise ValueError("principal_id must be omitted for principal_type=public")
+    elif principal_id is None:
+        raise ValueError(
+            f"principal_id is required for principal_type={principal_type}"
+        )
+
+
+class ConsoleAclGrantRequest(BaseModel):
+    """Body of ``POST /console/acl/{type}/{id}/grants`` and of each
+    bulk op. Carries no identity/audit field — those are token-derived."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    principal_type: ACL_PRINCIPAL_TYPES
+    principal_id: str | None = Field(None, min_length=1, max_length=64)
+    perm_bits: int = Field(..., ge=0, le=_ACL_MAX_BITS)
+    role_id: str | None = Field(None, min_length=1, max_length=36)
+    expired_at_ms: int | None = Field(None, ge=0, le=_ACL_MAX_MS)
+    tenant_id: str | None = Field(None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _principal_shape(self) -> Self:
+        _check_principal_shape(self.principal_type, self.principal_id)
+        return self
+
+
+class ConsoleAclModifyRequest(BaseModel):
+    """Body of ``PATCH /console/acl/{type}/{id}/grants``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    principal_type: ACL_PRINCIPAL_TYPES
+    principal_id: str | None = Field(None, min_length=1, max_length=64)
+    add_bits: int | None = Field(None, ge=0, le=_ACL_MAX_BITS)
+    remove_bits: int | None = Field(None, ge=0, le=_ACL_MAX_BITS)
+    tenant_id: str | None = Field(None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _principal_shape(self) -> Self:
+        _check_principal_shape(self.principal_type, self.principal_id)
+        return self
+
+
+class ConsoleAclBulkRequest(BaseModel):
+    """Body of ``POST /console/acl/{type}/{id}/grants/bulk``. The route
+    stamps the PATH's resource into every op — an op cannot name another
+    resource."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ops: list[ConsoleAclGrantRequest] = Field(
+        ..., min_length=1, max_length=_ACL_MAX_BATCH
+    )
+
+
+class ConsoleAclPredicate(BaseModel):
+    """One ``POST /console/acl/expire`` predicate — the five optional
+    keys the service accepts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    principal_type: ACL_PRINCIPAL_TYPES | None = None
+    principal_id: str | None = Field(None, min_length=1, max_length=64)
+    resource_type: ACL_RESOURCE_TYPES | None = None
+    resource_id: str | None = Field(None, min_length=1, max_length=36)
+    tenant_id: str | None = Field(None, min_length=1, max_length=64)
+
+
+class ConsoleAclExpireRequest(BaseModel):
+    """Body of ``POST /console/acl/expire``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    predicates: list[ConsoleAclPredicate] = Field(
+        ..., min_length=1, max_length=_ACL_MAX_BATCH
+    )
+
+
+class ConsoleAclEntryItem(BaseModel):
+    """One ACL row as answered by a write route. ``user_sub`` is
+    deliberately NOT echoed (it equals the caller)."""
+
+    id: str
+    principal_type: str
+    principal_id: str | None = None
+    principal_model: str | None = None
+    resource_type: str
+    resource_id: str
+    perm_bits: int
+    bits: dict[str, bool]
+    role_id: str | None = None
+    granted_by: str | None = None
+    granted_at_ms: int
+    expired_at_ms: int | None = None
+    inherited_from: str | None = None
+    tenant_id: str | None = None
+    trace_id: str | None = None
+    created_at_ms: int
+    updated_at_ms: int
+
+
+class ConsoleAclExpireResponse(BaseModel):
+    """Response of W2/W5. An empty ``expired_ids`` is the idempotent
+    answer, never a 404."""
+
+    expired_ids: list[str] = Field(default_factory=list)
+    visible_matched_count: int = 0
+    trace_id: str | None = None
+
+
+class ConsoleAclBulkResponse(BaseModel):
+    """Response of W4."""
+
+    acl_entry_ids: list[str] = Field(default_factory=list)
+    expired_ids: list[str] = Field(default_factory=list)
+    trace_id: str | None = None

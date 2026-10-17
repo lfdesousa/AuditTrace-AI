@@ -23,7 +23,7 @@
 >
 > **Mode branch (ADR-025):** the handler reads
 > `settings.memory_mode` per request. The flow below documents the
-> default **`inject`** path — the 4-layer context built up front and
+> default **`inject`** path — the five-layer context built up front and
 > merged into the system message. The alternative **`tools`** path —
 > ambient context + proxy-internal memory tool-call loop — is covered
 > in its own document: [`sequence-memory-tool-call.md`](sequence-memory-tool-call.md).
@@ -45,7 +45,7 @@ The chat completions endpoint (inject mode):
 1. Validates the bearer JWT and resolves a typed `UserContext` via
    `require_user` (DESIGN §15) — sub-millisecond on the Redis cache hot
    path, ~1-2ms on the cold path.
-2. Builds the 4-layer memory context inside an `@observe`-decorated
+2. Builds the five-layer memory context inside an `@observe`-decorated
    helper that returns a `trace_id` value (post-ADR-024 — span lifetime
    is decoupled from the streaming generator).
 3. Augments the system message with the memory context, preserving
@@ -95,7 +95,7 @@ sequenceDiagram
         Note over Build,Builder: Inside @observe span — trace_id captured here
         Build->>Builder: build_system_context_with_stats(project, query)
 
-        par 4-layer retrieval
+        par five-layer retrieval
             Builder->>Builder: episodic.search(query)
         and
             Builder->>Builder: procedural.search(query)

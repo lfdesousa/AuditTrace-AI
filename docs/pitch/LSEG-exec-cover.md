@@ -10,7 +10,7 @@ LLMs entered the enterprise faster than audit did. A production chat request tod
 
 ## The answer
 
-**AuditTrace-AI** is an OpenAI-compatible proxy + 4-layer memory platform where every request is reconstructible from user identity down to the datastore row, end-to-end. Drop-in replacement for `https://api.openai.com/v1` — point any OpenAI SDK at `https://audittrace.local/v1` and the existing code keeps working. What the proxy adds, underneath:
+**AuditTrace-AI** is an OpenAI-compatible proxy + five-layer memory platform where every request is reconstructible from user identity down to the datastore row, end-to-end. Drop-in replacement for `https://api.openai.com/v1` — point any OpenAI SDK at `https://audittrace.local/v1` and the existing code keeps working. What the proxy adds, underneath:
 
 - **Authenticated identity on every request** — Keycloak OAuth2 Device Flow (RFC 8628), JWT-validated with JWKS, `user_id` propagated to every span, log line, and database row.
 - **Per-user isolation enforced at the database layer** — Postgres Row-Level Security with `FORCE ROW LEVEL SECURITY` and a non-superuser app role. A bug in the service code can't leak data across users; the database itself refuses.

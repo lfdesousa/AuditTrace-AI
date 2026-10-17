@@ -31,7 +31,7 @@ Sent in response to your 2026-04-12 email. Ahead of our mid/late-April call, thi
 
 **Hardware-agnostic by construction, measurable on three reference profiles.**
 
-The runtime is container-based end-to-end; the Helm chart makes no assumption about CPU architecture or accelerator vendor. The three inference endpoints (Qwen 3.6-35B for chat, nomic-embed v1.5 for embeddings, Mistral 7B for session summarisation) are swappable via a single environment variable per endpoint — the chart does not bind to any specific quantisation or backend.
+The runtime is container-based end-to-end; the Helm chart makes no assumption about CPU architecture or accelerator vendor. The three inference endpoints (Qwen 3.8-27B dense+MTP for chat, nomic-embed v1.5 for embeddings, Mistral 7B for session summarisation) are swappable via a single environment variable per endpoint — the chart does not bind to any specific quantisation or backend.
 
 Three reference deployment profiles I intend to validate empirically as part of Phase 1:
 

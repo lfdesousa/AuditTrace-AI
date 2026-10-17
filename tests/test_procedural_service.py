@@ -2,12 +2,20 @@
 
 The service is **always S3-backed** in production (MinIO) — there is no
 filesystem implementation. Tests here exercise ``S3ProceduralService`` against
-a fake MinIO client and ``MockProceduralService`` directly. See
+a fake, bucket-aware MinIO client and ``MockProceduralService`` directly. See
 ``feedback_storage_always_s3``.
+
+ADR-062 Phase B (WU-B2): the layer is dual-tier — a caller's own writes land
+in the PRIVATE tier (``private_bucket/{user_id}/procedural/``); the
+pre-existing ``memory-shared`` content is the CORPUS tier (shared-read). The
+``TestDualTier*`` classes below are the isolation-safety-bar falsifiable
+tests: a second user must never see another user's private writes, and every
+caller must still see the corpus.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -17,13 +25,18 @@ from audittrace.services.procedural import (
     MockProceduralService,
     ProceduralService,
     S3ProceduralService,
+    UserScopedProceduralService,
 )
 
-# ── Fake MinIO client ────────────────────────────────────────────────────────
+# ── Fake, bucket-aware MinIO client ──────────────────────────────────────────
 #
-# ADR-006: fakes raise ObjectNotFoundError (shared package) rather than
-# the old minio-shaped S3Error("NoSuchKey", ...). Matches the
-# post-ADR-006 contract that the services catch.
+# ADR-006: fakes raise ObjectNotFoundError (shared package) rather than the
+# old minio-shaped S3Error("NoSuchKey", ...).
+#
+# ADR-062 Phase B: real MinIO partitions objects by BUCKET — a key in
+# ``memory-private`` is invisible to a client reading ``memory-shared``, even
+# if the key string is identical. The fake is a real ``{bucket: {key: bytes}}``
+# two-level store so the private/corpus boundary is faithfully simulated.
 
 
 class _FakeObject:
@@ -60,42 +73,53 @@ class _FakeResponse:
 
 
 class _FakeMinio:
-    def __init__(self, objects: dict[str, bytes]) -> None:
-        self._objects = dict(objects)
+    """Bucket-partitioned MinIO-client double. ``buckets`` is
+    ``{bucket_name: {key: content_bytes}}``. A key written to one bucket is
+    invisible from another — the same isolation real MinIO gives two
+    distinct buckets."""
+
+    def __init__(self, buckets: dict[str, dict[str, bytes]] | None = None) -> None:
+        self._buckets: dict[str, dict[str, bytes]] = {
+            b: dict(objs) for b, objs in (buckets or {}).items()
+        }
+
+    def _objects(self, bucket: str) -> dict[str, bytes]:
+        return self._buckets.setdefault(bucket, {})
 
     def list_objects(
         self, bucket: str, prefix: str = "", **kwargs: Any
     ) -> list[_FakeObject]:
-        del bucket, kwargs
-        return [_FakeObject(k) for k in self._objects if k.startswith(prefix)]
+        del kwargs
+        return [_FakeObject(k) for k in self._objects(bucket) if k.startswith(prefix)]
 
     def get_object(self, bucket: str, key: str) -> _FakeResponse:
-        del bucket
-        if key not in self._objects:
-            raise ObjectNotFoundError(f"Object does not exist: {key}")
-        return _FakeResponse(self._objects[key])
+        objs = self._objects(bucket)
+        if key not in objs:
+            raise ObjectNotFoundError(f"Object does not exist: {bucket}/{key}")
+        return _FakeResponse(objs[key])
 
     def put_object(self, bucket: str, key: str, body: Any, length: int) -> None:
-        del bucket, length
-        self._objects[key] = body.read()
+        del length
+        self._objects(bucket)[key] = body.read()
 
     def stat_object(self, bucket: str, key: str) -> object:
-        del bucket
-        if key not in self._objects:
-            raise ObjectNotFoundError(f"Object does not exist: {key}")
+        if key not in self._objects(bucket):
+            raise ObjectNotFoundError(f"Object does not exist: {bucket}/{key}")
         return object()
 
     def remove_object(self, bucket: str, key: str) -> None:
-        del bucket
-        self._objects.pop(key, None)
+        self._objects(bucket).pop(key, None)
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
+_SHARED = "memory-shared"
+_PRIVATE = "memory-private"
+
 
 @pytest.fixture
 def fake_skill_objects() -> dict[str, bytes]:
-    """Three sample SKILL-*.md objects under the ``procedural/`` prefix."""
+    """Three sample SKILL-*.md objects under the ``procedural/`` prefix (corpus)."""
     return {
         "procedural/SKILL-IAM.md": (
             b"# IAM Skill\n\nOAuth2, OIDC, JWT validation, BFF pattern.\n"
@@ -112,13 +136,36 @@ def fake_skill_objects() -> dict[str, bytes]:
 @pytest.fixture
 def s3_procedural(fake_skill_objects: dict[str, bytes]) -> S3ProceduralService:
     return S3ProceduralService(
-        minio_client=_FakeMinio(fake_skill_objects),
-        bucket="memory-shared",
+        minio_client=_FakeMinio({_SHARED: fake_skill_objects}),
+        bucket=_SHARED,
+        private_bucket=_PRIVATE,
         prefix="procedural/",
     )
 
 
-# ── S3ProceduralService tests ────────────────────────────────────────────────
+def _service(
+    corpus: dict[str, bytes] | None = None,
+    private: dict[str, bytes] | None = None,
+) -> S3ProceduralService:
+    client = _FakeMinio({_SHARED: corpus or {}, _PRIVATE: private or {}})
+    return S3ProceduralService(
+        client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+    )
+
+
+def _user(user_id: str) -> Any:
+    from audittrace.identity import UserContext
+
+    return UserContext(
+        user_id=user_id,
+        username=user_id,
+        agent_type="opencode",
+        scopes=("memory:procedural:read", "memory:procedural:write"),
+        is_admin=False,
+    )
+
+
+# ── S3ProceduralService tests (corpus-only, pre-existing coverage) ──────────
 
 
 class TestS3ProceduralService:
@@ -144,42 +191,42 @@ class TestS3ProceduralService:
         for d in docs:
             assert d.metadata["source"] == "procedural"
             assert d.metadata["file"].startswith("SKILL-")
+            assert d.metadata["tier"] == "corpus"
 
     async def test_load_includes_all_md_objects(self, user_context):
         """Backlog #15 (R1): every ``.md`` object is enumerated, not just
         SKILL-*.md — parity with the episodic fix."""
-        client = _FakeMinio(
-            {
+        service = _service(
+            corpus={
                 "procedural/README.md": b"# readme\n",
                 "procedural/runbook-notes.md": b"# notes\n\nbody\n",
                 "procedural/SKILL-X.md": b"# X\n\nbody\n",
             }
         )
-        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
         files = {d.metadata["file"] for d in await service.load(user_context)}
         assert files == {"README.md", "runbook-notes.md", "SKILL-X.md"}
 
     async def test_load_still_skips_non_md_objects(self, user_context):
-        client = _FakeMinio(
-            {
+        service = _service(
+            corpus={
                 "procedural/SKILL-X.md": b"# X\n\nbody\n",
                 "procedural/asset.bin": b"\x00\x01",
             }
         )
-        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
         files = {d.metadata["file"] for d in await service.load(user_context)}
         assert files == {"SKILL-X.md"}
 
     async def test_load_handles_empty_bucket(self, user_context):
-        service = S3ProceduralService(_FakeMinio({}), bucket="b", prefix="procedural/")
-        assert await service.load(user_context) == []
+        assert await _service().load(user_context) == []
 
     async def test_load_handles_client_exception(self, user_context):
         class _Broken:
             def list_objects(self, *a: Any, **kw: Any) -> list[_FakeObject]:
                 raise RuntimeError("connection refused")
 
-        service = S3ProceduralService(_Broken(), bucket="b", prefix="procedural/")
+        service = S3ProceduralService(
+            _Broken(), bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
         assert await service.load(user_context) == []
 
     async def test_search_filters_by_query(
@@ -208,9 +255,7 @@ class TestS3ProceduralService:
             ).encode()
             for n in ("STRATEGY", "APP-PATTERNS", "SECURITY", "MIGRATION")
         }
-        service = S3ProceduralService(
-            _FakeMinio(objs), bucket="b", prefix="procedural/"
-        )
+        service = _service(corpus=objs)
         results = await service.search(user_context, "cloud migration patterns")
         assert len(results) == 4
 
@@ -222,14 +267,13 @@ class TestS3ProceduralService:
     async def test_search_matches_content_beyond_first_200_chars(self, user_context):
         """Regression: keywords deep in the file must still match."""
         filler = "lorem ipsum " * 25
-        client = _FakeMinio(
-            {
+        service = _service(
+            corpus={
                 "procedural/SKILL-IAM.md": (
                     f"# IAM Skill\n\n{filler}\n\nDeep content with quantum keyword.\n"
                 ).encode()
             }
         )
-        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
         results = await service.search(user_context, "quantum")
         assert len(results) == 1
         assert results[0].metadata["skill"] == "IAM"
@@ -263,6 +307,7 @@ class TestS3ProceduralServiceRead:
         assert doc.metadata["file"] == "SKILL-IAM.md"
         assert doc.metadata["skill"] == "IAM"
         assert doc.metadata["source"] == "procedural"
+        assert doc.metadata["tier"] == "corpus"
 
     async def test_read_missing_file_returns_none(
         self, s3_procedural: S3ProceduralService, user_context
@@ -286,17 +331,288 @@ class TestS3ProceduralServiceRead:
             def get_object(self, *a: Any, **kw: Any) -> _FakeResponse:
                 raise RuntimeError("connection reset")
 
-        service = S3ProceduralService(_Broken(), bucket="b", prefix="procedural/")
+        service = S3ProceduralService(
+            _Broken(), bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
         assert await service.read(user_context, "SKILL-X.md") is None
 
     async def test_read_returns_full_untruncated_content(self, user_context):
         big = ("# IAM Skill\n\n" + ("body line.\n" * 5000)).encode()
-        client = _FakeMinio({"procedural/SKILL-IAM.md": big})
-        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
+        service = _service(corpus={"procedural/SKILL-IAM.md": big})
         doc = await service.read(user_context, "SKILL-IAM.md")
         assert doc is not None
         assert len(doc.page_content) == len(big.decode())
         assert len(doc.page_content) > 5000
+
+
+# ── ADR-062 Phase B — dual-tier isolation-safety-bar tests ──────────────────
+
+
+class TestDualTierWrite:
+    async def test_write_lands_in_private_bucket_only(self, user_context) -> None:
+        """WU-B2 falsifiable: write() must NOT touch the corpus bucket."""
+        client = _FakeMinio({_SHARED: {}, _PRIVATE: {}})
+        alice = _user("user-alice")
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        await service.write(alice, "SKILL-notes.md", "# notes\n")
+        assert "user-alice/procedural/SKILL-notes.md" in client._buckets[_PRIVATE]
+        assert client._buckets.get(_SHARED, {}) == {}
+
+    async def test_write_stamps_tier_private(self, user_context) -> None:
+        service = _service()
+        doc = await service.write(user_context, "SKILL-notes.md", "# notes\n")
+        assert doc.metadata["tier"] == "private"
+
+    async def test_write_never_shadows_another_users_key(self, user_context) -> None:
+        client = _FakeMinio({_SHARED: {}, _PRIVATE: {}})
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        alice, bob = _user("user-alice"), _user("user-bob")
+        await service.write(alice, "SKILL-notes.md", "# alice's notes\n")
+        await service.write(bob, "SKILL-notes.md", "# bob's notes\n")
+        private = client._buckets[_PRIVATE]
+        assert private["user-alice/procedural/SKILL-notes.md"] == b"# alice's notes\n"
+        assert private["user-bob/procedural/SKILL-notes.md"] == b"# bob's notes\n"
+
+
+class TestDualTierListAndSearchIsolation:
+    """The ADR-062 §3 isolation-safety-bar, falsified end to end: user A
+    writes private content; user B's ``load``/``search`` must NOT return it,
+    but BOTH must still see the corpus, tagged ``tier=corpus``."""
+
+    async def test_private_write_not_visible_to_other_user_via_load(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio(
+            {
+                _SHARED: {
+                    "procedural/SKILL-seed.md": b"# Seed skill\n\nCorpus content.\n"
+                }
+            }
+        )
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        alice, bob = _user("user-alice"), _user("user-bob")
+
+        await service.write(
+            alice, "SKILL-alice-secret.md", "# Alice's private skill note\n"
+        )
+
+        alice_files = {d.metadata["file"] for d in await service.load(alice)}
+        bob_files = {d.metadata["file"] for d in await service.load(bob)}
+
+        assert "SKILL-alice-secret.md" in alice_files
+        assert "SKILL-alice-secret.md" not in bob_files  # isolation-safety-bar
+        assert "SKILL-seed.md" in alice_files
+        assert "SKILL-seed.md" in bob_files
+
+    async def test_corpus_items_are_tagged_tier_corpus_for_every_caller(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio(
+            {
+                _SHARED: {
+                    "procedural/SKILL-seed.md": b"# Seed skill\n\nCorpus content.\n"
+                }
+            }
+        )
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        bob = _user("user-bob")
+        docs = await service.load(bob)
+        seed = next(d for d in docs if d.metadata["file"] == "SKILL-seed.md")
+        assert seed.metadata["tier"] == "corpus"
+
+    async def test_private_write_tagged_tier_private_for_owner(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio({_SHARED: {}})
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        alice = _user("user-alice")
+        await service.write(alice, "SKILL-alice-secret.md", "# secret\n")
+        docs = await service.load(alice)
+        mine = next(d for d in docs if d.metadata["file"] == "SKILL-alice-secret.md")
+        assert mine.metadata["tier"] == "private"
+
+    async def test_private_write_not_found_by_other_user_via_search(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio({_SHARED: {}})
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        alice, bob = _user("user-alice"), _user("user-bob")
+        await service.write(
+            alice,
+            "SKILL-alice-cache-tuning.md",
+            "# Cache tuning notes\n\ncache cache\n",
+        )
+        alice_hits = await service.search(alice, "cache tuning")
+        bob_hits = await service.search(bob, "cache tuning")
+        assert any(
+            d.metadata["file"] == "SKILL-alice-cache-tuning.md" for d in alice_hits
+        )
+        assert not any(
+            d.metadata["file"] == "SKILL-alice-cache-tuning.md" for d in bob_hits
+        )
+
+    async def test_private_shadows_same_named_corpus_object(self, user_context) -> None:
+        """A private object with the SAME filename as a corpus object wins
+        the merge (ADR-062 §3: "private shadows corpus")."""
+        client = _FakeMinio(
+            {_SHARED: {"procedural/SKILL-IAM.md": b"# IAM\n\ncorpus version\n"}}
+        )
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        alice = _user("user-alice")
+        await service.write(alice, "SKILL-IAM.md", "# IAM\n\nalice's private version\n")
+        docs = await service.load(alice)
+        matches = [d for d in docs if d.metadata["file"] == "SKILL-IAM.md"]
+        assert len(matches) == 1  # deduped, not duplicated
+        assert matches[0].metadata["tier"] == "private"
+        assert "alice's private version" in matches[0].page_content
+
+
+class TestDualTierRead:
+    async def test_read_tries_private_first(self, user_context) -> None:
+        client = _FakeMinio(
+            {
+                _SHARED: {"procedural/SKILL-IAM.md": b"# IAM\n\ncorpus\n"},
+                _PRIVATE: {
+                    "user-alice/procedural/SKILL-IAM.md": (
+                        b"# IAM\n\nprivate override\n"
+                    )
+                },
+            }
+        )
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        doc = await service.read(_user("user-alice"), "SKILL-IAM.md")
+        assert doc is not None
+        assert "private override" in doc.page_content
+        assert doc.metadata["tier"] == "private"
+
+    async def test_read_falls_back_to_corpus_when_no_private_object(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio(
+            {_SHARED: {"procedural/SKILL-IAM.md": b"# IAM\n\ncorpus\n"}, _PRIVATE: {}}
+        )
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        doc = await service.read(_user("user-bob"), "SKILL-IAM.md")
+        assert doc is not None
+        assert doc.metadata["tier"] == "corpus"
+
+    async def test_read_by_filename_never_leaks_another_users_private_object(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio({_SHARED: {}, _PRIVATE: {}})
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        alice, bob = _user("user-alice"), _user("user-bob")
+        await service.write(alice, "SKILL-alice-secret.md", "# secret\n")
+        assert await service.read(bob, "SKILL-alice-secret.md") is None
+        assert await service.read(alice, "SKILL-alice-secret.md") is not None
+
+
+class TestDualTierDelete:
+    async def test_delete_only_removes_private_object_never_corpus(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio(
+            {
+                _SHARED: {"procedural/SKILL-IAM.md": b"# IAM\n\ncorpus\n"},
+                _PRIVATE: {"user-alice/procedural/SKILL-IAM.md": b"# IAM\n\nprivate\n"},
+            }
+        )
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        alice = _user("user-alice")
+        deleted = await service.delete(alice, "SKILL-IAM.md")
+        assert deleted is True
+        assert "user-alice/procedural/SKILL-IAM.md" not in client._buckets[_PRIVATE]
+        assert "procedural/SKILL-IAM.md" in client._buckets[_SHARED]
+        doc = await service.read(alice, "SKILL-IAM.md")
+        assert doc is not None
+        assert doc.metadata["tier"] == "corpus"
+
+    async def test_delete_cannot_remove_another_users_private_object(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio(
+            {_PRIVATE: {"user-alice/procedural/SKILL-notes.md": b"# alice's notes\n"}}
+        )
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
+        bob = _user("user-bob")
+        deleted = await service.delete(bob, "SKILL-notes.md")
+        assert deleted is False
+        assert "user-alice/procedural/SKILL-notes.md" in client._buckets[_PRIVATE]
+
+
+class TestDualTierCacheIsolation:
+    """The Redis-cache leak WU-B1 exists to close, exercised through the
+    REAL service by neutering the user_id dimension in the key it consults.
+
+    NEUTER: monkeypatch ``layer_list_cache_key_private`` to ignore
+    ``user_id`` → Bob's ``load()`` picks up Alice's cached private write →
+    RED (leak proven). RESTORE: undo the monkeypatch → GREEN (isolated).
+    """
+
+    async def test_neutered_user_id_dimension_leaks_then_restored_key_isolates(
+        self, user_context, monkeypatch
+    ) -> None:
+        import audittrace.services.procedural as procedural_module
+        from audittrace.services.layer_cache import InMemoryLayerCacheStore
+
+        shared_cache = InMemoryLayerCacheStore()
+        client = _FakeMinio({_SHARED: {}, _PRIVATE: {}})
+        service = S3ProceduralService(
+            client,
+            bucket=_SHARED,
+            private_bucket=_PRIVATE,
+            prefix="procedural/",
+            cache=shared_cache,
+        )
+        alice, bob = _user("user-alice"), _user("user-bob")
+
+        monkeypatch.setattr(
+            procedural_module,
+            "layer_list_cache_key_private",
+            lambda layer, user_id: "audittrace:layer-cache:procedural:private:list",
+        )
+        await service.write(alice, "SKILL-alice-secret.md", "# secret\n")
+        await service.load(alice)  # warms the (now user_id-agnostic) key
+        bob_files_neutered = {d.metadata["file"] for d in await service.load(bob)}
+        assert "SKILL-alice-secret.md" in bob_files_neutered  # RED — leak proven
+
+        monkeypatch.undo()
+        clean_cache = InMemoryLayerCacheStore()
+        clean_client = _FakeMinio({_SHARED: {}, _PRIVATE: {}})
+        clean_service = S3ProceduralService(
+            clean_client,
+            bucket=_SHARED,
+            private_bucket=_PRIVATE,
+            prefix="procedural/",
+            cache=clean_cache,
+        )
+        await clean_service.write(alice, "SKILL-alice-secret.md", "# secret\n")
+        bob_files_restored = {d.metadata["file"] for d in await clean_service.load(bob)}
+        assert "SKILL-alice-secret.md" not in bob_files_restored  # GREEN
 
 
 # ── MockProceduralService tests ──────────────────────────────────────────────
@@ -313,6 +629,7 @@ class TestMockProceduralService:
         docs = await service.load(user_context)
         assert len(docs) == 1
         assert docs[0].metadata["skill"] == "IAM"
+        assert docs[0].metadata["tier"] == "corpus"
 
     async def test_mock_search_filters(self, user_context):
         service = MockProceduralService()
@@ -367,52 +684,93 @@ class TestMockProceduralService:
         service.add_document("body", skill="IAM", file="SKILL-IAM.md")
         assert await service.read(user_context, "../passwd.md") is None
 
+    def test_mock_add_document_private_requires_user_id(self) -> None:
+        service = MockProceduralService()
+        with pytest.raises(ValueError, match="user_id"):
+            service.add_document("secret", tier="private")
+
+
+class TestMockProceduralServiceDualTierIsolation:
+    async def test_private_document_not_visible_to_other_user(
+        self, user_context
+    ) -> None:
+        service = MockProceduralService()
+        service.add_document("corpus item", skill="Seed", file="SKILL-seed.md")
+        service.add_document(
+            "alice's private skill",
+            skill="Alice",
+            file="SKILL-alice.md",
+            tier="private",
+            user_id="user-alice",
+        )
+        alice = _user("user-alice")
+        bob = _user("user-bob")
+
+        alice_files = {d.metadata["file"] for d in await service.load(alice)}
+        bob_files = {d.metadata["file"] for d in await service.load(bob)}
+
+        assert "SKILL-alice.md" in alice_files
+        assert "SKILL-alice.md" not in bob_files
+        assert "SKILL-seed.md" in alice_files
+        assert "SKILL-seed.md" in bob_files
+
+    async def test_mock_read_never_leaks_across_users(self, user_context) -> None:
+        service = MockProceduralService()
+        service.add_document(
+            "secret", file="SKILL-secret.md", tier="private", user_id="user-alice"
+        )
+        assert await service.read(_user("user-bob"), "SKILL-secret.md") is None
+        assert await service.read(_user("user-alice"), "SKILL-secret.md") is not None
+
 
 # ── write / delete / invalidate_cache (PR A — CRUD backoffice) ──────────────
 
 
 class TestS3ProceduralServiceWriteDelete:
     async def test_write_creates_and_invalidates_cache(self, user_context) -> None:
-        client = _FakeMinio({})
-        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
+        service = _service()
         await service.load(user_context)  # warm
         doc = await service.write(user_context, "SKILL-NEW.md", "# NEW\n\nbody\n")
         assert doc.metadata["skill"] == "NEW"
-        assert "procedural/SKILL-NEW.md" in client._objects
+        key = f"{user_context.user_id}/procedural/SKILL-NEW.md"
+        assert key in service._client._buckets[_PRIVATE]
         assert any(
             d.metadata["file"] == "SKILL-NEW.md"
             for d in await service.load(user_context)
         )
 
     async def test_write_replaces_existing(self, user_context) -> None:
-        client = _FakeMinio({"procedural/SKILL-X.md": b"# v1\n"})
-        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
+        key = f"{user_context.user_id}/procedural/SKILL-X.md"
+        service = _service(private={key: b"# v1\n"})
         await service.write(user_context, "SKILL-X.md", "# v2\n")
         doc = await service.read(user_context, "SKILL-X.md")
         assert doc is not None and doc.page_content == "# v2\n"
 
     async def test_write_rejects_invalid_filename(self, user_context) -> None:
-        service = S3ProceduralService(_FakeMinio({}), bucket="b", prefix="procedural/")
+        service = _service()
         with pytest.raises(ValueError):
             await service.write(user_context, "../escape.md", "x")
 
     async def test_delete_existing(self, user_context) -> None:
-        client = _FakeMinio({"procedural/SKILL-bye.md": b"# bye\n"})
-        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
+        key = f"{user_context.user_id}/procedural/SKILL-bye.md"
+        service = _service(private={key: b"# bye\n"})
         await service.load(user_context)
         assert await service.delete(user_context, "SKILL-bye.md") is True
-        assert "procedural/SKILL-bye.md" not in client._objects
+        assert key not in service._client._buckets[_PRIVATE]
         assert await service.read(user_context, "SKILL-bye.md") is None
 
     async def test_delete_missing_returns_false(self, user_context) -> None:
-        service = S3ProceduralService(_FakeMinio({}), bucket="b", prefix="procedural/")
-        assert await service.delete(user_context, "never.md") is False
+        assert await _service().delete(user_context, "never.md") is False
 
-    async def test_invalidate_cache_explicit(self, user_context) -> None:
-        client = _FakeMinio({"procedural/SKILL-c.md": b"# c\n"})
-        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
+    async def test_invalidate_cache_explicit_covers_corpus_tier(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio({_SHARED: {"procedural/SKILL-c.md": b"# c\n"}})
+        service = S3ProceduralService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
+        )
         await service.load(user_context)
-        client._objects["procedural/SKILL-side.md"] = b"# side\n"
+        client._buckets[_SHARED]["procedural/SKILL-side.md"] = b"# side\n"
         before = {d.metadata["file"] for d in await service.load(user_context)}
         assert "SKILL-side.md" not in before
         service.invalidate_cache()
@@ -443,10 +801,10 @@ class TestMockProceduralServiceWriteDelete:
 # ── Filename-validation branch hardening (#364) ─────────────────────────────
 #
 # ``_validate_filename`` is the only thing standing between a CRUD-backoffice
-# caller and arbitrary object keys in the shared ``memory-shared`` bucket. The
-# tests below pin the guard on the write/delete surface (read was already
-# covered) and pin the "keep scanning" side of the per-document match loops,
-# where an off-by-one would clobber or delete the wrong skill.
+# caller and arbitrary object keys in the private bucket. The tests below pin
+# the guard on the write/delete surface (read was already covered) and pin
+# the "keep scanning" side of the per-document match loops, where an
+# off-by-one would clobber or delete the wrong skill.
 
 
 class TestFilenameValidationOnWriteDelete:
@@ -455,11 +813,11 @@ class TestFilenameValidationOnWriteDelete:
     async def test_empty_filename_is_rejected_everywhere(self, user_context) -> None:
         """An empty ``file`` must not resolve to the prefix directory itself.
 
-        ``key = f"{self._prefix}{file}"`` with an empty ``file`` produces
-        ``"procedural/"`` — a valid object key. Without the emptiness check a
-        delete of ``""`` would target that key, and a read of ``""`` would
-        return whatever sits there. The guard has to fire before the key is
-        built.
+        ``key = f"{user_id}/{self._prefix}{file}"`` with an empty ``file``
+        produces the user's prefix directory itself — a valid object key.
+        Without the emptiness check a delete of ``""`` would target that
+        key, and a read of ``""`` would return whatever sits there. The
+        guard has to fire before the key is built.
         """
         service = MockProceduralService()
         service.add_document("body", skill="IAM", file="SKILL-IAM.md")
@@ -468,7 +826,7 @@ class TestFilenameValidationOnWriteDelete:
         assert await service.delete(user_context, "") is False
         with pytest.raises(ValueError):
             await service.write(user_context, "", "payload")
-        # The pre-existing skill is untouched by any of the three attempts.
+        # The pre-existing corpus skill is untouched by any of the attempts.
         assert len(await service.load(user_context)) == 1
 
     async def test_non_string_filename_is_rejected(self, user_context) -> None:
@@ -499,7 +857,7 @@ class TestFilenameValidationOnWriteDelete:
         with pytest.raises(ValueError, match="invalid filename"):
             await service.write(user_context, "SKILL-notes.txt", "wrong suffix")
 
-        # Nothing was appended by the rejected writes.
+        # Nothing was appended by the rejected writes (private tier stays empty).
         assert await service.load(user_context) == []
 
     async def test_s3_delete_rejects_traversal_before_touching_storage(
@@ -507,26 +865,25 @@ class TestFilenameValidationOnWriteDelete:
     ) -> None:
         """The S3 delete guard must short-circuit *before* the MinIO call.
 
-        ``key = f"{self._prefix}{file}"`` normalises nothing, so
-        ``"../secrets.md"`` would resolve to ``procedural/../secrets.md`` —
-        an object outside the procedural prefix in the shared bucket. Asserting
-        the client was never called (rather than only that the return value is
-        ``False``) is what pins the short-circuit.
+        ``key = f"{user_id}/{self._prefix}{file}"`` normalises nothing, so
+        ``"../secrets.md"`` would resolve outside the intended prefix.
+        Asserting the client was never called (rather than only that the
+        return value is ``False``) is what pins the short-circuit.
         """
         calls: list[str] = []
 
         class _RecordingMinio(_FakeMinio):
             def stat_object(self, bucket: str, key: str) -> object:
-                calls.append(f"stat:{key}")
+                calls.append(f"stat:{bucket}:{key}")
                 return super().stat_object(bucket, key)
 
             def remove_object(self, bucket: str, key: str) -> None:
-                calls.append(f"remove:{key}")
+                calls.append(f"remove:{bucket}:{key}")
                 super().remove_object(bucket, key)
 
-        client = _RecordingMinio({"procedural/SKILL-IAM.md": b"# IAM\n"})
+        client = _RecordingMinio({_SHARED: {"procedural/SKILL-IAM.md": b"# IAM\n"}})
         service = S3ProceduralService(
-            client, bucket="memory-shared", prefix="procedural/"
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="procedural/"
         )
 
         assert await service.delete(user_context, "../secrets.md") is False
@@ -537,21 +894,26 @@ class TestFilenameValidationOnWriteDelete:
 
 
 class TestMockMatchLoops:
-    """The per-document scans must act on the named skill and nothing else."""
+    """The per-document scans must act on the named skill and nothing else.
+
+    ADR-062 Phase B: ``write``/``delete`` now target the PRIVATE tier only,
+    so these scans are seeded via ``write()`` (private) rather than
+    ``add_document(..., tier="corpus")`` — matching what the CRUD route
+    actually does.
+    """
 
     async def test_write_updates_only_the_named_skill(self, user_context) -> None:
         """Overwriting one skill must leave its siblings byte-identical.
 
-        The write path scans ``self._documents`` for a filename match and
-        replaces in place. If the scan stopped at the first entry rather than
-        continuing past non-matches, writing to the second or third skill
-        would silently overwrite the first — a shared-content corruption that
-        every user of the procedural layer would then read back.
+        The write path scans the caller's private documents for a filename
+        match and replaces in place. If the scan stopped at the first entry
+        rather than continuing past non-matches, writing to the second or
+        third skill would silently overwrite the first.
         """
         service = MockProceduralService()
-        service.add_document("iam body", skill="IAM", file="SKILL-IAM.md")
-        service.add_document("arch body", skill="ARCH", file="SKILL-ARCH.md")
-        service.add_document("cli body", skill="CLI", file="SKILL-CLI.md")
+        await service.write(user_context, "SKILL-IAM.md", "iam body")
+        await service.write(user_context, "SKILL-ARCH.md", "arch body")
+        await service.write(user_context, "SKILL-CLI.md", "cli body")
 
         updated = await service.write(user_context, "SKILL-CLI.md", "cli body v2")
 
@@ -591,8 +953,8 @@ class TestMockMatchLoops:
         success.
         """
         service = MockProceduralService()
-        service.add_document("iam body", skill="IAM", file="SKILL-IAM.md")
-        service.add_document("arch body", skill="ARCH", file="SKILL-ARCH.md")
+        await service.write(user_context, "SKILL-IAM.md", "iam body")
+        await service.write(user_context, "SKILL-ARCH.md", "arch body")
 
         assert await service.delete(user_context, "SKILL-NOPE.md") is False
 
@@ -606,11 +968,84 @@ class TestMockMatchLoops:
         used for ``pop`` has to be the index of the *matching* document.
         """
         service = MockProceduralService()
-        service.add_document("iam body", skill="IAM", file="SKILL-IAM.md")
-        service.add_document("arch body", skill="ARCH", file="SKILL-ARCH.md")
-        service.add_document("cli body", skill="CLI", file="SKILL-CLI.md")
+        await service.write(user_context, "SKILL-IAM.md", "iam body")
+        await service.write(user_context, "SKILL-ARCH.md", "arch body")
+        await service.write(user_context, "SKILL-CLI.md", "cli body")
 
         assert await service.delete(user_context, "SKILL-ARCH.md") is True
 
         remaining = {d.metadata["file"] for d in await service.load(user_context)}
         assert remaining == {"SKILL-IAM.md", "SKILL-CLI.md"}
+
+
+# ── UserScopedProceduralService (ADR-062 Phase B, WU-B1) ─────────────────────
+
+
+class TestUserScopedProceduralService:
+    """Mirrors ``TestUserScopedSemanticService`` (semantic.py precedent):
+    the bound identity wins over any per-call ``user_context`` — true
+    isolation by construction at the ``get_context_builder()`` DI seam."""
+
+    async def test_bound_identity_overrides_call_time_argument(
+        self, user_context
+    ) -> None:
+        inner = MockProceduralService()
+        inner.add_document(
+            "alice's skill",
+            file="SKILL-alice.md",
+            tier="private",
+            user_id="user-alice",
+        )
+        alice = _user("user-alice")
+        wrapper = UserScopedProceduralService(inner=inner, user_context=alice)
+
+        bogus = replace(user_context, user_id="someone-else", is_admin=True)
+        docs = await wrapper.load(bogus)
+        assert any(d.metadata["file"] == "SKILL-alice.md" for d in docs)
+
+    async def test_two_wrappers_stay_isolated(self, user_context) -> None:
+        inner = MockProceduralService()
+        alice, bob = _user("user-alice"), _user("user-bob")
+        wrapper_a = UserScopedProceduralService(inner=inner, user_context=alice)
+        wrapper_b = UserScopedProceduralService(inner=inner, user_context=bob)
+
+        await wrapper_a.write(alice, "SKILL-notes.md", "alice's content")
+        alice_doc = await wrapper_a.read(alice, "SKILL-notes.md")
+        bob_doc = await wrapper_b.read(bob, "SKILL-notes.md")
+
+        assert alice_doc is not None
+        assert bob_doc is None
+
+    async def test_search_and_as_context_and_delete_delegate_to_bound_user(
+        self, user_context
+    ) -> None:
+        inner = MockProceduralService()
+        alice = _user("user-alice")
+        wrapper = UserScopedProceduralService(inner=inner, user_context=alice)
+
+        await wrapper.write(alice, "SKILL-cache.md", "cache tuning details")
+        hits = await wrapper.search(alice, "cache tuning")
+        assert any(d.metadata["file"] == "SKILL-cache.md" for d in hits)
+
+        ctx = await wrapper.as_context(alice, "cache tuning")
+        assert "SKILL-cache.md" in ctx or "cache" in ctx.lower()
+
+        deleted = await wrapper.delete(alice, "SKILL-cache.md")
+        assert deleted is True
+        assert await wrapper.read(alice, "SKILL-cache.md") is None
+
+    def test_invalidate_cache_delegates_to_inner(self) -> None:
+        class _Spy(MockProceduralService):
+            def __init__(self) -> None:
+                super().__init__()
+                self.invalidated = False
+
+            def invalidate_cache(self) -> None:
+                self.invalidated = True
+
+        inner = _Spy()
+        wrapper = UserScopedProceduralService(
+            inner=inner, user_context=_user("user-alice")
+        )
+        wrapper.invalidate_cache()
+        assert inner.invalidated is True

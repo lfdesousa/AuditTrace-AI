@@ -77,6 +77,40 @@ async def test_mock_collection():
     assert len(results["ids"]) == 2
 
 
+async def test_mock_collection_get_with_where_filter():
+    """R1/R2b enumeration-sort support (backlog #15 residual, #375): a
+    real ChromaDB ``.get()`` filters by ``where`` without any vector
+    ranking — the recall-tool recency/id sorts depend on this."""
+    collection = MockCollection("test_collection")
+    await collection.add(
+        ids=["a", "b", "c"],
+        documents=["doc-a", "doc-b", "doc-c"],
+        metadatas=[
+            {"user_id": "alice"},
+            {"user_id": "bob"},
+            {"user_id": "alice"},
+        ],
+    )
+    results = await collection.get(where={"user_id": "alice"})
+    assert results["ids"] == ["a", "c"]
+
+
+async def test_mock_collection_get_with_limit_and_offset():
+    collection = MockCollection("test_collection")
+    await collection.add(
+        ids=["a", "b", "c", "d"],
+        documents=["doc-a", "doc-b", "doc-c", "doc-d"],
+    )
+    results = await collection.get(limit=2)
+    assert results["ids"] == ["a", "b"]
+
+    results = await collection.get(offset=2)
+    assert results["ids"] == ["c", "d"]
+
+    results = await collection.get(offset=1, limit=2)
+    assert results["ids"] == ["b", "c"]
+
+
 async def test_factory_call_tracking():
     """Test that factory call count is tracked."""
     factory = MockChromaDBFactory()

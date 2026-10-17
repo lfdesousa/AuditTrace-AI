@@ -198,6 +198,9 @@ class MockCollection:
     async def get(
         self,
         ids: list[str] | None = None,
+        where: dict[str, Any] | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         # Filter by ``ids`` if provided (matches ChromaDB's real API).
@@ -205,6 +208,21 @@ class MockCollection:
         if ids is not None:
             id_set = set(ids)
             rows = [r for r in rows if r["id"] in id_set]
+        # ``where``/``limit``/``offset`` (backlog #15 residual, #375): the
+        # real ChromaDB ``Collection.get`` supports a non-ranked, filtered,
+        # paged listing — used by the recall-tool enumeration sorts
+        # (recency/id) which need every candidate metadata field can rank
+        # by, not just the vector-nearest window ``query`` returns.
+        if where:
+            rows = [
+                r
+                for r in rows
+                if all(r["metadata"].get(k) == v for k, v in where.items())
+            ]
+        if offset:
+            rows = rows[offset:]
+        if limit is not None:
+            rows = rows[:limit]
         return {
             "ids": [r["id"] for r in rows],
             "documents": [r["document"] for r in rows],

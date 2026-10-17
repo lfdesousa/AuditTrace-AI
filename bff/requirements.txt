@@ -1,0 +1,13 @@
+# The LibreChat BFF is a genuinely separate deployable (its own image,
+# ADR-042 §5 Option A dedicated sidecar) — its own, minimal dependency
+# set rather than the full audittrace-server requirements.txt. Version
+# floors mirror the pins in the top-level requirements.txt so the two
+# processes stay on compatible major versions of shared libraries
+# (fastapi / httpx / python-jose) without pulling in anything the BFF
+# does not use (ChromaDB, boto3, pyhanko, OpenTelemetry, ...).
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-jose[cryptography]>=3.3.0
+httpx>=0.25.0

@@ -31,7 +31,7 @@ services:
     # which re-introduces `build: .` + bind-mounts /src for hot
     # reload. Override the tag for local dev builds with:
     #   AUDITTRACE_IMAGE_TAG=dev docker compose up -d
-    image: docker.io/lfds/audittrace-memory-server:${AUDITTRACE_IMAGE_TAG:-1.0.22}
+    image: docker.io/lfds/audittrace-memory-server:${AUDITTRACE_IMAGE_TAG:-1.29.5}
     container_name: audittrace-server
     entrypoint: ["/app/scripts/entrypoint.sh"]
     depends_on:
@@ -85,7 +85,7 @@ services:
       # otel-collector service is in a future B7 step.
       - AUDITTRACE_OTLP_ENDPOINT=${AUDITTRACE_OTLP_ENDPOINT:-}
       - OTEL_SERVICE_NAME=audittrace-server
-      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=audittrace,service.version=${AUDITTRACE_IMAGE_TAG:-1.0.22},deployment.environment=${AUDITTRACE_ENV:-local}
+      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=audittrace,service.version=${AUDITTRACE_IMAGE_TAG:-1.29.5},deployment.environment=${AUDITTRACE_ENV:-local}
       - OTEL_SEMCONV_STABILITY_OPT_IN=${OTEL_SEMCONV_STABILITY_OPT_IN:-http/dup}
       - AUDITTRACE_METRICS_ENABLED=${AUDITTRACE_METRICS_ENABLED:-true}
       - AUDITTRACE_LANGFUSE_HOST=${AUDITTRACE_LANGFUSE_HOST:-http://langfuse-web:3000}
@@ -173,7 +173,9 @@ services:
   chromadb:
     # Chart's chromadb is in-chart (not a subchart). Pin matches
     # `charts/audittrace/values.yaml::chromadb.image.tag`.
-    image: chromadb/chroma:1.5.7
+    # Mirrored to ghcr.io 2026-09-26 so compose and the chart pull the
+    # same bytes from a registry we control. See the MinIO finding.
+    image: ghcr.io/lfdesousa/audittrace-chroma:1.5.7-frozen-sep26
     container_name: audittrace-chromadb
     ports:
       - "18000:8000"
@@ -195,7 +197,7 @@ services:
   keycloak:
     # Chart-aligned (quay.io/keycloak/keycloak:24.0 — already
     # matched pre-B7; preserved here).
-    image: quay.io/keycloak/keycloak:24.0
+    image: ghcr.io/lfdesousa/audittrace-keycloak:24.0-frozen-sep26
     container_name: audittrace-keycloak
     command: start-dev --import-realm --health-enabled=true
     depends_on:
@@ -284,7 +286,10 @@ services:
     # — if he prefers we keep bitnami at any cost, we'd need to step
     # back and audit the bitnami libfile source to find the missing
     # override hook (or fork the image).
-    image: rabbitmq:3.13-management-alpine
+    # Upstream tag was FLOATING. Frozen at what it resolved to on
+    # 2026-09-26,
+    # sha256:606d8c0d6b3c18d1da9afc53bc7cdb2a8d5486df91b5a9830e9e07626c9ae281
+    image: ghcr.io/lfdesousa/audittrace-rabbitmq-mgmt:3.13-management-alpine-frozen-sep26
     container_name: audittrace-rabbitmq
     environment:
       # Upstream conventions: RABBITMQ_DEFAULT_USER/PASS/VHOST.
@@ -312,9 +317,14 @@ services:
     restart: unless-stopped
 
   minio:
-    # ADR-027 — S3-compatible storage. Chart pin is `minio/minio:latest`
-    # (upstream — NOT bitnami). Preserved here so compose matches.
-    image: minio/minio:latest
+    # ADR-027 — S3-compatible storage. Chart pin is the same image, so
+    # compose and the chart exercise identical bytes. MIRRORED to ghcr.io
+    # 2026-09-26: Docker Hub removed anonymous pull for the MinIO org on
+    # 2026-09-12 (we repinned to quay.io), and quay.io then closed the
+    # same way — both now 401 anonymously, even for `:latest`. See
+    # finding-minio-quay-anon-pull-removed-20260926.md. Pin exact dated
+    # tags, never `:latest`.
+    image: ghcr.io/lfdesousa/audittrace-minio:RELEASE.2025-04-22T22-12-26Z-frozen-sep26
     container_name: audittrace-minio
     command: server /data --console-address ":9001"
     environment:
@@ -376,7 +386,7 @@ services:
   # See AGENTS.md "docker-compose stack — B7 step 1 rebuild" for the
   # full compose-vs-helm posture rationale.
   vault:
-    image: hashicorp/vault:1.20.1
+    image: ghcr.io/lfdesousa/audittrace-vault:1.20.1-frozen-sep26
     container_name: audittrace-vault
     profiles: ["vault"]
     cap_add:
@@ -406,7 +416,7 @@ services:
   # Config files committed under config/compose/{otel-collector,tempo,
   # loki,grafana}/ — minimum-viable single-binary configs.
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.102.0
+    image: ghcr.io/lfdesousa/audittrace-otel-collector:0.102.0-frozen-sep26
     container_name: audittrace-otel-collector
     profiles: ["obs"]
     command: ["--config=/etc/otelcol/config.yaml"]
@@ -420,7 +430,7 @@ services:
     restart: unless-stopped
 
   tempo:
-    image: grafana/tempo:2.5.0
+    image: ghcr.io/lfdesousa/audittrace-tempo:2.5.0-frozen-sep26
     container_name: audittrace-tempo
     profiles: ["obs"]
     command: ["-config.file=/etc/tempo/tempo.yaml"]
@@ -434,7 +444,7 @@ services:
     restart: unless-stopped
 
   loki:
-    image: grafana/loki:3.0.0
+    image: ghcr.io/lfdesousa/audittrace-loki:3.0.0-frozen-sep26
     container_name: audittrace-loki
     profiles: ["obs"]
     command: ["-config.file=/etc/loki/loki-config.yaml"]
@@ -448,7 +458,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:10.4.0
+    image: ghcr.io/lfdesousa/audittrace-grafana:10.4.0-frozen-sep26
     container_name: audittrace-grafana
     profiles: ["obs"]
     environment:
@@ -493,7 +503,11 @@ services:
     restart: unless-stopped
 
   langfuse-web:
-    image: langfuse/langfuse:2
+    # Upstream tag was FLOATING (major only): the same `up` on two
+    # machines could get different bytes. Frozen at what `:2`
+    # resolved to on 2026-09-26,
+    # sha256:85c278dcab96c15db94191a5c1664f85aba2d7fb6771a00e99681c902c4b7015
+    image: ghcr.io/lfdesousa/audittrace-langfuse:2-frozen-sep26
     container_name: audittrace-langfuse-web
     profiles: ["langfuse"]
     depends_on:
@@ -514,11 +528,14 @@ services:
   # ─── B7 step 9 — Content-control sibling (profile: content-control) ─
   # cc-control-plane consumes scan.requests from RabbitMQ, scans via
   # clamd, publishes verdicts back. Same image the chart deploys at
-  # docker.io/lfds/audittrace-content-control:0.0.9 (multi-arch from
+  # docker.io/lfds/audittrace-content-control:0.1.5 (multi-arch from
   # cc-side PR-A14). clamd is the malware scanner — ≥1 GB RAM floor
   # per the PR-A11 OOMKill forensic; profile-only because of cost.
   cc-clamd:
-    image: clamav/clamav:1.4
+    # Upstream tag was FLOATING (minor). Frozen at what `1.4` resolved
+    # to on 2026-09-26,
+    # sha256:383f77291d9e3f8d2fc72da805d37895dfbe86844dc91c3520d5ff194922292d
+    image: ghcr.io/lfdesousa/audittrace-clamav:1.4-frozen-sep26
     container_name: audittrace-cc-clamd
     profiles: ["content-control"]
     healthcheck:
@@ -532,7 +549,7 @@ services:
     restart: unless-stopped
 
   cc-control-plane:
-    image: docker.io/lfds/audittrace-content-control:0.0.9
+    image: docker.io/lfds/audittrace-content-control:0.1.5
     container_name: audittrace-cc-control-plane
     profiles: ["content-control"]
     depends_on:
@@ -557,7 +574,10 @@ services:
     restart: unless-stopped
 
   traefik:
-    image: traefik:v3.6
+    # Upstream tag was FLOATING (minor). Frozen at what `v3.6` resolved
+    # to on 2026-09-26,
+    # sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d
+    image: ghcr.io/lfdesousa/audittrace-traefik:v3.6-frozen-sep26
     container_name: audittrace-traefik
     ports:
       - "443:443"

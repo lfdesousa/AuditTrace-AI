@@ -1,0 +1,40 @@
+meta {
+  name: W1 POST grants
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/console/acl/{{aclResourceType}}/{{aclResourceId}}/grants
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "principal_type": "user",
+    "principal_id": "{{aclPrincipalId}}",
+    "perm_bits": 1
+  }
+}
+
+tests {
+  test("201 + trace_id", function() {
+    expect(res.getStatus()).to.equal(201);
+    expect(res.getBody().trace_id).to.match(/^[0-9a-f]{32}$/);
+    expect(res.getBody()).to.not.have.property("user_sub");
+  });
+}
+
+docs {
+  Needs `memory:acl:write` (audittrace-acl-e2e client). Grant authority is the
+  database's (migration 032): owner-only today, so a non-owner gets 403 +
+  failure_class acl_denied_policy and a denial row. Never put user_sub /
+  granted_by / trace_id in the body — extra keys are 422.
+  Use a token minted by scripts/deploy/acl_e2e_device_mint.py with an ISOLATED
+  AUDITTRACE_TOKENS_DIR / AUDITTRACE_BRUNO_ENV — never the default token store.
+}
