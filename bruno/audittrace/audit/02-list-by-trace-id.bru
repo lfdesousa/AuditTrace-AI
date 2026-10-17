@@ -1,0 +1,30 @@
+meta {
+  name: GET /interactions?trace_id= — reconstruct one request
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/interactions?trace_id={{traceId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200 with only that trace", function() {
+    expect(res.getStatus()).to.equal(200);
+    const rows = res.getBody().interactions;
+    expect(rows).to.be.an("array");
+    rows.forEach(r => expect(r.trace_id).to.equal(bru.getEnvVar("traceId")));
+  });
+}
+
+docs {
+  R7 (ACL WU-2c): filter by the 32-lowercase-hex trace_id a write route
+  returned. RLS-scoped — narrows WITHIN the caller's own rows. Needs
+  `audittrace:audit` (an audittrace-opencode token, not the acl-e2e one).
+}

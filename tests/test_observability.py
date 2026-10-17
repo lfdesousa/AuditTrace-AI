@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -238,6 +239,292 @@ def test_init_telemetry_wires_otlp_exporters_when_endpoint_set(monkeypatch):
         )
 
 
+def _restore_suite_telemetry():
+    """Put the module globals back into the no-op state the rest of the
+    suite assumes (tracer installed, metrics installed, no exporters)."""
+    telemetry._reset_for_tests()
+    telemetry.init_telemetry(
+        service_name="audittrace-server-tests",
+        otlp_endpoint="",
+        tracing_enabled=True,
+        metrics_enabled=True,
+    )
+
+
+def test_init_telemetry_skips_metrics_pipeline_when_metrics_disabled(monkeypatch):
+    """``metrics_enabled=False`` must leave the histogram/counter uninstalled
+    while tracing keeps working.
+
+    Metrics are the optional half of the observability stack (operators turn
+    them off on constrained nodes); tracing is not, because the EU AI Act
+    Art. 12 trail rides on spans. If ``record_operation`` dereferenced a
+    missing histogram, every ``@log_call`` in the process would raise and take
+    the request down with it — a metrics opt-out would become an outage.
+    """
+    telemetry._reset_for_tests()
+    monkeypatch.setattr(telemetry, "_langfuse_client", None)
+    monkeypatch.delenv("AUDITTRACE_LANGFUSE_ENABLED", raising=False)
+    try:
+        telemetry.init_telemetry(
+            service_name="metrics-off",
+            otlp_endpoint="",
+            tracing_enabled=True,
+            metrics_enabled=False,
+        )
+        assert telemetry._duration_histogram is None
+        assert telemetry._error_counter is None
+        # Tracing must be unaffected — traceability does not depend on metrics.
+        assert telemetry._tracer is not None
+        # And the metric-recording call site must stay a silent no-op.
+        telemetry.record_operation("metrics-off.op", 0.25, error="ValueError")
+    finally:
+        _restore_suite_telemetry()
+
+
+def test_init_telemetry_leaves_tracer_unset_when_tracing_disabled(monkeypatch):
+    """``tracing_enabled=False`` must leave ``_tracer`` unset so ``start_span``
+    yields ``None`` and ``@log_call`` degrades to logging only.
+
+    The degraded shape is what every span-consuming helper branches on. If
+    ``_tracer`` were left populated by a half-initialised provider, the
+    decorator would hand real span objects to code paths that were never
+    exercised with tracing off, and a tracing opt-out would start raising
+    inside the aspect wrapping every service call.
+    """
+    telemetry._reset_for_tests()
+    monkeypatch.setattr(telemetry, "_langfuse_client", None)
+    monkeypatch.delenv("AUDITTRACE_LANGFUSE_ENABLED", raising=False)
+    try:
+        telemetry.init_telemetry(
+            service_name="tracing-off",
+            otlp_endpoint="",
+            tracing_enabled=False,
+            metrics_enabled=False,
+        )
+        assert telemetry._tracer is None
+        with telemetry.start_span("anything", metadata={"k": "v"}) as span:
+            assert span is None
+
+        # The aspect must still run the wrapped function and return its value.
+        @log_call(logger=logging.getLogger("audittrace.tests.tracing_off"))
+        def compute(x):
+            return x * 2
+
+        assert compute(21) == 42
+    finally:
+        _restore_suite_telemetry()
+
+
+def test_init_telemetry_installs_own_provider_when_global_lacks_processor_api(
+    monkeypatch,
+):
+    """Without Langfuse the global provider is OTel's ``ProxyTracerProvider``,
+    which has no ``add_span_processor``. ``init_telemetry`` must then install
+    its own SDK ``TracerProvider`` carrying the OTLP exporter.
+
+    This is the Tempo-only deployment path. If the code only ever attached the
+    processor to a pre-existing provider, disabling Langfuse would silently
+    stop every span from reaching Tempo — the reconstructibility walkthrough
+    (trace-ID hop) would have nothing to show, with no error anywhere.
+    """
+    telemetry._reset_for_tests()
+    monkeypatch.setattr(telemetry, "_langfuse_client", None)
+    monkeypatch.delenv("AUDITTRACE_LANGFUSE_ENABLED", raising=False)
+
+    span_exporter_mock = MagicMock()
+    fake_trace_mod = MagicMock()
+    fake_trace_mod.OTLPSpanExporter = span_exporter_mock
+    monkeypatch.setitem(
+        sys.modules,
+        "opentelemetry.exporter.otlp.proto.http.trace_exporter",
+        fake_trace_mod,
+    )
+
+    import opentelemetry.trace as otel_trace
+
+    class _ProviderWithoutProcessorApi:
+        """Stand-in for ProxyTracerProvider: no add_span_processor."""
+
+        def get_tracer(self, *a, **kw):  # pragma: no cover - not the path used
+            return MagicMock()
+
+    installed: list = []
+    monkeypatch.setattr(
+        otel_trace, "get_tracer_provider", lambda: _ProviderWithoutProcessorApi()
+    )
+    monkeypatch.setattr(otel_trace, "set_tracer_provider", installed.append)
+    monkeypatch.setattr(otel_trace, "get_tracer", lambda name: MagicMock(name=name))
+
+    try:
+        telemetry.init_telemetry(
+            service_name="tempo-only",
+            otlp_endpoint="http://otel.test",
+            tracing_enabled=True,
+            metrics_enabled=False,
+        )
+        assert len(installed) == 1, "an app-owned TracerProvider must be installed"
+        provider = installed[0]
+        # The installed provider must actually carry our OTLP exporter —
+        # installing an empty provider would look identical from the outside
+        # but export nothing.
+        exporters = [
+            getattr(p, "span_exporter", None)
+            for p in provider._active_span_processor._span_processors
+        ]
+        assert span_exporter_mock.return_value in exporters
+        span_exporter_mock.assert_called_once_with(
+            endpoint="http://otel.test/v1/traces"
+        )
+    finally:
+        _restore_suite_telemetry()
+
+
+def test_init_telemetry_tags_tracer_with_langfuse_scope(monkeypatch):
+    """With the Langfuse SDK active, the app tracer must be created under the
+    ``langfuse-sdk`` instrumentation scope carrying the ``public_key``.
+
+    ``LangfuseSpanProcessor``'s default filter rejects spans emitted under any
+    other scope (see ``_should_export_span``). Getting this wrong empties the
+    Langfuse trace tree without a single error log — the failure mode is a
+    dashboard that looks fine but has no observations to filter by user.
+
+    SEC-JWT-IN-LANGFUSE-SPAN: ``init_telemetry`` now ALWAYS builds and owns
+    its own real ``TracerProvider`` (S-C2 — the scrubber must be attached
+    first, via the public API, before anything else touches it) rather
+    than reading back whatever ``trace.get_tracer_provider()`` happens to
+    return. A real provider is required for the startup self-test (S-C1)
+    to run at all, so this test SPIES on ``TracerProvider.get_tracer``
+    instead of replacing the provider wholesale with a MagicMock — the
+    probe span must actually fire.
+    """
+    telemetry._reset_for_tests()
+    monkeypatch.setattr(telemetry, "_langfuse_client", MagicMock())
+    monkeypatch.setenv("AUDITTRACE_LANGFUSE_PUBLIC_KEY", "pk-scope-test")
+
+    from opentelemetry.sdk.trace import TracerProvider
+
+    calls: list[tuple[tuple, dict]] = []
+    original_get_tracer = TracerProvider.get_tracer
+
+    def _spy_get_tracer(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return original_get_tracer(self, *args, **kwargs)
+
+    monkeypatch.setattr(TracerProvider, "get_tracer", _spy_get_tracer)
+
+    try:
+        telemetry.init_telemetry(
+            service_name="langfuse-scoped",
+            otlp_endpoint="",
+            tracing_enabled=True,
+            metrics_enabled=False,
+        )
+        scoped_calls = [
+            (args, kwargs) for args, kwargs in calls if args == ("langfuse-sdk",)
+        ]
+        assert scoped_calls, f"no 'langfuse-sdk'-scoped get_tracer call seen: {calls}"
+        assert scoped_calls[0][1] == {"attributes": {"public_key": "pk-scope-test"}}
+    finally:
+        monkeypatch.setattr(telemetry, "_langfuse_client", None)
+        _restore_suite_telemetry()
+
+
+def test_langfuse_filter_rejects_span_without_instrumentation_scope(monkeypatch):
+    """A span whose ``instrumentation_scope`` is ``None`` has no scope name, so
+    the filter must fall through to reject it.
+
+    Spans reach that state when an exporter re-emits a span stripped of its
+    scope. Treating "no scope" as acceptable would re-open the leak ADR-045
+    closed: untagged third-party auto-spans (httpx, FastAPI probes) flooding
+    the Langfuse trace tree and burying the @log_call observations operators
+    actually reconstruct from.
+    """
+    monkeypatch.setattr(telemetry, "_langfuse_client", None)
+    monkeypatch.setenv("AUDITTRACE_LANGFUSE_ENABLED", "true")
+    monkeypatch.setenv("AUDITTRACE_LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("AUDITTRACE_LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("AUDITTRACE_LANGFUSE_HOST", "http://lf.test")
+
+    fake_lf_class = MagicMock()
+    monkeypatch.setitem(sys.modules, "langfuse", MagicMock(Langfuse=fake_lf_class))
+    monkeypatch.setitem(
+        sys.modules,
+        "langfuse.span_filter",
+        MagicMock(is_default_export_span=lambda span: True),
+    )
+
+    try:
+        telemetry._init_langfuse_client()
+        filter_fn = fake_lf_class.call_args.kwargs["should_export_span"]
+
+        scopeless = MagicMock(attributes={}, instrumentation_scope=None)
+        assert filter_fn(scopeless) is False
+
+        # Control: the *only* difference is the scope, and it flips the
+        # verdict — proving the rejection came from the scope check and not
+        # from the empty attribute bag.
+        langfuse_scope = MagicMock()
+        langfuse_scope.name = "langfuse-sdk"
+        scoped = MagicMock(attributes={}, instrumentation_scope=langfuse_scope)
+        assert filter_fn(scoped) is True
+    finally:
+        monkeypatch.setattr(telemetry, "_langfuse_client", None)
+
+
+def test_start_span_drops_none_metadata_values(monkeypatch):
+    """``start_span`` must skip ``None`` metadata values instead of writing
+    them onto the span.
+
+    The OTel API rejects ``None`` attribute values. ``span_metadata`` is built
+    by ``@log_call`` from values that can legitimately be absent (an unset
+    ``langgraph_step`` ContextVar, an unclassified component). Passing one
+    through makes the SDK complain and can abort the remaining metadata writes
+    for that observation, so the Langfuse graph view loses the node.
+    """
+    fake_span = MagicMock()
+    fake_tracer = MagicMock()
+    fake_tracer.start_as_current_span.return_value.__enter__.return_value = fake_span
+    monkeypatch.setattr(telemetry, "_tracer", fake_tracer)
+
+    with telemetry.start_span("op", metadata={"kept": "yes", "dropped": None}) as span:
+        assert span is fake_span
+
+    written = {
+        call.args[0]: call.args[1] for call in fake_span.set_attribute.call_args_list
+    }
+    assert written == {"langfuse.observation.metadata.kept": "yes"}, (
+        "None-valued metadata must never reach span.set_attribute"
+    )
+
+
+def test_shutdown_flushes_traces_when_meter_provider_has_no_shutdown(monkeypatch):
+    """``shutdown()`` must flush the TracerProvider even when the MeterProvider
+    is a no-op object without ``shutdown()``.
+
+    That is exactly the state after ``init_telemetry(metrics_enabled=False)``.
+    An unguarded ``mp.shutdown()`` would raise ``AttributeError``, get
+    swallowed by the outer ``except``, and the pending span batch would be lost
+    on pod termination — dropping the trail for every in-flight request at
+    exactly the moment (a rollout) an operator most needs it.
+    """
+    import opentelemetry.metrics as otel_metrics
+    import opentelemetry.trace as otel_trace
+
+    fake_tp = MagicMock()
+
+    class _MeterProviderWithoutShutdown:
+        pass
+
+    monkeypatch.setattr(otel_trace, "get_tracer_provider", lambda: fake_tp)
+    monkeypatch.setattr(
+        otel_metrics, "get_meter_provider", lambda: _MeterProviderWithoutShutdown()
+    )
+
+    telemetry.shutdown()
+
+    fake_tp.shutdown.assert_called_once_with()
+
+
 def test_record_operation_emits_error_counter():
     """record_operation should bump the error counter when an error type is given."""
     # No-op in test mode (histogram + counter exist as MeterProvider primitives),
@@ -377,7 +664,14 @@ def test_start_span_uses_otel_tracer(monkeypatch):
     with telemetry.start_span("test-op", metadata={"node": "foo", "step": 1}) as span:
         assert span is fake_span
 
-    fake_tracer.start_as_current_span.assert_called_once_with("test-op")
+    # record_exception/set_status_on_exception are disabled here because
+    # SEC-JWT-IN-LANGFUSE-SPAN makes ``_record_span_error`` the single
+    # exception recorder (ADDENDUM A §3 B2) — letting OTel's own
+    # automatic recording run too double-recorded every failing call
+    # (spec fact A2), the second time via the raw, unscrubbed path.
+    fake_tracer.start_as_current_span.assert_called_once_with(
+        "test-op", record_exception=False, set_status_on_exception=False
+    )
     stamped = {
         call.args[0]: call.args[1] for call in fake_span.set_attribute.call_args_list
     }
@@ -445,6 +739,204 @@ def test_log_call_logs_and_reraises_errors(caplog):
     assert any("ERROR" in r.message for r in caplog.records if r.name == logger.name)
 
 
+def test_log_call_4xx_httpexception_warns_without_traceback(caplog):
+    """Pentest F-L1: an expected 4xx HTTPException (bad/expired token, missing
+    scope, not found, validation) must be logged concisely at WARNING with NO
+    stack trace — not ERROR+traceback — so attacker-controllable 4xx cannot
+    flood ERROR logs or disclose internal paths."""
+    from fastapi import HTTPException
+
+    logger = logging.getLogger("audittrace.tests.client_err")
+
+    @log_call(logger=logger)
+    async def deny():
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        with pytest.raises(HTTPException):
+            asyncio.run(deny())
+
+    recs = [r for r in caplog.records if r.name == logger.name]
+    # No ERROR record from the wrapper, and no traceback attached.
+    assert not any(r.levelno >= logging.ERROR for r in recs), (
+        "4xx must not log at ERROR"
+    )
+    warns = [r for r in recs if r.levelno == logging.WARNING]
+    assert warns, "expected a WARNING for the 4xx"
+    assert all(r.exc_info is None for r in warns), "WARNING must carry no traceback"
+
+
+def test_log_call_5xx_httpexception_still_errors_with_traceback(caplog):
+    """A 5xx HTTPException is a real server fault and must still log at ERROR
+    with the traceback (only 4xx are downgraded)."""
+    from fastapi import HTTPException
+
+    logger = logging.getLogger("audittrace.tests.server_err")
+
+    @log_call(logger=logger)
+    async def fault():
+        raise HTTPException(status_code=502, detail="upstream boom")
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        with pytest.raises(HTTPException):
+            asyncio.run(fault())
+
+    recs = [r for r in caplog.records if r.name == logger.name]
+    errs = [r for r in recs if r.levelno >= logging.ERROR]
+    assert errs, "5xx must still log at ERROR"
+    assert any(r.exc_info is not None for r in errs), "5xx ERROR must carry traceback"
+
+
+def test_log_call_sync_4xx_httpexception_warns_without_traceback(caplog):
+    """The same F-L1 downgrade must hold for SYNC decorated callables.
+
+    ``log_call`` builds two independent wrappers (async and sync) with
+    duplicated error handling. Most auth/scope guards that raise 4xx are plain
+    sync functions, so a divergence here means the very call sites the
+    downgrade was written for keep emitting ERROR+traceback on
+    attacker-controllable input.
+    """
+    from fastapi import HTTPException
+
+    logger = logging.getLogger("audittrace.tests.sync_client_err")
+
+    @log_call(logger=logger)
+    def deny_sync(token: str):
+        raise HTTPException(status_code=403, detail="missing scope memory:write")
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        with pytest.raises(HTTPException):
+            deny_sync("bad-token")
+
+    recs = [r for r in caplog.records if r.name == logger.name]
+    assert not any(r.levelno >= logging.ERROR for r in recs), (
+        "sync 4xx must not log at ERROR"
+    )
+    warns = [r for r in recs if r.levelno == logging.WARNING]
+    assert warns, "expected a WARNING for the sync 4xx"
+    assert all(r.exc_info is None for r in warns), "WARNING must carry no traceback"
+    # The operation is still identified, so the WARNING remains actionable.
+    assert all(r.operation.endswith("deny_sync") for r in warns)
+
+
+def test_log_call_payload_opt_out_keeps_span_but_drops_input_and_output(monkeypatch):
+    """``include_input=False`` / ``include_output=False`` must suppress the
+    payload attributes while still emitting a classified span.
+
+    This is the opt-out used by call sites that handle secrets or PII (token
+    exchange, credential lookup): they stay observable in Langfuse/Tempo
+    without shipping their arguments and return values to the trace backend.
+    If the flags only gated the DEBUG log lines, every such call would leak its
+    payload into an external observability store.
+    """
+    fake_span = MagicMock()
+    fake_span.is_recording.return_value = True
+    fake_tracer = MagicMock()
+    fake_tracer.start_as_current_span.return_value.__enter__.return_value = fake_span
+
+    import opentelemetry.trace as otel_trace
+
+    monkeypatch.setattr(otel_trace, "get_current_span", lambda: fake_span)
+    monkeypatch.setattr(telemetry, "_tracer", fake_tracer)
+
+    @log_call(
+        logger=logging.getLogger("audittrace.tests.optout"),
+        include_input=False,
+        include_output=False,
+    )
+    def exchange_token(client_secret):
+        return "access-token-abc"
+
+    assert exchange_token("s3cret-value") == "access-token-abc"
+
+    attrs = {
+        call.args[0]: call.args[1] for call in fake_span.set_attribute.call_args_list
+    }
+    assert "input.value" not in attrs
+    assert "output.value" not in attrs
+    # And neither Langfuse mirror key was written either.
+    assert "langfuse.observation.input" not in attrs
+    assert "langfuse.observation.output" not in attrs
+    # The secret / token never appear under any attribute key.
+    assert not any(
+        isinstance(v, str) and ("s3cret-value" in v or "access-token-abc" in v)
+        for v in attrs.values()
+    )
+    # The span is still emitted and classified — observability is not lost,
+    # only the payload is.
+    assert attrs["sovereign.operation"].endswith("exchange_token")
+
+
+def test_structured_formatter_renames_otel_trace_fields(monkeypatch):
+    """``otelTraceID`` / ``otelSpanID`` / ``otelServiceName`` must be renamed to
+    ``trace_id`` / ``span_id`` / ``service`` in the JSON line.
+
+    Those are the exact field names the reconstructibility walkthrough's Loki
+    query filters on (``| json | trace_id="..."``). OTel's LoggingInstrumentor
+    only ever sets the SDK-internal names, so without this rename an operator
+    holding a trace ID from Tempo cannot pivot to the matching log lines and
+    the log↔trace hop of the audit trail breaks.
+    """
+    import json as _json
+
+    from audittrace.logging_config import StructuredFormatter
+
+    fmt = StructuredFormatter()
+    record = logging.LogRecord(
+        name="audittrace.routes.chat",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="chat completed",
+        args=(),
+        exc_info=None,
+    )
+    record.otelTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+    record.otelSpanID = "00f067aa0ba902b7"
+    record.otelServiceName = "audittrace-server"
+
+    data = _json.loads(fmt.format(record))
+    assert data["trace_id"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+    assert data["span_id"] == "00f067aa0ba902b7"
+    assert data["service"] == "audittrace-server"
+    # The SDK-internal names must not also be emitted — Loki would index two
+    # labels for the same value.
+    assert "otelTraceID" not in data
+    assert "otelSpanID" not in data
+
+
+def test_structured_formatter_preserves_stack_info():
+    """``stack_info=True`` must survive into the JSON line under ``stack_info``.
+
+    Callers pass ``stack_info=True`` when the interesting part is *where the
+    call came from*, not an exception — the diagnostic for silent misbehaviour
+    with no raise (e.g. an unexpected re-entry into a worker loop). Dropping it
+    leaves such a log line with no way to identify the caller, which is the
+    only reason it was emitted.
+    """
+    import json as _json
+
+    from audittrace.logging_config import StructuredFormatter
+
+    fmt = StructuredFormatter()
+    record = logging.LogRecord(
+        name="audittrace.workers.summariser",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=1,
+        msg="unexpected re-entry",
+        args=(),
+        exc_info=None,
+    )
+    record.stack_info = 'File "worker.py", line 12, in run\n    loop()'
+
+    data = _json.loads(fmt.format(record))
+    assert "stack_info" in data
+    assert "worker.py" in data["stack_info"]
+    # A stack-info line is not an exception line — the two fields are distinct.
+    assert "exception" not in data
+
+
 def test_telemetry_init_is_idempotent_and_noop_without_endpoint():
     telemetry._reset_for_tests()
     telemetry.init_telemetry(service_name="test-svc", otlp_endpoint="")
@@ -488,22 +980,187 @@ def test_structured_formatter_emits_json():
     data = _json.loads(line)
     assert data["message"] == "hello"
     assert data["operation"] == "op"
+    # No exception → no exception field.
+    assert "exception" not in data
+
+
+def test_structured_formatter_merges_all_extra_keys():
+    """User-supplied ``extra=`` keys must all reach the JSON line (SPEC #457).
+
+    Regression: the formatter previously copied only a hardcoded 3-name
+    allowlist (request_id/duration/operation), so dead-letter fields like
+    scan_id/code/attempts (#450) never reached Loki.
+    """
+    import json as _json
+
+    from audittrace.logging_config import StructuredFormatter
+
+    fmt = StructuredFormatter()
+    record = logging.LogRecord(
+        name="audittrace.workers.pdf_ingest",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="dead-lettered",
+        args=(),
+        exc_info=None,
+    )
+    record.scan_id = "s1"
+    record.code = "pdf_corrupted_structure"
+    record.attempts = 3
+
+    data = _json.loads(fmt.format(record))
+    assert data["scan_id"] == "s1"
+    assert data["code"] == "pdf_corrupted_structure"
+    assert data["attempts"] == 3
+
+
+def test_structured_formatter_excludes_reserved_logrecord_attrs():
+    """Standard LogRecord attributes must not leak into the JSON line.
+
+    Neuter proof: if the ``_RESERVED_LOGRECORD_ATTRS`` exclusion is dropped,
+    pathname/lineno/args/funcName/levelno/process all appear in the output
+    and this test goes RED.
+    """
+    import json as _json
+
+    from audittrace.logging_config import StructuredFormatter
+
+    fmt = StructuredFormatter()
+    record = logging.LogRecord(
+        name="audittrace.routes.chat",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=42,
+        msg="hello",
+        args=(),
+        exc_info=None,
+    )
+    record.scan_id = "s1"  # an extra= key, proving the merge still runs
+
+    data = _json.loads(fmt.format(record))
+    assert data["scan_id"] == "s1"
+    for reserved in (
+        "pathname",
+        "lineno",
+        "args",
+        "funcName",
+        "levelno",
+        "process",
+    ):
+        assert reserved not in data, f"reserved attr {reserved!r} leaked into JSON"
+
+
+def test_structured_formatter_degrades_unserializable_extra_to_str():
+    """A non-JSON-serializable ``extra=`` value must not crash the log call.
+
+    SEC-JWT-IN-LANGFUSE-SPAN (2026-10-08): it degrades to ITS BARE TYPE
+    NAME via ``render_value``, not to ``str(value)`` via
+    ``json.dumps(..., default=str)`` any more — that escape hatch is
+    exactly what let a ``Settings`` object with plain-``str`` secret
+    fields render its secrets in full through an unknown object's
+    ``__str__`` (spec fact F5). One odd value still can never break the
+    logging path for the whole process; it now degrades to
+    ``<TypeName>`` instead of an arbitrary, unvetted ``str()``.
+    """
+    import json as _json
+
+    from audittrace.logging_config import StructuredFormatter
+
+    fmt = StructuredFormatter()
+    record = logging.LogRecord(
+        name="audittrace.workers.pdf_ingest",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="weird extra",
+        args=(),
+        exc_info=None,
+    )
+
+    class _Opaque:
+        def __str__(self) -> str:
+            return "opaque-value"
+
+    record.odd = _Opaque()
+
+    data = _json.loads(fmt.format(record))
+    assert data["odd"] == "<_Opaque>"
+
+
+def test_structured_formatter_preserves_exception_traceback():
+    """logger.exception()/exc_info=True must survive into the JSON line.
+
+    Regression: the formatter previously dropped record.exc_info, so a
+    background worker's only failure signal carried just the message and the
+    stack was lost — which masked the 2026-06-09 summariser poison-pill root
+    cause. The traceback must now appear under an ``exception`` field.
+    """
+    import json as _json
+
+    from audittrace.logging_config import StructuredFormatter
+
+    fmt = StructuredFormatter()
+    try:
+        raise ValueError("boom-detail")
+    except ValueError:
+        record = logging.LogRecord(
+            name="x",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="it failed",
+            args=(),
+            exc_info=sys.exc_info(),
+        )
+    data = _json.loads(fmt.format(record))
+    assert data["message"] == "it failed"
+    assert "exception" in data
+    assert "ValueError" in data["exception"]
+    assert "boom-detail" in data["exception"]
+    assert "Traceback" in data["exception"]
 
 
 class TestRecordSpanError:
-    """Tests for _record_span_error — dispatches to OTel or Langfuse APIs."""
+    """Tests for _record_span_error — dispatches to OTel or Langfuse APIs.
 
-    def test_otel_span_calls_record_exception(self):
-        """OTel spans expose record_exception; it must be called."""
+    SEC-JWT-IN-LANGFUSE-SPAN (ADDENDUM A §3 B2): ``_record_span_error``
+    is now the SINGLE exception recorder for OTel spans — it builds the
+    ``exception`` event + ERROR status itself (via the public
+    ``add_event``/``set_status`` API, scrubbed), rather than delegating
+    to ``span.record_exception()`` (which OTel's own ``start_span``
+    disabled via ``record_exception=False`` precisely so this path is
+    the only one that runs — spec fact A2 measured a DOUBLE exception
+    event when both ran).
+    """
+
+    def test_otel_span_calls_add_event_and_set_status(self):
+        """OTel spans expose add_event/set_status; both must be called,
+        with the exception text + status description scrubbed."""
         from audittrace.logging_config import _record_span_error
 
-        span = MagicMock(spec=["record_exception"])
-        exc = ValueError("boom")
+        span = MagicMock(spec=["add_event", "set_status"])
+        secret = "eyJ" + "a" * 20 + "." + "b" * 20 + "." + "c" * 20
+        exc = ValueError(f"boom {secret}")
         _record_span_error(span, exc)
-        span.record_exception.assert_called_once_with(exc)
+
+        span.add_event.assert_called_once()
+        event_name, event_attrs = span.add_event.call_args.args
+        assert event_name == "exception"
+        assert event_attrs["exception.type"] == "ValueError"
+        assert secret not in event_attrs["exception.message"]
+        assert "[REDACTED:jwt]" in event_attrs["exception.message"]
+        assert secret not in event_attrs["exception.stacktrace"]
+        assert event_attrs["exception.escaped"] == "True"
+
+        span.set_status.assert_called_once()
+        (status_obj,) = span.set_status.call_args.args
+        assert secret not in status_obj.description
+        assert "[REDACTED:jwt]" in status_obj.description
 
     def test_langfuse_span_calls_update_with_error_level(self):
-        """Langfuse spans have update() but not record_exception()."""
+        """Langfuse-shaped spans (legacy — update() but no add_event/
+        set_status) still get a scrubbed status_message."""
         from audittrace.logging_config import _record_span_error
 
         span = MagicMock(spec=["update"])
@@ -520,18 +1177,18 @@ class TestRecordSpanError:
         _record_span_error(None, ValueError("ignored"))
 
     def test_span_with_neither_method_is_noop(self):
-        """A span that has neither record_exception nor update must not raise."""
+        """A span with neither add_event/set_status nor update must not raise."""
         from audittrace.logging_config import _record_span_error
 
         span = MagicMock(spec=[])
         _record_span_error(span, ValueError("ignored"))
 
-    def test_failing_record_exception_is_swallowed(self):
-        """If record_exception itself raises, the error must be swallowed."""
+    def test_failing_add_event_is_swallowed(self):
+        """If add_event itself raises, the error must be swallowed."""
         from audittrace.logging_config import _record_span_error
 
-        span = MagicMock(spec=["record_exception"])
-        span.record_exception.side_effect = RuntimeError("telemetry broken")
+        span = MagicMock(spec=["add_event", "set_status"])
+        span.add_event.side_effect = RuntimeError("telemetry broken")
         # Must not raise
         _record_span_error(span, ValueError("original"))
 
@@ -542,3 +1199,28 @@ def test_telemetry_start_span_returns_none_when_uninitialised():
         assert span is None
     # Re-init so downstream tests keep working
     telemetry.init_telemetry(service_name="audittrace-server-tests", otlp_endpoint="")
+
+
+def test_g6_canary_registered_value_leg_is_scanned(_canary_registered_value_leg):
+    """Dedicated per-test canary for the net's registered-value-leg
+    category (gate REJECT round 4, R1) — registers a real, >=16-char
+    secret so ``scan_for_registered_secret_values`` (called
+    unconditionally on ``texts`` every test, in
+    ``tests/conftest.py::_redaction_net``) actually scans a NON-EMPTY
+    registry rather than returning early. Deliberately does not emit
+    the secret anywhere — a positive "the leg ran" canary must not
+    also BE a leak, which would additionally trip the net's ``hits``
+    check.
+
+    Lives HERE, not in ``test_log_call_redaction.py``: that module has
+    its OWN local autouse ``_clean_registry`` fixture (same function
+    scope, closer to the test than any conftest.py fixture), which
+    pytest tears down BEFORE ``_redaction_net``'s finally block runs —
+    clearing the registry before this canary's assertion could ever
+    see it, regardless of ``_redaction_net``'s own explicit dependency
+    on ``_reset_request_secrets``. This module carries no such
+    colliding local fixture, so the registration genuinely survives to
+    the net's own teardown check."""
+    from audittrace.identity import register_request_secret
+
+    register_request_secret("s3cr3t-canary-" + "A" * 20)

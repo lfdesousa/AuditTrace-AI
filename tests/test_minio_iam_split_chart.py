@@ -183,6 +183,26 @@ class TestAudittraceAppPolicy:
         ]
         assert any("quarantine/*" in r for s in allow_put for r in s["Resource"])
 
+    def test_allows_readwrite_on_assessments_prefix(
+        self, bucket_init_script: str
+    ) -> None:
+        """ADR-058 WS-A4: the recorder stores raw self-audit artefacts under
+        ``assessments/`` — without this grant the artefact PUT is AccessDenied
+        (found in the 2026-07-14 live run) and the "record what, not only
+        that" evidence is silently lost."""
+        block = _extract_heredoc(bucket_init_script, "/tmp/audittrace_app.json")
+        policy = json.loads(block)
+        rw = [
+            s
+            for s in policy["Statement"]
+            if s["Effect"] == "Allow"
+            and "s3:PutObject" in s["Action"]
+            and "s3:GetObject" in s["Action"]
+        ]
+        assert any("assessments/*" in r for s in rw for r in s["Resource"]), (
+            "audittrace_app policy must grant read+write on assessments/*"
+        )
+
 
 class TestContentControlPolicy:
     """The sibling pod's policy: read+delete quarantine, write

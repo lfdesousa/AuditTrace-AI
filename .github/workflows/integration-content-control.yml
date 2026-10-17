@@ -249,11 +249,29 @@ jobs:
 
       - name: Smoke test — memory-server /health
         run: |
+          # #384 WS3 — wait for the Deployment to be Ready before the
+          # curl instead of a single `sleep 3; curl` that flaked on the
+          # cold-start dependency race (RabbitMQ/xDS warm-up). The
+          # rollout gate proves the pod is Ready; the retry loop then
+          # tolerates a slow-but-healthy /health rather than failing the
+          # job on the first attempt.
+          kubectl rollout status deployment/audittrace-memory-server --timeout=180s
           kubectl port-forward svc/audittrace-memory-server 8765:8765 &
           PF=$!
           trap 'kill ${PF} 2>/dev/null || true' EXIT
-          sleep 3
-          curl -fsS http://localhost:8765/health
+          ok=""
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost:8765/health; then
+              ok=1
+              break
+            fi
+            echo "…/health not ready yet (attempt ${attempt}/30); retrying"
+            sleep 2
+          done
+          if [ -z "${ok}" ]; then
+            echo "✗ memory-server /health never responded 200" >&2
+            exit 1
+          fi
           echo
           echo "✓ memory-server /health responded"
 

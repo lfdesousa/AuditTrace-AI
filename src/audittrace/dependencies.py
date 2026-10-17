@@ -4,6 +4,8 @@ ADR-020: PostgreSQL replaces SQLite. ChromaDB is server-mode only.
 No file-based databases from this point forward.
 """
 
+import asyncio
+import inspect
 import logging
 from typing import Any, cast
 
@@ -23,6 +25,51 @@ from audittrace.db.postgres import (
 )
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
+from audittrace.services.console_acl import (
+    ConsoleAclEntriesService,
+    MockConsoleAclEntriesService,
+    PostgresConsoleAclEntriesService,
+)
+from audittrace.services.console_agents import (
+    ConsoleAgentsService,
+    MockConsoleAgentsService,
+    PostgresConsoleAgentsService,
+)
+from audittrace.services.console_chat_projects import (
+    ConsoleChatProjectsService,
+    MockConsoleChatProjectsService,
+    PostgresConsoleChatProjectsService,
+)
+from audittrace.services.console_conversation_tags import (
+    ConsoleConversationTagsService,
+    MockConsoleConversationTagsService,
+    PostgresConsoleConversationTagsService,
+)
+from audittrace.services.console_conversations import (
+    ConsoleConversationsService,
+    MockConsoleConversationsService,
+    PostgresConsoleConversationsService,
+)
+from audittrace.services.console_files import (
+    ConsoleFilesService,
+    MockConsoleFilesService,
+    PostgresConsoleFilesService,
+)
+from audittrace.services.console_presets import (
+    ConsolePresetsService,
+    MockConsolePresetsService,
+    PostgresConsolePresetsService,
+)
+from audittrace.services.console_prompts import (
+    ConsolePromptsService,
+    MockConsolePromptsService,
+    PostgresConsolePromptsService,
+)
+from audittrace.services.console_tool_favorites import (
+    ConsoleToolFavoritesService,
+    MockConsoleToolFavoritesService,
+    PostgresConsoleToolFavoritesService,
+)
 from audittrace.services.context_builder import (
     ContextBuilderService,
     DefaultContextBuilder,
@@ -36,6 +83,7 @@ from audittrace.services.episodic import (
     EpisodicService,
     MockEpisodicService,
     S3EpisodicService,
+    UserScopedEpisodicService,
 )
 from audittrace.services.memory_manifest import (
     MemoryManifestService,
@@ -45,6 +93,7 @@ from audittrace.services.procedural import (
     MockProceduralService,
     ProceduralService,
     S3ProceduralService,
+    UserScopedProceduralService,
 )
 
 # ADR-006 — direct ``minio.Minio`` import removed; the bare client is
@@ -56,6 +105,11 @@ from audittrace.services.semantic import (
     MockSemanticService,
     SemanticService,
     UserScopedSemanticService,
+)
+from audittrace.services.session_memory import (
+    MockSessionMemoryService,
+    PostgresSessionMemoryService,
+    SessionMemoryService,
 )
 from audittrace.services.trust_store import (
     CompositeTrustStoreBuilder,
@@ -69,6 +123,25 @@ from audittrace.services.trust_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_coroutine(coro: Any) -> Any:
+    """Run an awaitable to completion from synchronous code.
+
+    The DI container's ``create_instance`` is synchronous but the ChromaDB
+    factories are ``async def`` (#263). With no running loop (test-container
+    build) use ``asyncio.run``; if a loop IS running (FastAPI lifespan)
+    offload to a fresh loop on a worker thread so the active loop isn't
+    blocked.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(coro)).result()
 
 
 class DependencyContainer:
@@ -92,6 +165,12 @@ class DependencyContainer:
     def create_instance(self, name: str) -> Any:
         factory = self.get_factory(name)
         instance = factory.get_client()
+        # #263: ChromaDB factories are ``async def get_client``. Resolve the
+        # coroutine to a concrete client so the synchronous container API
+        # keeps returning a usable instance (callers run before/outside the
+        # request event loop).
+        if inspect.iscoroutine(instance):
+            instance = _resolve_coroutine(instance)
         self._instances[name] = instance
         return instance
 
@@ -195,11 +274,26 @@ def _create_object_storage_provider(settings: Settings) -> object:
             secure=(parsed.scheme == "https"),
         )
     elif backend == "aws":
-        if not settings.aws_region or not settings.aws_bucket:
+        # ADR-062 Phase B (WU-B1) — ``aws_private_bucket`` is required
+        # alongside ``aws_bucket`` for the same reason ``aws_bucket`` already
+        # is: this function doesn't consume either value directly (the
+        # bucket name is threaded per-service in ``_register_memory_services``
+        # below), but failing fast here beats a private-tier write silently
+        # misrouting to an empty bucket name at request time. Fail-closed
+        # choice (ADR-062 Phase B population of the real S3 bucket + IAM
+        # policy is deferred to [[#417]]; the guard exists now so a future
+        # AWS-backend rollout cannot ship without it).
+        if (
+            not settings.aws_region
+            or not settings.aws_bucket
+            or not settings.aws_private_bucket
+        ):
             raise RuntimeError(
-                "AWS backend selected but AUDITTRACE_AWS_REGION or AUDITTRACE_AWS_BUCKET "
-                "is empty. Set both. With aws_use_irsa=True (default) no other secrets "
-                "are needed — boto3 resolves IRSA from the pod's ServiceAccount."
+                "AWS backend selected but AUDITTRACE_AWS_REGION, "
+                "AUDITTRACE_AWS_BUCKET, or AUDITTRACE_AWS_PRIVATE_BUCKET is "
+                "empty. Set all three. With aws_use_irsa=True (default) no "
+                "other secrets are needed — boto3 resolves IRSA from the "
+                "pod's ServiceAccount."
             )
         config = ObjectStorageConfig(
             backend="aws",
@@ -252,25 +346,141 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         if settings.object_storage_backend == "aws"
         else settings.minio_shared_bucket
     )
+    # ADR-062 Phase B (WU-B1) — mirrors ``effective_bucket`` above for the
+    # per-user private tier. Laptop/MinIO default: ``minio_private_bucket``
+    # ("memory-private"). AWS value + bucket/IAM provisioning deferred to
+    # the cloud follow-up ([[#417]]); ``_create_object_storage_provider``
+    # already fails startup fast if the AWS backend is selected without it.
+    effective_private_bucket = (
+        settings.aws_private_bucket
+        if settings.object_storage_backend == "aws"
+        else settings.minio_private_bucket
+    )
     container._instances["object_storage"] = object_store
+
+    # Backlog #15 — shared cross-replica listing cache. Redis-backed in
+    # production so a write's ``invalidate_cache()`` is coherent across all
+    # replicas (replicaCount: 3); a missed invalidation self-heals after the
+    # TTL. Fail-open to a fresh S3 read on any Redis error.
+    from audittrace.services.layer_cache import get_layer_cache
+
+    layer_cache = get_layer_cache()
 
     episodic: EpisodicService = S3EpisodicService(
         minio_client=object_store,
         bucket=effective_bucket,
+        private_bucket=effective_private_bucket,
         prefix="episodic/",
+        cache=layer_cache,
+        cache_ttl_seconds=settings.memory_cache_ttl,
     )
     procedural: ProceduralService = S3ProceduralService(
         minio_client=object_store,
         bucket=effective_bucket,
+        private_bucket=effective_private_bucket,
         prefix="procedural/",
+        cache=layer_cache,
+        cache_ttl_seconds=settings.memory_cache_ttl,
     )
     logger.info(
-        "Memory layers 1+2: %s-backed (bucket=%s)",
+        "Memory layers 1+2: %s-backed (corpus bucket=%s, private bucket=%s)",
         settings.object_storage_backend,
         effective_bucket,
+        effective_private_bucket,
     )
 
     conversational = PostgresConversationalService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
+    # WU-1 (Sovereign-Attach EPIC) — the `session` layer's backing store.
+    # Postgres-only (no S3 tier, no corpus): see
+    # services/session_memory.py's module docstring for the rationale.
+    session_memory: SessionMemoryService = PostgresSessionMemoryService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
+    # WU-1 (MongoDB-elimination EPIC) — the console-conversations store's
+    # backing service (Postgres RLS-isolated, migration 023). Same
+    # session factory as conversational/session_memory above.
+    console_conversations: ConsoleConversationsService = (
+        PostgresConsoleConversationsService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+    )
+
+    # WU-presets (MongoDB-elimination EPIC) — the console-presets store's
+    # backing service (Postgres RLS-isolated, migration 024). Same
+    # session factory as console_conversations above.
+    console_presets: ConsolePresetsService = PostgresConsolePresetsService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
+    # WU-prompts (MongoDB-elimination EPIC) — the console-prompts
+    # store's backing service (Postgres RLS-isolated, migration 025).
+    # Same session factory as console_presets above.
+    console_prompts: ConsolePromptsService = PostgresConsolePromptsService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
+    # Chat-Projects domain (MongoDB-elimination EPIC) — the console-
+    # chat-projects store's backing service (Postgres RLS-isolated,
+    # migration 026). Same session factory as console_prompts above.
+    console_chat_projects: ConsoleChatProjectsService = (
+        PostgresConsoleChatProjectsService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+    )
+
+    # Files-metadata domain (MongoDB-elimination EPIC) — the
+    # console-files store's backing service (Postgres RLS-isolated,
+    # migration 027). Same session factory as console_chat_projects
+    # above.
+    console_files: ConsoleFilesService = PostgresConsoleFilesService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
+    # Agents domain (MongoDB-elimination EPIC) — the console-agents
+    # store's backing service (Postgres RLS-isolated, migration 028).
+    # Same session factory as console_files above.
+    console_agents: ConsoleAgentsService = PostgresConsoleAgentsService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
+    # Conversation-Tags domain (MongoDB-elimination EPIC) — the
+    # console-conversation-tags store's backing service (Postgres
+    # RLS-isolated, migration 029). Same session factory as
+    # console_agents above.
+    console_conversation_tags: ConsoleConversationTagsService = (
+        PostgresConsoleConversationTagsService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+    )
+
+    # Tool-Favorites domain (MongoDB-elimination EPIC) — the
+    # console-tool-favorites store's backing service (Postgres
+    # RLS-isolated, migration 030). Same session factory as
+    # console_conversation_tags above.
+    console_tool_favorites: ConsoleToolFavoritesService = (
+        PostgresConsoleToolFavoritesService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+    )
+
+    # ACL domain (Sovereign Authorization Layer EPIC, WU-1 — READ PATH
+    # ONLY, migration 031). Same session factory as console_tool_
+    # favorites above. No write method exists yet (WU-2).
+    console_acl: ConsoleAclEntriesService = PostgresConsoleAclEntriesService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
+    # Memory-layer manifest (CRUD backoffice — migration 009 + the
+    # /memory/<layer> REST endpoints). Postgres-backed; same session
+    # factory as conversational since the table is in the same DB.
+    # Constructed BEFORE the semantic service so it can be threaded into
+    # ChromaSemanticService below (ADR-062 §6 / WU-A5 — recall consults
+    # the manifest's soft-delete tombstone).
+    memory_manifest = MemoryManifestService(
         session_factory=pg_factory.get_session_factory(),
     )
 
@@ -285,13 +495,12 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
             "ai_research_papers",  # /memory/index?collections=ai_research_papers (PDF corpus, ADR-047 path)
             "scm_coursework",
         ],
-    )
-
-    # Memory-layer manifest (CRUD backoffice — migration 009 + the
-    # /memory/<layer> REST endpoints). Postgres-backed; same session
-    # factory as conversational since the table is in the same DB.
-    memory_manifest = MemoryManifestService(
-        session_factory=pg_factory.get_session_factory(),
+        # ADR-047 — vectors computed on the dedicated nomic embed server.
+        embed_url=settings.embed_url,
+        embed_model=settings.embed_model,
+        # ADR-062 §6 (WU-A5) — recall honours the manifest soft-delete
+        # tombstone; see ChromaSemanticService._filter_soft_deleted.
+        manifest=memory_manifest,
     )
 
     context_builder = DefaultContextBuilder(
@@ -305,6 +514,16 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     container._instances["procedural"] = procedural
     container._instances["conversational"] = conversational
     container._instances["semantic"] = semantic
+    container._instances["session_memory"] = session_memory
+    container._instances["console_conversations"] = console_conversations
+    container._instances["console_presets"] = console_presets
+    container._instances["console_prompts"] = console_prompts
+    container._instances["console_chat_projects"] = console_chat_projects
+    container._instances["console_files"] = console_files
+    container._instances["console_agents"] = console_agents
+    container._instances["console_conversation_tags"] = console_conversation_tags
+    container._instances["console_tool_favorites"] = console_tool_favorites
+    container._instances["console_acl"] = console_acl
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
 
@@ -312,14 +531,30 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     # selected. The Provider is the storage layer (where the PEM
     # lives — default S3/MinIO); the Builder is the sourcing layer
     # (where the PEM comes from — default EU LOTL via pyhanko[etsi]).
-    trust_store_provider: TrustStoreProvider
+    container._instances["trust_store_provider"] = _build_trust_store_provider(
+        settings, object_store, effective_bucket
+    )
+    container._instances["trust_store_builder"] = _build_trust_store_builder(settings)
+
+
+def _build_trust_store_provider(
+    settings: Settings, object_store: Any, bucket: str
+) -> TrustStoreProvider:
+    """Resolve ``AUDITTRACE_PDF_TRUST_STORE_PROVIDER`` to a Provider.
+
+    Extracted from ``register_default_dependencies`` so the selection can be
+    tested without booting the whole container — that function performs real
+    network I/O (ChromaDB, embedder) before it reaches this point, which made
+    these config branches unreachable from a unit test. Mirrors the shape of
+    ``_build_inner_builder`` below.
+    """
     if settings.pdf_trust_store_provider == "s3":
-        trust_store_provider = S3TrustStoreProvider(
+        return S3TrustStoreProvider(
             minio_client=object_store,
-            bucket=effective_bucket,
+            bucket=bucket,
             pem_key=settings.pdf_trust_store_s3_key,
         )
-    elif settings.pdf_trust_store_provider == "file":
+    if settings.pdf_trust_store_provider == "file":
         # Pre-ADR-052 backwards-compat: when the operator points
         # AUDITTRACE_PDF_SIGNATURE_TRUST_STORE at a Vault-Agent-mounted
         # PEM file, the validator picks that up directly — the
@@ -327,40 +562,39 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         # so DI shape is uniform; load() raises FileNotFoundError
         # when called, which the validator handles by falling back
         # to certifi.
-        trust_store_provider = MockTrustStoreProvider()
-    else:
-        raise RuntimeError(
-            f"Unknown AUDITTRACE_PDF_TRUST_STORE_PROVIDER="
-            f"{settings.pdf_trust_store_provider!r}; expected one of "
-            f"'s3', 'file' (per ADR-052 §2)."
-        )
+        return MockTrustStoreProvider()
+    raise RuntimeError(
+        f"Unknown AUDITTRACE_PDF_TRUST_STORE_PROVIDER="
+        f"{settings.pdf_trust_store_provider!r}; expected one of "
+        f"'s3', 'file' (per ADR-052 §2)."
+    )
 
-    trust_store_builder: TrustStoreBuilder
+
+def _build_trust_store_builder(settings: Settings) -> TrustStoreBuilder:
+    """Resolve ``AUDITTRACE_PDF_TRUST_STORE_BUILDER`` to a Builder.
+
+    Extracted alongside ``_build_trust_store_provider`` for the same reason.
+    """
     builder_kind = settings.pdf_trust_store_builder
-    if builder_kind == "composite":
-        # ADR-053 — compose multiple jurisdictional builders so the
-        # bundle covers EU + CH (and any future programs) in one
-        # refresh cycle.
-        names = [
-            n.strip()
-            for n in settings.pdf_trust_store_composite_builders.split(",")
-            if n.strip()
-        ]
-        if not names:
-            raise RuntimeError(
-                "AUDITTRACE_PDF_TRUST_STORE_BUILDER=composite requires "
-                "AUDITTRACE_PDF_TRUST_STORE_COMPOSITE_BUILDERS to be a "
-                "non-empty comma-separated list (e.g. 'eu_lotl,swiss_tsl')."
-            )
-        inner_builders: list[TrustStoreBuilder] = [
-            _build_inner_builder(n, settings) for n in names
-        ]
-        trust_store_builder = CompositeTrustStoreBuilder(inner_builders)
-    else:
-        trust_store_builder = _build_inner_builder(builder_kind, settings)
+    if builder_kind != "composite":
+        return _build_inner_builder(builder_kind, settings)
 
-    container._instances["trust_store_provider"] = trust_store_provider
-    container._instances["trust_store_builder"] = trust_store_builder
+    # ADR-053 — compose multiple jurisdictional builders so the bundle
+    # covers EU + CH (and any future programs) in one refresh cycle.
+    names = [
+        n.strip()
+        for n in settings.pdf_trust_store_composite_builders.split(",")
+        if n.strip()
+    ]
+    if not names:
+        raise RuntimeError(
+            "AUDITTRACE_PDF_TRUST_STORE_BUILDER=composite requires "
+            "AUDITTRACE_PDF_TRUST_STORE_COMPOSITE_BUILDERS to be a "
+            "non-empty comma-separated list (e.g. 'eu_lotl,swiss_tsl')."
+        )
+    return CompositeTrustStoreBuilder(
+        [_build_inner_builder(n, settings) for n in names]
+    )
 
 
 def _build_inner_builder(name: str, settings: Settings) -> TrustStoreBuilder:
@@ -408,34 +642,44 @@ def get_postgres_factory() -> PostgresFactory:
 def get_context_builder(
     user: UserContext = Depends(require_user),
 ) -> ContextBuilderService:
-    """Return a per-request context builder with a user-scoped semantic layer.
+    """Return a per-request context builder with user-scoped layers.
 
-    DESIGN §16 Phase 4 follow-up. The episodic, procedural and
-    conversational services are shared singletons (their per-user
-    isolation is already enforced at the service layer via the Phase 2
-    `user_context` plumbing + Postgres RLS from migration 005). The
-    semantic service is the one layer that needs the extra
-    ``UserScopedSemanticService`` wrapper: ChromaDB has no native RLS
-    equivalent, and the wrapper enforces the isolation property by
-    construction — the bound UserContext cannot be overridden by the
-    per-call argument, so a bug that leaks an admin context elsewhere
-    in the code cannot bypass the filter.
+    DESIGN §16 Phase 4 + ADR-062 Phase B (WU-B1). The conversational
+    service is a shared singleton (its per-user isolation is enforced at
+    the service layer via Postgres RLS from migration 005 — no wrapper
+    needed, RLS reads ``app.current_user_id`` set per-request elsewhere).
+    Episodic, procedural, and semantic each get a request-scoped wrapper
+    (``UserScopedEpisodicService`` / ``UserScopedProceduralService`` /
+    ``UserScopedSemanticService``) bound to the caller's ``UserContext``:
+    episodic/procedural now read/write a real per-user private tier
+    (``memory-private/{jwt.sub}/...`` — ADR-062 §2/§3) and ChromaDB has no
+    native RLS equivalent, so both need the same "isolation by
+    construction" property the semantic wrapper pioneered — the bound
+    identity cannot be overridden by a per-call argument, so a bug that
+    threads the wrong (or an admin) context elsewhere in the code cannot
+    leak another caller's private tier.
 
-    One new ``DefaultContextBuilder`` instance is built per request.
-    The three shared services are referenced by identity (no copy);
-    only the semantic slot gets a fresh wrapper.
+    One new ``DefaultContextBuilder`` instance is built per request. The
+    three underlying shared services are referenced by identity (no copy)
+    inside their wrappers; the conversational slot is unwrapped.
     """
-    episodic = container._instances["episodic"]
-    procedural = container._instances["procedural"]
+    shared_episodic = container._instances["episodic"]
+    shared_procedural = container._instances["procedural"]
     conversational = container._instances["conversational"]
     shared_semantic = container._instances["semantic"]
 
+    scoped_episodic = UserScopedEpisodicService(
+        inner=shared_episodic, user_context=user
+    )
+    scoped_procedural = UserScopedProceduralService(
+        inner=shared_procedural, user_context=user
+    )
     scoped_semantic = UserScopedSemanticService(
         inner=shared_semantic, user_context=user
     )
     return DefaultContextBuilder(
-        episodic=episodic,
-        procedural=procedural,
+        episodic=scoped_episodic,
+        procedural=scoped_procedural,
         conversational=conversational,
         semantic=scoped_semantic,
     )
@@ -451,6 +695,119 @@ def get_episodic_service() -> EpisodicService:
 def get_conversational_service() -> ConversationalService:
     """Get conversational memory service (dependency injection)."""
     return cast(ConversationalService, container._instances["conversational"])
+
+
+@log_call(logger=logger)
+def get_session_memory_service() -> SessionMemoryService:
+    """Get the ``session`` memory-layer service (dependency injection).
+
+    WU-1 (Sovereign-Attach EPIC) — the ephemeral, per-user, Postgres-only
+    layer ``/memory/upload?layer=session`` writes through
+    (``routes/memory.py::_write_layer_private``).
+    """
+    return cast(SessionMemoryService, container._instances["session_memory"])
+
+
+@log_call(logger=logger)
+def get_console_conversations_service() -> ConsoleConversationsService:
+    """Get the console-conversations service (dependency injection).
+
+    WU-1 (MongoDB-elimination EPIC) — the RLS-isolated store
+    ``routes/console_conversations.py`` writes/reads through.
+    """
+    return cast(
+        ConsoleConversationsService, container._instances["console_conversations"]
+    )
+
+
+@log_call(logger=logger)
+def get_console_presets_service() -> ConsolePresetsService:
+    """Get the console-presets service (dependency injection).
+
+    WU-presets (MongoDB-elimination EPIC) — the RLS-isolated store
+    ``routes/console_presets.py`` writes/reads through.
+    """
+    return cast(ConsolePresetsService, container._instances["console_presets"])
+
+
+@log_call(logger=logger)
+def get_console_prompts_service() -> ConsolePromptsService:
+    """Get the console-prompts service (dependency injection).
+
+    WU-prompts (MongoDB-elimination EPIC) — the RLS-isolated store
+    ``routes/console_prompts.py`` writes/reads through.
+    """
+    return cast(ConsolePromptsService, container._instances["console_prompts"])
+
+
+@log_call(logger=logger)
+def get_console_chat_projects_service() -> ConsoleChatProjectsService:
+    """Get the console-chat-projects service (dependency injection).
+
+    Chat-Projects domain (MongoDB-elimination EPIC) — the RLS-isolated
+    store ``routes/console_chat_projects.py`` writes/reads through.
+    """
+    return cast(
+        ConsoleChatProjectsService, container._instances["console_chat_projects"]
+    )
+
+
+@log_call(logger=logger)
+def get_console_files_service() -> ConsoleFilesService:
+    """Get the console-files service (dependency injection).
+
+    Files-metadata domain (MongoDB-elimination EPIC) — the RLS-isolated
+    store ``routes/console_files.py`` writes/reads through.
+    """
+    return cast(ConsoleFilesService, container._instances["console_files"])
+
+
+@log_call(logger=logger)
+def get_console_agents_service() -> ConsoleAgentsService:
+    """Get the console-agents service (dependency injection).
+
+    Agents domain (MongoDB-elimination EPIC) — the RLS-isolated store
+    ``routes/console_agents.py`` writes/reads through.
+    """
+    return cast(ConsoleAgentsService, container._instances["console_agents"])
+
+
+@log_call(logger=logger)
+def get_console_conversation_tags_service() -> ConsoleConversationTagsService:
+    """Get the console-conversation-tags service (dependency injection).
+
+    Conversation-Tags domain (MongoDB-elimination EPIC) — the
+    RLS-isolated store ``routes/console_conversation_tags.py``
+    writes/reads through.
+    """
+    return cast(
+        ConsoleConversationTagsService,
+        container._instances["console_conversation_tags"],
+    )
+
+
+@log_call(logger=logger)
+def get_console_tool_favorites_service() -> ConsoleToolFavoritesService:
+    """Get the console-tool-favorites service (dependency injection).
+
+    Tool-Favorites domain (MongoDB-elimination EPIC) — the RLS-isolated
+    store ``routes/console_tool_favorites.py`` writes/reads through.
+    """
+    return cast(
+        ConsoleToolFavoritesService,
+        container._instances["console_tool_favorites"],
+    )
+
+
+@log_call(logger=logger)
+def get_console_acl_service() -> ConsoleAclEntriesService:
+    """Get the console-ACL service (dependency injection).
+
+    Sovereign Authorization Layer EPIC, WU-1 (READ PATH ONLY) — the
+    RLS-isolated store ``routes/console_acl.py`` reads through. No
+    write path exists yet (WU-2).
+    """
+    return cast(ConsoleAclEntriesService, container._instances["console_acl"])
 
 
 @log_call(logger=logger)
@@ -510,6 +867,16 @@ def _register_mock_memory_services() -> None:
     procedural = MockProceduralService()
     conversational = MockConversationalService()
     semantic = MockSemanticService()
+    session_memory = MockSessionMemoryService()
+    console_conversations = MockConsoleConversationsService()
+    console_presets = MockConsolePresetsService()
+    console_prompts = MockConsolePromptsService()
+    console_chat_projects = MockConsoleChatProjectsService()
+    console_files = MockConsoleFilesService()
+    console_agents = MockConsoleAgentsService()
+    console_conversation_tags = MockConsoleConversationTagsService()
+    console_tool_favorites = MockConsoleToolFavoritesService()
+    console_acl = MockConsoleAclEntriesService()
     memory_manifest = MockMemoryManifestService()
     context_builder = DefaultContextBuilder(
         episodic=episodic,
@@ -521,6 +888,16 @@ def _register_mock_memory_services() -> None:
     container._instances["procedural"] = procedural
     container._instances["conversational"] = conversational
     container._instances["semantic"] = semantic
+    container._instances["session_memory"] = session_memory
+    container._instances["console_conversations"] = console_conversations
+    container._instances["console_presets"] = console_presets
+    container._instances["console_prompts"] = console_prompts
+    container._instances["console_chat_projects"] = console_chat_projects
+    container._instances["console_files"] = console_files
+    container._instances["console_agents"] = console_agents
+    container._instances["console_conversation_tags"] = console_conversation_tags
+    container._instances["console_tool_favorites"] = console_tool_favorites
+    container._instances["console_acl"] = console_acl
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
     # ADR-052 — Mock trust store + Static builder pointed at a
@@ -569,5 +946,70 @@ def create_test_container() -> DependencyContainer:
         directory="/tmp/audittrace-test-trust-store-empty"
     )
     # In-memory PostgreSQL factory so persistence side-effects work in tests
-    test_container._instances["postgres_factory"] = InMemoryPostgresFactory()
+    pg_factory = InMemoryPostgresFactory()
+    test_container._instances["postgres_factory"] = pg_factory
+    # WU-1 (Sovereign-Attach EPIC) — real Postgres-backed session-memory
+    # service (not a mock): the acceptance tests exercise the actual
+    # write + explicit-user_id-filter isolation logic through the route
+    # layer, and InMemoryPostgresFactory (aiosqlite) is already wired
+    # above for exactly this purpose (same pattern PostgresConversationalService
+    # would use if this container wired it directly).
+    test_container._instances["session_memory"] = PostgresSessionMemoryService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+    # WU-1 (MongoDB-elimination EPIC) — same rationale as session_memory
+    # above: the real Postgres-backed service (not a mock), so route-
+    # layer acceptance tests exercise the actual explicit-user_sub-filter
+    # isolation logic, backed by the same InMemoryPostgresFactory.
+    test_container._instances["console_conversations"] = (
+        PostgresConsoleConversationsService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+    )
+    # WU-presets (MongoDB-elimination EPIC) — same rationale as
+    # console_conversations above.
+    test_container._instances["console_presets"] = PostgresConsolePresetsService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+    # WU-prompts (MongoDB-elimination EPIC) — same rationale as
+    # console_presets above.
+    test_container._instances["console_prompts"] = PostgresConsolePromptsService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+    # Chat-Projects domain (MongoDB-elimination EPIC) — same rationale
+    # as console_prompts above.
+    test_container._instances["console_chat_projects"] = (
+        PostgresConsoleChatProjectsService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+    )
+    # Files-metadata domain (MongoDB-elimination EPIC) — same rationale
+    # as console_chat_projects above.
+    test_container._instances["console_files"] = PostgresConsoleFilesService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+    # Agents domain (MongoDB-elimination EPIC) — same rationale as
+    # console_files above.
+    test_container._instances["console_agents"] = PostgresConsoleAgentsService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+    # Conversation-Tags domain (MongoDB-elimination EPIC) — same
+    # rationale as console_agents above.
+    test_container._instances["console_conversation_tags"] = (
+        PostgresConsoleConversationTagsService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+    )
+    # Tool-Favorites domain (MongoDB-elimination EPIC) — same rationale
+    # as console_conversation_tags above.
+    test_container._instances["console_tool_favorites"] = (
+        PostgresConsoleToolFavoritesService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+    )
+    # ACL domain (Sovereign Authorization Layer EPIC, WU-1) — same
+    # rationale as console_tool_favorites above.
+    test_container._instances["console_acl"] = PostgresConsoleAclEntriesService(
+        session_factory=pg_factory.get_session_factory(),
+    )
     return test_container

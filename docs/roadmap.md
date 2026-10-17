@@ -13,7 +13,7 @@ AuditTrace-AI is organised around hardening that reconstructibility contract. Ev
 **Shipped and verifiable on the current `main`:**
 
 - Drop-in OpenAI-compatible `/v1/chat/completions` proxy, strict-superset response shapes, regression-locked against the upstream spec (ADR-024, ADR-033).
-- Four-layer memory (episodic, procedural, conversational, semantic) exposed to the LLM via the *memory-as-tools* pattern (ADR-025). Every retrieval is an auditable tool call, not a hidden pre-prompt.
+- Five-layer memory: four per-user isolated layers (episodic, procedural, conversational, semantic) plus one shared corpus (ADR-062), exposed to the LLM via the *memory-as-tools* pattern (ADR-025). Every retrieval is an auditable tool call, not a hidden pre-prompt.
 - OAuth2 Device Flow (RFC 8628) via Keycloak; JWKS-validated JWT on every request; per-user context propagated to every span, log, and database row (ADR-022, ADR-023, ADR-026, ADR-032).
 - PostgreSQL Row-Level Security with `FORCE ROW LEVEL SECURITY` and a non-superuser application role. Separate minimum-privilege `audittrace_summariser` role for cross-user background jobs. RLS is the enforcement boundary; the service layer is defence-in-depth (ADR-026).
 - k3s + Istio `STRICT` mTLS; SPIFFE workload identity; deny-all AuthorizationPolicy plus six per-flow allow rules; Helm chart as the single deployable unit.
@@ -113,6 +113,15 @@ The ADR number is reserved with an empty shell at `docs/ADR-038-memory-sync-prot
 - Experimental questions: can the actor degrade reconstructibility without triggering a detectable signal? What failure modes does the audit trail itself have?
 - Target milestone: published `docs/eval-adversarial-reconstructibility.md` with named attack vectors, observed system response, and recommended mitigations. Negative results published as rigorously as positive ones.
 
+## Milestone M3 — First-party console
+
+**Why this next.** A pilot-ready end-user console lets people use the system directly, without a developer harness, and without weakening the audit boundary. The UI stays a thin shell; the orchestrator stays the sole path.
+
+- A thin-shell chat console over the orchestrator: every request still travels `/v1`, so every answer stays grounded, recalled, and traced. No parallel memory, retrieval, or model path lives in the UI.
+- Identity is Keycloak-once (OIDC); the user identity reaching the orchestrator stays token-derived.
+- Answers cite the documents retrieved into context.
+- Target milestone: an end-user reaches a grounded, cited answer through the console via OIDC login, and the interaction is reconstructible end-to-end (`user_id` + `session_id` + `trace_id`) in the audit trail.
+
 ## Research programme (parallel track, not on critical path)
 
 Coordinated with the University of Liverpool Department of Computer Science (initial contact 2023, active discussion 2026-04). Programme resumes in late April 2026 following Liverpool's internal academic-hire process.
@@ -126,7 +135,7 @@ What could cause dates to slip:
 - **Phase 1.1 Vault integration** — Vault Agent Injector has deployment-environment variance (Kubernetes version, CNI, security policies) that can consume weeks. Mitigation: ship External Secrets Operator as the simpler alternative first, Vault second.
 - **Phase 2.1 sync protocol specification** — GDPR-RoE semantics over an append-only substrate are legally subtle; the protocol may need counsel review. Expected slippage envelope: up to 2 weeks on 2.1, cascading to 2.2.
 - **Phase 3.2 multi-tenant isolation** — schema-per-tenant sounds simple on a whiteboard; in practice, Alembic migration across N schemas plus per-schema role grants is a non-trivial tooling problem.
-- **Phase 4 evaluations** — hardware bottlenecks. Qwen 3.6-35B at concurrency N requires GPU memory beyond a single laptop; the eval may require a rented GPU server, which introduces cost and cloud-sovereignty trade-offs worth documenting.
+- **Phase 4 evaluations** — hardware bottlenecks. Qwen 3.8-27B dense+MTP at concurrency N requires GPU memory beyond a single laptop; the eval may require a rented GPU server, which introduces cost and cloud-sovereignty trade-offs worth documenting.
 
 **Renegotiation policy.** If a phase slips by more than 2 weeks against its target, the roadmap is updated on `main`, the cause is documented in this file's commit history, and the slippage is public. No silent moving of goalposts. The credibility of the dates above depends on that discipline.
 

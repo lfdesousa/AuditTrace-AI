@@ -160,7 +160,7 @@ def test_list_interactions_empty(client):
     assert body["total"] == 0
 
 
-def _seed_interaction(
+async def _seed_interaction(
     *,
     project: str,
     question: str = "q",
@@ -175,7 +175,7 @@ def _seed_interaction(
     from audittrace.dependencies import get_postgres_factory
 
     pg = get_postgres_factory()
-    with pg.get_session_factory()() as db:
+    async with pg.get_session_factory()() as db:
         r = Row(
             project=project,
             question=question,
@@ -186,16 +186,16 @@ def _seed_interaction(
             timestamp=timestamp,
         )
         db.add(r)
-        db.commit()
-        db.refresh(r)
+        await db.commit()
+        await db.refresh(r)
         return int(r.id)
 
 
-def test_list_interactions_returns_seeded_rows(client):
+async def test_list_interactions_returns_seeded_rows(client):
     """Seeded rows come back in DESC id order with correct shape."""
-    _seed_interaction(project="alpha", question="q1")
-    _seed_interaction(project="alpha", question="q2")
-    _seed_interaction(project="beta", question="q3")
+    await _seed_interaction(project="alpha", question="q1")
+    await _seed_interaction(project="alpha", question="q2")
+    await _seed_interaction(project="beta", question="q3")
 
     r = client.get("/interactions?project=alpha&limit=10")
     assert r.status_code == 200
@@ -230,15 +230,17 @@ def test_list_interactions_returns_seeded_rows(client):
         assert key in row
 
 
-def test_list_interactions_filters_by_session_source_user(client):
+async def test_list_interactions_filters_by_session_source_user(client):
     """All four filter params narrow the result set independently."""
-    _seed_interaction(
+    await _seed_interaction(
         project="multi", session_id="s-A", source="opencode", user_id="u-A"
     )
-    _seed_interaction(
+    await _seed_interaction(
         project="multi", session_id="s-B", source="opencode", user_id="u-B"
     )
-    _seed_interaction(project="multi", session_id="s-A", source="curl", user_id="u-A")
+    await _seed_interaction(
+        project="multi", session_id="s-A", source="curl", user_id="u-A"
+    )
 
     r = client.get("/interactions?project=multi&session_id=s-A")
     assert r.json()["total"] == 2
@@ -250,7 +252,7 @@ def test_list_interactions_filters_by_session_source_user(client):
     assert r.json()["total"] == 1
 
 
-def test_list_interactions_exposes_failure_audit_columns(client):
+async def test_list_interactions_exposes_failure_audit_columns(client):
     """ADR-033 migration 007 added status/failure_class/error_detail/
     duration_ms. The /interactions serialiser must surface them so the
     audit browser can enumerate real failures."""
@@ -258,7 +260,7 @@ def test_list_interactions_exposes_failure_audit_columns(client):
     from audittrace.dependencies import get_postgres_factory
 
     pg = get_postgres_factory()
-    with pg.get_session_factory()() as db:
+    async with pg.get_session_factory()() as db:
         r = Row(
             project="fail-vis",
             question="q",
@@ -273,7 +275,7 @@ def test_list_interactions_exposes_failure_audit_columns(client):
             duration_ms=2018,
         )
         db.add(r)
-        db.commit()
+        await db.commit()
 
     resp = client.get("/interactions?project=fail-vis&status=failed")
     body = resp.json()
@@ -289,21 +291,21 @@ def test_list_interactions_exposes_failure_audit_columns(client):
     assert resp_success.json()["total"] == 0
 
 
-def test_list_interactions_filter_since(client):
+async def test_list_interactions_filter_since(client):
     """since= is an inclusive lower bound on timestamp."""
-    _seed_interaction(project="t", timestamp="2026-04-13T00:00:00")
-    _seed_interaction(project="t", timestamp="2026-04-14T00:00:00")
-    _seed_interaction(project="t", timestamp="2026-04-15T00:00:00")
+    await _seed_interaction(project="t", timestamp="2026-04-13T00:00:00")
+    await _seed_interaction(project="t", timestamp="2026-04-14T00:00:00")
+    await _seed_interaction(project="t", timestamp="2026-04-15T00:00:00")
 
     r = client.get("/interactions?project=t&since=2026-04-14T00:00:00")
     body = r.json()
     assert body["total"] == 2
 
 
-def test_list_interactions_pagination(client):
+async def test_list_interactions_pagination(client):
     """limit + offset slice the ordered result set."""
     for i in range(5):
-        _seed_interaction(project="page", question=f"q{i}")
+        await _seed_interaction(project="page", question=f"q{i}")
 
     r = client.get("/interactions?project=page&limit=2&offset=0")
     body = r.json()
@@ -330,7 +332,7 @@ def test_list_interactions_rejects_negative_offset(client):
 # ───────────────────────────── /sessions ───────────────────────────────────
 
 
-def _seed_session(
+async def _seed_session(
     *,
     sid: str,
     project: str = "p",
@@ -345,7 +347,7 @@ def _seed_session(
     from audittrace.dependencies import get_postgres_factory
 
     pg = get_postgres_factory()
-    with pg.get_session_factory()() as db:
+    async with pg.get_session_factory()() as db:
         r = Row(
             id=sid,
             project=project,
@@ -357,7 +359,7 @@ def _seed_session(
             summarized_at=summarized_at,
         )
         db.add(r)
-        db.commit()
+        await db.commit()
 
 
 def test_list_sessions_empty(client):
@@ -369,18 +371,20 @@ def test_list_sessions_empty(client):
     assert body["limit"] == 5
 
 
-def test_list_sessions_returns_rows_with_full_shape(client):
+async def test_list_sessions_returns_rows_with_full_shape(client):
     from datetime import datetime
 
-    _seed_session(sid="s-A", project="alpha", date="2026-04-17", summary="day-1")
-    _seed_session(
+    await _seed_session(sid="s-A", project="alpha", date="2026-04-17", summary="day-1")
+    await _seed_session(
         sid="s-B",
         project="alpha",
         date="2026-04-18",
         summary="day-2",
         summarized_at=datetime(2026, 4, 18, 9, 0),
     )
-    _seed_session(sid="s-C", project="other", date="2026-04-18", summary="elsewhere")
+    await _seed_session(
+        sid="s-C", project="other", date="2026-04-18", summary="elsewhere"
+    )
 
     r = client.get("/sessions?project=alpha&limit=10")
     assert r.status_code == 200
@@ -404,28 +408,30 @@ def test_list_sessions_returns_rows_with_full_shape(client):
         assert key in row
 
 
-def test_list_sessions_summarised_filter(client):
+async def test_list_sessions_summarised_filter(client):
     from datetime import datetime
 
-    _seed_session(sid="s-done", project="filt", summarized_at=datetime(2026, 4, 18))
-    _seed_session(sid="s-todo", project="filt", summarized_at=None)
+    await _seed_session(
+        sid="s-done", project="filt", summarized_at=datetime(2026, 4, 18)
+    )
+    await _seed_session(sid="s-todo", project="filt", summarized_at=None)
 
     assert client.get("/sessions?project=filt&summarised=true").json()["total"] == 1
     assert client.get("/sessions?project=filt&summarised=false").json()["total"] == 1
     assert client.get("/sessions?project=filt").json()["total"] == 2
 
 
-def test_list_sessions_since_filter(client):
-    _seed_session(sid="s-old", project="since", date="2026-04-10")
-    _seed_session(sid="s-new", project="since", date="2026-04-18")
+async def test_list_sessions_since_filter(client):
+    await _seed_session(sid="s-old", project="since", date="2026-04-10")
+    await _seed_session(sid="s-new", project="since", date="2026-04-18")
     r = client.get("/sessions?project=since&since=2026-04-15")
     assert r.json()["total"] == 1
     assert r.json()["sessions"][0]["id"] == "s-new"
 
 
-def test_list_sessions_pagination(client):
+async def test_list_sessions_pagination(client):
     for i in range(5):
-        _seed_session(
+        await _seed_session(
             sid=f"s-p{i}",
             project="page-sess",
             date=f"2026-04-{10 + i:02d}",
@@ -472,7 +478,7 @@ def test_save_session(client):
     assert data["status"] == "ok"
 
 
-def test_save_session_summary(client):
+async def test_save_session_summary(client):
     """Persists a one-sentence summary + key points (legacy memory.py session-save)."""
     r = client.post(
         "/session/summary",
@@ -499,7 +505,7 @@ def test_save_session_summary(client):
     from audittrace.identity import sentinel_user_context
 
     service = get_conversational_service()
-    sessions = service.load_sessions(sentinel_user_context(), "AuditTrace")
+    sessions = await service.load_sessions(sentinel_user_context(), "AuditTrace")
     assert any("Langfuse" in s["summary"] for s in sessions)
 
 

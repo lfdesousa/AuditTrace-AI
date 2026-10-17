@@ -21,6 +21,14 @@ spec:
               # (least-privilege; the Job only needs admin REST
               # access for the duration of its run).
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-memory-scopes-job"
+              {{- if .Values.console.enabled }}
+              # M3-WU-3b (D1) — the LibreChat BFF validates inbound tokens
+              # against the in-cluster JWKS and RFC 8693 token-exchanges
+              # against the in-cluster token endpoint — both in-mesh, never
+              # via the external front door (D1: "in-mesh, NOT the external
+              # front door — it's in-mesh now").
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.console.bff.serviceAccount.name }}"
+              {{- end }}
       to:
         - operation:
             ports: ["8080"]

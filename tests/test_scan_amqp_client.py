@@ -91,8 +91,10 @@ class TestEnsureConnected:
 
     async def test_connect_gives_up_after_max_attempts(self) -> None:
         """If RabbitMQ stays unreachable past the retry budget, the
-        client raises ``RuntimeError`` so the lifespan fails fast and
-        kubelet restarts the pod. Better than silently hanging."""
+        client raises ``RuntimeError``. #384 WS3: the lifespan CATCHES
+        this and degrades to lazy (fail-open) instead of crash-looping —
+        but the client still surfaces the exhaustion so the caller can
+        decide. Budget rebalanced to 8 attempts (see WS3 budget comment)."""
         aio_pika, _conn, _ch, _ex = _patch_aio_pika()
         aio_pika.connect_robust = AsyncMock(
             side_effect=ConnectionRefusedError("broker down")
@@ -100,9 +102,53 @@ class TestEnsureConnected:
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             with patch("asyncio.sleep", new=AsyncMock()):
                 client = ScanAmqpClient(_settings())
-                with pytest.raises(RuntimeError, match="connect failed after 6"):
+                with pytest.raises(RuntimeError, match="connect failed after 8"):
                     await client.ensure_connected()
-        assert aio_pika.connect_robust.await_count == 6
+        assert aio_pika.connect_robust.await_count == 8
+
+    async def test_connect_backoff_is_capped_and_fits_startup_probe(self) -> None:
+        """#384 WS3 — the exponential backoff is CAPPED at 16 s. Assert
+        the exact sleep sequence (7 sleeps between 8 attempts):
+        1+2+4+8+16+16+16 = 63 s, and that no single sleep exceeds the
+        cap."""
+        aio_pika, _conn, _ch, _ex = _patch_aio_pika()
+        aio_pika.connect_robust = AsyncMock(
+            side_effect=ConnectionRefusedError("broker down")
+        )
+        with patch.dict(sys.modules, {"aio_pika": aio_pika}):
+            with patch("asyncio.sleep", new=AsyncMock()) as sleep_mock:
+                client = ScanAmqpClient(_settings())
+                with pytest.raises(RuntimeError, match="connect failed after 8"):
+                    await client.ensure_connected()
+        delays = [c.args[0] for c in sleep_mock.await_args_list]
+        assert delays == [1, 2, 4, 8, 16, 16, 16]
+        assert max(delays) <= ScanAmqpClient._CONNECT_BACKOFF_CAP_SECONDS
+        assert sum(delays) == 63
+
+    def test_worst_case_connect_budget_fits_startup_probe(self) -> None:
+        """#384 WS3 NIT-1 — encode the INVARIANT, not just the sequence,
+        so a future budget bump that breaks the bound fails here.
+
+        The eager connect runs in the lifespan critical path, so its
+        WORST case (all connects blackhole and burn the full timeout,
+        plus every backoff sleep) must stay under the 150 s startupProbe
+        for the fail-open path to remain reachable::
+
+            sum(sleeps) + MAX_ATTEMPTS × CONNECT_TIMEOUT_SECONDS < 150
+        """
+        n = ScanAmqpClient._CONNECT_MAX_ATTEMPTS
+        cap = ScanAmqpClient._CONNECT_BACKOFF_CAP_SECONDS
+        timeout = ScanAmqpClient._CONNECT_TIMEOUT_SECONDS
+        # Sleeps happen BETWEEN attempts — n attempts sleep n-1 times.
+        sleeps = sum(min(2**attempt, cap) for attempt in range(n - 1))
+        worst_case_total = sleeps + n * timeout
+        assert worst_case_total < 150, (
+            f"worst-case connect budget {worst_case_total}s exceeds the "
+            f"150 s startupProbe — fail-open would be unreachable"
+        )
+        # And the sleep window must still comfortably cover the observed
+        # ~35-40 s RabbitMQ cold-start.
+        assert sleeps >= 55
 
 
 class TestPublish:

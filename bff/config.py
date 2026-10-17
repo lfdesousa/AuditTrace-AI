@@ -1,0 +1,232 @@
+"""Configuration for the LibreChat BFF (12-factor, env-parameterized).
+
+Mirrors ``audittrace.config.Settings`` in shape and discipline — a
+``pydantic_settings.BaseSettings`` subclass, laptop-safe defaults, real
+values injected via env/Vault at deploy time — but this is a genuinely
+separate deployable (its own image, own env prefix
+``AUDITTRACE_BFF_``), not a code path inside ``src/audittrace``.
+
+Portability invariant: every target-shaped value (Keycloak host, realm,
+orchestrator base URL, confidential-client secret) sits behind config
+with a laptop default. A cloud target overrides via env, never a
+rewrite.
+"""
+
+from __future__ import annotations
+
+import os
+from functools import lru_cache
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from bff.console_promote_scopes import DURABLE_PROMOTE_LAYERS
+
+# Skip .env loading when BFF_ENV=test, same discipline as
+# ``audittrace.config`` — a developer's local .env (with a real client
+# secret) must never leak into the test suite.
+_ENV_FILE: str | None = (
+    None if os.environ.get("AUDITTRACE_BFF_ENV") == "test" else ".env"
+)
+
+
+class Settings(BaseSettings):
+    """Configuration for the LibreChat BFF sidecar."""
+
+    model_config = SettingsConfigDict(
+        env_file=_ENV_FILE,
+        env_file_encoding="utf-8",
+        env_prefix="AUDITTRACE_BFF_",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # "local" (laptop k3s / dev), "production", "test" (set by conftest).
+    env: str = "local"
+
+    host: str = "0.0.0.0"
+    port: int = 8766
+    log_level: str = "INFO"
+
+    # ── Orchestrator target (the frozen /v1 surface) ─────────────────────
+    # Laptop default is the in-mesh Service DNS name the memory-server
+    # chart already exposes port 8765 on; override per target (compose
+    # profile, cloud rig) — never hardcode a second value in code.
+    orchestrator_base_url: str = "http://localhost:8765"
+    orchestrator_chat_path: str = "/v1/chat/completions"
+    # M3-WU-D2-1 — the Souvenirs panel's memory-proxy target. Mirrors
+    # ``orchestrator_chat_path``'s own discipline: the orchestrator's
+    # ``/memory`` mount point is a frozen API contract
+    # (``src/audittrace/routes/memory.py``), not a target-shaped value, but
+    # it lives in Settings anyway for the same reason ``orchestrator_chat_path``
+    # does — one place to override in a test double, never two hardcoded
+    # literals to keep in sync.
+    orchestrator_memory_path_prefix: str = "/memory"
+    # WU-1 (MongoDB-elimination EPIC) — the console-conversations store's
+    # mount point on the orchestrator (``src/audittrace/routes/
+    # console_conversations.py``, ``server.py``). Same "one place to
+    # override" rationale as ``orchestrator_memory_path_prefix`` above —
+    # a frozen API contract, not a target-shaped value.
+    orchestrator_console_conversations_path_prefix: str = "/console/conversations"
+    # Mongo-repl WU-presets (MongoDB-elimination EPIC) — the console-
+    # presets store's mount point on the orchestrator
+    # (``src/audittrace/routes/console_presets.py``, ``server.py``). Same
+    # "one place to override" rationale as
+    # ``orchestrator_console_conversations_path_prefix`` above.
+    orchestrator_console_presets_path_prefix: str = "/console/presets"
+    # Mongo-repl WU-prompts (MongoDB-elimination EPIC) — the console-
+    # prompts store's mount point on the orchestrator
+    # (``src/audittrace/routes/console_prompts.py``, ``server.py``). Same
+    # "one place to override" rationale as
+    # ``orchestrator_console_presets_path_prefix`` above.
+    orchestrator_console_prompts_path_prefix: str = "/console/prompts"
+    # Chat-Projects domain (MongoDB-elimination EPIC) — the console-
+    # chat-projects store's mount point on the orchestrator
+    # (``src/audittrace/routes/console_chat_projects.py``, ``server.py``).
+    # Same "one place to override" rationale as
+    # ``orchestrator_console_prompts_path_prefix`` above.
+    orchestrator_console_chat_projects_path_prefix: str = "/console/chat-projects"
+    # Files-metadata domain (MongoDB-elimination EPIC) — the
+    # console-files store's mount point on the orchestrator
+    # (``src/audittrace/routes/console_files.py``, ``server.py``). Same
+    # "one place to override" rationale as
+    # ``orchestrator_console_chat_projects_path_prefix`` above.
+    #
+    # NAMED DIFFERENTLY FROM THE BFF-FACING ROUTE (spec deviation, noted
+    # in the build record): the orchestrator mounts this store at
+    # ``/console/files`` exactly as the ratified spec names it — no
+    # collision there, the orchestrator never had a route at that path.
+    # The BFF, however, ALREADY owns ``POST /console/files`` (the
+    # pre-existing M3 Sovereign-Attach WU-2 ephemeral file-INGEST route,
+    # a completely different concern: multipart bytes forwarded to
+    # ``/memory/upload``) and ``POST /console/files/{filename}/promote``
+    # — reusing that exact path+method for this domain's upsert would
+    # silently shadow one of the two behaviours. Fail-closed resolution:
+    # this metadata CRUD proxy is exposed on the BFF at
+    # ``/console/file-records`` instead (see ``bff/app.py``), while
+    # still forwarding to the orchestrator's ``/console/files`` mount —
+    # the orchestrator's contract matches the spec's literal text; only
+    # the BFF-facing path differs, to avoid colliding with pre-existing,
+    # frozen infrastructure this spec never asked to change.
+    orchestrator_console_files_path_prefix: str = "/console/files"
+    # Agents domain (MongoDB-elimination EPIC) — the console-agents
+    # store's mount point on the orchestrator (``src/audittrace/routes/
+    # console_agents.py``, ``server.py``). Same "one place to override"
+    # rationale as ``orchestrator_console_files_path_prefix`` above — no
+    # naming collision here (unlike the files domain): the BFF never had
+    # a pre-existing route at ``/console/agents``, so this proxy's
+    # BFF-facing path matches the orchestrator mount 1:1.
+    orchestrator_console_agents_path_prefix: str = "/console/agents"
+    # Conversation-Tags domain (MongoDB-elimination EPIC) — the
+    # console-conversation-tags store's mount point on the orchestrator
+    # (``src/audittrace/routes/console_conversation_tags.py``,
+    # ``server.py``). Same "one place to override" rationale as
+    # ``orchestrator_console_agents_path_prefix`` above — no naming
+    # collision here: the BFF never had a pre-existing route at
+    # ``/console/conversation-tags``, so this proxy's BFF-facing path
+    # matches the orchestrator mount 1:1.
+    orchestrator_console_conversation_tags_path_prefix: str = (
+        "/console/conversation-tags"
+    )
+    # Tool-Favorites domain (MongoDB-elimination EPIC) — the
+    # console-tool-favorites store's mount point on the orchestrator
+    # (``src/audittrace/routes/console_tool_favorites.py``,
+    # ``server.py``). Same "one place to override" rationale as
+    # ``orchestrator_console_conversation_tags_path_prefix`` above — no
+    # naming collision here: the BFF never had a pre-existing route at
+    # ``/console/tool-favorites``, so this proxy's BFF-facing path
+    # matches the orchestrator mount 1:1.
+    orchestrator_console_tool_favorites_path_prefix: str = "/console/tool-favorites"
+    orchestrator_timeout_seconds: float = 120.0
+    # M3 Sovereign-Attach WU-2 — the console file-upload route
+    # (``POST /console/files``) always forwards to
+    # ``/memory/upload?layer=<this value>``, regardless of any ``layer``
+    # the caller's query string carries. Explicit + testable config
+    # rather than a bare string literal in ``bff/app.py``, so a reviewer
+    # (or a future WU) can see and override the forced layer in one
+    # place — see ``bff/console_files_scopes.py`` for the scope half of
+    # the same wall.
+    console_files_forced_layer: str = "session"
+
+    # M3 Sovereign-Attach WU-4 — the "keep this" promote route
+    # (``POST /console/files/{filename}/promote``) forwards this value
+    # as the orchestrator ``/memory/promote`` request's ``target_layer``
+    # field AND uses it to compute the SINGLE durable scope the
+    # per-request RFC 8693 exchange requests (see
+    # ``bff/console_promote_scopes.py``). Constrained to the durable set
+    # (episodic/semantic) — fail-closed at STARTUP (``ValidationError``),
+    # not at the first request, if misconfigured.
+    console_promote_default_layer: str = "episodic"
+
+    @field_validator("console_promote_default_layer")
+    @classmethod
+    def _validate_console_promote_default_layer(cls, value: str) -> str:
+        if value not in DURABLE_PROMOTE_LAYERS:
+            raise ValueError(
+                f"console_promote_default_layer must be one of "
+                f"{sorted(DURABLE_PROMOTE_LAYERS)} (got {value!r})"
+            )
+        return value
+
+    # ── Inbound-token validation (the token LibreChat forwards) ──────────
+    # Same Keycloak realm as the orchestrator's own auth.py; the BFF
+    # deliberately does NOT enforce a fixed audience on the inbound token
+    # (that ambiguity — access vs id_token, wrong-audience — is exactly
+    # what token-exchange resolves), only signature + issuer + expiry.
+    keycloak_issuer: str = "http://localhost:8080/realms/audittrace"
+    keycloak_issuer_extras: list[str] = []
+    keycloak_jwks_url: str = (
+        "http://localhost:8080/realms/audittrace/protocol/openid-connect/certs"
+    )
+    jwks_cache_ttl_seconds: int = 300
+
+    # ── RFC 8693 token exchange (confidential client) ─────────────────────
+    keycloak_token_url: str = (
+        "http://localhost:8080/realms/audittrace/protocol/openid-connect/token"
+    )
+    exchange_client_id: str = "audittrace-librechat-bff"
+    # Vault/env-sourced ONLY — never hard-coded, never defaulted to a real
+    # value. No default means an unset secret fails Settings construction
+    # (fail-closed at startup, not at the first request).
+    exchange_client_secret: str
+    # The client whose scope profile (`aud-audittrace-server` mapper +
+    # `audittrace:query` default scope) the exchanged token should carry.
+    # Reuses the WU-1 `audittrace-librechat` client's own protocol mappers
+    # rather than declaring a second copy of the same audience/scope
+    # wiring — see bff/README.md.
+    exchange_audience: str = "audittrace-librechat"
+    exchange_subject_token_type: str = "urn:ietf:params:oauth:token-type:access_token"
+    exchange_requested_token_type: str = "urn:ietf:params:oauth:token-type:access_token"
+    exchange_grant_type: str = "urn:ietf:params:oauth:grant-type:token-exchange"
+    exchange_timeout_seconds: float = 30.0
+
+    # X-Source stamped on every proxied request so orchestrator-side audit
+    # rows / interactions.source attribute this channel distinctly from
+    # webui/opencode (routes/chat.py::_detect_source).
+    proxy_source_label: str = "librechat"
+
+    # ── Outbound TLS trust (M3-WU-3) ──────────────────────────────────────
+    # JWKS fetches, RFC 8693 token-exchange, and the `/v1` proxy all hit
+    # ``orchestrator_base_url`` / ``keycloak_*_url`` over TLS. httpx's
+    # default trust store is the certifi bundle, which does NOT include
+    # the laptop front door's locally-minted cert (chart's
+    # secret-tls.yaml, self-signed). Empty (default) = httpx's normal
+    # certifi trust (correct for a real-CA front door, e.g. the cloud
+    # rig's Let's Encrypt cert). Set to a mounted PEM path to trust an
+    # additional local CA (the laptop's `~/.config/audittrace/ca.crt`,
+    # same cert `scripts/install-audittrace-trust.sh` extracts — see
+    # `bff/app.py::lifespan`). Portability invariant: env-parameterized,
+    # no hardcoded target; mirrors `src/audittrace/ops/pod_reaper.py`'s
+    # ``verify=str(_CA_PATH)`` pattern for the same class of problem.
+    ca_bundle_path: str = ""
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """Return the process-wide cached Settings singleton.
+
+    ``lru_cache`` mirrors ``audittrace.config.get_settings`` — constructed
+    once, re-read only via ``get_settings.cache_clear()`` (tests use this
+    to pick up monkeypatched env vars).
+    """
+    return Settings()  # type: ignore[call-arg]

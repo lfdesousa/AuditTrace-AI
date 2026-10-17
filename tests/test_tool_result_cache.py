@@ -134,6 +134,76 @@ class TestHousekeeping:
         cache.clear()
         assert redis_client.get("audittrace:token:xyz") == "preserved"
 
+    def test_clear_follows_scan_cursor_across_pages(self):
+        """clear() must keep scanning until the cursor returns to 0.
+
+        Redis SCAN is a paginated cursor, not a snapshot: with more entries
+        than COUNT it returns a non-zero cursor and only part of the keyset.
+        Stopping after the first page would leave stale tool results cached
+        under the prefix — the exact failure the operator escape hatch
+        (clear the cache after a correctness bug) is supposed to fix, and it
+        would look like it succeeded.
+        """
+
+        class PagedRedis:
+            """Returns two pages, then cursor 0. Records what was deleted."""
+
+            def __init__(self):
+                self.deleted: list[str] = []
+                self.scan_calls: list[int] = []
+
+            def scan(self, cursor, match, count):
+                self.scan_calls.append(cursor)
+                pages = {
+                    0: (17, ["audittrace:tool-result:a", "audittrace:tool-result:b"]),
+                    17: (42, ["audittrace:tool-result:c"]),
+                    42: (0, ["audittrace:tool-result:d"]),
+                }
+                return pages[cursor]
+
+            def delete(self, *keys):
+                self.deleted.extend(keys)
+
+        redis = PagedRedis()
+        ToolResultCache(redis, default_ttl_seconds=900).clear()
+
+        # All three pages were walked, resuming from the returned cursor.
+        assert redis.scan_calls == [0, 17, 42]
+        # And every key from every page was deleted, not just page one.
+        assert redis.deleted == [
+            "audittrace:tool-result:a",
+            "audittrace:tool-result:b",
+            "audittrace:tool-result:c",
+            "audittrace:tool-result:d",
+        ]
+
+    def test_size_counts_keys_across_scan_pages(self):
+        """size() must sum every SCAN page, not just the first.
+
+        size() feeds the observability endpoint. Counting one page would
+        under-report cache occupancy by an arbitrary factor once the cache
+        grows past COUNT=100 entries — so the metric would look flat and
+        healthy precisely when the cache is largest.
+        """
+
+        class PagedRedis:
+            def __init__(self):
+                self.scan_calls: list[int] = []
+
+            def scan(self, cursor, match, count):
+                self.scan_calls.append(cursor)
+                pages = {
+                    0: (17, ["k1", "k2", "k3"]),
+                    17: (0, ["k4", "k5"]),
+                }
+                return pages[cursor]
+
+        redis = PagedRedis()
+        cache = ToolResultCache(redis, default_ttl_seconds=900)
+        # 5, not 3 — the second page is included.
+        assert cache.size() == 5
+        assert redis.scan_calls == [0, 17]
+
     def test_size_returns_zero_on_redis_error(self):
         class BrokenRedis:
             def scan(self, cursor, match, count):

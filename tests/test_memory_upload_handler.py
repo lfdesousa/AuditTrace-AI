@@ -59,8 +59,8 @@ class TestPdfBranch:
 
         # Side effects: MinIO PUT, manifest INSERT, queue PUT.
         minio.put_object.assert_called_once()
-        with factory() as session:
-            row = get_by_scan_id(session, body["scan_id"])
+        async with factory() as session:
+            row = await get_by_scan_id(session, body["scan_id"])
         assert row is not None
         assert row.scan_status == "pending_scan"
         assert row.published_at_ms is None
@@ -105,8 +105,8 @@ class TestPdfBranch:
         # Manifest row carries the trace_id too.
         from audittrace.routes.memory_upload.manifest import get_by_scan_id
 
-        with factory() as session:
-            row = get_by_scan_id(session, body["scan_id"])
+        async with factory() as session:
+            row = await get_by_scan_id(session, body["scan_id"])
         assert row is not None
         assert row.trace_id == env.trace_id
 

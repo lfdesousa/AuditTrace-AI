@@ -17,6 +17,7 @@ covered for good rows too).
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from audittrace.db.models import InteractionRecord
 from audittrace.dependencies import get_postgres_factory
@@ -66,10 +67,13 @@ class _FakeStreamGenericExcClient(_FakeAsyncClient):
         return _StreamGenericExcCtx()
 
 
-def _latest_interaction() -> InteractionRecord | None:
+async def _latest_interaction() -> InteractionRecord | None:
     pg = get_postgres_factory()
-    with pg.get_session_factory()() as db:
-        return db.query(InteractionRecord).order_by(InteractionRecord.id.desc()).first()
+    async with pg.get_session_factory()() as db:
+        result = await db.execute(
+            select(InteractionRecord).order_by(InteractionRecord.id.desc())
+        )
+        return result.scalars().first()
 
 
 class TestStreamingFailureAudit:
@@ -77,7 +81,9 @@ class TestStreamingFailureAudit:
     yielded from inside the generator because HTTP headers have already
     been sent by the time the upstream failure occurs."""
 
-    def test_streaming_timeout_persists_failed_row_with_sse_error_frame(self, client):
+    async def test_streaming_timeout_persists_failed_row_with_sse_error_frame(
+        self, client
+    ):
         fake = _FakeStreamTimeoutClient()
         with _patch_async_client(fake):
             response = client.post(
@@ -99,7 +105,7 @@ class TestStreamingFailureAudit:
         assert '"status": 504' in body
         assert "[DONE]" in body
 
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None, "no interaction row written on timeout"
         assert row.status == "failed"
         assert row.failure_class == "proxy_timeout"
@@ -109,7 +115,9 @@ class TestStreamingFailureAudit:
         assert row.duration_ms >= 0
         assert row.user_id == SENTINEL_SUBJECT
 
-    def test_streaming_generic_exception_persists_internal_error_row(self, client):
+    async def test_streaming_generic_exception_persists_internal_error_row(
+        self, client
+    ):
         fake = _FakeStreamGenericExcClient()
         with _patch_async_client(fake):
             response = client.post(
@@ -128,13 +136,13 @@ class TestStreamingFailureAudit:
         assert '"code": "internal_error"' in body
         assert "[DONE]" in body
 
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "failed"
         assert row.failure_class == "internal_error"
         assert row.duration_ms is not None
 
-    def test_streaming_connect_error_now_persists_failed_row(self, client):
+    async def test_streaming_connect_error_now_persists_failed_row(self, client):
         """Prior to migration 007 the ConnectError path yielded an error
         frame but did NOT persist a row. The audit taxonomy now requires
         a row for every failure class, including this one."""
@@ -166,7 +174,7 @@ class TestStreamingFailureAudit:
         assert "unreachable" in body
         assert "[DONE]" in body
 
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "failed"
         assert row.failure_class == "upstream_unreachable"
@@ -177,7 +185,9 @@ class TestNonStreamingFailureAudit:
     this confirms the interaction row now lands too, and carries the
     correct failure_class."""
 
-    def test_non_streaming_timeout_returns_504_and_persists_failed_row(self, client):
+    async def test_non_streaming_timeout_returns_504_and_persists_failed_row(
+        self, client
+    ):
         fake = _FakeAsyncClient(post_exc=httpx.ReadTimeout("Read timed out on POST"))
         with _patch_async_client(fake):
             response = client.post(
@@ -192,14 +202,16 @@ class TestNonStreamingFailureAudit:
         assert response.status_code == 504
         assert "timeout" in response.json()["detail"].lower()
 
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "failed"
         assert row.failure_class == "proxy_timeout"
         assert row.error_detail
         assert row.duration_ms is not None
 
-    def test_non_streaming_connect_error_returns_502_and_persists_row(self, client):
+    async def test_non_streaming_connect_error_returns_502_and_persists_row(
+        self, client
+    ):
         fake = _FakeAsyncClient(post_exc=httpx.ConnectError("no route"))
         with _patch_async_client(fake):
             response = client.post(
@@ -212,12 +224,12 @@ class TestNonStreamingFailureAudit:
             )
 
         assert response.status_code == 502
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "failed"
         assert row.failure_class == "upstream_unreachable"
 
-    def test_non_streaming_error_envelope_persists_failed_row(self, client):
+    async def test_non_streaming_error_envelope_persists_failed_row(self, client):
         """Phase A.4 regression: when the upstream returns HTTP 200 with a
         body containing an ADR-033-shaped error envelope, the local audit row
         MUST be ``status='failed'`` with a ``failure_class`` set — not
@@ -248,14 +260,14 @@ class TestNonStreamingFailureAudit:
         body = response.json()
         assert body["error"]["code"] == "upstream_error"
 
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "failed"
         assert row.failure_class == "upstream_error"
         assert "malformed response" in (row.error_detail or "")
         assert row.duration_ms is not None
 
-    def test_non_streaming_error_envelope_unknown_code_falls_back_to_upstream_error(
+    async def test_non_streaming_error_envelope_unknown_code_falls_back_to_upstream_error(
         self, client
     ):
         """An envelope with an unrecognised ``code`` still gets persisted as
@@ -279,7 +291,7 @@ class TestNonStreamingFailureAudit:
                 },
             )
 
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "failed"
         assert row.failure_class == "upstream_error"
@@ -316,7 +328,7 @@ class TestInteractionTraceIdCapture:
     3-tuple join on (user_id, session_id, timestamp).
     """
 
-    def test_non_streaming_success_persists_trace_id(
+    async def test_non_streaming_success_persists_trace_id(
         self, client, _real_tracer_provider
     ):
         fake = _FakeAsyncClient(post_json=_ok_chat_response())
@@ -330,7 +342,7 @@ class TestInteractionTraceIdCapture:
                 },
             )
         assert response.status_code == 200
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         # FastAPI's auto-instrumented server span is active throughout the
         # request, so trace_id is always captured. 32-char lowercase hex.
@@ -341,7 +353,7 @@ class TestInteractionTraceIdCapture:
         # OTel uses INVALID_TRACE_ID == 0 for those.
         assert row.trace_id != "0" * 32
 
-    def test_non_streaming_failure_persists_trace_id(
+    async def test_non_streaming_failure_persists_trace_id(
         self, client, _real_tracer_provider
     ):
         """Even error rows carry the trace_id — that's the most useful case
@@ -356,13 +368,15 @@ class TestInteractionTraceIdCapture:
                     "project": "AuditTrace",
                 },
             )
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "failed"
         assert row.trace_id is not None
         assert len(row.trace_id) == 32
 
-    def test_error_envelope_path_persists_trace_id(self, client, _real_tracer_provider):
+    async def test_error_envelope_path_persists_trace_id(
+        self, client, _real_tracer_provider
+    ):
         """The Phase A.4 path (body-level error envelope) also captures
         trace_id — confirms the new persist branch added in this sweep
         threads through ``_current_trace_id_hex``."""
@@ -384,7 +398,7 @@ class TestInteractionTraceIdCapture:
                     "project": "AuditTrace",
                 },
             )
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "failed"
         assert row.trace_id is not None
@@ -441,7 +455,7 @@ class TestToolsModeFailureAudit:
     def _tools_mode(self, monkeypatch):
         yield from self._flip_to_tools_mode(monkeypatch)
 
-    def test_tools_mode_timeout_returns_504_and_persists_failed_row(
+    async def test_tools_mode_timeout_returns_504_and_persists_failed_row(
         self, client, _tools_mode
     ):
         fake = _FakeAsyncClient(
@@ -458,14 +472,14 @@ class TestToolsModeFailureAudit:
             )
 
         assert response.status_code == 504
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "failed"
         assert row.failure_class == "proxy_timeout"
         assert row.error_detail
         assert row.duration_ms is not None
 
-    def test_tools_mode_generic_exception_triggers_global_envelope(
+    async def test_tools_mode_generic_exception_triggers_global_envelope(
         self, app, _tools_mode
     ):
         """Unexpected exception: tools-mode handler persists a failed row
@@ -506,7 +520,7 @@ class TestToolsModeFailureAudit:
         assert "operator_hint" in err
         assert "trace_id" in err  # may be None in test env, but key present
 
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "failed"
         assert row.failure_class == "internal_error"
@@ -516,7 +530,7 @@ class TestSuccessCaseDurationPersisted:
     """Success-path rows also carry ``duration_ms`` now; regression guard
     against accidentally removing the parameter in future edits."""
 
-    def test_non_streaming_success_populates_duration_ms(self, client):
+    async def test_non_streaming_success_populates_duration_ms(self, client):
         fake = _FakeAsyncClient(post_json=_ok_chat_response("Hi"))
         with _patch_async_client(fake):
             response = client.post(
@@ -529,14 +543,14 @@ class TestSuccessCaseDurationPersisted:
             )
 
         assert response.status_code == 200
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "success"
         assert row.failure_class is None
         assert row.duration_ms is not None
         assert row.duration_ms >= 0
 
-    def test_streaming_success_populates_duration_ms(self, client):
+    async def test_streaming_success_populates_duration_ms(self, client):
         stream_lines = [
             'data: {"choices":[{"delta":{"content":"hi"}}]}',
             "",
@@ -560,13 +574,13 @@ class TestSuccessCaseDurationPersisted:
             )
 
         assert response.status_code == 200
-        row = _latest_interaction()
+        row = await _latest_interaction()
         assert row is not None
         assert row.status == "success"
         assert row.failure_class is None
         assert row.duration_ms is not None
 
-    def test_tools_mode_success_populates_duration_ms(self, client, monkeypatch):
+    async def test_tools_mode_success_populates_duration_ms(self, client, monkeypatch):
         from audittrace import config as config_mod
         from tests.test_chat_proxy import _SequencedClient
 
@@ -584,9 +598,118 @@ class TestSuccessCaseDurationPersisted:
                     },
                 )
             assert response.status_code == 200
-            row = _latest_interaction()
+            row = await _latest_interaction()
             assert row is not None
             assert row.status == "success"
             assert row.duration_ms is not None
         finally:
             config_mod.get_settings.cache_clear()
+
+
+class TestPersistTraceIdBinding:
+    """Migration 008 / #344: ``interactions.trace_id`` is the single join key
+    from an audit row to the Langfuse trace and the Tempo spans. Without it
+    an auditor holding a row cannot reach the evidence that reconstructs it
+    (EU AI Act Art. 12, ``feedback_traceability_requirement``)."""
+
+    async def test_explicit_trace_id_wins_over_the_auto_captured_one(
+        self, client, monkeypatch
+    ):
+        """Deferred persists — the post-stream tail and the async-persist
+        worker — run *after* the request span has closed or under a
+        different span entirely. Auto-capture there would file the row under
+        the wrong trace, which is worse than no trace at all: it points an
+        auditor at someone else's request. An explicitly supplied trace_id
+        must therefore never be overwritten by the ambient one."""
+        from audittrace.routes import chat as chat_mod
+
+        explicit = "a" * 32
+        ambient = "b" * 32
+        monkeypatch.setattr(chat_mod, "_current_trace_id_hex", lambda: ambient)
+
+        interaction_id = await chat_mod._persist_interaction(
+            project="AuditTrace",
+            source="curl",
+            question="q",
+            answer="a",
+            prompt_tokens=1,
+            completion_tokens=1,
+            session_id="sess-1",
+            model="qwen3.5-35b",
+            user_id=SENTINEL_SUBJECT,
+            trace_id=explicit,
+        )
+
+        assert interaction_id is not None
+        row = await _latest_interaction()
+        assert row is not None
+        assert row.trace_id == explicit
+        assert row.trace_id != ambient
+
+    async def test_trace_id_is_auto_captured_when_the_caller_omits_it(
+        self, client, monkeypatch
+    ):
+        """The hot-path callers omit ``trace_id`` and rely on auto-capture
+        from the live FastAPI server span. If that silently produced NULL,
+        every in-request audit row would lose its only link to the trace and
+        the reconstructibility walkthrough would dead-end at Postgres."""
+        from audittrace.routes import chat as chat_mod
+
+        ambient = "c" * 32
+        monkeypatch.setattr(chat_mod, "_current_trace_id_hex", lambda: ambient)
+
+        await chat_mod._persist_interaction(
+            project="AuditTrace",
+            source="curl",
+            question="q",
+            answer="a",
+            prompt_tokens=1,
+            completion_tokens=1,
+            session_id="sess-1",
+            model="qwen3.5-35b",
+            user_id=SENTINEL_SUBJECT,
+        )
+
+        row = await _latest_interaction()
+        assert row is not None
+        assert row.trace_id == ambient
+
+
+class TestFlushPendingToolCallsGuard:
+    """ADR-025 §Decision.5: ``tool_calls`` rows hang off ``interactions`` via
+    a NOT NULL FK. The flush runs in the response tail, where raising would
+    break a chat response that already succeeded."""
+
+    async def test_no_rows_written_when_the_parent_interaction_failed(self, client):
+        """``_persist_interaction`` returns ``None`` when the DB write fails,
+        and the flush is called with that ``None``. Attempting the insert
+        anyway would either raise inside the response tail or leave orphan
+        rows that ``GET /interactions/{id}/tool-calls`` can never surface —
+        breaking the "zero versus missing" distinction that endpoint exists
+        to guarantee. The guard must drop the children silently."""
+        from datetime import datetime
+
+        from audittrace.db.models import ToolCall
+        from audittrace.routes._memory_tool_loop import PendingToolCall
+        from audittrace.routes.chat import _flush_pending_tool_calls
+
+        pending = [
+            PendingToolCall(
+                tool_name="recall_decisions",
+                user_id=SENTINEL_SUBJECT,
+                agent_type="chat",
+                args='{"query": "rls"}',
+                result_summary="1 hit",
+                error=None,
+                started_at=datetime.now(),
+                duration_ms=3,
+                granted_scope="memory:episodic:read",
+            )
+        ]
+
+        await _flush_pending_tool_calls(pending, None)  # must not raise
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(ToolCall))).scalars().all()
+        assert rows == []

@@ -30,7 +30,7 @@ async def get_context(
     user: UserContext = Depends(require_user),
 ) -> ContextBuildResponse:
     """Retrieve relevant context from all 4 memory layers."""
-    context_string, layer_stats = context_builder.build_system_context_with_stats(
+    context_string, layer_stats = await context_builder.build_system_context_with_stats(
         user,
         project=request.project,
         query=request.query,

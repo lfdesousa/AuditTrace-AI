@@ -1,0 +1,38 @@
+meta {
+  name: GET /memory/semantic/{collection}/{doc_id}?whole_document=true — whole-document read
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{exampleDocId}}?whole_document=true
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  whole_document: true
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("returns reassembled content + chunk_count", function() {
+    const body = res.getBody();
+    expect(body.content).to.be.a("string");
+    expect(body.chunk_count).to.be.at.least(1);
+  });
+}
+
+docs {
+  Fleet Bruno memory logging. WU-1 whole-document read:
+  reassembles every chunk of the document whose chunk-0 id is exampleDocId
+  (= sha256("<collection>:<filename>:0")[:16], see routes/memory.py::_doc_id),
+  byte-exact. Used by the fleet read-back step to compare the server copy
+  with the uploaded bytes (sha256 + byte length).
+}

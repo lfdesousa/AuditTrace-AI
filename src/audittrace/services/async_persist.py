@@ -36,7 +36,7 @@ import logging
 import os
 import socket
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any
@@ -210,8 +210,8 @@ class AsyncPersistConsumer:
         self,
         *,
         settings: Settings,
-        persist_callable: Callable[..., int | None],
-        flush_tool_calls_callable: Callable[..., None],
+        persist_callable: Callable[..., Awaitable[int | None]],
+        flush_tool_calls_callable: Callable[..., Awaitable[None]],
         redis: AsyncRedis[str],
         consumer_name: str | None = None,
     ) -> None:
@@ -385,25 +385,26 @@ class AsyncPersistConsumer:
             _completed_counter.add(1, {"outcome": "dlq"})
             return
 
-        # Persist + flush. Sync work runs in a thread.
+        # Persist + flush. The persist/flush callables are async coroutine
+        # functions (#263 async rewrite) — await them directly. Wrapping a
+        # coroutine function in ``asyncio.to_thread`` would never execute it
+        # (it returns an un-awaited coroutine), so the row would silently never
+        # be written.
         # IMPORTANT: the consumer task does NOT pass through FastAPI's auth
-        # middleware, so the ``app.current_user_id`` ContextVar is unset.
-        # Set it from the deserialised ``user_id`` kwarg so the SQLAlchemy
-        # ``after_begin`` listener (db/rls.py) sets ``SET LOCAL
-        # app.current_user_id = ...`` on the txn — Postgres RLS WITH CHECK
-        # then accepts the INSERT instead of rejecting with
-        # ``InsufficientPrivilege``. ContextVars propagate through
-        # ``asyncio.to_thread`` in Python 3.9+ via contextvars.copy_context.
+        # middleware, so the ``app.current_user_id`` ContextVar is unset. Set
+        # it from the deserialised ``user_id`` kwarg so the persist path can
+        # apply the per-user RLS GUC (db/rls.py) — Postgres RLS WITH CHECK then
+        # accepts the INSERT instead of rejecting with ``InsufficientPrivilege``.
         from audittrace.db.rls import set_current_user_id
 
         user_id = kwargs.get("user_id") or ""
         if user_id:
             set_current_user_id(user_id)
         try:
-            interaction_id = await asyncio.to_thread(self._persist, **kwargs)
+            interaction_id = await self._persist(**kwargs)
             if tcs and interaction_id is not None:
                 pending = reconstruct_pending_tool_calls(tcs)
-                await asyncio.to_thread(self._flush, pending, interaction_id)
+                await self._flush(pending, interaction_id)
         except Exception as exc:
             logger.warning(
                 "async-persist transient failure id=%s (will retry): %s",

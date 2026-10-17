@@ -20,57 +20,63 @@ from audittrace.services.conversational import (
 
 
 class TestMockConversationalService:
-    def test_mock_starts_empty(self, user_context):
+    async def test_mock_starts_empty(self, user_context):
         service = MockConversationalService()
-        assert service.load_sessions(user_context, "any") == []
+        assert await service.load_sessions(user_context, "any") == []
 
-    def test_mock_save_and_load(self, user_context):
+    async def test_mock_save_and_load(self, user_context):
         service = MockConversationalService()
-        service.save_session(
+        await service.save_session(
             user_context, "AuditTrace", "Test summary", ["point1"], session_id="s1"
         )
-        sessions = service.load_sessions(user_context, "AuditTrace")
+        sessions = await service.load_sessions(user_context, "AuditTrace")
         assert len(sessions) == 1
         assert sessions[0]["summary"] == "Test summary"
 
-    def test_mock_filters_by_project(self, user_context):
+    async def test_mock_filters_by_project(self, user_context):
         service = MockConversationalService()
-        service.save_session(user_context, "ProjectA", "Summary A", [], session_id="a1")
-        service.save_session(user_context, "ProjectB", "Summary B", [], session_id="b1")
-        assert len(service.load_sessions(user_context, "ProjectA")) == 1
-        assert len(service.load_sessions(user_context, "ProjectB")) == 1
+        await service.save_session(
+            user_context, "ProjectA", "Summary A", [], session_id="a1"
+        )
+        await service.save_session(
+            user_context, "ProjectB", "Summary B", [], session_id="b1"
+        )
+        assert len(await service.load_sessions(user_context, "ProjectA")) == 1
+        assert len(await service.load_sessions(user_context, "ProjectB")) == 1
 
-    def test_mock_isolates_by_user(self, user_context):
+    async def test_mock_isolates_by_user(self, user_context):
         """Phase 2 contract: user B cannot see user A's sessions, even for
         the same project. No admin bypass — conversations are per-user."""
         service = MockConversationalService()
         alice = replace(user_context, user_id="user-alice", is_admin=False)
         bob = replace(user_context, user_id="user-bob", is_admin=False)
-        service.save_session(
+        await service.save_session(
             alice, "SharedProject", "Alice summary", [], session_id="alice-1"
         )
-        service.save_session(
+        await service.save_session(
             bob, "SharedProject", "Bob summary", [], session_id="bob-1"
         )
-        alice_sessions = service.load_sessions(alice, "SharedProject")
-        bob_sessions = service.load_sessions(bob, "SharedProject")
+        alice_sessions = await service.load_sessions(alice, "SharedProject")
+        bob_sessions = await service.load_sessions(bob, "SharedProject")
         assert len(alice_sessions) == 1
         assert alice_sessions[0]["summary"] == "Alice summary"
         assert len(bob_sessions) == 1
         assert bob_sessions[0]["summary"] == "Bob summary"
 
-    def test_mock_reset(self, user_context):
+    async def test_mock_reset(self, user_context):
         service = MockConversationalService()
-        service.save_session(user_context, "P", "S", [], session_id="reset-1")
+        await service.save_session(user_context, "P", "S", [], session_id="reset-1")
         service.reset()
-        assert service.load_sessions(user_context, "P") == []
+        assert await service.load_sessions(user_context, "P") == []
 
     def test_abstract_interface(self):
         assert isinstance(MockConversationalService(), ConversationalService)
 
-    def test_mock_as_context_passes_through(self, user_context):
+    async def test_mock_as_context_passes_through(self, user_context):
         service = MockConversationalService()
-        service.save_session(user_context, "P", "A summary", ["k1"], session_id="ctx-1")
-        ctx = service.as_context(user_context, "P")
+        await service.save_session(
+            user_context, "P", "A summary", ["k1"], session_id="ctx-1"
+        )
+        ctx = await service.as_context(user_context, "P")
         assert "Recent Sessions" in ctx
         assert "A summary" in ctx

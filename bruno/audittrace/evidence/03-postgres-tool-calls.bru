@@ -1,0 +1,119 @@
+meta {
+  name: Postgres — tool calls from the system of record (closes RF-10)
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/interactions/{{interactionId}}/tool-calls
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    const body = res.getBody();
+    const names = body.tool_calls.map(c => c.tool_name).sort();
+    bru.setEnvVar("pgToolCallCount", String(body.total));
+    bru.setEnvVar("pgToolCallNames", JSON.stringify(names));
+    const refused = body.tool_calls.filter(c => c.granted_scope === "");
+    console.log("postgres tool_calls:", body.total, names,
+                "(refused:", refused.length + ")");
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("echoes the interaction we asked about", function() {
+    expect(res.getBody().interaction_id).to.equal(Number(bru.getEnvVar("interactionId")));
+  });
+  test("total matches the array length (no silent truncation)", function() {
+    const body = res.getBody();
+    expect(body.total).to.equal(body.tool_calls.length);
+  });
+  test("every call carries the audit fields that make it evidence", function() {
+    // tool_name alone is not evidence. granted_scope is what answers
+    // "who was allowed to call what" — and args/result make the call
+    // re-derivable rather than merely counted.
+    for (const c of res.getBody().tool_calls) {
+      expect(c.id).to.be.a("string");
+      expect(c.tool_name).to.be.a("string");
+      expect(c.args).to.be.a("string");
+      expect(c.granted_scope).to.be.a("string");   // "" on a refusal
+      expect(c.interaction_id).to.equal(Number(bru.getEnvVar("interactionId")));
+    }
+  });
+  test("THREE-STORE CORROBORATION — every Postgres tool call appears in Langfuse AND Tempo", function() {
+    // This is EV-03 in its intended form. Requests 01 and 02 stashed the
+    // observation/span names; the memory tool loop emits a span named
+    // `memory_tool.<tool_name>` for each dispatch, so a tool call present
+    // in the system of record MUST have a matching span in both stores.
+    //
+    // A Postgres row with no matching span means the call was executed and
+    // recorded but never traced — the emission-loss case the two-store
+    // check could not see. That is the whole reason this leg exists.
+    const lf = JSON.parse(bru.getEnvVar("langfuseObsNames") || "[]");
+    const tp = JSON.parse(bru.getEnvVar("tempoSpanNames") || "[]");
+    if (!lf.length && !tp.length) {
+      console.log("no trace-store names captured — run 01 and 02 first.");
+      return;
+    }
+    for (const c of res.getBody().tool_calls) {
+      const span = `memory_tool.${c.tool_name}`;
+      console.log(`  corroborating ${span}: langfuse=${lf.includes(span)} tempo=${tp.includes(span)}`);
+      expect(lf, `${span} missing from Langfuse`).to.include(span);
+      expect(tp, `${span} missing from Tempo`).to.include(span);
+    }
+  });
+  test("refusals are present as rows, not omitted", function() {
+    // The RF-10 property. A refused call is recorded with
+    // granted_scope="" and an error, so an empty list means the model
+    // invoked nothing — NOT that the record was lost. If this run has
+    // no refusals there is nothing to assert; log and move on.
+    const refused = res.getBody().tool_calls.filter(c => c.granted_scope === "");
+    if (!refused.length) {
+      console.log("no refusals in this interaction — nothing to assert here.");
+      return;
+    }
+    for (const c of refused) expect(c.error).to.be.a("string");
+  });
+}
+
+docs {
+  **Step 4 of the evidence chain — the Postgres leg, and the one that
+  makes the corroboration three-store.**
+
+  Until this endpoint existed (RF-10, found 2026-07-20), `tool_calls` was
+  written on every model tool invocation but reachable through no API
+  surface. An auditor holding a scoped JWT could not ask the **system of
+  record** how many tools a decision invoked, so `01` and `02` could only
+  check the two observability stores against each other — and both are
+  fed by the same process, so they could agree and still both be wrong.
+
+  This request closes that. Run it after `00-capture-trace-id`, which
+  stashes `interactionId` alongside `traceId`.
+
+  **Zero versus missing — the property this exists to prove.** A tool the
+  model was refused is recorded at dispatch with `granted_scope=""` and
+  an `error`. So an empty list here means the model invoked nothing,
+  rather than that the record went missing. That distinction is the
+  difference between an audit trail and a log.
+
+  **Isolation.** `tool_calls` carries the same migration-005 RLS policy as
+  `interactions` (`ENABLE` + `FORCE ROW LEVEL SECURITY`,
+  `tenant_isolation_tool_calls` on `user_id`), so this returns only the
+  caller's own rows. Asking for another user's `interaction_id` yields an
+  empty list, not a leak — and deliberately not a 404, because
+  distinguishing "does not exist" from "exists but is not yours" would
+  make the endpoint an existence oracle for other users' rows.
+
+  **Front door.** Unlike the Langfuse and Tempo legs, this one runs under
+  the caller's own scoped JWT (`audittrace:audit`) — same trust basis as
+  the rest of the audit API, no observability-store credentials involved.
+}

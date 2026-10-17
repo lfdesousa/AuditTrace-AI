@@ -1,0 +1,71 @@
+{{- if .Values.reaper.enabled }}
+# Exit-79 vault-injection auto-heal reaper (#384 WS4a).
+#
+# Runs the pure-Python controller `audittrace.ops.pod_reaper` from the SAME
+# image as the memory-server (no new heavy dependency; talks to the k8s API
+# with httpx + the in-cluster ServiceAccount). It detects memory-server pods
+# that were admitted WITHOUT the vault-agent sidecar (injector not ready at
+# admission → entrypoint exit 79 → CrashLoopBackOff forever) and deletes them
+# so the ReplicaSet recreates them through a now-healthy injector.
+#
+# Deliberate posture:
+#   * NO vault annotations — the reaper reads config from env only and must
+#     never itself depend on the very injection path it repairs.
+#   * Istio injection disabled — it talks only to the out-of-mesh kube API, so
+#     it needs no sidecar (and must not race the sidecar it is here to rescue).
+#   * Single replica — the work is idempotent and a second reaper would only
+#     duplicate DELETEs; the per-pod cooldown already guards API races.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-pod-reaper
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pod-reaper
+spec:
+  replicas: 1
+  # Recreate: never run two reapers at once (they would race the same DELETEs).
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "audittrace.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: pod-reaper
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: pod-reaper
+        # The reaper talks only to the out-of-mesh kube API — no Istio sidecar
+        # (and it must not depend on the mesh it may be helping to recover).
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: {{ .Release.Name }}-pod-reaper
+      containers:
+        - name: pod-reaper
+          image: "{{ .Values.reaper.image.repository | default .Values.memoryServer.image.repository }}:{{ .Values.reaper.image.tag | default .Values.memoryServer.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.reaper.image.pullPolicy | default .Values.memoryServer.image.pullPolicy }}
+          command: ["python", "-m", "audittrace.ops.pod_reaper"]
+          env:
+            - name: AUDITTRACE_REAPER_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: AUDITTRACE_REAPER_POLL_INTERVAL_SECONDS
+              value: {{ .Values.reaper.pollIntervalSeconds | quote }}
+            - name: AUDITTRACE_REAPER_COOLDOWN_SECONDS
+              value: {{ .Values.reaper.cooldownSeconds | quote }}
+            - name: AUDITTRACE_REAPER_LABEL_SELECTOR
+              value: {{ .Values.reaper.labelSelector | quote }}
+            - name: AUDITTRACE_REAPER_INJECTOR_DEPLOYMENT
+              value: {{ .Values.reaper.injectorDeploymentName | default (printf "%s-vault-agent-injector" .Release.Name) | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            # Matches the image's baked-in non-root `sovereign` user (uid 1000).
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            {{- toYaml .Values.reaper.resources | nindent 12 }}
+{{- end }}

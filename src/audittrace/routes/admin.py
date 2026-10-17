@@ -38,6 +38,7 @@ from audittrace.logging_config import log_call
 from audittrace.routes.memory import _invalidate_validation_context
 from audittrace.services.trust_store import (
     TrustStoreBuilder,
+    TrustStoreBuilderInternalError,
     TrustStoreBuilderUnavailableError,
     TrustStoreProvider,
 )
@@ -72,8 +73,9 @@ async def refresh_trust_store(
       unreachable, XAdES verification failed). The previously-stored
       bundle remains in place; subsequent signature checks continue
       to use it. Operator can retry once upstream conditions clear.
-    * 500 — Provider write failed (MinIO down, permission issue).
-      Investigate and retry.
+    * 500 — Provider write failed (MinIO down, permission issue), OR a
+      Builder's own code failed (``trust_store_build_internal_error``;
+      the stored bundle is kept). Investigate and retry.
     """
     # Defence-in-depth: validate_jwt's scope check is the gate, but
     # mirror the existing per-route ``user.is_admin`` style guard from
@@ -103,6 +105,19 @@ async def refresh_trust_store(
             status_code=http_status.HTTP_502_BAD_GATEWAY,
             detail={
                 "error": "trust_store_build_failed",
+                "builder_id": builder.builder_id,
+                "cause": str(exc),
+            },
+        ) from exc
+    except TrustStoreBuilderInternalError as exc:
+        # A Builder's own code failed (call-shape drift, non-conforming
+        # verified payload): fail the refresh CLOSED. ``provider.store`` is
+        # never reached, so the previously stored bundle is untouched.
+        logger.error("trust-store refresh — Builder internal error: %s", exc)
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "trust_store_build_internal_error",
                 "builder_id": builder.builder_id,
                 "cause": str(exc),
             },

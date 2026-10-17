@@ -149,6 +149,9 @@ downstream policy uses it.
 ## References
 
 - ADR-044 — External IdP federation via Keycloak brokering (decision)
+- [`docs/architecture/oidc-google-keycloak-brokering.md`](../architecture/oidc-google-keycloak-brokering.md)
+  — the as-built end-to-end walkthrough (sequence diagram, drift guard,
+  scopes) for the Google broker this guide provisions
 - `scripts/setup-idp-federation.sh` — the provisioner this guide uses
 - `charts/audittrace/values.yaml` — `keycloak.externalIssuers` and
   `keycloak.hostnameUrl` documentation blocks for the override pattern

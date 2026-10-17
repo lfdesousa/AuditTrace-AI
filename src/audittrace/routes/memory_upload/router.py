@@ -16,17 +16,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Security
-from sqlalchemy.orm import Session, sessionmaker
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Security
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.auth import require_user, validate_jwt
 from audittrace.identity import UserContext
 from audittrace.routes.memory_upload.manifest import get_by_scan_id
+from audittrace.services.memory_audit import schedule_read_audit
 
 router = APIRouter(prefix="/memory/upload", tags=["memory"])
 
 
-def _get_session_factory() -> sessionmaker[Session]:
+def _get_session_factory() -> async_sessionmaker[AsyncSession]:
     """Lazy lookup of the FastAPI app's session factory.
 
     Imported lazily so test harnesses that wire the upload
@@ -35,7 +36,9 @@ def _get_session_factory() -> sessionmaker[Session]:
     """
     from audittrace.dependencies import get_postgres_factory  # noqa: PLC0415
 
-    factory: sessionmaker[Session] = get_postgres_factory().get_session_factory()
+    factory: async_sessionmaker[AsyncSession] = (
+        get_postgres_factory().get_session_factory()
+    )
     return factory
 
 
@@ -44,7 +47,9 @@ async def get_upload_status(
     scan_id: str = Query(..., description="Scan ID returned by POST /memory/upload"),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=[]),
     user: UserContext = Depends(require_user),
-    session_factory: sessionmaker[Session] = Depends(_get_session_factory),
+    session_factory: async_sessionmaker[AsyncSession] = Depends(_get_session_factory),
+    *,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     """Return the current scan_status of the named upload.
 
@@ -53,26 +58,56 @@ async def get_upload_status(
     requesting user is the same one who created the row OR an
     admin — content-control verdicts shouldn't leak across
     tenant boundaries even pre-PR-B7 IAM split."""
-    with session_factory() as session:
-        row = get_by_scan_id(session, scan_id)
-    if row is None:
+    async with session_factory() as session:
+        row = await get_by_scan_id(session, scan_id)
+        # Snapshot inside the session scope (#364). ``get_by_scan_id``
+        # returns a session-bound ORM row, so every attribute read below —
+        # including the ``created_by_user_id`` the authorization check
+        # depends on — must happen before the block exits. Reading a
+        # detached row raises rather than returning a wrong value, so this
+        # was fail-closed rather than a leak, but a 500 in an authz path is
+        # still the wrong failure.
+        snapshot = (
+            None
+            if row is None
+            else {
+                "created_by_user_id": row.created_by_user_id,
+                "scan_id": row.id,
+                "status": row.scan_status,
+                "object_uri": row.key,
+                "object_sha256": row.document_sha256,
+                "size_bytes": row.size_bytes,
+                "created_at_ms": row.created_at_ms,
+                "modified_at_ms": row.modified_at_ms,
+                "trace_id": row.trace_id,
+            }
+        )
+
+    if snapshot is None:
         raise HTTPException(status_code=404, detail=f"scan_id not found: {scan_id}")
     if not (
         user.is_admin
         or "audittrace:admin" in user.scopes
-        or row.created_by_user_id == user.user_id
+        or snapshot["created_by_user_id"] == user.user_id
     ):
         # Don't reveal whether the scan_id exists for some other
         # tenant — return the same 404 shape.
         raise HTTPException(status_code=404, detail=f"scan_id not found: {scan_id}")
 
-    return {
-        "scan_id": row.id,
-        "status": row.scan_status,
-        "object_uri": row.key,
-        "object_sha256": row.document_sha256,
-        "size_bytes": row.size_bytes,
-        "created_at_ms": row.created_at_ms,
-        "modified_at_ms": row.modified_at_ms,
-        "trace_id": row.trace_id,
-    }
+    # ADR-062 §5 (WU-A4) — read path, fail-open background emit. Every
+    # scanned upload lands in ``layer="episodic"`` at insert time
+    # (``insert_pending_scan`` — PDFs promote to ``episodic/papers/``); the
+    # scan_id doubles as the "key", the caller-supplied handle for this
+    # upload's scan-status row.
+    schedule_read_audit(
+        background_tasks,
+        user=user,
+        op="read",
+        layer="episodic",
+        key=scan_id,
+        detail_extra={"endpoint": "upload_status"},
+    )
+
+    # created_by_user_id is an authorization input, not part of the
+    # response contract — drop it rather than widen the payload.
+    return {k: v for k, v in snapshot.items() if k != "created_by_user_id"}

@@ -11,6 +11,7 @@ from datetime import datetime
 
 import pytest
 from sqlalchemy import create_engine, inspect
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from audittrace.db.models import (
@@ -47,7 +48,8 @@ class TestSessionRecordSchema:
         inspector = inspect(engine)
         columns = {col["name"] for col in inspector.get_columns("sessions")}
         # user_id (Phase 0 multi-user identity) and summarized_at
-        # (ADR-030 Part 2 background summariser) are later additions.
+        # (ADR-030 Part 2 background summariser) are later additions;
+        # trace_id (#344) links a summary row to the summariser run's trace.
         assert columns == {
             "id",
             "project",
@@ -57,6 +59,7 @@ class TestSessionRecordSchema:
             "model",
             "user_id",
             "summarized_at",
+            "trace_id",
         }
 
     def test_primary_key_is_id(self, engine):
@@ -126,6 +129,7 @@ class TestSessionRecordCRUD:
         )
         assert len(results) == 2
 
+    @pytest.mark.filterwarnings("error::sqlalchemy.exc.SAWarning")
     def test_duplicate_id_raises(self, db_session: Session):
         record1 = SessionRecord(
             id="dup_id",
@@ -145,8 +149,12 @@ class TestSessionRecordCRUD:
         )
         db_session.add(record1)
         db_session.commit()
+        # Drop record1 from the identity map so the duplicate insert exercises
+        # the DB UNIQUE/PK constraint (a real IntegrityError) instead of the
+        # in-memory identity-map conflict (which only raises a SAWarning).
+        db_session.expunge_all()
         db_session.add(record2)
-        with pytest.raises(Exception):  # IntegrityError from DB constraint
+        with pytest.raises(IntegrityError):
             db_session.commit()
         db_session.rollback()
 
@@ -178,6 +186,14 @@ class TestToolCallSchema:
             "started_at",
             "duration_ms",
             "granted_scope",
+            # Migration 021 (ADR-063 Phase 2 Track B) — broker provenance,
+            # all nullable/additive. NULL on every Phase 1 own-tool row.
+            "provenance",
+            "phase",
+            "downstream_server",
+            "downstream_tool",
+            "args_digest",
+            "result_digest",
         }
 
 
@@ -217,6 +233,32 @@ class TestToolCallCRUD:
         assert loaded.granted_scope == "memory:read-decisions"
         assert loaded.error is None
         assert loaded.user_id == _TEST_SUB
+
+
+class TestInteractionRecordCreatedAt:
+    """ADR-058 WS-A1 — ``created_at`` is assigned by the database at INSERT
+    (``server_default=now()``), independent of the application writer, so the
+    record's clock cannot be set or backdated by the caller. Contrast with
+    ``timestamp``, which the application supplies as a String."""
+
+    def test_created_at_is_db_assigned_when_not_supplied(
+        self, db_session: Session
+    ) -> None:
+        interaction = InteractionRecord(
+            project="AuditTrace",
+            source="opencode",
+            question="q",
+            answer="a",
+            prompt_tokens=1,
+            completion_tokens=1,
+            timestamp="2026-07-14T10:00:00",
+            user_id=_TEST_SUB,
+        )
+        # The application deliberately never sets created_at.
+        db_session.add(interaction)
+        db_session.flush()
+        db_session.refresh(interaction)
+        assert interaction.created_at is not None
 
 
 class TestInteractionRecordUserId:

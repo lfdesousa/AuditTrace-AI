@@ -1,0 +1,1884 @@
+"""Deterministic, INDEPENDENT deploy-verify runner — Component 3 of the CD program.
+
+The instrument the **Deploy-Verify Agent** executes to certify a deploy *from the
+outside*. It re-derives cluster health itself — read-only ``kubectl`` / ``helm``
+plus the public front door — and emits a PASS/FAIL verdict.
+
+**The independence contract is the whole point.** This runner NEVER reads the
+deploy runner's report and NEVER trusts its claims. The ``reads_deploy_report``
+field stamped into every report is DERIVED from :meth:`evidence_sources` (the
+enumerated list of what the verdict actually stands on), not self-asserted — a
+``deploy-report:`` source would flip it True. A green deploy report can never move
+the verdict. The deployer decides "it deployed"; this
+runner decides, separately and on evidence it gathered itself, "it works". FAIL
+blocks "done": *up* means complete AND working, not "helm exited 0".
+
+Eleven deploy-health probes — five CORE + four MESH-HEALTH (#384 WS2) + one
+AUDIT-RELIABILITY (scan-DLQ depth, spec 2026-08-23) + one FIRST-PARTY-IMAGE
+(the BFF, D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-
+guard.md) — each PASS/FAIL/SKIPPED with captured evidence (failures-are-
+findings, every check declares the evidence it stands on):
+
+* **pods-ready**             — every expected app component has ≥1 Ready pod.
+* **digest-matches-published** — the LIVE memory-server pod digest == the intended
+  published digest (reuses :func:`scripts.deploy.registry.resolve`). The
+  tracks-published-digest invariant.
+* **no-drift**               — helm release STATUS == ``deployed`` AND the live
+  memory-server Deployment ``strategy`` matches the surge-safe chart intent
+  (``maxSurge=0`` / ``maxUnavailable=1``). Catches a WS1 regression or a stray
+  live ``kubectl patch``.
+* **health-version**         — front-door ``GET /health`` reports ``status=ok`` and
+  ``version`` == the intended target version. ``--skip-version-check`` (#412)
+  turns this probe advisory (reported ``SKIPPED``, never a FAIL) for a
+  dev-tagged build (image tag isn't a release ``vX.Y.Z``) that can only be
+  certified on ``digest-matches-published`` alone; every other probe, INCLUDING
+  the digest anchor, is unaffected and still gates normally.
+* **recall-e2e**             — a REAL front-door recall through the audit plane:
+  ``POST /v1/chat/completions`` (scoped JWT, real model) that triggers a
+  ``recall_*``, then ``GET /interactions/{id}/tool-calls`` asserting a recall row
+  was recorded. Memory + auth alone is not E2E. The chat call alone uses a
+  calibrated, configurable client timeout (``--e2e-timeout`` /
+  ``AUDITTRACE_VERIFY_E2E_TIMEOUT``, default 400s — see
+  :data:`E2E_CHAT_TIMEOUT_DEFAULT`); every other probe keeps the short,
+  unwidened fast-probe timeout (:data:`FAST_PROBE_TIMEOUT`).
+
+The four MESH-HEALTH probes (#384 WS2, spec §4) certify that the deploy did not
+leave the Istio mesh unable to cert, secret, or route — "up" means the mesh
+survived, not "helm exited 0". Each RE-DERIVES its signal from an INDEPENDENT
+read-only cluster read (never the deploy runner's report, never the WS1 mesh
+gate's result — the same independence contract the core probes hold):
+
+* **istiod-api-reachable**   — istiod Deployment fully Ready, Service has ≥1
+  endpoint, and ZERO #307 smoking-gun lines (``no route to host`` /
+  ``Unauthenticated`` / ``tokenreviews``) in the istiod log window — a new sidecar
+  can get a cert. Reuses the *pure* diagnosers in :mod:`scripts.deploy.mesh`
+  (:func:`mesh.evaluate_istiod_logs` / :func:`mesh.evaluate_istiod_readiness`) over
+  reads THIS runner gathered itself — shared logic, independent evidence.
+* **sidecars-have-certs**    — every istio-injected pod's ``istio-proxy`` container
+  is Ready and the pod reached ``Running`` (no cert-starved data plane, no pod
+  wedged in Init).
+* **vault-secret-rendered**  — every vault-annotated pod has a Ready ``vault-agent``
+  sidecar, no container exited ``79`` (``/vault/secrets/env`` absent), and no
+  CrashLoop — captures container statuses, NEVER secret values.
+* **no-unhealthy-upstream**  — front-door ``/health`` == 200 ``status=ok`` AND no
+  "no healthy upstream" 503 signature in the memory-server log window.
+* **scan-dlq-depth**         — front-door ``GET /health`` ``components.scan_dlq_depth``
+  and ``components.dead_lettered_index_count`` (#387 P2b). Both values are ALWAYS
+  captured as evidence, whatever the verdict. FAILs when ``scan_dlq_depth`` is
+  NUMERIC and exceeds ``--scan-dlq-threshold`` (default
+  :data:`SCAN_DLQ_DEFAULT_THRESHOLD`) — closes the SCAN-URI-BUG loop gap: a future
+  regression that re-floods the scan DLQ now trips certification instead of
+  passing silently. SKIPS (never FAILs) when the field is ABSENT (an older image
+  predating #387 P2b) or ``"unknown"`` (the health handler's own best-effort
+  telemetry degraded, same pattern as ``async_persist_dlq_depth``) — certify must
+  not be brittle against a telemetry-field hiccup.
+* **first-party-images-match-published** — the LIVE BFF pod digest == the
+  published digest for ``--target-version`` on the registry (D5). PASS
+  with ``{"bff": "absent"}`` when no BFF Deployment exists (the common
+  laptop posture); PASS with ``{"bff": "skipped", ...}`` under
+  ``--registry local`` (the BFF is hub-only, S3b). The deploy runner's own
+  D3 check (``scripts/deploy/runner/images.py``) compares render-vs-chart
+  and chart-vs-live; THIS probe is the only one that ties the BFF to what
+  was actually PUBLISHED, independently re-derived.
+
+**Method discipline:** front door + read-only ``kubectl``/``helm`` only. NO
+``kubectl exec``, NO root creds, NO scope-skip. Deterministic: no wall-clock
+branching in control flow; timestamps live in evidence only. All network egress
+funnels through the single monkeypatchable :func:`_http_request`; all URL routing
+decisions use :func:`urllib.parse.urlparse` exact-match, never substring checks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import ssl
+import subprocess  # noqa: S404 - read-only kubectl/helm; fixed argv, no shell
+import sys
+import urllib.request
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError
+from urllib.parse import urlparse
+
+from scripts.deploy import mesh, registry
+from scripts.deploy.frontdoor import (
+    DEFAULT_FRONT_DOOR as _DEFAULT_FRONT_DOOR,
+)
+from scripts.deploy.frontdoor import (
+    FRONT_DOOR_ENV_VAR as _FRONT_DOOR_ENV_VAR,
+)
+from scripts.deploy.frontdoor import (
+    resolve_front_door,
+)
+from scripts.deploy.runner import extract_digest, normalize_version
+
+logger = logging.getLogger("audittrace.deploy.verify")
+
+# Re-export DEFAULT_FRONT_DOOR for backward compatibility (external code may
+# import it from verify; tests assert verify.DEFAULT_FRONT_DOOR == the shared
+# module's value). The noqa silences ruff's "unused import" because the name
+# is re-exported at the module level, not used in the function body.
+DEFAULT_FRONT_DOOR = _DEFAULT_FRONT_DOOR  # noqa: F401
+# Re-export the env-var NAME too (external code / tests reference
+# verify.FRONT_DOOR_ENV_VAR). The precedence lives ONCE in
+# scripts.deploy.frontdoor; these are backward-compat aliases.
+FRONT_DOOR_ENV_VAR = _FRONT_DOOR_ENV_VAR  # noqa: F401
+
+
+def _front_door_default() -> str:
+    """Thin backward-compat wrapper over the shared resolver (SPEC #401).
+
+    The precedence (explicit > AUDITTRACE_FRONT_DOOR env > hardcoded fallback)
+    is defined ONCE in :func:`scripts.deploy.frontdoor.resolve_front_door`;
+    this no-arg wrapper is kept so external callers / tests can reference
+    ``verify._front_door_default`` and so the CLI-omission path resolves the
+    env/fallback default through a single seam.
+    """
+    return resolve_front_door()
+
+
+# Independence is NOT a self-attested boolean. It is proven two ways: (1) the
+# report exposes the FULL enumerated list of evidence sources this runner
+# consulted (``evidence_sources``) and DERIVES ``reads_deploy_report`` from it —
+# a deploy-report source would flip the flag and be visible; (2) the real
+# guarantee is the behavioural property test
+# (``test_hostile_deploy_report_cannot_move_the_verdict``): a hostile on-disk
+# deploy report claiming PASS/certified cannot move a FAIL verdict, because the
+# verdict is computed only from re-derived health. The tag prefix below is the
+# marker an evidence source would carry IF it were a deploy report.
+DEPLOY_REPORT_SOURCE_PREFIX = "deploy-report:"
+INDEPENDENCE_NOTE = (
+    "verdict re-derived from the cluster API + public front door; the deploy "
+    "runner's report is never read and its success claims never move this verdict"
+)
+
+DEFAULT_TOKEN_FILE = Path.home() / ".config" / "audittrace" / "tokens.json"
+
+
+# Every in-cluster app component that must have a Ready pod for the deploy to be
+# "up", matched by EXACT LABEL (never a pod-NAME substring — a rogue/old pod
+# whose name merely contains a token, e.g. ``redis-exporter`` or a stale
+# ``memory-server-<oldhash>``, must not be able to MASK a down component and
+# produce a false PASS in a certifier). App components carry
+# ``app.kubernetes.io/component``; Bitnami subcharts (postgresql/redis/rabbitmq)
+# carry ``app.kubernetes.io/name``.
+#
+# The LLM tier is deliberately NOT here: on the laptop target ``externalLLM`` is
+# ExternalName Services with NO backing pods (``llmStub`` is kind-only, default
+# off), so a pod-readiness check would false-FAIL. LLM health is instead
+# certified END-TO-END by the recall-e2e probe (a real model call). Enumerating
+# the in-cluster stub topology's three llm services is deferred (follow-up F3).
+COMPONENT_SELECTORS: dict[str, tuple[str, str]] = {
+    "memory-server": ("app.kubernetes.io/component", "memory-server"),
+    "chromadb": ("app.kubernetes.io/component", "chromadb"),
+    "keycloak": ("app.kubernetes.io/component", "keycloak"),
+    "minio": ("app.kubernetes.io/component", "minio"),
+    "otel-collector": ("app.kubernetes.io/component", "otel-collector"),
+    "postgresql": ("app.kubernetes.io/name", "postgresql"),
+    "redis": ("app.kubernetes.io/name", "redis"),
+    "rabbitmq": ("app.kubernetes.io/name", "rabbitmq"),
+}
+
+MEMORY_SERVER_COMPONENT = "memory-server"
+MEMORY_SERVER_CONTAINER = "memory-server"
+_COMPONENT_SELECTOR = f"app.kubernetes.io/component={MEMORY_SERVER_COMPONENT}"
+
+# The surge-safe chart intent (WS1). A live Deployment that drifts from this — a
+# stray ``kubectl patch`` or a reverted chart change — reintroduces the cascade
+# precondition and must FAIL the no-drift probe.
+EXPECTED_STRATEGY_TYPE = "RollingUpdate"
+EXPECTED_MAX_SURGE = "0"
+EXPECTED_MAX_UNAVAILABLE = "1"
+
+PASS = "PASS"
+FAIL = "FAIL"
+# A probe that was deliberately not evaluated -- health-version under
+# --skip-version-check (#412), or scan-dlq-depth when its telemetry field is
+# absent/"unknown" (spec 2026-08-23). Distinct from FAIL: it carries no
+# evidence about whether the underlying condition holds, so it must never move
+# the verdict either way. Distinct from PASS: it must never manufacture a
+# green result the runner did not actually check.
+SKIPPED = "SKIPPED"
+
+# The fixed advisory reason recorded on health-version when --skip-version-check
+# is set. A literal, not a computed string: the probe is skipped UNCONDITIONALLY
+# (it never even queries the front door) so the reason can never depend on an
+# outcome that was never observed.
+SKIP_VERSION_CHECK_REASON = "skipped (--skip-version-check)"
+
+# The per-status log level for ``_record`` (#412-nit). SKIPPED maps to WARNING,
+# not INFO or ERROR: an intentional skip is worth surfacing ("heads up, a check
+# was skipped") without alarming an ERROR-level dashboard/log query as if the
+# run had failed. Falsifiable: neuter this map back to a two-way PASS/else
+# ternary (SKIPPED collapses onto ERROR) and the SKIPPED-logs-at-WARNING test
+# goes RED. FAIL and any unrecognised status fall through the ``.get`` default
+# to ERROR — a real failure must stay loud.
+_LOG_LEVEL_BY_STATUS: dict[str, int] = {
+    PASS: logging.INFO,
+    SKIPPED: logging.WARNING,
+    FAIL: logging.ERROR,
+}
+
+# ── #384 WS2 mesh-health probe constants ─────────────────────────────────────
+# The mesh probes RE-DERIVE their signal from INDEPENDENT read-only cluster reads
+# gathered by THIS runner. Where the fault SIGNATURE (the #307 log patterns,
+# istiod readiness semantics, the log window) is already encoded as PURE, tested
+# logic in ``scripts.deploy.mesh`` (WS1), we REUSE that logic rather than
+# duplicate it — but never its deploy-side STATE / result. That keeps the
+# #307 signature single-sourced while the evidence stays independent.
+ISTIO_PROXY_CONTAINER = "istio-proxy"
+VAULT_AGENT_CONTAINER = "vault-agent"
+VAULT_INJECT_ANNOTATION = "vault.hashicorp.com/agent-inject"
+# entrypoint.sh trips VAULT_AGENT_REQUIRED and exits 79 when /vault/secrets/env is
+# absent (mode 4, fail-closed BY DESIGN). A 79 in lastState is the smoking gun.
+VAULT_FAILCLOSED_EXIT_CODE = 79
+# The cert-dead-mesh data-plane signature (mode 3): Envoy has no upstream cert/route.
+UNHEALTHY_UPSTREAM_SIGNATURES = ("no healthy upstream",)
+# Fail-closed ALLOWLIST of mesh-Finding evidence keys this runner may surface.
+# A denylist would be fail-OPEN: mesh diagnosers already attach RAW command/log
+# output under SEVERAL keys (``log_tail`` in evaluate_istiod_logs; ``error`` /
+# ``deployment_error`` / ``endpoints_error`` in MeshGate.diagnose_mesh), and a
+# future diagnoser could add another. So we keep ONLY these known-safe derived
+# keys and DROP every other key — the raw ones today AND any unknown future key —
+# by default, so a newly-added raw key can never leak
+# (CodeQL py/clear-text-logging-of-sensitive-data). Each allowed key is a derived
+# scalar or short status label, verified against every mesh diagnoser's evidence,
+# never raw log/command output:
+#   match_count       int   — count of smoking-gun log lines
+#   window            str   — the log-window label (e.g. "3m")
+#   ready_replicas    int   — istiod ready replica count
+#   desired_replicas  int   — istiod desired replica count
+#   endpoint_count    int   — istiod Service ready-endpoint count
+#   spec_replicas     scalar— istiod spec.replicas value (or None)
+#   ready_statuses    list  — node Ready booleans ("True"/"False"), no node names
+#   deployment        None  — the null sentinel (only ever None in a finding)
+ALLOWED_EVIDENCE_KEYS = frozenset(
+    {
+        "match_count",
+        "window",
+        "ready_replicas",
+        "desired_replicas",
+        "endpoint_count",
+        "spec_replicas",
+        "ready_statuses",
+        "deployment",
+    }
+)
+# Pods that have RUN TO COMPLETION — their istio-proxy sidecar terminates normally,
+# so a not-Ready proxy on them is NOT a cert failure (e.g. a finished Helm-hook
+# Job). They are exempt from the live-data-plane sidecar-readiness check.
+COMPLETED_PHASES = ("Succeeded", "Completed")
+# Single-source the istiod-log window from the WS1 gate (Q6: tied to the 150 s
+# startupProbe budget so a normal cold start is never mis-read as the fault).
+MESH_LOG_WINDOW = mesh.DEFAULT_LOG_WINDOW
+# Fail-closed bound (seconds) on every read-only kubectl/helm read: a wedged
+# ClusterIP (the #307 case) makes a read HANG, so it must time out into a
+# non-zero-exit sentinel rather than block run(). Single-sourced from the WS1 gate.
+PROBE_TIMEOUT = mesh.DEFAULT_PROBE_TIMEOUT
+
+# Client-side HTTP timeout (seconds) for the FAST front-door probes (health,
+# interactions list, tool-calls) — matches ``_http_request``'s own default so
+# there is exactly one number to change if it ever needs to move. These probes
+# do not invoke the LLM, so a short bound is appropriate and must NOT widen
+# (v1.17.0 SPEC: "calibrate probe only" — scope is the chat probe alone).
+FAST_PROBE_TIMEOUT = 30
+
+# Client-side HTTP timeout (seconds) for the recall-e2e CHAT probe
+# (``POST /v1/chat/completions``) ONLY. Calibrated, not arbitrary: the v1.17.0
+# deploy-verify FAIL recorded a real backend SUCCESS at 30.577s against the old
+# fixed 30s budget (interaction 806, Tempo trace 3c826281...), which is why
+# this became a dedicated, configurable bound in the first place. It was then
+# set to 120s on 2026-07-20 (v1.10.0), ~2x the then-worst-observed 59s for
+# max_tokens=2000 on a REASONING chat model.
+#
+# That calibration went stale with the permanent swap to the dense
+# **Qwen3.8-27B + MTP** chat model (`project_chat_model_q4_27b`): its
+# recall-tool-loop latency on the reference laptop runs ~150-181s, over the
+# 120s bound. The v1.25.0 deploy-verify run (2026-08-31) FAILed the
+# recall-e2e probe on exactly this — the backend audit trail proves the turn
+# SUCCEEDED end-to-end (interaction id=3823, duration_ms=181118, 3 recorded
+# tool calls), it just overran the stale client-side bound. 400s is ~2x that
+# worst-observed 181s (362), rounded up for run-to-run variance headroom —
+# the SAME "~2x worst observed" principle as the original 120s, NOT a number
+# chosen merely to make the FAIL go away. A response past 400s is still a
+# genuine FAIL worth surfacing, not something this bound papers over.
+# Configurable via ``--e2e-timeout`` / the ``AUDITTRACE_VERIFY_E2E_TIMEOUT``
+# env var so a different target/model can be tuned without a code change
+# (portability invariant).
+E2E_CHAT_TIMEOUT_DEFAULT = 400
+E2E_TIMEOUT_ENV_VAR = "AUDITTRACE_VERIFY_E2E_TIMEOUT"
+
+# The scan-dlq-depth probe's FAIL threshold (spec 2026-08-23, closes the
+# SCAN-URI-BUG loop gap). A small default: normal steady-state depth for the
+# janitor's scan DLQ is near-zero (a handful of genuinely-poison objects at
+# most), so anything above a low single-to-double-digit count is already a
+# flood signature, not noise. Deliberately NOT zero — a transient blip (one
+# object briefly dead-lettered mid-retry) must not trip certification; only a
+# sustained flood should. Configurable via ``--scan-dlq-threshold`` so a
+# different target/workload can recalibrate without a code change (portability
+# invariant), same posture as E2E_CHAT_TIMEOUT_DEFAULT above.
+SCAN_DLQ_DEFAULT_THRESHOLD = 10
+
+# The eleven probe identifiers — fixed order (determinism contract). The
+# four mesh-health probes are APPENDED so the core five keep their indices;
+# scan-dlq-depth is APPENDED after that (spec 2026-08-23); first-party-
+# images-match-published (D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-
+# stale-override-guard.md) is APPENDED last for the same reason — every
+# earlier index stays stable.
+PROBES = (
+    "pods-ready",
+    "digest-matches-published",
+    "no-drift",
+    "health-version",
+    "recall-e2e",
+    "istiod-api-reachable",
+    "sidecars-have-certs",
+    "vault-secret-rendered",
+    "no-unhealthy-upstream",
+    "scan-dlq-depth",
+    "first-party-images-match-published",
+)
+
+# The BFF Deployment this probe reads — mirrors the chart's own naming
+# (``templates/console/deployment-bff.yaml``) and the deploy runner's
+# ``_CONSOLE_COMPONENT_SELECTORS["bff"]`` selector/container pair
+# (``scripts/deploy/runner/config.py``), duplicated here rather than
+# imported — this runner NEVER imports from the deploy runner package
+# (independence contract: two separately-derived readings of the same
+# cluster, not one shared code path).
+BFF_DEPLOYMENT_SUFFIX = "librechat-bff"
+BFF_CONTAINER = "bff"
+BFF_COMPONENT_SELECTOR = "app.kubernetes.io/component=librechat-bff"
+
+
+# ── external-effect indirections (monkeypatched in tests) ────────────────────
+
+
+def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+    """Run a read-only kubectl/helm command. Sole subprocess entry point.
+
+    Fail-closed like :meth:`scripts.deploy.mesh.MeshGate._probe`: a HUNG or MISSING
+    ``kubectl`` must never hang or crash :meth:`VerifyRunner.run`. A wedged
+    ClusterIP — the exact #307 case the mesh probes target — is precisely when a
+    kube-API read HANGS, so every read is bounded by ``PROBE_TIMEOUT``; an
+    ``OSError`` (binary not on PATH) or a ``subprocess.SubprocessError``
+    (``TimeoutExpired``) is mapped to the SAME non-zero-exit ``CompletedProcess``
+    sentinel a genuine non-zero exit already produces — so every probe that reads
+    through this seam degrades to a clean FAIL, never a hang or an uncaught crash.
+    """
+    logger.info("exec: %s", " ".join(cmd))
+    try:
+        return subprocess.run(  # noqa: S603 - fixed argv lists, no shell
+            cmd, capture_output=True, text=True, check=False, timeout=PROBE_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.error("read-only command failed (fail-closed): %s (%s)", cmd, exc)
+        return subprocess.CompletedProcess(
+            cmd, returncode=1, stdout="", stderr=str(exc)
+        )
+
+
+def ssl_context(insecure: bool) -> ssl.SSLContext | None:
+    """Return an SSL context for front-door requests.
+
+    Default (``insecure=False``) returns ``None`` → urllib uses the STRICT
+    system trust store (certificate + hostname verified). ``insecure=True`` is an
+    EXPLICIT dev/self-signed opt-in (``--insecure``) that disables verification —
+    the laptop front door presents a self-signed cert, so live validation there
+    needs this (the equivalent of ``curl -k``). Nothing is weakened by default.
+    """
+    if not insecure:
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _http_request(  # pragma: no cover - thin urllib egress boundary; monkeypatched in tests
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    body: bytes | None = None,
+    timeout: int = FAST_PROBE_TIMEOUT,
+    context: ssl.SSLContext | None = None,
+) -> tuple[int, dict[str, str], bytes]:
+    """Perform an HTTP request; return ``(status, response_headers, body)``.
+
+    The single network-egress point (front door). Monkeypatched in tests so no
+    real socket is opened. A transport failure returns status ``0`` so a probe
+    reads it as a hard failure rather than an exception. ``context`` (when set)
+    is the unverified SSL context selected by ``--insecure``.
+
+    Real ``urlopen`` RAISES the WHOLE transport-error class here, not just
+    ``URLError``: a READ timeout surfaces as a bare ``TimeoutError`` (==
+    ``socket.timeout``, an ``OSError``) that is NOT a ``URLError``, so an
+    ``except (HTTPError, URLError)`` would let it escape and crash the probe with
+    no verdict (the WS5 fault-injection finding; same class as the WS2 CodeQL
+    urllib lesson). Catching ``OSError`` after ``HTTPError`` maps the ENTIRE class
+    — ``URLError``, ``TimeoutError``/``socket.timeout``, ``ConnectionError`` — to
+    the same clean status-``0`` sentinel in ONE place, so no probe can ever see an
+    uncaught transport exception.
+    """
+    request = urllib.request.Request(
+        url, data=body, headers=headers or {}, method=method
+    )
+    try:
+        with urllib.request.urlopen(  # noqa: S310 - https front door
+            request, timeout=timeout, context=context
+        ) as response:
+            status = response.status
+            resp_headers = {k.lower(): v for k, v in response.headers.items()}
+            payload = response.read()
+        return status, resp_headers, payload
+    except HTTPError as exc:
+        return exc.code, {}, exc.read()
+    except OSError:
+        # URLError (an OSError), a bare TimeoutError/socket.timeout on a read
+        # timeout, or any ConnectionError — one sentinel for the whole class.
+        return 0, {}, b""
+
+
+def _now_iso() -> str:
+    """UTC ISO-8601 timestamp — EVIDENCE ONLY, never read back into logic."""
+    return datetime.now(UTC).isoformat()
+
+
+def load_token(token_file: Path) -> str | None:
+    """Resolve a scoped JWT: ``AUDITTRACE_TOKEN`` env first, then the token file.
+
+    The token is used only as a Bearer header and is NEVER logged or written to
+    the report. Returns ``None`` when no token is available.
+    """
+    env_token = os.environ.get("AUDITTRACE_TOKEN")
+    if env_token:
+        return env_token
+    try:
+        data = json.loads(Path(token_file).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    token = data.get("access_token")
+    return token if isinstance(token, str) and token else None
+
+
+# ── config + records ─────────────────────────────────────────────────────────
+
+
+def _normalize_front_door(url: str) -> str:
+    """Validate + normalise the front-door base URL (exact scheme/host check).
+
+    Uses :func:`urllib.parse.urlparse` — NOT substring matching — so a hostile
+    URL like ``https://evil/?x=audittrace`` cannot slip through a naive
+    ``"audittrace" in url`` test (the CodeQL ``py/incomplete-url-substring``
+    class). Rejects anything that is not an http/https URL with a hostname.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"front-door must be an http(s) URL with a host: {url!r}")
+    return url.rstrip("/")
+
+
+@dataclass(frozen=True)
+class VerifyConfig:
+    target_version: str
+    namespace: str = "audittrace"
+    release: str = "audittrace"
+    registry: str = "hub"
+    front_door: str | None = None
+    token_file: Path = DEFAULT_TOKEN_FILE
+    model: str = "audittrace-chat"
+    interactions_limit: int = 5
+    # STRICT TLS by default; --insecure is an explicit dev/self-signed opt-in.
+    insecure: bool = False
+    out_dir: Path = Path(__file__).resolve().parents[2] / "scripts" / "deploy" / "runs"
+    # Client-side timeout (seconds) for the recall-e2e CHAT probe ONLY — see
+    # E2E_CHAT_TIMEOUT_DEFAULT for the calibration rationale. Every other probe
+    # (fast HTTP + kubectl/helm) is untouched by this field.
+    e2e_timeout: int = E2E_CHAT_TIMEOUT_DEFAULT
+    # STRICT by default: health-version gates normally. --skip-version-check
+    # (#412) is an explicit opt-in for a dev-tagged build (image tag isn't a
+    # release vX.Y.Z) that verifies on digest-matches-published alone — see
+    # SKIP_VERSION_CHECK_REASON. Additive, backward-compatible: default False
+    # leaves every existing caller's behaviour byte-for-byte unchanged.
+    skip_version_check: bool = False
+    # The scan-dlq-depth probe's FAIL threshold — see SCAN_DLQ_DEFAULT_THRESHOLD
+    # for the calibration rationale. Additive: default leaves every existing
+    # caller's behaviour byte-for-byte unchanged.
+    scan_dlq_threshold: int = SCAN_DLQ_DEFAULT_THRESHOLD
+
+    def __post_init__(self) -> None:
+        # Resolve None → the environment-dynamic default (env var > fallback).
+        # When constructed via config_from_args the value is already resolved,
+        # but direct construction (tests) may pass None — this ensures a real
+        # URL is always present without callers having to remember to resolve.
+        if self.front_door is None:
+            object.__setattr__(self, "front_door", resolve_front_door())
+
+    @property
+    def deployment(self) -> str:
+        return f"{self.release}-memory-server"
+
+    @property
+    def image_tag(self) -> str:
+        """The IMAGE tag / version to resolve + compare (git ``v`` prefix stripped)."""
+        return normalize_version(self.target_version)
+
+
+@dataclass
+class ProbeResult:
+    name: str
+    status: str  # PASS | FAIL | SKIPPED
+    detail: str = ""
+    evidence: dict[str, Any] = field(default_factory=dict)
+    checked_at: str = ""
+
+    @property
+    def passed(self) -> bool:
+        return self.status == PASS
+
+
+# ── pure helpers (unit-tested directly) ──────────────────────────────────────
+
+
+def pod_labels(pod: dict[str, Any]) -> dict[str, str]:
+    labels = pod.get("metadata", {}).get("labels", {})
+    return labels if isinstance(labels, dict) else {}
+
+
+def pod_ready(pod: dict[str, Any]) -> bool:
+    """True iff the pod's ``Ready`` condition is ``True``."""
+    for cond in pod.get("status", {}).get("conditions", []):
+        if cond.get("type") == "Ready":
+            return cond.get("status") == "True"
+    return False
+
+
+def component_readiness(
+    pods: list[dict[str, Any]], selectors: dict[str, tuple[str, str]]
+) -> dict[str, dict[str, int]]:
+    """Map each expected component to ``{"pods": n, "ready": r}`` by EXACT LABEL.
+
+    A pod matches a component only when it carries the component's label
+    key=value EXACTLY. A pod whose NAME merely contains the component token but
+    lacks the label (a metrics exporter, a stale ReplicaSet pod of a different
+    component) does NOT match — so a rogue Ready pod cannot mask a down
+    component. This is the certifier-correctness fix over name-substring
+    matching.
+    """
+    result: dict[str, dict[str, int]] = {}
+    for comp, (key, value) in selectors.items():
+        matched = [p for p in pods if pod_labels(p).get(key) == value]
+        ready = sum(1 for p in matched if pod_ready(p))
+        result[comp] = {"pods": len(matched), "ready": ready}
+    return result
+
+
+def unready_components(readiness: dict[str, dict[str, int]]) -> list[str]:
+    """Components with no Ready pod — missing OR present-but-not-Ready both fail."""
+    return [comp for comp, st in readiness.items() if st["ready"] < 1]
+
+
+def strategy_matches_intent(strategy: dict[str, Any]) -> tuple[bool, str]:
+    """Return ``(ok, reason)`` for the surge-safe chart intent.
+
+    ``maxSurge`` / ``maxUnavailable`` may render as int or string ("0" vs 0, or
+    "25%") — normalised to ``str`` for comparison so both forms agree.
+    """
+    stype = strategy.get("type")
+    if stype != EXPECTED_STRATEGY_TYPE:
+        return False, f"strategy.type={stype!r} (expected {EXPECTED_STRATEGY_TYPE!r})"
+    rolling = strategy.get("rollingUpdate") or {}
+    surge = str(rolling.get("maxSurge"))
+    unavail = str(rolling.get("maxUnavailable"))
+    if surge != EXPECTED_MAX_SURGE:
+        return (
+            False,
+            f"maxSurge={surge} (expected {EXPECTED_MAX_SURGE}) — surge risk reintroduced",
+        )
+    if unavail != EXPECTED_MAX_UNAVAILABLE:
+        return False, f"maxUnavailable={unavail} (expected {EXPECTED_MAX_UNAVAILABLE})"
+    return True, f"surge-safe: maxSurge={surge}, maxUnavailable={unavail}"
+
+
+def is_recall_tool(tool_name: str) -> bool:
+    """A recorded tool call is a recall when its name starts with ``recall``."""
+    return tool_name.startswith("recall")
+
+
+def _parse_json(body: bytes) -> Any:
+    try:
+        return json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+# ── #384 WS2 mesh-health pure helpers (unit-tested directly, no I/O) ──────────
+
+
+def pod_name(pod: dict[str, Any]) -> str:
+    name = pod.get("metadata", {}).get("name")
+    return name if isinstance(name, str) and name else "<unknown>"
+
+
+def pod_annotations(pod: dict[str, Any]) -> dict[str, str]:
+    ann = pod.get("metadata", {}).get("annotations", {})
+    return ann if isinstance(ann, dict) else {}
+
+
+def _all_container_statuses(pod: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every reported container status — regular AND init/native-sidecar.
+
+    Istio's ``istio-proxy`` may be a native sidecar (an initContainer with
+    ``restartPolicy: Always``), so its readiness surfaces in
+    ``initContainerStatuses``; the app's exit-79 surfaces in ``containerStatuses``.
+    Scanning both makes the readiness / exit-code helpers robust to either shape.
+    """
+    status = pod.get("status", {})
+    if not isinstance(status, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for key in ("containerStatuses", "initContainerStatuses"):
+        value = status.get(key)
+        if isinstance(value, list):
+            out.extend(c for c in value if isinstance(c, dict))
+    return out
+
+
+def pod_container_names(pod: dict[str, Any]) -> set[str]:
+    """All container names known for the pod (spec + status, regular + init)."""
+    names = {c.get("name") for c in _all_container_statuses(pod)}
+    spec = pod.get("spec", {})
+    if isinstance(spec, dict):
+        for key in ("containers", "initContainers"):
+            for container in spec.get(key, []) or []:
+                if isinstance(container, dict):
+                    names.add(container.get("name"))
+    return {n for n in names if isinstance(n, str)}
+
+
+def pod_has_container(pod: dict[str, Any], name: str) -> bool:
+    return name in pod_container_names(pod)
+
+
+def container_is_ready(pod: dict[str, Any], name: str) -> bool:
+    """True iff a container status named ``name`` reports ``ready: true``.
+
+    A container that is ABSENT (never injected) or present-but-not-ready both
+    return False — the fail-closed reading a certifier needs.
+    """
+    for cs in _all_container_statuses(pod):
+        if cs.get("name") == name:
+            return cs.get("ready") is True
+    return False
+
+
+def containers_with_exit_code(pod: dict[str, Any], code: int) -> list[str]:
+    """Names of containers whose ``lastState.terminated.exitCode`` == ``code``."""
+    out: list[str] = []
+    for cs in _all_container_statuses(pod):
+        terminated = (cs.get("lastState", {}) or {}).get("terminated", {}) or {}
+        if terminated.get("exitCode") == code:
+            out.append(str(cs.get("name")))
+    return out
+
+
+def crashlooping_containers(pod: dict[str, Any]) -> list[str]:
+    """Names of containers currently in ``CrashLoopBackOff``."""
+    out: list[str] = []
+    for cs in _all_container_statuses(pod):
+        waiting = (cs.get("state", {}) or {}).get("waiting", {}) or {}
+        if waiting.get("reason") == "CrashLoopBackOff":
+            out.append(str(cs.get("name")))
+    return out
+
+
+def sidecar_cert_findings(pods: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Istio-injected pods whose data plane is not certified.
+
+    A pod is checked only if it carries an ``istio-proxy`` container. A pod that has
+    RUN TO COMPLETION (``Succeeded``/``Completed`` — e.g. a finished Helm-hook Job)
+    is exempt: its sidecar terminates normally, which is not a cert failure. Any
+    remaining injected pod fails when its sidecar is not Ready (no workload cert) OR
+    it has not reached ``Running`` (wedged in Init — the #307 cert-starved
+    signature). Pods with no sidecar are not part of the data plane and are skipped.
+    """
+    findings: list[dict[str, Any]] = []
+    for pod in pods:
+        if not pod_has_container(pod, ISTIO_PROXY_CONTAINER):
+            continue
+        status = pod.get("status")
+        status = status if isinstance(status, dict) else {}
+        phase = status.get("phase")
+        if phase in COMPLETED_PHASES:
+            # A completed pod's terminated sidecar is not a cert failure.
+            continue
+        reasons: list[str] = []
+        if not container_is_ready(pod, ISTIO_PROXY_CONTAINER):
+            reasons.append("istio-proxy sidecar not Ready (no workload cert)")
+        if phase != "Running":
+            reasons.append(f"pod phase={phase!r} (wedged Init / not Running)")
+        if reasons:
+            findings.append({"pod": pod_name(pod), "phase": phase, "reasons": reasons})
+    return findings
+
+
+def vault_render_findings(pods: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Vault-annotated pods whose secret was not rendered fail-closed.
+
+    For each pod carrying the vault inject annotation: the ``vault-agent`` sidecar
+    must be Ready (an annotated pod with NO ready vault-agent is the mode-4a
+    silent-non-injection signature), no container may have exited 79
+    (``/vault/secrets/env`` absent), and no container may be in CrashLoopBackOff.
+    Evidence is container status only — secret VALUES are never read or emitted.
+
+    Named ``vault_render_findings`` (not ``*_secret_*``): it returns render/readiness
+    findings (pod names + status reasons), holding NO secret values. The former
+    ``vault_secret_findings`` name was a misnomer that also tripped CodeQL's
+    name-based clear-text-logging classifier when its output reached a log line
+    (#384 WS2) — a false positive the accurate name removes.
+    """
+    findings: list[dict[str, Any]] = []
+    for pod in pods:
+        if pod_annotations(pod).get(VAULT_INJECT_ANNOTATION) != "true":
+            continue
+        reasons: list[str] = []
+        if not container_is_ready(pod, VAULT_AGENT_CONTAINER):
+            reasons.append(
+                "vault-agent sidecar missing or not Ready "
+                "(secret not rendered / silent non-injection)"
+            )
+        exited = containers_with_exit_code(pod, VAULT_FAILCLOSED_EXIT_CODE)
+        if exited:
+            reasons.append(
+                f"container(s) {exited} exited {VAULT_FAILCLOSED_EXIT_CODE} "
+                "(/vault/secrets/env absent)"
+            )
+        crashing = crashlooping_containers(pod)
+        if crashing:
+            reasons.append(f"container(s) {crashing} in CrashLoopBackOff")
+        if reasons:
+            findings.append({"pod": pod_name(pod), "reasons": reasons})
+    return findings
+
+
+def count_unhealthy_upstream(logs: str) -> int:
+    """Count log LINES carrying a cert-dead-mesh "no healthy upstream" signature."""
+    return sum(
+        1
+        for line in logs.splitlines()
+        if any(sig in line for sig in UNHEALTHY_UPSTREAM_SIGNATURES)
+    )
+
+
+def sanitized_finding(finding: mesh.Finding) -> dict[str, Any]:
+    """A mesh :class:`~scripts.deploy.mesh.Finding` as a dict, safe to put in the report.
+
+    FAIL-CLOSED: keeps ``signal`` + ``detail`` (the diagnoser's own derived status
+    strings) and, for evidence, ONLY keys in :data:`ALLOWED_EVIDENCE_KEYS` — every
+    other key is DROPPED. mesh diagnosers attach RAW command/log output under keys
+    like ``log_tail`` / ``error`` / ``deployment_error`` / ``endpoints_error``;
+    allowlisting (rather than denylisting those) means a NEW raw key added to any
+    diagnoser is dropped by default, never leaked by default
+    (CodeQL py/clear-text-logging-of-sensitive-data).
+    """
+    raw = finding.as_dict()
+    evidence = {
+        key: value
+        for key, value in (raw.get("evidence") or {}).items()
+        if key in ALLOWED_EVIDENCE_KEYS
+    }
+    return {"signal": raw["signal"], "detail": raw["detail"], "evidence": evidence}
+
+
+# ── the runner ────────────────────────────────────────────────────────────────
+
+
+class VerifyRunner:
+    """Runs the ten deploy-health probes and emits an independent PASS/FAIL verdict."""
+
+    def __init__(self, cfg: VerifyConfig) -> None:
+        self.cfg = cfg
+        self.results: list[ProbeResult] = []
+
+    # -- independence, DERIVED (not self-attested) --
+
+    def evidence_sources(self) -> list[str]:
+        """The full, enumerated list of evidence this runner consults.
+
+        Exposed in the report so a reader sees EXACTLY what the verdict stands on.
+        None of these is a deploy-runner report — the deployer's report is not an
+        input. If a deploy-report source were ever added it would appear here and
+        flip :attr:`reads_deploy_report`. This transparency is secondary; the real
+        guarantee is behavioural (a hostile on-disk deploy report cannot move the
+        verdict — see the property test).
+        """
+        return [
+            "cluster-api:kubectl:get-pods",
+            "cluster-api:kubectl:get-deployment",
+            "cluster-api:kubectl:memory-server-pod-imageID",
+            "cluster-api:helm:status",
+            f"registry:{self.cfg.registry}:published-digest",
+            f"front-door:{self.cfg.front_door}",
+            # ── #384 WS2 mesh-health evidence (independent cluster reads) ──
+            "cluster-api:kubectl:istiod-logs",
+            "cluster-api:kubectl:istiod-deployment",
+            "cluster-api:kubectl:istiod-endpoints",
+            "cluster-api:kubectl:memory-server-logs",
+            # ── D5 (spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-
+            # guard.md) ──
+            "cluster-api:kubectl:bff-deployment",
+            "cluster-api:kubectl:bff-pod-imageID",
+            f"registry:{self.cfg.registry}:bff-published-digest",
+        ]
+
+    @property
+    def reads_deploy_report(self) -> bool:
+        """DERIVED from :meth:`evidence_sources`: True iff any source is a deploy
+        report. Always False here because no source is tagged as one — but it is
+        computed, not asserted, so it cannot silently lie about a source that was
+        added."""
+        return any(
+            s.startswith(DEPLOY_REPORT_SOURCE_PREFIX) for s in self.evidence_sources()
+        )
+
+    def _record(
+        self, name: str, status: str, detail: str, evidence: dict[str, Any]
+    ) -> ProbeResult:
+        rec = ProbeResult(
+            name=name,
+            status=status,
+            detail=detail,
+            evidence=evidence,
+            checked_at=_now_iso(),
+        )
+        self.results.append(rec)
+        level = _LOG_LEVEL_BY_STATUS.get(status, logging.ERROR)
+        logger.log(level, "[%s] %s — %s", name, status, detail)
+        return rec
+
+    # -- read-only cluster reads --
+
+    def _pods_json(self) -> list[dict[str, Any]]:
+        proc = _run(["kubectl", "get", "pods", "-n", self.cfg.namespace, "-o", "json"])
+        if proc.returncode != 0:
+            return []
+        parsed = _parse_json(proc.stdout.encode())
+        if not isinstance(parsed, dict):
+            return []
+        items = parsed.get("items")
+        return items if isinstance(items, list) else []
+
+    def _live_memory_server_digest(self) -> str | None:
+        jsonpath = (
+            '{.items[*].status.containerStatuses[?(@.name=="'
+            + MEMORY_SERVER_CONTAINER
+            + '")].imageID}'
+        )
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "pods",
+                "-l",
+                _COMPONENT_SELECTOR,
+                "-n",
+                self.cfg.namespace,
+                "-o",
+                f"jsonpath={jsonpath}",
+            ]
+        )
+        if proc.returncode != 0:
+            return None
+        for token in proc.stdout.split():
+            digest = extract_digest(token)
+            if digest:
+                return digest
+        return None
+
+    def _helm_status(self) -> str | None:
+        proc = _run(
+            ["helm", "status", self.cfg.release, "-n", self.cfg.namespace, "-o", "json"]
+        )
+        if proc.returncode != 0:
+            return None
+        parsed = _parse_json(proc.stdout.encode())
+        if not isinstance(parsed, dict):
+            return None
+        return parsed.get("info", {}).get("status")
+
+    def _deployment_strategy(self) -> dict[str, Any] | None:
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "deployment",
+                self.cfg.deployment,
+                "-n",
+                self.cfg.namespace,
+                "-o",
+                "json",
+            ]
+        )
+        if proc.returncode != 0:
+            return None
+        parsed = _parse_json(proc.stdout.encode())
+        if not isinstance(parsed, dict):
+            return None
+        strategy = parsed.get("spec", {}).get("strategy")
+        return strategy if isinstance(strategy, dict) else None
+
+    # -- #384 WS2 mesh-health cluster reads (independent, read-only) --
+
+    def _istiod_logs(self) -> str | None:
+        """istiod log window. ``None`` on a non-zero exit → fail-closed FAIL."""
+        proc = _run(
+            [
+                "kubectl",
+                "logs",
+                "-n",
+                mesh.ISTIO_NAMESPACE,
+                "-l",
+                mesh.ISTIOD_LABEL,
+                f"--since={MESH_LOG_WINDOW}",
+            ]
+        )
+        return proc.stdout if proc.returncode == 0 else None
+
+    def _istiod_deployment(self) -> dict[str, Any] | None:
+        """Parsed istiod Deployment JSON. ``None`` when unreadable (fail-closed)."""
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "deployment",
+                mesh.ISTIOD_DEPLOYMENT,
+                "-n",
+                mesh.ISTIO_NAMESPACE,
+                "-o",
+                "json",
+            ]
+        )
+        if proc.returncode != 0:
+            return None
+        parsed = _parse_json(proc.stdout.encode())
+        return parsed if isinstance(parsed, dict) else None
+
+    def _istiod_endpoint_ips(self) -> str | None:
+        """Space-joined istiod Service endpoint IPs. ``None`` on error (fail-closed)."""
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "endpoints",
+                mesh.ISTIOD_DEPLOYMENT,
+                "-n",
+                mesh.ISTIO_NAMESPACE,
+                "-o",
+                "jsonpath={.subsets[*].addresses[*].ip}",
+            ]
+        )
+        return proc.stdout if proc.returncode == 0 else None
+
+    def _memory_server_logs(self) -> str | None:
+        """memory-server log window. ``None`` on a non-zero exit → fail-closed FAIL."""
+        proc = _run(
+            [
+                "kubectl",
+                "logs",
+                "-n",
+                self.cfg.namespace,
+                "-l",
+                _COMPONENT_SELECTOR,
+                f"--since={MESH_LOG_WINDOW}",
+            ]
+        )
+        return proc.stdout if proc.returncode == 0 else None
+
+    # -- front-door reads (single egress seam: _http_request) --
+
+    def _front_get(self, path: str, token: str | None) -> tuple[int, Any]:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        status, _h, body = _http_request(
+            "GET",
+            f"{self.cfg.front_door}{path}",
+            headers,
+            context=ssl_context(self.cfg.insecure),
+        )
+        return status, _parse_json(body)
+
+    def _front_post(
+        self,
+        path: str,
+        token: str | None,
+        payload: dict[str, Any],
+        timeout: int = FAST_PROBE_TIMEOUT,
+    ) -> tuple[int, Any]:
+        """POST to the front door. ``timeout`` defaults to the FAST bound.
+
+        Only the recall-e2e chat probe overrides it (to
+        :attr:`VerifyConfig.e2e_timeout`) — every other caller of
+        ``_front_post``/``_front_get`` keeps the short, unwidened fast-probe
+        timeout (SPEC: "calibrate probe only").
+        """
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        body = json.dumps(payload).encode()
+        status, _h, resp = _http_request(
+            "POST",
+            f"{self.cfg.front_door}{path}",
+            headers,
+            body,
+            timeout=timeout,
+            context=ssl_context(self.cfg.insecure),
+        )
+        return status, _parse_json(resp)
+
+    # -- probe 1: pods-ready --
+
+    def probe_pods_ready(self) -> ProbeResult:
+        pods = self._pods_json()
+        if not pods:
+            return self._record(
+                PROBES[0],
+                FAIL,
+                "no pods returned from the cluster API (unreachable or namespace empty)",
+                {"namespace": self.cfg.namespace, "pod_count": 0},
+            )
+        readiness = component_readiness(pods, COMPONENT_SELECTORS)
+        failing = unready_components(readiness)
+        if failing:
+            return self._record(
+                PROBES[0],
+                FAIL,
+                f"components with no Ready pod (matched by exact label): {', '.join(failing)}",
+                {"readiness": readiness, "unready": failing},
+            )
+        return self._record(
+            PROBES[0],
+            PASS,
+            f"all {len(COMPONENT_SELECTORS)} expected components have a Ready pod (exact-label match)",
+            {"readiness": readiness},
+        )
+
+    # -- probe 2: digest-matches-published --
+
+    def probe_digest_matches_published(self) -> ProbeResult:
+        try:
+            ref = registry.resolve(self.cfg.image_tag, self.cfg.registry)
+        except registry.DigestResolutionError as exc:
+            return self._record(
+                PROBES[1],
+                FAIL,
+                f"could not resolve the published digest for {self.cfg.image_tag}: {exc}",
+                {"error": str(exc), "registry": self.cfg.registry},
+            )
+        if not ref.digest:
+            return self._record(
+                PROBES[1],
+                FAIL,
+                f"registry {self.cfg.registry} returned no digest — cannot certify the "
+                "tracks-published-digest invariant",
+                {"published": ref.as_dict()},
+            )
+        live = self._live_memory_server_digest()
+        if live is None:
+            return self._record(
+                PROBES[1],
+                FAIL,
+                "no live memory-server pod digest readable from the cluster",
+                {"published_digest": ref.digest, "live_digest": None},
+            )
+        if live != ref.digest:
+            return self._record(
+                PROBES[1],
+                FAIL,
+                "live digest does NOT match the published digest (running an unpublished image)",
+                {"published_digest": ref.digest, "live_digest": live},
+            )
+        return self._record(
+            PROBES[1],
+            PASS,
+            "live memory-server digest matches the published digest",
+            {"published_digest": ref.digest, "live_digest": live},
+        )
+
+    # -- probe 3: no-drift --
+
+    def probe_no_drift(self) -> ProbeResult:
+        status = self._helm_status()
+        strategy = self._deployment_strategy()
+        if status != "deployed":
+            return self._record(
+                PROBES[2],
+                FAIL,
+                f"helm release status={status!r} (expected 'deployed')",
+                {"helm_status": status, "strategy": strategy},
+            )
+        if strategy is None:
+            return self._record(
+                PROBES[2],
+                FAIL,
+                "could not read the live Deployment strategy",
+                {"helm_status": status, "strategy": None},
+            )
+        ok, reason = strategy_matches_intent(strategy)
+        if not ok:
+            return self._record(
+                PROBES[2],
+                FAIL,
+                f"chart↔cluster drift — {reason}",
+                {"helm_status": status, "strategy": strategy},
+            )
+        return self._record(
+            PROBES[2],
+            PASS,
+            f"no drift: release deployed and {reason}",
+            {"helm_status": status, "strategy": strategy},
+        )
+
+    # -- probe 4: health-version --
+
+    def probe_health_version(self) -> ProbeResult:
+        if self.cfg.skip_version_check:
+            # Unconditional skip -- the probe never even queries the front door,
+            # so the reported reason is a fixed literal, never an observed
+            # outcome (#412). digest-matches-published (probe 2) and every
+            # other probe are untouched and still gate normally.
+            return self._record(
+                PROBES[3],
+                SKIPPED,
+                SKIP_VERSION_CHECK_REASON,
+                {"target_version": self.cfg.image_tag},
+            )
+        status_code, body = self._front_get("/health", token=None)
+        if status_code != 200 or not isinstance(body, dict):
+            return self._record(
+                PROBES[3],
+                FAIL,
+                f"front-door /health returned HTTP {status_code} (expected 200 + JSON)",
+                {"http_status": status_code},
+            )
+        health_status = body.get("status")
+        version = body.get("version")
+        want = self.cfg.image_tag
+        if health_status != "ok":
+            return self._record(
+                PROBES[3],
+                FAIL,
+                f"/health status={health_status!r} (expected 'ok')",
+                {"health": body},
+            )
+        if normalize_version(str(version)) != want:
+            return self._record(
+                PROBES[3],
+                FAIL,
+                f"/health version={version!r} does NOT match target {want!r}",
+                {"reported_version": version, "target_version": want},
+            )
+        return self._record(
+            PROBES[3],
+            PASS,
+            f"/health ok and reports the target version {want}",
+            {"reported_version": version, "target_version": want},
+        )
+
+    # -- probe 5: recall-e2e (front door, scoped JWT, real model) --
+
+    def probe_recall_e2e(self) -> ProbeResult:
+        token = load_token(self.cfg.token_file)
+        if not token:
+            return self._record(
+                PROBES[4],
+                FAIL,
+                "no scoped JWT available — the mandatory recall E2E cannot run "
+                "(a deploy that cannot be exercised through the audit plane is not certified)",
+                {"token_source": None},
+            )
+        chat_payload = {
+            "model": self.cfg.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Use your memory tools to recall what governs memory_mode in "
+                        "this project. Call recall_semantic before answering."
+                    ),
+                }
+            ],
+        }
+        # The chat probe alone gets the calibrated (configurable) timeout — every
+        # other request in this probe (interactions list, tool-calls) and every
+        # other probe keeps the FAST_PROBE_TIMEOUT default (SPEC: "calibrate
+        # probe only").
+        chat_status, chat_body = self._front_post(
+            "/v1/chat/completions", token, chat_payload, timeout=self.cfg.e2e_timeout
+        )
+        if (
+            chat_status != 200
+            or not isinstance(chat_body, dict)
+            or not chat_body.get("choices")
+        ):
+            return self._record(
+                PROBES[4],
+                FAIL,
+                f"front-door /v1/chat/completions returned HTTP {chat_status} without a completion",
+                {"http_status": chat_status, "e2e_timeout_s": self.cfg.e2e_timeout},
+            )
+        list_status, list_body = self._front_get(
+            f"/interactions?limit={self.cfg.interactions_limit}", token
+        )
+        interactions = (
+            list_body.get("interactions") if isinstance(list_body, dict) else None
+        )
+        if list_status != 200 or not interactions:
+            return self._record(
+                PROBES[4],
+                FAIL,
+                f"audit plane returned no interaction after the chat call (HTTP {list_status})",
+                {"http_status": list_status},
+            )
+        interaction_id = interactions[0].get("id")
+        tc_status, tc_body = self._front_get(
+            f"/interactions/{interaction_id}/tool-calls", token
+        )
+        tool_calls = tc_body.get("tool_calls") if isinstance(tc_body, dict) else None
+        if tc_status != 200 or tool_calls is None:
+            return self._record(
+                PROBES[4],
+                FAIL,
+                f"tool-calls endpoint returned HTTP {tc_status} for interaction {interaction_id}",
+                {"http_status": tc_status, "interaction_id": interaction_id},
+            )
+        recalls = [
+            tc for tc in tool_calls if is_recall_tool(str(tc.get("tool_name", "")))
+        ]
+        if not recalls:
+            return self._record(
+                PROBES[4],
+                FAIL,
+                "the audit plane recorded the interaction but NO recall_* tool call — "
+                "recall did not reach the audit trail",
+                {
+                    "interaction_id": interaction_id,
+                    "tool_names": [tc.get("tool_name") for tc in tool_calls],
+                },
+            )
+        return self._record(
+            PROBES[4],
+            PASS,
+            f"recall recorded on the audit plane for interaction {interaction_id} "
+            f"({len(recalls)} recall row(s))",
+            {
+                "interaction_id": interaction_id,
+                "recall_tool_names": [tc.get("tool_name") for tc in recalls],
+                "e2e_timeout_s": self.cfg.e2e_timeout,
+            },
+        )
+
+    # -- probe 6: istiod-api-reachable (#384 WS2, the #307 signal) --
+
+    def probe_istiod_api_reachable(self) -> ProbeResult:
+        """istiod can reach the kube-API to cert a NEW sidecar (#307).
+
+        Independent evidence: this runner reads the istiod logs, Deployment and
+        endpoints ITSELF, then feeds them to the PURE ``mesh`` diagnosers. It never
+        reads the WS1 gate's result. Any unreadable transport read → fail-closed.
+        """
+        logs = self._istiod_logs()
+        deployment = self._istiod_deployment()
+        endpoint_ips = self._istiod_endpoint_ips()
+        unreadable = [
+            label
+            for label, value in (
+                ("istiod-logs", logs),
+                ("istiod-endpoints", endpoint_ips),
+            )
+            if value is None
+        ]
+        if unreadable:
+            return self._record(
+                PROBES[5],
+                FAIL,
+                f"could not read {', '.join(unreadable)} (fail-closed)",
+                {"unreadable": unreadable},
+            )
+        findings = mesh.evaluate_istiod_logs(
+            logs, MESH_LOG_WINDOW
+        ) + mesh.evaluate_istiod_readiness(deployment, endpoint_ips)
+        if findings:
+            return self._record(
+                PROBES[5],
+                FAIL,
+                "istiod<->kube-API path degraded: "
+                + ", ".join(f.signal for f in findings),
+                # sanitized: raw istiod log_tail stripped (see sanitized_finding).
+                {"findings": [sanitized_finding(f) for f in findings]},
+            )
+        return self._record(
+            PROBES[5],
+            PASS,
+            "istiod fully Ready with endpoints and no #307 smoking-gun in the log window",
+            {"log_window": MESH_LOG_WINDOW},
+        )
+
+    # -- probe 7: sidecars-have-certs (#384 WS2) --
+
+    def probe_sidecars_have_certs(self) -> ProbeResult:
+        """Every istio-injected pod has a Ready istio-proxy and is Running."""
+        pods = self._pods_json()
+        if not pods:
+            return self._record(
+                PROBES[6],
+                FAIL,
+                "no pods returned from the cluster API (unreachable or namespace empty)",
+                {"namespace": self.cfg.namespace, "pod_count": 0},
+            )
+        injected = [p for p in pods if pod_has_container(p, ISTIO_PROXY_CONTAINER)]
+        if not injected:
+            return self._record(
+                PROBES[6],
+                FAIL,
+                "no istio-injected pods found — the data plane cannot be certified",
+                {"pod_count": len(pods)},
+            )
+        findings = sidecar_cert_findings(pods)
+        if findings:
+            return self._record(
+                PROBES[6],
+                FAIL,
+                "cert-starved data plane: " + ", ".join(f["pod"] for f in findings),
+                {"findings": findings},
+            )
+        return self._record(
+            PROBES[6],
+            PASS,
+            f"all {len(injected)} istio-injected pod(s) have a Ready istio-proxy sidecar",
+            {"injected_pods": [pod_name(p) for p in injected]},
+        )
+
+    # -- probe 8: vault-secret-rendered (#384 WS2) --
+
+    def probe_vault_secret_rendered(self) -> ProbeResult:
+        """Every vault-annotated pod rendered its secret (no exit-79 / non-injection)."""
+        pods = self._pods_json()
+        if not pods:
+            return self._record(
+                PROBES[7],
+                FAIL,
+                "no pods returned from the cluster API (unreachable or namespace empty)",
+                {"namespace": self.cfg.namespace, "pod_count": 0},
+            )
+        annotated = [
+            p for p in pods if pod_annotations(p).get(VAULT_INJECT_ANNOTATION) == "true"
+        ]
+        if not annotated:
+            return self._record(
+                PROBES[7],
+                FAIL,
+                "no vault-annotated pods found — cannot certify secret render (fail-closed)",
+                {"pod_count": len(pods)},
+            )
+        findings = vault_render_findings(pods)
+        if findings:
+            return self._record(
+                PROBES[7],
+                FAIL,
+                "vault secret not rendered: " + ", ".join(f["pod"] for f in findings),
+                {"findings": findings},
+            )
+        return self._record(
+            PROBES[7],
+            PASS,
+            f"all {len(annotated)} vault-annotated pod(s) rendered their secret "
+            "(Ready vault-agent, no exit-79)",
+            {"vault_pods": [pod_name(p) for p in annotated]},
+        )
+
+    # -- probe 9: no-unhealthy-upstream (#384 WS2) --
+
+    def probe_no_unhealthy_upstream(self) -> ProbeResult:
+        """Front door serves AND no cert-dead-mesh 503 in the memory-server logs."""
+        status_code, body = self._front_get("/health", token=None)
+        if (
+            status_code != 200
+            or not isinstance(body, dict)
+            or body.get("status") != "ok"
+        ):
+            reported = body.get("status") if isinstance(body, dict) else None
+            return self._record(
+                PROBES[8],
+                FAIL,
+                f"front-door /health HTTP {status_code} status={reported!r} "
+                "(expected 200 + status=ok)",
+                {"http_status": status_code, "health_status": reported},
+            )
+        logs = self._memory_server_logs()
+        if logs is None:
+            return self._record(
+                PROBES[8],
+                FAIL,
+                "could not read memory-server logs (fail-closed)",
+                {"http_status": status_code},
+            )
+        hits = count_unhealthy_upstream(logs)
+        if hits:
+            return self._record(
+                PROBES[8],
+                FAIL,
+                f"{hits} 'no healthy upstream' 503 signature(s) in the last {MESH_LOG_WINDOW} "
+                "(cert-dead mesh data plane)",
+                # SECURITY: emit only the DERIVED count + window + the named signature,
+                # never raw log content — memory-server logs can carry tokens / request
+                # content / PII (CodeQL py/clear-text-logging-of-sensitive-data). The
+                # count + window + signature name is sufficient reconstruction evidence.
+                {"match_count": hits, "log_window": MESH_LOG_WINDOW},
+            )
+        return self._record(
+            PROBES[8],
+            PASS,
+            "front door serving and no 'no healthy upstream' 503 in the log window",
+            {"log_window": MESH_LOG_WINDOW},
+        )
+
+    # -- probe 10: scan-dlq-depth (spec 2026-08-23, closes the SCAN-URI-BUG loop gap) --
+
+    def probe_scan_dlq_depth(self) -> ProbeResult:
+        """Front-door ``/health`` scan-DLQ depth — trips certification on a flood.
+
+        Reads ``/health`` the same read-only, front-door way probes 4 and 9
+        already do (no direct AMQP/RabbitMQ management API, no kubectl-exec
+        bypass). Both ``scan_dlq_depth`` and ``dead_lettered_index_count`` are
+        recorded as evidence on EVERY outcome (visibility at certify), not just
+        on FAIL. Degrades gracefully rather than failing on a telemetry
+        hiccup: the field is ABSENT on an older image (pre-#387 P2b) or
+        ``"unknown"`` when the health handler's own best-effort Redis read
+        degraded (``routes/health.py``'s ``except Exception: "unknown"``
+        pattern) — neither is evidence of a flood, so the probe SKIPS rather
+        than FAILing. Only a genuinely NUMERIC depth above
+        :attr:`VerifyConfig.scan_dlq_threshold` FAILs.
+        """
+        status_code, body = self._front_get("/health", token=None)
+        if status_code != 200 or not isinstance(body, dict):
+            return self._record(
+                PROBES[9],
+                FAIL,
+                f"front-door /health returned HTTP {status_code} (expected 200 + JSON)",
+                {"http_status": status_code},
+            )
+        components = body.get("components")
+        components = components if isinstance(components, dict) else {}
+        depth_raw = components.get("scan_dlq_depth")
+        dead_lettered_raw = components.get("dead_lettered_index_count")
+        evidence: dict[str, Any] = {
+            "scan_dlq_depth": depth_raw,
+            "dead_lettered_index_count": dead_lettered_raw,
+            "scan_dlq_threshold": self.cfg.scan_dlq_threshold,
+        }
+        if depth_raw is None:
+            return self._record(
+                PROBES[9],
+                SKIPPED,
+                "scan_dlq_depth absent from /health components (older image, "
+                "predates #387 P2b) — degrading gracefully, not a certification"
+                "-blocking finding",
+                evidence,
+            )
+        if depth_raw == "unknown":
+            return self._record(
+                PROBES[9],
+                SKIPPED,
+                'scan_dlq_depth="unknown" (best-effort telemetry degraded) — '
+                "degrading gracefully, not a certification-blocking finding",
+                evidence,
+            )
+        try:
+            depth = int(str(depth_raw))
+        except ValueError:
+            return self._record(
+                PROBES[9],
+                SKIPPED,
+                f"scan_dlq_depth={depth_raw!r} is not numeric — degrading "
+                "gracefully, not a certification-blocking finding",
+                evidence,
+            )
+        if depth > self.cfg.scan_dlq_threshold:
+            return self._record(
+                PROBES[9],
+                FAIL,
+                f"scan_dlq_depth={depth} exceeds threshold "
+                f"{self.cfg.scan_dlq_threshold} (scan-DLQ flood)",
+                evidence,
+            )
+        return self._record(
+            PROBES[9],
+            PASS,
+            f"scan_dlq_depth={depth} within threshold {self.cfg.scan_dlq_threshold}",
+            evidence,
+        )
+
+    # -- probe 11: first-party-images-match-published (D5) --
+
+    def _bff_deployment_name(self) -> str:
+        return f"{self.cfg.release}-{BFF_DEPLOYMENT_SUFFIX}"
+
+    def _bff_deployment_exists(self) -> bool | None:
+        """Whether the BFF Deployment is present in this namespace — the
+        PASS-with-``absent`` gate (D5): ``console.enabled=false`` is the
+        common laptop posture, and that must never FAIL this probe.
+
+        Returns ``True``/``False`` when determinable, or ``None`` when the
+        read failed for a reason OTHER than "not found" (a genuinely
+        unreachable cluster, an RBAC error, ...) — kept DISTINCT from
+        ``False`` so the probe FAILs fail-closed on an unreadable cluster
+        rather than silently reporting the unrelated-but-similar-looking
+        ``absent`` PASS (proven by
+        ``test_hostile_deploy_report_cannot_move_the_verdict``: EVERY probe
+        must FAIL when every cluster read fails, this one included)."""
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "deployment",
+                self._bff_deployment_name(),
+                "-n",
+                self.cfg.namespace,
+                "-o",
+                "json",
+            ]
+        )
+        if proc.returncode == 0:
+            return True
+        if "NotFound" in proc.stderr:
+            return False
+        return None
+
+    def _live_bff_digest(self) -> str | None:
+        """The live BFF digest, requiring EVERY matching pod to agree
+        (fix-round should-fix) — never just the first token. Two pods, one
+        stale, used to PASS on the first (possibly stale) one; now any
+        disagreement is ``None`` (unreadable), mirroring the deploy
+        runner's own S1 all-pods-agree rule
+        (``scripts.deploy.runner.images._live_row_digest``)."""
+        jsonpath = (
+            '{.items[*].status.containerStatuses[?(@.name=="'
+            + BFF_CONTAINER
+            + '")].imageID}'
+        )
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "pods",
+                "-l",
+                BFF_COMPONENT_SELECTOR,
+                "-n",
+                self.cfg.namespace,
+                "-o",
+                f"jsonpath={jsonpath}",
+            ]
+        )
+        if proc.returncode != 0:
+            return None
+        digests = {
+            digest
+            for token in proc.stdout.split()
+            for digest in (extract_digest(token),)
+            if digest
+        }
+        if len(digests) == 1:
+            return next(iter(digests))
+        return None
+
+    def probe_first_party_images_match_published(self) -> ProbeResult:
+        """The BFF's live pod digest matches the published ``--target-version``
+        digest on the registry (D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-
+        stale-override-guard.md) — ties the console BFF to the registry, the
+        one check NEITHER the deploy runner's render-level D3 nor a chart-
+        file read can give: a wrong CHART pin would move both sides of D3
+        together (Addendum A A1) but can never fool a THIRD, independent
+        read of what was actually published.
+
+        Scoped to ``--registry hub`` (S3b): the BFF is published to Docker
+        Hub only (``publish.yml``, spec F8), so under ``--registry local``
+        this probe reports PASS with ``{"bff": "skipped", "reason":
+        "registry local"}`` rather than ever resolving or FAILing. PASS
+        with ``{"bff": "absent"}`` when no BFF Deployment exists in the
+        namespace (``console.enabled=false``, the common laptop posture) —
+        absence is not a finding. FAILs when the Deployment EXISTS but no
+        live pod digest is readable, when the registry cannot resolve the
+        published digest, or when the two digests disagree.
+        """
+        if self.cfg.registry != "hub":
+            return self._record(
+                PROBES[10],
+                PASS,
+                f"skipped (registry={self.cfg.registry!r}); the BFF is published to hub only",
+                {"bff": "skipped", "reason": "registry local"},
+            )
+        exists = self._bff_deployment_exists()
+        if exists is None:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                "could not determine whether a BFF Deployment exists (unreadable cluster read)",
+                {"bff": "unreadable"},
+            )
+        if not exists:
+            return self._record(
+                PROBES[10],
+                PASS,
+                "no BFF Deployment in this namespace — nothing to certify",
+                {"bff": "absent"},
+            )
+        try:
+            ref = registry.resolve(
+                self.cfg.image_tag, self.cfg.registry, repo_path="bff"
+            )
+        except registry.DigestResolutionError as exc:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                f"could not resolve the published BFF digest for {self.cfg.image_tag}: {exc}",
+                {"error": str(exc)},
+            )
+        live = self._live_bff_digest()
+        if live is None:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                "BFF Deployment exists but no live pod digest is readable",
+                {"published_digest": ref.digest, "live_digest": None},
+            )
+        if live != ref.digest:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                "live BFF digest does NOT match the published digest (running an unpublished image)",
+                {"published_digest": ref.digest, "live_digest": live},
+            )
+        return self._record(
+            PROBES[10],
+            PASS,
+            "live BFF digest matches the published digest",
+            {"published_digest": ref.digest, "live_digest": live},
+        )
+
+    # -- orchestration + verdict --
+
+    @property
+    def verdict(self) -> str:
+        """PASS iff every COUNTED probe passed; ANY FAIL → FAIL (the mandate-to-fail).
+
+        SKIPPED probes (health-version under ``--skip-version-check``, #412; or
+        scan-dlq-depth when its telemetry field is absent/"unknown", spec
+        2026-08-23) are EXCLUDED from the tally — they carry
+        no evidence either way, so they can neither manufacture a PASS nor block
+        one. A result set with no counted probes (empty, or every probe SKIPPED)
+        is fail-closed FAIL: a verdict must stand on at least one probe that was
+        actually evaluated.
+        """
+        counted = [r for r in self.results if r.status != SKIPPED]
+        if not counted:
+            return FAIL
+        return PASS if all(r.passed for r in counted) else FAIL
+
+    def run(self) -> dict[str, Any]:
+        self.probe_pods_ready()
+        self.probe_digest_matches_published()
+        self.probe_no_drift()
+        self.probe_health_version()
+        self.probe_recall_e2e()
+        # ── #384 WS2 mesh-health probes (independent, fail-closed) ──
+        self.probe_istiod_api_reachable()
+        self.probe_sidecars_have_certs()
+        self.probe_vault_secret_rendered()
+        self.probe_no_unhealthy_upstream()
+        # ── scan-dlq-depth (spec 2026-08-23, closes the SCAN-URI-BUG loop gap) ──
+        self.probe_scan_dlq_depth()
+        # ── first-party-images-match-published (D5) ──
+        self.probe_first_party_images_match_published()
+        return self.write_report()
+
+    def build_report(self) -> dict[str, Any]:
+        return {
+            "schema_version": "1",
+            "runner": "audittrace-verify-runner",
+            "target_version": self.cfg.target_version,
+            "namespace": self.cfg.namespace,
+            "release": self.cfg.release,
+            "registry": self.cfg.registry,
+            "front_door": self.cfg.front_door,
+            "insecure_tls": self.cfg.insecure,
+            "skip_version_check": self.cfg.skip_version_check,
+            # ── the independence contract: DERIVED + transparent ──
+            "evidence_sources": self.evidence_sources(),
+            "reads_deploy_report": self.reads_deploy_report,
+            "independence": INDEPENDENCE_NOTE,
+            "verdict": self.verdict,
+            "probes": [asdict(r) for r in self.results],
+            "generated_at": _now_iso(),
+        }
+
+    def human_summary(self, report: dict[str, Any]) -> str:
+        lines = [
+            "AuditTrace verify runner — INDEPENDENT deploy certification",
+            "=" * 56,
+            f"target version : {report['target_version']}",
+            f"front door     : {report['front_door']}",
+            f"namespace      : {report['namespace']}",
+            f"reads deploy report : {report['reads_deploy_report']}  (must be False)",
+            "",
+            "probes:",
+        ]
+        for rec in report["probes"]:
+            lines.append(f"  [{rec['name']}] {rec['status']} — {rec['detail']}")
+        lines += ["", f"VERDICT: {report['verdict']}  (any FAIL blocks 'done')"]
+        return "\n".join(lines) + "\n"
+
+    def write_report(self) -> dict[str, Any]:
+        out_dir = Path(self.cfg.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        report = self.build_report()
+        stamp = _now_iso().replace(":", "").replace("-", "")
+        base = f"verify-{self.cfg.target_version}-{stamp}"
+        (out_dir / f"{base}.json").write_text(json.dumps(report, indent=2, default=str))
+        (out_dir / f"{base}.txt").write_text(self.human_summary(report))
+        return report
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+
+def _e2e_timeout_default() -> int:
+    """Resolve the recall-e2e chat-probe timeout default.
+
+    ``AUDITTRACE_VERIFY_E2E_TIMEOUT`` overrides :data:`E2E_CHAT_TIMEOUT_DEFAULT`
+    when set to a valid integer; an unset or non-integer value falls back
+    (fail-closed to the calibrated default, never a crash on a bad env var).
+    Read fresh on every call (NOT cached at import time) so tests can
+    monkeypatch ``os.environ`` without reload tricks, and so
+    :func:`build_parser` picks up the current environment each time it runs.
+    """
+    raw = os.environ.get(E2E_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return E2E_CHAT_TIMEOUT_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        return E2E_CHAT_TIMEOUT_DEFAULT
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m scripts.deploy.verify",
+        description="Deterministic INDEPENDENT deploy-verify runner (front door + read-only kubectl).",
+    )
+    parser.add_argument(
+        "--target-version", required=True, help="intended deployed version"
+    )
+    parser.add_argument("--namespace", default="audittrace")
+    parser.add_argument("--release", default="audittrace")
+    parser.add_argument("--registry", choices=("hub", "local"), default="hub")
+    parser.add_argument("--front-door", default=None)
+    parser.add_argument("--token-file", type=Path, default=DEFAULT_TOKEN_FILE)
+    parser.add_argument(
+        "--model", default="audittrace-chat", help="chat model for the recall E2E"
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help=(
+            "disable front-door TLS verification (dev/self-signed opt-in, the "
+            "equivalent of curl -k). Default is STRICT verification."
+        ),
+    )
+    parser.add_argument(
+        "--e2e-timeout",
+        type=int,
+        default=_e2e_timeout_default(),
+        help=(
+            "client-side timeout in SECONDS for the recall-e2e CHAT probe "
+            "(POST /v1/chat/completions) ONLY -- every other probe (health, "
+            "kubectl, helm) keeps its own short, unwidened timeout. Default "
+            f"{E2E_CHAT_TIMEOUT_DEFAULT}s, calibrated to ~2x the worst observed "
+            "real-model latency (181s, 2026-08-31 v1.25.0 run, dense "
+            "Qwen3.8-27B+MTP); a response past the bound is still a genuine "
+            "FAIL. Portable across targets/models via this flag or the "
+            f"{E2E_TIMEOUT_ENV_VAR} env var."
+        ),
+    )
+    parser.add_argument(
+        "--skip-version-check",
+        action="store_true",
+        help=(
+            "treat health-version as advisory (reported SKIPPED, never a FAIL) "
+            "instead of gating the verdict -- for a dev-tagged build (image tag "
+            "isn't a release vX.Y.Z) that can only be certified on "
+            "digest-matches-published alone. Default is STRICT: health-version "
+            "gates normally. Every other probe, INCLUDING digest-matches-"
+            "published, is unaffected."
+        ),
+    )
+    parser.add_argument(
+        "--scan-dlq-threshold",
+        type=int,
+        default=SCAN_DLQ_DEFAULT_THRESHOLD,
+        help=(
+            "FAIL threshold for the scan-dlq-depth probe's front-door "
+            "/health components.scan_dlq_depth reading -- a numeric depth "
+            "above this trips certification (a scan-DLQ flood); the field "
+            f'being absent or "unknown" always SKIPS, never FAILs. Default '
+            f"{SCAN_DLQ_DEFAULT_THRESHOLD}, portable across targets/workloads "
+            "via this flag."
+        ),
+    )
+    parser.add_argument("--out-dir", type=Path, default=VerifyConfig.out_dir)
+    return parser
+
+
+def config_from_args(args: argparse.Namespace) -> VerifyConfig:
+    return VerifyConfig(
+        target_version=args.target_version,
+        namespace=args.namespace,
+        release=args.release,
+        registry=args.registry,
+        front_door=_normalize_front_door(resolve_front_door(args.front_door)),
+        token_file=args.token_file,
+        model=args.model,
+        insecure=args.insecure,
+        out_dir=args.out_dir,
+        e2e_timeout=args.e2e_timeout,
+        skip_version_check=args.skip_version_check,
+        scan_dlq_threshold=args.scan_dlq_threshold,
+    )
+
+
+def print_verdict(report: dict[str, Any]) -> None:
+    print(
+        f"verify — target {report['target_version']} via {report['front_door']} "
+        f"(reads_deploy_report={report['reads_deploy_report']})\n"
+    )
+    for rec in report["probes"]:
+        print(f"  [{rec['name']}] {rec['status']} — {rec['detail']}")
+    print(f"\n  VERDICT: {report['verdict']}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
+    args = build_parser().parse_args(argv)
+    cfg = config_from_args(args)
+    report = VerifyRunner(cfg).run()
+    print_verdict(report)
+    return 0 if report["verdict"] == PASS else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

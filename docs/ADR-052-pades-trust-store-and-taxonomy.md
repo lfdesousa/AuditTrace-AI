@@ -192,3 +192,9 @@ When PR 2 lands: edit [`docs/architecture/pdf-ingestion-status.md`](architecture
 When PR 3 lands: same row → ✅ **Shipped**; tier-A summary updated to "code-complete; data-side resolved 2026-05-09 (this ADR + PR 3)"; backlog #13 closed with a "Resolved 2026-05-09 in ADR-052 / PR 3" stanza at the top of the backlog file.
 
 The pre-commit gate does not enforce status-doc updates, but the test-and-evidence discipline (ADR-049) does — the PR body's Reconstruction section references this file's diff alongside the live-evidence artefacts.
+
+## Addendum (2026-10, #460 / GitHub #366): `check_error` and the Swiss TSL extraction rule
+
+- **10th signature code, `check_error`** (additive, closed-set): "our call into the validator failed for a reason other than the document". `check_failed` is narrowed to "the document could not be validated" (a type-based split, `DOCUMENT_FAILURE_TYPES` in `routes/memory_pdf/signature_errors.py`); anything outside that tuple is `check_error`, logged at ERROR and counted in `audittrace_pdf_signature_checks_total{status}`.
+- **Swiss TSL builder** extracts trust anchors from the XML pyhanko RETURNED from signature verification, never from the raw network payload (XML-signature-wrapping defence). A builder-code error (`TrustStoreBuilderInternalError`) fails the refresh closed and keeps the stored bundle; it is not caught by the composite.
+- **Metadata** gains `contributing_builders` and `failed_builders` (actual outcomes; `null` for bundles stored before this change).

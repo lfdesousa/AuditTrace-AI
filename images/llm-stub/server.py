@@ -27,7 +27,7 @@ app = FastAPI(title="audittrace-llm-stub")
 # nomic-embed-text-v1.5 dimensionality (matches
 # config.py::memory_embedding_dim). Deterministic non-zero vector so
 # downstream cosine-similarity math stays well-defined.
-_EMBEDDING_DIM = 1024
+_EMBEDDING_DIM = 768
 _CANNED_EMBEDDING = [0.1] * _EMBEDDING_DIM
 
 
@@ -121,7 +121,7 @@ async def chat_completions(req: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/v1/embeddings")
 async def embeddings(req: dict[str, Any]) -> dict[str, Any]:
-    """Embed path. Returns one canned 1024-dim vector per input.
+    """Embed path. Returns one canned 768-dim vector per input.
 
     Accepts the OpenAI shape where `input` is a string or list of
     strings; emits one embedding object per input element.

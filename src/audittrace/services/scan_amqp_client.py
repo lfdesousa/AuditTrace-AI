@@ -50,15 +50,47 @@ class ScanAmqpClient:
         self._channel: Any = None
         self._exchange: Any = None
 
-    # PR-B10 — retry budget for the initial AMQP connection. The
-    # cumulative max wait is the sum of backoff sleeps:
-    #   1 + 2 + 4 + 8 + 16 + 32 = 63 s of sleeping
-    # plus up to 6 × CONNECT_TIMEOUT_SECONDS of in-flight connects.
-    # That bracket comfortably covers fresh-cluster cases where
-    # kube-proxy hasn't programmed the Service IP yet AND single-node
-    # kind boots where RabbitMQ readiness lags the chart install.
-    _CONNECT_MAX_ATTEMPTS: int = 6
-    _CONNECT_TIMEOUT_SECONDS: float = 10.0
+    # PR-B10 + #384 WS3 — retry budget for the INITIAL AMQP connect.
+    #
+    # This connect runs in the lifespan CRITICAL PATH (before the app
+    # yields), so its WORST-CASE total time must fit inside the 150 s
+    # Kubernetes ``startupProbe`` — otherwise the pod is probe-killed
+    # BEFORE the lifespan fail-open (#384 WS3) can trigger, re-opening the
+    # "never crashloop" hole. Worst case is NOT just the sleep sum: if a
+    # connect BLACKHOLES (packets dropped, not fast-fail) each attempt
+    # burns the full ``_CONNECT_TIMEOUT_SECONDS`` before raising. So the
+    # bound the tests enforce is:
+    #     sum(sleeps) + MAX_ATTEMPTS × CONNECT_TIMEOUT_SECONDS  <  150 s
+    #
+    # Backoff is exponential but CAPPED at ``_CONNECT_BACKOFF_CAP_SECONDS``
+    # so late attempts don't balloon. With MAX_ATTEMPTS=8 the loop sleeps
+    # 7 times BETWEEN the 8 attempts (it never sleeps after the final
+    # attempt), each ``delay = min(2**attempt, 16)``:
+    #     sleeps   = 1 + 2 + 4 + 8 + 16 + 16 + 16          = 63 s
+    #     connects = 8 × 6                                  = 48 s
+    #     WORST-CASE TOTAL                                  = 111 s  (< 150 s,
+    #                                                         ~39 s margin)
+    # The 63 s sleep window comfortably covers the observed ~35-40 s
+    # RabbitMQ cold-start, so a real cold reboot connects well before the
+    # budget is spent; the 39 s margin guarantees the fail-open path is
+    # always reachable even in the blackhole worst case.
+    #
+    # Beyond this budget the eager connect in the lifespan FAILS OPEN: the
+    # app still starts, ``/health`` + recall serve immediately, and the
+    # publisher self-connects lazily on first publish (its ``_publish_one``
+    # already treats a publish failure as "leave published_at_ms NULL;
+    # janitor re-enqueues").
+    #
+    # (History: an earlier comment claimed "1+2+4+8+16+32 = 63 s" for 6
+    # attempts, but 6 attempts sleep only 5 times = 31 s — HALF the
+    # intended budget. That shortfall missed RabbitMQ readiness on a
+    # 2026-07-29 cold reboot and crash-looped the pod. Widened to a
+    # 121 s-sleep / 9-attempt budget first, then rebalanced here so the
+    # worst-case INCLUDING connect timeouts — not just the sleep sum —
+    # stays under 150 s.)
+    _CONNECT_MAX_ATTEMPTS: int = 8
+    _CONNECT_TIMEOUT_SECONDS: float = 6.0
+    _CONNECT_BACKOFF_CAP_SECONDS: float = 16.0
 
     async def ensure_connected(self) -> None:
         """Open the connection + channel + exchange handle on first
@@ -109,7 +141,10 @@ class ScanAmqpClient:
                 last_exc = exc
                 if attempt == self._CONNECT_MAX_ATTEMPTS - 1:
                     break
-                delay = 2**attempt
+                # Capped exponential backoff — see the budget comment on
+                # ``_CONNECT_MAX_ATTEMPTS``. The cap keeps the cumulative
+                # sleep inside the 150 s startupProbe (#384 WS3).
+                delay = min(2**attempt, self._CONNECT_BACKOFF_CAP_SECONDS)
                 logger.warning(
                     "scan_amqp.connect_retry",
                     extra={

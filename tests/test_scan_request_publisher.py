@@ -55,10 +55,12 @@ class TestEnvelopePayload:
 
 class TestPublishOne:
     @pytest.fixture
-    def setup(self) -> tuple[Any, Any, Any]:
+    async def setup(self) -> tuple[Any, Any, Any]:
         amqp = MagicMock()
         amqp.publish_scan_request = AsyncMock()
-        factory = InMemoryPostgresFactory().get_session_factory()
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
         queue: asyncio.Queue[ScanRequestEnvelope] = asyncio.Queue()
         publisher = ScanRequestPublisher(
             amqp_client=amqp, queue=queue, session_factory=factory
@@ -69,8 +71,8 @@ class TestPublishOne:
         publisher, amqp, factory = setup
         env = _envelope()
         # Seed the manifest row (route would have done this).
-        with factory() as session:
-            manifest_mod.insert_pending_scan(
+        async with factory() as session:
+            await manifest_mod.insert_pending_scan(
                 session,
                 scan_id=env.scan_id,
                 user_id=env.user_id,
@@ -84,8 +86,8 @@ class TestPublishOne:
         await publisher._publish_one(env)
 
         amqp.publish_scan_request.assert_awaited_once()
-        with factory() as session:
-            row = manifest_mod.get_by_scan_id(session, env.scan_id)
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, env.scan_id)
         assert row is not None
         assert row.published_at_ms is not None
         assert row.published_at_ms > 0
@@ -97,8 +99,8 @@ class TestPublishOne:
         publisher, amqp, factory = setup
         amqp.publish_scan_request.side_effect = OSError("broker down")
         env = _envelope("scan-fail")
-        with factory() as session:
-            manifest_mod.insert_pending_scan(
+        async with factory() as session:
+            await manifest_mod.insert_pending_scan(
                 session,
                 scan_id=env.scan_id,
                 user_id=env.user_id,
@@ -111,8 +113,8 @@ class TestPublishOne:
 
         await publisher._publish_one(env)
 
-        with factory() as session:
-            row = manifest_mod.get_by_scan_id(session, env.scan_id)
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, env.scan_id)
         assert row is not None
         assert row.published_at_ms is None
 
@@ -122,8 +124,8 @@ class TestPublishOne:
         # doesn't corrupt the timestamp.
         publisher, amqp, factory = setup
         env = _envelope("scan-idem")
-        with factory() as session:
-            row = manifest_mod.insert_pending_scan(
+        async with factory() as session:
+            row = await manifest_mod.insert_pending_scan(
                 session,
                 scan_id=env.scan_id,
                 user_id=env.user_id,
@@ -134,12 +136,12 @@ class TestPublishOne:
                 trace_id=env.trace_id,
             )
             row.published_at_ms = 99999
-            session.commit()
+            await session.commit()
 
         await publisher._publish_one(env)
 
-        with factory() as session:
-            row = manifest_mod.get_by_scan_id(session, env.scan_id)
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, env.scan_id)
         assert row is not None
         # Stayed at 99999 — not over-written by NOW().
         assert row.published_at_ms == 99999
@@ -149,14 +151,16 @@ class TestRunLoop:
     async def test_run_drains_queue_and_cancels_cleanly(self) -> None:
         amqp = MagicMock()
         amqp.publish_scan_request = AsyncMock()
-        factory = InMemoryPostgresFactory().get_session_factory()
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
         queue: asyncio.Queue[ScanRequestEnvelope] = asyncio.Queue()
 
         # Seed two manifest rows + queue them.
         for i in range(2):
             scan_id = f"scan-{i}"
-            with factory() as session:
-                manifest_mod.insert_pending_scan(
+            async with factory() as session:
+                await manifest_mod.insert_pending_scan(
                     session,
                     scan_id=scan_id,
                     user_id="alice",

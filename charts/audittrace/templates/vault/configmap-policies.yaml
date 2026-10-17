@@ -100,6 +100,14 @@ data:
       capabilities = ["read"]
     }
 
+  librechat-bff.hcl: |
+    # M3-WU-3b (D4) — the LibreChat BFF reads its RFC 8693 token-exchange
+    # confidential-client secret. Read-only on a single KV path — least
+    # privilege, mirrors the chromadb/keycloak policies above.
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/librechat/*" {
+      capabilities = ["read"]
+    }
+
   # ----- Role bindings (Kubernetes auth) -------------------------------
   # Each role maps "ServiceAccount in namespace" → policy. Consumed by
   # scripts/setup-vault.sh which calls `vault write auth/kubernetes/role/<name>`.
@@ -153,6 +161,15 @@ data:
     policies=chromadb
     ttl=24h
     audience=https://kubernetes.default.svc.cluster.local
+
+  {{- if .Values.console.enabled }}
+  role-librechat-bff.env: |
+    bound_service_account_names={{ .Values.console.bff.serviceAccount.name }}
+    bound_service_account_namespaces={{ .Release.Namespace }}
+    policies=librechat-bff
+    ttl=24h
+    audience=https://kubernetes.default.svc.cluster.local
+  {{- end }}
 
   # ----- KV mount layout ----------------------------------------------
   # Helps the script know which paths to enable / pre-create.

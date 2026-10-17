@@ -2,7 +2,36 @@
 title: "test(chat): replace 'Profil' string assertion with structural check"
 labels: ["test", "tech-debt"]
 priority: P4
+status: closed
+closed: 2026-07-30
 ---
+
+## Closure note (2026-07-30, Batch A)
+
+Audit during backlog Batch A confirmed this item was already resolved by
+normal test-hardening work. The brittle literal `"Profil"` assertion no
+longer exists anywhere in the suite:
+
+- `tests/test_chat_proxy.py` (L523, L1335) and `tests/test_routes.py`
+  assert on the **symbolic constant** `PROFILE_SECTION_HEADER`, imported
+  from `src/audittrace/services/context_builder.py:52`
+  (`PROFILE_SECTION_HEADER = "## Profile"`). The section header is now a
+  single named source of truth shared by production code and tests, so a
+  reword changes both sides together instead of silently breaking a magic
+  string.
+- No test depends on the literal text content of any file under
+  `memory/procedural/`.
+
+Acceptance criteria from the original ticket re-evaluated:
+
+> All tests that currently grep for `"Profil"` are rewritten to use a
+> structural assertion or a mocked sentinel.
+> No test depends on the literal text content of any file under
+> `memory/procedural/`.
+
+Met: the tests reference the symbolic `PROFILE_SECTION_HEADER` constant
+rather than a French string literal, and none read procedural-file text.
+Item closed without further code change.
 
 ## Context
 

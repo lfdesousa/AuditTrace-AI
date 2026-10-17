@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests._hermetic_env import hermetic_env
+
 CHART_DIR = Path(__file__).resolve().parent.parent / "charts" / "audittrace"
 
 # Throwaway secret values to satisfy the chart's productionMode hygiene
@@ -226,14 +228,22 @@ class TestMemoryServerEntrypointSafety:
             f" Got command: {cmd}"
         )
 
-    def test_memory_limit_at_least_4gi(self) -> None:
-        """Regression guard for the 2026-05-06 OOMKilled (exit 137)
-        on /memory/index. The streaming refactor cut peak working
-        set substantially, but the safety floor for this pod is
-        ≥4 GiB so a burst of /memory/upload buffers + a hot embedder
-        + the ai_research_papers PDF rebuild can't drive RSS into
-        the limit again. If a future PR drops below this, the live
-        index path will start dying under realistic loads."""
+    def test_memory_limit_has_post_adr047_floor(self) -> None:
+        """Regression guard for the memory-server memory limit (#334).
+
+        History: the 2026-05-06 OOMKilled (exit 137) on /memory/index
+        forced a 4 GiB ceiling because the *in-process* embedder
+        (onnxruntime + MiniLM) loaded its model into the same RSS as a
+        PDF rebuild. ADR-047 moved embedding to the nomic server, so the
+        in-process embedder is gone entirely — chunk vectors are computed
+        on nomic (embed_via_nomic) and supplied explicitly; ChromaDB
+        never embeds client-side. The 4 GiB OOM class is structurally
+        impossible now. Re-baselined to a 1 GiB floor: over 7 days of
+        real operation (spanning the full _v2 re-index, the heaviest
+        ingest workload) the container's cgroup high-water mark was
+        241 MiB, so 1 GiB is 4.2× the observed peak. If a future PR drops
+        below this floor, the gate exists so the reduction is a
+        deliberate, reviewed decision rather than an accident."""
         import re as _re
 
         out = _render(["--set", "vault.enabled=true"])
@@ -255,12 +265,116 @@ class TestMemoryServerEntrypointSafety:
             "G": value * 1000,  # binary-vs-decimal slop is fine for the floor
             "M": value,
         }[unit]
-        assert mib >= 4 * 1024, (
+        assert mib >= 1 * 1024, (
             f"memory-server limit is {limit} (~{mib} MiB) — must be at "
-            f"least 4Gi to absorb one PDF's pymupdf parse-tree plus the "
-            f"warm embedder. Single-file ?file= mode is the contract; "
-            f"bulk synchronous indexing is intentionally not supported "
-            f"for the ai_research_papers collection (2026-05-06)."
+            f"least 1Gi (#334). Post-ADR-047 the in-process embedder is "
+            f"gone, so the old 4Gi OOM class can't recur; but 1Gi (4.2× "
+            f"the observed 241 MiB 7-day peak) is the reviewed floor so "
+            f"pymupdf parse + orchestration keeps generous headroom."
+        )
+
+
+class TestMemoryServerSurgeSafeStrategy:
+    """WS1 (ADR — CD-agent Component 1): the memory-server Deployment must
+    render a surge-safe RollingUpdate strategy BY DEFAULT.
+
+    History: on 2026-07-26 a routine image roll on the single-node laptop
+    k3s cascaded into a full outage. Root cause: this Deployment had NO
+    ``strategy:`` block, so it inherited the k8s default ``maxSurge=25%``.
+    On ``replicaCount=1`` that rounds up to 1 and surges a SECOND
+    memory-server pod (app + istio + vault sidecars) onto the one node —
+    CPU contention starved the vault injector, its admitted-sidecarless pod
+    hit the fail-closed exit 79, and the chain locked up the mesh.
+
+    The durable fix is a values-driven ``memoryServer.strategy`` defaulting
+    to ``maxSurge=0, maxUnavailable=1`` — correct for BOTH single node
+    (never two pods) and cloud HA 3-replica (one-at-a-time, zero downtime,
+    no surge). These tests pin the default AND prove an operator override is
+    honoured; they are designed to FAIL loudly if the strategy block is ever
+    dropped or its surge default regresses to the unsafe k8s inheritance.
+    """
+
+    def _strategy(self, extra_args: list[str]) -> dict:
+        out = _render(["--set", "vault.enabled=true", *extra_args])
+        doc = _find_workload(out, "Deployment", "audittrace-memory-server")
+        return doc["spec"].get("strategy") or {}
+
+    def test_default_strategy_is_surge_safe(self) -> None:
+        """By DEFAULT the rendered Deployment must be surge-safe:
+        maxSurge=0 (never a second pod on a single node) and
+        maxUnavailable=1 (one pod at a time on an HA cluster)."""
+        strategy = self._strategy([])
+        assert strategy.get("type") == "RollingUpdate", (
+            "memory-server must use a RollingUpdate strategy; got "
+            f"{strategy.get('type')!r}. Without an explicit surge-safe "
+            "strategy the Deployment inherits the k8s default maxSurge=25% "
+            "which surges a 2nd pod onto a single node (2026-07-26 cascade)."
+        )
+        rolling = strategy.get("rollingUpdate") or {}
+        assert rolling.get("maxSurge") == 0, (
+            "memory-server rollout must have maxSurge=0 so a single-node "
+            "cluster never runs two pods at once (the 2026-07-26 cascade "
+            f"root cause). Got maxSurge={rolling.get('maxSurge')!r}."
+        )
+        assert rolling.get("maxUnavailable") == 1, (
+            "memory-server rollout must have maxUnavailable=1 so an HA "
+            "cluster rolls one pod at a time with zero downtime. Got "
+            f"maxUnavailable={rolling.get('maxUnavailable')!r}."
+        )
+
+    def test_default_strategy_holds_on_single_node_replica_count(self) -> None:
+        """The surge-safe default must not depend on replicaCount — the
+        laptop path (replicaCount=1) is exactly where the cascade fired."""
+        rolling = (
+            self._strategy(["--set", "memoryServer.replicaCount=1"]).get(
+                "rollingUpdate"
+            )
+            or {}
+        )
+        assert rolling.get("maxSurge") == 0
+        assert rolling.get("maxUnavailable") == 1
+
+    def test_operator_can_override_max_surge(self) -> None:
+        """An operator on a large cluster may opt into a surging roll.
+        Overriding maxSurge via values must be honoured verbatim."""
+        rolling = (
+            self._strategy(
+                ["--set", "memoryServer.strategy.rollingUpdate.maxSurge=1"]
+            ).get("rollingUpdate")
+            or {}
+        )
+        assert rolling.get("maxSurge") == 1, (
+            "operator override memoryServer.strategy.rollingUpdate.maxSurge=1 "
+            f"was not honoured; got {rolling.get('maxSurge')!r}"
+        )
+        # maxUnavailable default is untouched by the surge override.
+        assert rolling.get("maxUnavailable") == 1
+
+    def test_operator_can_disable_strategy_block(self) -> None:
+        """The guarded ``with`` lets an operator fall back to the k8s
+        default by nulling ``memoryServer.strategy`` — the rendered
+        Deployment then emits NO strategy block at all.
+
+        Note: ``null`` (not ``{}``) is the correct clearing override. Helm
+        MERGES maps, so ``strategy: {}`` coalesces the empty map over the
+        default and the default keys survive; only ``null`` deletes the key
+        (Helm's coalesce treats null as delete). The guarded ``with`` is
+        falsy for both nil and empty-map, so either value that actually
+        reaches the template as empty renders no block — but the operator
+        path that produces that value is ``null``."""
+        out = _render(
+            [
+                "--set",
+                "vault.enabled=true",
+                "--set-json",
+                "memoryServer.strategy=null",
+            ]
+        )
+        doc = _find_workload(out, "Deployment", "audittrace-memory-server")
+        assert "strategy" not in doc["spec"], (
+            "memoryServer.strategy=null must render NO strategy block (fall "
+            "back to k8s default); the guarded `with` was lost so a nulled "
+            "override still emitted a strategy key."
         )
 
 
@@ -280,7 +394,7 @@ class TestEntrypointScriptSafety:
         result = subprocess.run(
             ["bash", "scripts/entrypoint.sh"],
             cwd=str(Path(__file__).resolve().parent.parent),
-            env={"VAULT_AGENT_REQUIRED": "true", "PATH": "/usr/bin:/bin"},
+            env=hermetic_env({"VAULT_AGENT_REQUIRED": "true", "PATH": "/usr/bin:/bin"}),
             capture_output=True,
             text=True,
             timeout=10,
@@ -311,7 +425,7 @@ class TestEntrypointScriptSafety:
                 "fi; "
                 'echo "would-skip-guard"',
             ],
-            env={"PATH": "/usr/bin:/bin"},  # no VAULT_AGENT_REQUIRED
+            env=hermetic_env({"PATH": "/usr/bin:/bin"}),  # no VAULT_AGENT_REQUIRED
             capture_output=True,
             text=True,
             timeout=5,
@@ -323,12 +437,12 @@ class TestEntrypointScriptSafety:
 # ── Phase B.9: realm.json templated audittrace-webui client URIs ─────────────
 
 
-def _rendered_realm(extra_args: list[str]) -> dict:
-    """Return the audittrace-webui client dict from the rendered realm JSON."""
+def _rendered_realm(extra_args: list[str], client_id: str = "audittrace-webui") -> dict:
+    """Return the named client dict from the rendered realm JSON."""
     out = _render(extra_args)
     cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
     realm = _json.loads(cm["data"]["realm.json"])
-    return next(c for c in realm["clients"] if c["clientId"] == "audittrace-webui")
+    return next(c for c in realm["clients"] if c["clientId"] == client_id)
 
 
 class TestRealmWebuiClientFromValues:
@@ -336,25 +450,24 @@ class TestRealmWebuiClientFromValues:
     audittrace-webui client are populated from chart values via `tpl`. Without
     this, fresh installs on non-`.local` hostnames fail at first login until
     the operator kcadm-patches in their URIs (the M2 evidence pattern we
-    explicitly wanted to eliminate)."""
+    explicitly wanted to eliminate).
+
+    M3-WU-1 (OIDC-REDIRECT-URI-DRIFT): the defaults below are exact-match —
+    no ``/*`` wildcard survives, per ADR-042 §3 / RFC 9700. The local-dev
+    harness's origin (``webui/serve.py`` on ``localhost:8765``) is folded in
+    from a SEPARATE ``devRedirectUris``/``devWebOrigins`` value (a distinct,
+    droppable dev profile) rather than mixed into the same list as the
+    mesh-served exact-match entries.
+    """
 
     def test_default_includes_localhost_8765_and_local(self) -> None:
-        """Out-of-the-box defaults cover localhost-dev + .local k3s gateway.
-
-        Subset comparison rather than ``"<url>" in <list>`` because
-        CodeQL's "Incomplete URL substring sanitization" rule
-        false-positives on the latter pattern (it can't tell that the
-        right-hand side is a list, not a string, so it warns as if
-        we were doing substring matching for security validation).
-        Subset semantics are equivalent here — every expected URI must
-        be exactly present in the rendered list — and read more
-        clearly besides.
-        """
+        """Out-of-the-box defaults cover localhost-dev + .local k3s gateway,
+        both as EXACT-match entries (no ``/*`` wildcard anywhere)."""
         client = _rendered_realm(["--set", "vault.enabled=true"])
         expected_redirect_uris = {
-            "http://localhost:8765/*",
-            "https://audittrace.local/*",
-            "https://audittrace.local:30952/*",
+            "http://localhost:8765/",
+            "https://audittrace.local/oauth2/callback",
+            "https://audittrace.local:30952/oauth2/callback",
         }
         expected_web_origins = {
             "http://localhost:8765",
@@ -363,14 +476,29 @@ class TestRealmWebuiClientFromValues:
         assert expected_redirect_uris <= set(client["redirectUris"])
         assert expected_web_origins <= set(client["webOrigins"])
 
+    def test_no_wildcard_redirect_uris_or_web_origins(self) -> None:
+        """RFC 9700 + ADR-042 §3: no ``redirectUris``/``webOrigins`` entry may
+        end in a wildcard. Falsifiable: re-adding
+        ``https://audittrace.local/*`` to ``keycloak.webui.redirectUris``
+        (the OIDC-REDIRECT-URI-DRIFT regression) turns this red."""
+        client = _rendered_realm(["--set", "vault.enabled=true"])
+        offenders = [
+            uri
+            for uri in client["redirectUris"] + client["webOrigins"]
+            if uri.endswith("*")
+        ]
+        assert not offenders, (
+            f"audittrace-webui carries wildcard URI(s): {offenders} — "
+            "RFC 9700 / ADR-042 §3 forbid redirect-URI/webOrigin wildcards."
+        )
+
     def test_redirect_uris_extend_via_values_override(self) -> None:
-        """A custom redirectUris value lands verbatim in the rendered client.
-        Asserts the per-deployment override pattern works for new hostnames
-        (e.g. an operator's audittrace.allaboutdata.eu:30952)."""
+        """A custom redirectUris value lands verbatim in the rendered client
+        when the dev-profile list is cleared alongside it. Asserts the
+        per-deployment override pattern works for new hostnames (e.g. an
+        operator's audittrace.allaboutdata.eu:30952)."""
         custom = [
-            "https://audittrace.example.com/*",
             "https://audittrace.example.com/oauth2/callback",
-            "http://localhost:8765/*",
         ]
         client = _rendered_realm(
             [
@@ -378,18 +506,37 @@ class TestRealmWebuiClientFromValues:
                 "vault.enabled=true",
                 "--set-json",
                 f"keycloak.webui.redirectUris={_json.dumps(custom)}",
+                "--set-json",
+                "keycloak.webui.devRedirectUris=[]",
             ]
         )
         assert client["redirectUris"] == custom
 
+    def test_dev_redirect_uris_droppable_per_deployment(self) -> None:
+        """A stricter deployment profile can drop the dev-only localhost
+        entry entirely without touching the prod ``redirectUris`` list —
+        the whole point of splitting the two."""
+        client = _rendered_realm(
+            [
+                "--set",
+                "vault.enabled=true",
+                "--set-json",
+                "keycloak.webui.devRedirectUris=[]",
+            ]
+        )
+        assert "http://localhost:8765/" not in client["redirectUris"]
+        assert "https://audittrace.local/oauth2/callback" in client["redirectUris"]
+
     def test_web_origins_extend_via_values_override(self) -> None:
-        custom = ["https://audittrace.example.com", "http://localhost:8765"]
+        custom = ["https://audittrace.example.com"]
         client = _rendered_realm(
             [
                 "--set",
                 "vault.enabled=true",
                 "--set-json",
                 f"keycloak.webui.webOrigins={_json.dumps(custom)}",
+                "--set-json",
+                "keycloak.webui.devWebOrigins=[]",
             ]
         )
         assert client["webOrigins"] == custom
@@ -407,6 +554,58 @@ class TestRealmWebuiClientFromValues:
             client["attributes"]["post.logout.redirect.uris"]
             == "https://audittrace.example.com/logout"
         )
+
+
+class TestRealmLibrechatClientFromValues:
+    """M3-WU-1: ``audittrace-librechat`` mirrors the ``audittrace-webui``
+    values-driven pattern (Phase B.9) from day one — exact-match
+    ``redirectUris``/``webOrigins`` plus a droppable dev profile."""
+
+    def test_default_includes_dev_port_and_local(self) -> None:
+        client = _rendered_realm(
+            ["--set", "vault.enabled=true"], client_id="audittrace-librechat"
+        )
+        # M3-WU-3d (D4/D5) — the dedicated console.librechat.host root,
+        # NOT the retired `/librechat` subpath.
+        expected_redirect_uris = {
+            "http://localhost:3080/oauth/openid/callback",
+            "https://librechat.audittrace.local/oauth/openid/callback",
+        }
+        expected_web_origins = {
+            "http://localhost:3080",
+            "https://librechat.audittrace.local",
+        }
+        assert expected_redirect_uris <= set(client["redirectUris"])
+        assert expected_web_origins <= set(client["webOrigins"])
+
+    def test_no_wildcard_redirect_uris_or_web_origins(self) -> None:
+        client = _rendered_realm(
+            ["--set", "vault.enabled=true"], client_id="audittrace-librechat"
+        )
+        offenders = [
+            uri
+            for uri in client["redirectUris"] + client["webOrigins"]
+            if uri.endswith("*")
+        ]
+        assert not offenders, (
+            f"audittrace-librechat carries wildcard URI(s): {offenders} — "
+            "RFC 9700 / ADR-042 §3 forbid redirect-URI/webOrigin wildcards."
+        )
+
+    def test_redirect_uris_extend_via_values_override(self) -> None:
+        custom = ["https://audittrace.example.com/librechat/oauth/openid/callback"]
+        client = _rendered_realm(
+            [
+                "--set",
+                "vault.enabled=true",
+                "--set-json",
+                f"keycloak.librechat.redirectUris={_json.dumps(custom)}",
+                "--set-json",
+                "keycloak.librechat.devRedirectUris=[]",
+            ],
+            client_id="audittrace-librechat",
+        )
+        assert client["redirectUris"] == custom
 
     def test_realm_json_remains_valid_after_tpl_render(self) -> None:
         """tpl() rendering leaves the source file with `{{ }}` directives that
@@ -698,3 +897,188 @@ class TestMemoryScopesProvisioningJob:
             admin_pw["valueFrom"]["secretKeyRef"]["name"]
             == "audittrace-keycloak-secret"
         )
+
+
+class TestRealmAssessmentIngestScope:
+    """ADR-058 WS-B3: the recursive-self-audit ingest scope
+    ``audittrace:assessment:ingest`` gates ``POST /assessments``. Like
+    ``audittrace:admin`` it must be OPTIONAL on user-facing clients (never
+    a default — an assessment write is a privileged, deliberate act) and
+    reconciled onto existing realms by the provisioner Job."""
+
+    _SCOPE = "audittrace:assessment:ingest"
+
+    def test_scope_declared_in_realm(self) -> None:
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        scope_names = {s["name"] for s in realm.get("clientScopes", [])}
+        assert self._SCOPE in scope_names, (
+            f"{self._SCOPE} not declared in realm.json::clientScopes"
+        )
+
+    def test_user_facing_clients_offer_scope_optionally_never_by_default(
+        self,
+    ) -> None:
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        for client_id in ("audittrace-webui", "audittrace-opencode"):
+            client = next(c for c in realm["clients"] if c["clientId"] == client_id)
+            defaults = set(client.get("defaultClientScopes") or [])
+            optional = set(client.get("optionalClientScopes") or [])
+            assert self._SCOPE not in defaults, (
+                f"{client_id} carries {self._SCOPE} in defaults — every token "
+                "would be able to write assessments"
+            )
+            assert self._SCOPE in optional, (
+                f"{client_id} missing optional {self._SCOPE}"
+            )
+
+    def test_provisioner_script_lists_scope(self) -> None:
+        """The Job reconciles the scope onto existing realms — realm.json
+        alone only affects fresh installs."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-memory-scopes-script")
+        script = cm["data"]["ensure-memory-scopes.sh"]
+        assert self._SCOPE in script, f"provisioner script missing {self._SCOPE}"
+
+
+class TestPodReaperComponent:
+    """The exit-79 vault-injection reaper (#384 WS4a) must render as a
+    least-privilege, injection-free component when enabled and vanish entirely
+    when disabled."""
+
+    def test_reaper_renders_when_enabled(self) -> None:
+        out = _render(["--set", "reaper.enabled=true"])
+        dep = _find_workload(out, "Deployment", "audittrace-pod-reaper")
+        spec = dep["spec"]["template"]["spec"]
+        container = spec["containers"][0]
+        assert container["command"] == ["python", "-m", "audittrace.ops.pod_reaper"]
+        # Reuses the memory-server image so it stays in lockstep with the
+        # entrypoint whose exit-79 signature it keys on.
+        assert "audittrace-memory-server" in container["image"]
+        # Must NOT depend on the injection path it repairs: no vault annotations
+        # and no Istio sidecar.
+        annotations = dep["spec"]["template"]["metadata"].get("annotations", {})
+        # Exact domain-segment match (not a substring `in` check) so CodeQL's
+        # incomplete-url-substring-sanitization does not flag the hostname
+        # literal: no annotation key is in the vault.hashicorp.com/ namespace.
+        assert not any(k.split("/", 1)[0] == "vault.hashicorp.com" for k in annotations)
+        labels = dep["spec"]["template"]["metadata"]["labels"]
+        assert labels.get("sidecar.istio.io/inject") == "false"
+        # Least-privilege RBAC: a NAMESPACED Role (never a ClusterRole) with no
+        # access to secrets.
+        role = _find_workload(out, "Role", "audittrace-pod-reaper")
+        assert "audittrace-pod-reaper" not in [
+            d.get("metadata", {}).get("name")
+            for d in _docs(out)
+            if d.get("kind") == "ClusterRole"
+        ]
+        resources = {r for rule in role["rules"] for r in rule.get("resources", [])}
+        assert "secrets" not in resources
+        assert "pods" in resources and "deployments" in resources
+        _find_workload(out, "ServiceAccount", "audittrace-pod-reaper")
+        _find_workload(out, "RoleBinding", "audittrace-pod-reaper")
+
+    def test_reaper_absent_when_disabled(self) -> None:
+        out = _render(["--set", "reaper.enabled=false"])
+        assert "audittrace-pod-reaper" not in out
+        for kind in ("Deployment", "Role", "RoleBinding", "ServiceAccount"):
+            names = [
+                d.get("metadata", {}).get("name")
+                for d in _docs(out)
+                if d.get("kind") == kind
+            ]
+            assert "audittrace-pod-reaper" not in names
+
+
+class TestGatewayStreamIdleTimeoutEnvoyFilter:
+    """Codifies the 2026-08-12 live-applied fix (feedback_no_more_drifts) —
+    an EnvoyFilter on the ingress gateway raising ``stream_idle_timeout``
+    from Envoy's 300s default to 1800s.
+
+    Root cause it closes: the ingress gateway's HTTP connection manager had
+    no explicit ``stream_idle_timeout``, so Envoy's 300s default applied.
+    A VirtualService route ``timeout:`` does NOT override
+    ``stream_idle_timeout`` — the memory tool-loop runs non-streaming, so a
+    long silent reasoning turn produced zero bytes on the wire and Envoy
+    reset the stream at 5 minutes (``{"type":"error","message":"Transport"}``).
+    An operator applied the fix live via ``kubectl apply``; these tests
+    prove the chart now renders the *same* resource, so a chart reinstall
+    reproduces it instead of depending on manual drift."""
+
+    def test_envoyfilter_renders_with_live_applied_shape(self) -> None:
+        """Field-for-field match against the manifest that was applied
+        live and confirmed to fix the Transport drop (see
+        ~/work/audittrace-private/specs/2026-08-12-envoyfilter-stream-idle.yaml).
+        Falsifiable: delete the template (or null out any field below) and
+        this test fails."""
+        out = _render(["--set", "istio.enabled=true"])
+        doc = _find_workload(
+            out, "EnvoyFilter", "audittrace-long-reasoning-stream-idle"
+        )
+        assert doc["apiVersion"] == "networking.istio.io/v1alpha3"
+        assert doc["metadata"]["namespace"] == "audittrace"
+        assert doc["spec"]["workloadSelector"]["labels"] == {
+            "istio": "audittrace-gateway"
+        }
+        patch = doc["spec"]["configPatches"][0]
+        assert patch["applyTo"] == "NETWORK_FILTER"
+        assert patch["match"]["context"] == "GATEWAY"
+        assert (
+            patch["match"]["listener"]["filterChain"]["filter"]["name"]
+            == "envoy.filters.network.http_connection_manager"
+        )
+        assert patch["patch"]["operation"] == "MERGE"
+        typed_config = patch["patch"]["value"]["typed_config"]
+        assert typed_config["@type"] == (
+            "type.googleapis.com/envoy.extensions.filters.network."
+            "http_connection_manager.v3.HttpConnectionManager"
+        )
+        assert typed_config["stream_idle_timeout"] == "1800s"
+
+    def test_default_timeout_matches_the_live_applied_value(self) -> None:
+        """Default MUST equal what is live (1800s) — no silent divergence
+        between the chart default and the manually-applied fix it
+        replaces."""
+        out = _render(["--set", "istio.enabled=true"])
+        doc = _find_workload(
+            out, "EnvoyFilter", "audittrace-long-reasoning-stream-idle"
+        )
+        stream_idle = doc["spec"]["configPatches"][0]["patch"]["value"]["typed_config"][
+            "stream_idle_timeout"
+        ]
+        assert stream_idle == "1800s"
+
+    def test_timeout_is_operator_configurable(self) -> None:
+        """An operator on a different infra profile may need a different
+        ceiling; the value must not be hardcoded in the template."""
+        out = _render(
+            [
+                "--set",
+                "istio.enabled=true",
+                "--set",
+                "istio.gateway.streamIdleTimeout=900s",
+            ]
+        )
+        doc = _find_workload(
+            out, "EnvoyFilter", "audittrace-long-reasoning-stream-idle"
+        )
+        stream_idle = doc["spec"]["configPatches"][0]["patch"]["value"]["typed_config"][
+            "stream_idle_timeout"
+        ]
+        assert stream_idle == "900s"
+
+    def test_absent_when_istio_disabled(self) -> None:
+        """Additive/default-safe: with istio.enabled=false the chart must
+        render NO EnvoyFilter at all — this is mesh-only infra config and
+        must not leak into a non-Istio install."""
+        out = _render(["--set", "istio.enabled=false"])
+        assert "audittrace-long-reasoning-stream-idle" not in out
+        names = [
+            d.get("metadata", {}).get("name")
+            for d in _docs(out)
+            if d.get("kind") == "EnvoyFilter"
+        ]
+        assert "audittrace-long-reasoning-stream-idle" not in names

@@ -57,7 +57,7 @@ def test_settings_chroma_token_defaults_none():
 
 
 def test_database_url_property():
-    """Test PostgreSQL URL construction with psycopg2 driver."""
+    """database_url uses the async asyncpg driver (the runtime engine)."""
     settings = Settings(
         postgres_user="audittrace",
         postgres_password="secret",
@@ -67,14 +67,98 @@ def test_database_url_property():
     )
 
     url = settings.database_url
-    assert url == "postgresql+psycopg2://audittrace:secret@postgres:5432/audittrace"
+    assert url == "postgresql+asyncpg://audittrace:secret@postgres:5432/audittrace"
+
+
+def test_database_url_sync_property():
+    """database_url_sync exposes the psycopg2 URL for Alembic + the RLS oracle."""
+    settings = Settings(
+        postgres_user="audittrace",
+        postgres_password="secret",
+        postgres_host="postgres",
+        postgres_port=5432,
+        postgres_db="audittrace",
+    )
+
+    assert (
+        settings.database_url_sync
+        == "postgresql+psycopg2://audittrace:secret@postgres:5432/audittrace"
+    )
 
 
 def test_database_url_from_full_url():
-    """Test using full postgres_url when provided."""
+    """A psycopg2 postgres_url is normalised to the async driver for database_url."""
     custom_url = "postgresql+psycopg2://custom:pass@host:5432/custom_db"
     settings = Settings(postgres_url=custom_url)
-    assert settings.database_url == custom_url
+    assert (
+        settings.database_url == "postgresql+asyncpg://custom:pass@host:5432/custom_db"
+    )
+    assert settings.database_url_sync == custom_url
+
+
+def test_database_url_already_async_sqlite_is_idempotent():
+    """An already-async SQLite URL must survive normalisation unchanged, and
+    ``database_url_sync`` must strip ``+aiosqlite`` back off for Alembic.
+
+    Both directions matter in production. ``_as_async_url`` must not double
+    up the driver (``sqlite+aiosqlite+aiosqlite://``) when an operator has
+    already written the async form, and Alembic — which runs sync — is
+    handed ``database_url_sync``; if the ``+aiosqlite`` prefix leaked through
+    there, migrations would fail at engine construction with "the loaded
+    'aiosqlite' dialect is async" before a single revision ran.
+    """
+    settings = Settings(postgres_url="sqlite+aiosqlite:///./audittrace.db")
+
+    # Idempotent: the async normaliser leaves an already-async URL alone.
+    assert settings.database_url == "sqlite+aiosqlite:///./audittrace.db"
+    # And the sync form drops the async driver so Alembic can use it.
+    assert settings.database_url_sync == "sqlite:///./audittrace.db"
+
+
+def test_database_url_unrecognised_driver_passes_through_unchanged():
+    """A driver the normalisers don't know about must pass through verbatim
+    in *both* directions rather than being partially rewritten.
+
+    The normalisers are prefix-rewrites over a small allow-list. If an
+    unknown scheme fell into any rewrite branch the operator's URL would be
+    silently corrupted and the connection failure would point at the wrong
+    thing (a mangled DSN, not an unsupported driver). Passing it through
+    unchanged means SQLAlchemy raises the accurate "can't load plugin" error.
+    """
+    exotic = "mysql+aiomysql://user:pw@db:3306/audittrace"
+    settings = Settings(postgres_url=exotic)
+
+    assert settings.database_url == exotic
+    assert settings.database_url_sync == exotic
+
+
+def test_summarizer_database_url_normalised_to_asyncpg():
+    """The summariser owner-role URL must be normalised to the asyncpg driver.
+
+    Regression — live laptop k3s crashloop 2026-05-31. The summariser runs on
+    AsyncSession, and ``URLPostgresFactory`` builds ``create_async_engine``,
+    which raises "The loaded 'psycopg2' is not async" if handed a raw
+    psycopg2/driverless URL. The operator supplies ``summarizer_postgres_url``
+    with owner-role creds (typically driverless) — it must come back as
+    ``+asyncpg``. The unit suite missed this because the live summariser
+    startup block is ``# pragma: no cover`` and the kind integration runs with
+    ``summarizer_enabled=false``.
+    """
+    plain = Settings(
+        summarizer_postgres_url=(
+            "postgresql://owner:pw@audittrace-postgresql:5432/audittrace"
+        )
+    )
+    assert plain.summarizer_database_url == (
+        "postgresql+asyncpg://owner:pw@audittrace-postgresql:5432/audittrace"
+    )
+
+    psyco = Settings(
+        summarizer_postgres_url="postgresql+psycopg2://owner:pw@host:5432/db"
+    )
+    assert psyco.summarizer_database_url == (
+        "postgresql+asyncpg://owner:pw@host:5432/db"
+    )
 
 
 def test_database_url_none():
@@ -203,6 +287,50 @@ def test_cors_origins_empty_list_from_env_disables_cors():
         assert settings.cors_origins == []
     finally:
         del os.environ["AUDITTRACE_CORS_ORIGINS"]
+
+
+# ───────────────────── FLEET-ROUTE: model_routes settings ───────────────────
+
+
+def test_model_routes_default_is_empty_dict():
+    """SPEC invariant 1 (default-unchanged): the empty dict is what makes
+    resolve_chat_upstream fall back to llama_url for every request when
+    an operator has not opted into FLEET-ROUTE."""
+    settings = Settings()
+    assert settings.model_routes == {}
+    assert settings.llama_url == "http://host.docker.internal:11435/v1"
+
+
+def test_model_routes_parses_json_object_from_env():
+    """Chart values inject the map as a JSON object literal — same
+    mechanism pydantic-settings already uses for
+    AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS / AUDITTRACE_CORS_ORIGINS. This is
+    the laptop FLEET-ROUTE map (builder=Mistral :11438, reviewer=Qwen
+    :11435)."""
+    os.environ["AUDITTRACE_MODEL_ROUTES"] = (
+        '{"qwen":"http://host.docker.internal:11435/v1",'
+        '"mistral":"http://host.docker.internal:11438/v1"}'
+    )
+    try:
+        settings = Settings()
+        assert settings.model_routes == {
+            "qwen": "http://host.docker.internal:11435/v1",
+            "mistral": "http://host.docker.internal:11438/v1",
+        }
+    finally:
+        del os.environ["AUDITTRACE_MODEL_ROUTES"]
+
+
+def test_model_routes_empty_object_from_env_disables_routing():
+    """An explicit '{}' env value round-trips to the same default-
+    unchanged empty dict (operator can force-disable routing without
+    unsetting the var)."""
+    os.environ["AUDITTRACE_MODEL_ROUTES"] = "{}"
+    try:
+        settings = Settings()
+        assert settings.model_routes == {}
+    finally:
+        del os.environ["AUDITTRACE_MODEL_ROUTES"]
 
 
 # ─────────────────── ADR-025: memory-as-tools settings ──────────────────────

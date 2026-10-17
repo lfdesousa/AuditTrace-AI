@@ -119,3 +119,64 @@ def test_extract_user_id_prefers_positional_over_contextvar() -> None:
 def test_extract_user_id_none_when_empty() -> None:
     rls.set_current_user_id(None)
     assert _extract_user_id((), {}) is None
+
+
+def test_extract_user_id_ignores_positional_context_with_blank_user_id() -> None:
+    """A ``UserContext`` carrying a blank ``user_id`` must not win over the
+    RLS ContextVar.
+
+    Blank-subject contexts appear on internal/system call paths. Returning
+    ``""`` from here would stamp ``langfuse.user.id=""`` on the span, which
+    Langfuse indexes as a real (empty) user — the per-user filter then splits
+    one request's observations across two "users" and the Art. 12 trail for
+    that call becomes unreconstructable from the dashboard.
+    """
+    rls.set_current_user_id("sub-from-contextvar")
+    try:
+        blank = UserContext(user_id="", username="system", agent_type="curl", scopes=())
+        assert _extract_user_id((blank,), {}) == "sub-from-contextvar"
+    finally:
+        rls.set_current_user_id(None)
+
+
+def test_extract_user_id_ignores_kwarg_context_with_blank_user_id() -> None:
+    """Same rule for a ``UserContext`` passed by keyword.
+
+    The kwargs scan is a separate loop from the positional scan, so the blank
+    guard has to hold on both. Services are called both ways across the
+    codebase; a gap on either side reintroduces the empty-user span attribute.
+    """
+    rls.set_current_user_id("sub-from-contextvar")
+    try:
+        blank = UserContext(user_id="", username="system", agent_type="curl", scopes=())
+        assert _extract_user_id((), {"ctx": blank}) == "sub-from-contextvar"
+    finally:
+        rls.set_current_user_id(None)
+
+
+def test_extract_user_id_falls_back_to_rls_when_identity_import_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``audittrace.identity`` cannot be imported, the RLS ContextVar path
+    must still resolve the caller.
+
+    The import is deliberately defensive — ``logging_config`` is imported by
+    almost everything and must not hard-fail on a circular-import edge. The
+    point of that tolerance is that traceability degrades rather than
+    disappears: with no ``UserContext`` class to isinstance-check against, the
+    ContextVar remains the source of ``user.id`` on every span.
+    """
+    import sys
+
+    # ``None`` in sys.modules makes the `from ... import` raise ImportError,
+    # which is the shape of the circular-import failure being guarded against.
+    monkeypatch.setitem(sys.modules, "audittrace.identity", None)
+
+    rls.set_current_user_id("sub-still-traced")
+    try:
+        # A UserContext is passed but cannot be recognised — the fallback is
+        # what keeps the span tagged.
+        ctx = _make_ctx("sub-unreachable")
+        assert _extract_user_id((ctx,), {}) == "sub-still-traced"
+    finally:
+        rls.set_current_user_id(None)

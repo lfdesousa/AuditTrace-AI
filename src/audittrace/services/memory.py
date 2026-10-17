@@ -15,7 +15,7 @@ class MemoryService(ABC):
     """Abstract memory service for 4-tier memory architecture."""
 
     @abstractmethod
-    def store(
+    async def store(
         self,
         project: str,
         source: str,
@@ -25,7 +25,7 @@ class MemoryService(ABC):
         """Store a memory chunk."""
 
     @abstractmethod
-    def retrieve(
+    async def retrieve(
         self,
         query: str,
         project: str | None = None,
@@ -35,7 +35,7 @@ class MemoryService(ABC):
         """Retrieve relevant memories for a query."""
 
     @abstractmethod
-    def count(self, project: str | None = None) -> int:
+    async def count(self, project: str | None = None) -> int:
         """Count total memories."""
 
 
@@ -45,17 +45,22 @@ class ChromaMemoryService(MemoryService):
     def __init__(self, client: ChromaDBClient, collection_name: str = "audittrace"):
         self.client = client
         self.collection_name = collection_name
-        self._collection = self._ensure_collection()
+        # Lazy-awaited cache — the async Chroma client's
+        # get_or_create_collection is a coroutine, so it can't be resolved in
+        # __init__. First use awaits it once and memoises (PYTHON-ENGINEERING §2).
+        self._collection: Any | None = None
 
     @log_call(logger=logger)
-    def _ensure_collection(self) -> Any:
-        return self.client.get_or_create_collection(
-            name=self.collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
+    async def _ensure_collection(self) -> Any:
+        if self._collection is None:
+            self._collection = await self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+        return self._collection
 
     @log_call(logger=logger)
-    def store(
+    async def store(
         self,
         project: str,
         source: str,
@@ -69,7 +74,8 @@ class ChromaMemoryService(MemoryService):
             "type": "memory",
             **(metadata or {}),
         }
-        self._collection.add(
+        collection = await self._ensure_collection()
+        await collection.add(
             ids=[mem_id],
             documents=[content],
             metadatas=[doc_metadata],
@@ -77,14 +83,15 @@ class ChromaMemoryService(MemoryService):
         return mem_id
 
     @log_call(logger=logger)
-    def retrieve(
+    async def retrieve(
         self,
         query: str,
         project: str | None = None,
         limit: int = 10,
         k: int = 10,
     ) -> list[dict[str, Any]]:
-        results = self._collection.query(
+        collection = await self._ensure_collection()
+        results = await collection.query(
             query_texts=[query],
             n_results=min(limit, k),
             where={"project": project} if project else None,
@@ -105,10 +112,11 @@ class ChromaMemoryService(MemoryService):
         return memories
 
     @log_call(logger=logger)
-    def count(self, project: str | None = None) -> int:
+    async def count(self, project: str | None = None) -> int:
+        collection = await self._ensure_collection()
         if project:
-            return int(self._collection.count(where={"project": project}))
-        return int(self._collection.count())
+            return int(await collection.count(where={"project": project}))
+        return int(await collection.count())
 
 
 class MockMemoryService(MemoryService):
@@ -119,7 +127,7 @@ class MockMemoryService(MemoryService):
         self.call_count: int = 0
 
     @log_call(logger=logger)
-    def store(
+    async def store(
         self,
         project: str,
         source: str,
@@ -140,7 +148,7 @@ class MockMemoryService(MemoryService):
         return mem_id
 
     @log_call(logger=logger)
-    def retrieve(
+    async def retrieve(
         self,
         query: str,
         project: str | None = None,
@@ -161,7 +169,7 @@ class MockMemoryService(MemoryService):
         ]
 
     @log_call(logger=logger)
-    def count(self, project: str | None = None) -> int:
+    async def count(self, project: str | None = None) -> int:
         if project:
             return len([m for m in self.memories if m["project"] == project])
         return len(self.memories)

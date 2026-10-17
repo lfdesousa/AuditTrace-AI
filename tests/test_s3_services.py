@@ -53,15 +53,29 @@ def _mock_get_response(content: str) -> MagicMock:
 
 class TestS3EpisodicService:
     def _make_service(self, objects: dict[str, str]) -> S3EpisodicService:
-        """Create service with mocked MinIO client."""
+        """Create service with mocked MinIO client.
+
+        ADR-062 Phase B: ``load()``/``search()`` now query BOTH tiers
+        (private + corpus), so ``list_objects``/``get_object`` are called
+        twice per operation — once per tier. The mock's ``return_value`` /
+        ``side_effect`` is prefix-agnostic (same fixed payload regardless of
+        which bucket/prefix is queried), so the private-tier query returns
+        the identical fixture rows as the corpus-tier query; the dedupe-by-
+        filename merge in ``_merged_rows`` then collapses them back down to
+        one row per file — the doc-count assertions below are unaffected.
+        """
         client = MagicMock()
         client.list_objects.return_value = [_mock_s3_object(name) for name in objects]
         client.get_object.side_effect = lambda bucket, name: _mock_get_response(
             objects[name]
         )
-        return S3EpisodicService(minio_client=client, bucket="memory-shared")
+        return S3EpisodicService(
+            minio_client=client,
+            bucket="memory-shared",
+            private_bucket="memory-private",
+        )
 
-    def test_load_returns_adr_documents(self):
+    async def test_load_returns_adr_documents(self):
         svc = self._make_service(
             {
                 "episodic/ADR-018-four-layer-memory-port.md": "# Four-Layer Memory\n\nContent here.",
@@ -69,24 +83,26 @@ class TestS3EpisodicService:
             }
         )
         user = _make_user()
-        docs = svc.load(user)
+        docs = await svc.load(user)
         assert len(docs) == 2
         assert docs[0].metadata["file"] == "ADR-018-four-layer-memory-port.md"
         assert docs[0].metadata["title"] == "Four-Layer Memory"
 
-    def test_load_ignores_non_adr_files(self):
+    async def test_load_includes_all_md_files(self):
+        """Backlog #15 (R1): the bulk loader enumerates every ``.md`` object,
+        not just ADR-*.md — the exact blind spot that hid decision-*.md."""
         svc = self._make_service(
             {
                 "episodic/ADR-018.md": "# ADR\n\nContent.",
-                "episodic/agent-configuration.md": "Not an ADR.",
-                "episodic/README.md": "Not an ADR.",
+                "episodic/agent-configuration.md": "# Agent config\n\nNot an ADR.",
+                "episodic/README.md": "# Readme\n\nNot an ADR.",
             }
         )
-        docs = svc.load(_make_user())
-        assert len(docs) == 1
-        assert docs[0].metadata["file"] == "ADR-018.md"
+        docs = await svc.load(_make_user())
+        files = {d.metadata["file"] for d in docs}
+        assert files == {"ADR-018.md", "agent-configuration.md", "README.md"}
 
-    def test_search_filters_by_keyword(self):
+    async def test_search_filters_by_keyword(self):
         svc = self._make_service(
             {
                 "episodic/ADR-009.md": "# KV Cache\n\nKV cache compression reduces memory by 75%.",
@@ -94,40 +110,44 @@ class TestS3EpisodicService:
             }
         )
         user = _make_user()
-        results = svc.search(user, "cache compression")
+        results = await svc.search(user, "cache compression")
         assert len(results) == 1
         assert "KV cache" in results[0].page_content
 
-    def test_as_context_formats_results(self):
+    async def test_as_context_formats_results(self):
         svc = self._make_service(
             {
                 "episodic/ADR-009.md": "# KV Cache\n\nContent about caching.",
             }
         )
-        ctx = svc.as_context(_make_user(), "cache")
+        ctx = await svc.as_context(_make_user(), "cache")
         assert "## Architecture Decisions" in ctx
         assert "KV Cache" in ctx
 
-    def test_load_caches_on_first_call(self):
+    async def test_load_caches_on_first_call(self):
         svc = self._make_service(
             {
                 "episodic/ADR-018.md": "# ADR\n\nContent.",
             }
         )
         user = _make_user()
-        docs1 = svc.load(user)
-        docs2 = svc.load(user)
+        docs1 = await svc.load(user)
+        docs2 = await svc.load(user)
         assert docs1 == docs2
-        # list_objects should only be called once (cached)
-        assert svc._client.list_objects.call_count == 1
+        # ADR-062 Phase B: one list_objects call per tier (private + corpus)
+        # on the first (cold-cache) load; the second load is served entirely
+        # from cache, so the count does not grow.
+        assert svc._client.list_objects.call_count == 2
 
-    def test_shared_content_no_user_prefix(self):
-        """Shared bucket: list_objects uses 'episodic/' prefix, not user_id."""
+    async def test_shared_content_no_user_prefix(self):
+        """Corpus tier: list_objects uses 'episodic/' prefix, not user_id —
+        checked on the LAST call, which is the corpus-tier query (private
+        tier is queried first — see ``_merged_rows``)."""
         svc = self._make_service({})
-        svc.load(_make_user(user_id="kc-john-001"))
+        await svc.load(_make_user(user_id="kc-john-001"))
         call_args = svc._client.list_objects.call_args
         assert call_args[0] == ("memory-shared",)
-        # Should NOT contain user_id — shared content has no per-user prefix
+        # Should NOT contain user_id — corpus content has no per-user prefix
         assert "kc-john" not in str(call_args)
 
 
@@ -141,61 +161,69 @@ class TestS3ProceduralService:
         client.get_object.side_effect = lambda bucket, name: _mock_get_response(
             objects[name]
         )
-        return S3ProceduralService(minio_client=client, bucket="memory-shared")
+        return S3ProceduralService(
+            minio_client=client,
+            bucket="memory-shared",
+            private_bucket="memory-private",
+        )
 
-    def test_load_returns_skill_documents(self):
+    async def test_load_returns_skill_documents(self):
         svc = self._make_service(
             {
                 "procedural/SKILL-ARCHITECTURE.md": "Architecture skill content.",
                 "procedural/SKILL-GENAI.md": "GenAI skill content about agents and RAG.",
             }
         )
-        docs = svc.load(_make_user())
+        docs = await svc.load(_make_user())
         assert len(docs) == 2
         assert docs[0].metadata["skill"] == "ARCHITECTURE"
         assert docs[1].metadata["skill"] == "GENAI"
 
-    def test_load_ignores_non_skill_files(self):
+    async def test_load_includes_all_md_files(self):
+        """Backlog #15 (R1): every ``.md`` object is enumerated — parity
+        with the episodic fix."""
         svc = self._make_service(
             {
                 "procedural/SKILL-IAM.md": "IAM content.",
                 "procedural/README.md": "Not a skill.",
             }
         )
-        docs = svc.load(_make_user())
-        assert len(docs) == 1
+        docs = await svc.load(_make_user())
+        assert {d.metadata["file"] for d in docs} == {"SKILL-IAM.md", "README.md"}
 
-    def test_search_matches_skill_name_and_content(self):
+    async def test_search_matches_skill_name_and_content(self):
         svc = self._make_service(
             {
                 "procedural/SKILL-IAM.md": "OAuth2 OIDC JWT validation patterns.",
                 "procedural/SKILL-GENAI.md": "Agent design and RAG patterns.",
             }
         )
-        results = svc.search(_make_user(), "OAuth2 validation")
+        results = await svc.search(_make_user(), "OAuth2 validation")
         assert len(results) == 1
         assert results[0].metadata["skill"] == "IAM"
 
-    def test_as_context_formats_skill_list(self):
+    async def test_as_context_formats_skill_list(self):
         svc = self._make_service(
             {
                 "procedural/SKILL-ARCHITECTURE.md": "C4 model patterns.",
             }
         )
-        ctx = svc.as_context(_make_user(), "architecture patterns")
+        ctx = await svc.as_context(_make_user(), "architecture patterns")
         assert "## Relevant Skills" in ctx
         assert "ARCHITECTURE" in ctx
 
-    def test_load_caches_results(self):
+    async def test_load_caches_results(self):
         svc = self._make_service(
             {
                 "procedural/SKILL-IAM.md": "IAM content.",
             }
         )
         user = _make_user()
-        svc.load(user)
-        svc.load(user)
-        assert svc._client.list_objects.call_count == 1
+        await svc.load(user)
+        await svc.load(user)
+        # ADR-062 Phase B: one list_objects call per tier on the cold-cache
+        # first load; the second load is served entirely from cache.
+        assert svc._client.list_objects.call_count == 2
 
 
 # ── _create_minio_client (dependencies.py) ────────────────────────────────────
@@ -217,6 +245,7 @@ class TestCreateObjectStorageProvider:
         # AWS branch defaults — irrelevant unless backend == "aws"
         settings.aws_region = ""
         settings.aws_bucket = ""
+        settings.aws_private_bucket = ""
         settings.aws_endpoint_url = ""
         settings.aws_use_irsa = True
         settings.aws_access_key_id = ""
@@ -277,7 +306,20 @@ class TestCreateObjectStorageProvider:
         settings = self._base_settings(backend="aws")
         settings.aws_region = "eu-central-2"
         settings.aws_bucket = ""  # missing
+        settings.aws_private_bucket = "audittrace-private"
         with pytest.raises(RuntimeError, match="AUDITTRACE_AWS_REGION"):
+            _create_object_storage_provider(settings)
+
+    def test_aws_raises_when_private_bucket_missing(self):
+        """ADR-062 Phase B (WU-B1): parity with the shared-bucket guard —
+        region and shared bucket both set, only the private bucket missing."""
+        from audittrace.dependencies import _create_object_storage_provider
+
+        settings = self._base_settings(backend="aws")
+        settings.aws_region = "eu-central-2"
+        settings.aws_bucket = "audittrace-shared"
+        settings.aws_private_bucket = ""  # missing
+        with pytest.raises(RuntimeError, match="AUDITTRACE_AWS_PRIVATE_BUCKET"):
             _create_object_storage_provider(settings)
 
     def test_unknown_backend_raises(self):

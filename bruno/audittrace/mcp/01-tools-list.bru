@@ -1,0 +1,141 @@
+meta {
+  name: MCP — tools/list
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/list",
+    "params": {}
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("JSON-RPC 2.0 result envelope", function() {
+    const body = res.getBody();
+    expect(body.jsonrpc).to.equal("2.0");
+    expect(body.id).to.equal(1);
+    expect(body.result).to.be.an("object");
+    expect(body.result.tools).to.be.an("array");
+  });
+  test("Phase 1 read/recall tools present (ADR-063 Phase 1, #293)", function() {
+    const names = res.getBody().result.tools.map((t) => t.name);
+    expect(names).to.include("recall_decisions");
+    expect(names).to.include("recall_skills");
+    expect(names).to.include("recall_recent_sessions");
+    expect(names).to.include("recall_semantic");
+    expect(names).to.include("read_decision");
+    expect(names).to.include("read_skill");
+  });
+  test("Phase 2 Track A write/curation tools — present iff auth is enforced (#297)", function() {
+    // Environment-aware, NOT a skip: this asserts the REAL, opposite
+    // behaviour on each env, per services/mcp_write_bridge.py's own
+    // no-is_admin-bypass invariant (list_write_tools checks the literal
+    // scope grant only).
+    const names = res.getBody().result.tools.map((t) => t.name);
+    const authRequired = bru.getEnvVar("authRequired") === "true";
+    if (authRequired) {
+      // cluster (AUDITTRACE_AUTH_REQUIRED=true): a real device-flow token
+      // carrying the collection's default `scope` (which already includes
+      // memory:decisions:write memory:skills:write, added alongside Track
+      // A) makes both tools visible — the certifiable path.
+      expect(names).to.include("write_decision");
+      expect(names).to.include("write_skill");
+    } else {
+      // local (AUDITTRACE_AUTH_REQUIRED=false, laptop default —
+      // ADR-026 §15): require_user's bypass mode returns the sentinel
+      // identity (identity.py:192-208) — is_admin=True but scopes are
+      // ONLY ("memory:admin", "memory:read", "session:read-own"), which
+      // do NOT include memory:decisions:write/memory:skills:write.
+      // services/mcp_write_bridge.py::list_write_tools has NO is_admin
+      // bypass (deliberate — the security property Track A certified), so
+      // both write tools are correctly ABSENT here. Same caveat as
+      // 03-tools-call-write.bru/05-no-auth-401.bru's docs blocks.
+      expect(names).to.not.include("write_decision");
+      expect(names).to.not.include("write_skill");
+    }
+  });
+  test("Phase 2 Track B broker tools — namespaced broker:<server>:<tool>, downstream-gated (#296)", function() {
+    // NOT a "must be non-empty" assertion. The laptop AND the v1.24.8
+    // candidate deploy both run with the portability-invariant laptop
+    // default AUDITTRACE_MCP_BROKER_SERVERS="{}" (no operator-configured
+    // downstream MCP server) — so `brokerTools` is legitimately [] until
+    // an operator wires one up. Whenever it IS non-empty, every entry
+    // must be correctly namespaced (this part IS certifiable today: it
+    // is exercised by seeding `registry` directly in
+    // tests/test_mcp_broker_routes.py, not by this Bruno run).
+    const tools = res.getBody().result.tools;
+    const brokerTools = tools.filter((t) => t.name.startsWith("broker:"));
+    brokerTools.forEach((t) => {
+      const rest = t.name.slice("broker:".length);
+      const parts = rest.split(":");
+      expect(parts.length).to.be.at.least(2);
+      expect(parts[0]).to.not.be.empty;
+      expect(parts.slice(1).join(":")).to.not.be.empty;
+    });
+  });
+}
+
+docs {
+  ADR-063 Phase 1 + Phase 2 Track A + Phase 2 Track B, all in one
+  `tools/list` call — the merged, final MCP surface (Track C spec:
+  "fold read + write + broker + no-auth-401 in one coherent add").
+
+  `result.tools` is the union of three sources
+  (`routes/mcp.py::_handle_tools_list`):
+
+  1. Phase 1 read/recall tools (`services.mcp_bridge.list_read_tools`) —
+     unnamespaced, always present for a caller with the matching
+     `memory:*:read`/`memory:conversational:read-own` scope.
+  2. Phase 2 Track A write/curation tools
+     (`services.mcp_write_bridge.list_write_tools`) — unnamespaced,
+     visible ONLY to a caller literally holding
+     `memory:decisions:write`/`memory:skills:write` (no `is_admin`
+     bypass — see that module's docstring).
+  3. Phase 2 Track B brokered tools
+     (`services.mcp_broker.list_downstream_tools`) — namespaced
+     `broker:<server>:<tool>`, discovered live from every ENABLED,
+     operator-configured downstream MCP server the caller is
+     authorized for. Empty by default (portability invariant: laptop
+     default `AUDITTRACE_MCP_BROKER_SERVERS="{}"`).
+
+  Run against the `cluster` env with a token minted via
+  `auth/01-device-flow-init.bru` → `auth/02-device-flow-poll.bru` using
+  the collection's default `scope` (already includes
+  `memory:decisions:write memory:skills:write`, added alongside Track
+  A). `require_user` gates this endpoint even for `tools/list` — see
+  `routes/mcp.py`'s module docstring, "not just tools/call".
+
+  **Environment-dependent by design (same caveat as
+  `03-tools-call-write.bru`/`05-no-auth-401.bru`).** Against `local`
+  (`AUDITTRACE_AUTH_REQUIRED=false`, the laptop default — ADR-026 §15)
+  `require_user`'s bypass mode returns the sentinel identity, which is
+  `is_admin=True` but does NOT literally hold
+  `memory:decisions:write`/`memory:skills:write`
+  (`audittrace.identity.sentinel_user_context`). Read tools stay
+  present regardless of env — `services.mcp_bridge.list_read_tools`
+  DOES have an `is_admin` bypass (Phase 1's convention). Write tools do
+  NOT — `services.mcp_write_bridge.list_write_tools` checks the
+  literal scope grant only (no `is_admin` short-circuit), so they are
+  correctly absent on `local` and correctly present on `cluster` with
+  a real, properly-scoped token. The `authRequired` env var
+  (`local`=`false`, `cluster`=`true`) drives which branch the
+  write-tool test above asserts — both branches assert real,
+  non-vacuous behaviour, this is not a skip.
+}

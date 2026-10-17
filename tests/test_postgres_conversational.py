@@ -13,7 +13,7 @@ import json
 from dataclasses import replace
 
 import pytest
-from sqlalchemy.orm import Session
+import pytest_asyncio
 
 from audittrace.db.models import InteractionRecord, SessionRecord
 from audittrace.db.postgres import InMemoryPostgresFactory
@@ -24,22 +24,16 @@ from audittrace.services.conversational import (
 )
 
 
-@pytest.fixture
-def pg_factory():
-    """Fresh in-memory factory with tables created."""
-    return InMemoryPostgresFactory()
+@pytest_asyncio.fixture
+async def pg_factory():
+    """Fresh in-memory factory with tables created (async)."""
+    factory = InMemoryPostgresFactory()
+    await factory.create_schema()
+    return factory
 
 
-@pytest.fixture
-def pg_session(pg_factory) -> Session:
-    """Session for seeding test data directly."""
-    session = pg_factory.get_session_factory()()
-    yield session
-    session.close()
-
-
-@pytest.fixture
-def seeded_factory(pg_factory, pg_session):
+@pytest_asyncio.fixture
+async def seeded_factory(pg_factory):
     """Factory with pre-seeded session data. All rows carry the sentinel
     user_id so the default ``user_context`` fixture (sentinel-backed) can
     see them via the Phase 2 per-user filter."""
@@ -72,9 +66,10 @@ def seeded_factory(pg_factory, pg_session):
             user_id=SENTINEL_SUBJECT,
         ),
     ]
-    for s in sessions:
-        pg_session.add(s)
-    pg_session.commit()
+    async with pg_factory.get_session_factory()() as session:
+        for s in sessions:
+            session.add(s)
+        await session.commit()
     return pg_factory
 
 
@@ -101,41 +96,41 @@ class TestPostgresConversationalService:
     def test_implements_abc(self, service):
         assert isinstance(service, ConversationalService)
 
-    def test_load_sessions_for_project(self, service, user_context):
-        sessions = service.load_sessions(user_context, "AuditTrace")
+    async def test_load_sessions_for_project(self, service, user_context):
+        sessions = await service.load_sessions(user_context, "AuditTrace")
         assert len(sessions) == 2
 
-    def test_load_sessions_filters_by_project(self, service, user_context):
-        sessions = service.load_sessions(user_context, "OtherProject")
+    async def test_load_sessions_filters_by_project(self, service, user_context):
+        sessions = await service.load_sessions(user_context, "OtherProject")
         assert len(sessions) == 1
 
-    def test_load_sessions_empty_project(self, service, user_context):
-        sessions = service.load_sessions(user_context, "NonExistent")
+    async def test_load_sessions_empty_project(self, service, user_context):
+        sessions = await service.load_sessions(user_context, "NonExistent")
         assert sessions == []
 
-    def test_load_sessions_respects_limit(self, service, user_context):
-        sessions = service.load_sessions(user_context, "AuditTrace", n=1)
+    async def test_load_sessions_respects_limit(self, service, user_context):
+        sessions = await service.load_sessions(user_context, "AuditTrace", n=1)
         assert len(sessions) == 1
 
-    def test_load_sessions_ordered_by_date_desc(self, service, user_context):
-        sessions = service.load_sessions(user_context, "AuditTrace")
+    async def test_load_sessions_ordered_by_date_desc(self, service, user_context):
+        sessions = await service.load_sessions(user_context, "AuditTrace")
         dates = [s["date"] for s in sessions]
         assert dates == sorted(dates, reverse=True)
 
-    def test_load_sessions_content(self, service, user_context):
-        sessions = service.load_sessions(user_context, "AuditTrace")
+    async def test_load_sessions_content(self, service, user_context):
+        sessions = await service.load_sessions(user_context, "AuditTrace")
         summaries = [s["summary"] for s in sessions]
         assert any("KV cache" in s for s in summaries)
         assert any("Phase 0" in s for s in summaries)
 
-    def test_load_sessions_includes_key_points(self, service, user_context):
-        sessions = service.load_sessions(user_context, "AuditTrace")
+    async def test_load_sessions_includes_key_points(self, service, user_context):
+        sessions = await service.load_sessions(user_context, "AuditTrace")
         for s in sessions:
             assert "key_points" in s
             assert isinstance(s["key_points"], list)
 
-    def test_save_session_creates_record(self, empty_service, user_context):
-        session_id = empty_service.save_session(
+    async def test_save_session_creates_record(self, empty_service, user_context):
+        session_id = await empty_service.save_session(
             user_context,
             "AuditTrace",
             "Test save",
@@ -143,45 +138,46 @@ class TestPostgresConversationalService:
             session_id="creates-1",
         )
         assert session_id == "creates-1"
-        sessions = empty_service.load_sessions(user_context, "AuditTrace")
+        sessions = await empty_service.load_sessions(user_context, "AuditTrace")
         assert len(sessions) == 1
         assert sessions[0]["summary"] == "Test save"
 
-    def test_save_session_persists_user_id(self, empty_service, user_context):
+    async def test_save_session_persists_user_id(self, empty_service, user_context):
         """Phase 2 write-side contract: save_session persists
         ``user_context.user_id`` on the SessionRecord row."""
-        empty_service.save_session(
+        await empty_service.save_session(
             user_context, "P", "Summary", ["k1"], session_id="uid-1"
         )
         # Read back via raw query to see the column value, not the dict slice.
-        from sqlalchemy.orm import Session as _Session
+        from sqlalchemy import select
 
-        sess: _Session = empty_service._session_factory()
-        try:
-            row = sess.query(SessionRecord).filter(SessionRecord.project == "P").one()
+        async with empty_service._session_factory() as sess:
+            row = (
+                await sess.execute(
+                    select(SessionRecord).filter(SessionRecord.project == "P")
+                )
+            ).scalar_one()
             assert row.user_id == user_context.user_id
-        finally:
-            sess.close()
 
-    def test_save_session_persists(self, service, user_context):
-        service.save_session(
+    async def test_save_session_persists(self, service, user_context):
+        await service.save_session(
             user_context,
             "AuditTrace",
             "New session",
             ["k1", "k2"],
             session_id="new-1",
         )
-        sessions = service.load_sessions(user_context, "AuditTrace")
+        sessions = await service.load_sessions(user_context, "AuditTrace")
         assert len(sessions) == 3  # 2 existing + 1 new
 
-    def test_save_session_key_points_default(self, empty_service, user_context):
-        empty_service.save_session(
+    async def test_save_session_key_points_default(self, empty_service, user_context):
+        await empty_service.save_session(
             user_context, "P", "Summary", session_id="kp-default-1"
         )
-        sessions = empty_service.load_sessions(user_context, "P")
+        sessions = await empty_service.load_sessions(user_context, "P")
         assert sessions[0]["key_points"] == []
 
-    def test_save_session_is_idempotent_on_session_id(
+    async def test_save_session_is_idempotent_on_session_id(
         self, empty_service, user_context
     ):
         """Regression test for the 2026-05-22 /session/summary 500.
@@ -201,66 +197,66 @@ class TestPostgresConversationalService:
         call's payload must overwrite the first.
         """
         # First write — creates the row.
-        empty_service.save_session(
+        await empty_service.save_session(
             user_context,
             "AuditTrace",
             "first draft",
             ["initial-key"],
             session_id="upsert-fixture",
         )
-        first_load = empty_service.load_sessions(user_context, "AuditTrace")
+        first_load = await empty_service.load_sessions(user_context, "AuditTrace")
         assert len(first_load) == 1
         assert first_load[0]["summary"] == "first draft"
         assert first_load[0]["key_points"] == ["initial-key"]
 
         # Second write — same session_id, different content. Pre-fix
         # this raised IntegrityError; post-fix it updates in place.
-        empty_service.save_session(
+        await empty_service.save_session(
             user_context,
             "AuditTrace",
             "revised draft",
             ["updated-key", "added-key"],
             session_id="upsert-fixture",
         )
-        second_load = empty_service.load_sessions(user_context, "AuditTrace")
+        second_load = await empty_service.load_sessions(user_context, "AuditTrace")
         # Still exactly one row — UPSERT did not duplicate.
         assert len(second_load) == 1
         assert second_load[0]["summary"] == "revised draft"
         assert second_load[0]["key_points"] == ["updated-key", "added-key"]
 
-    def test_as_context_returns_formatted_string(self, service, user_context):
-        ctx = service.as_context(user_context, "AuditTrace")
+    async def test_as_context_returns_formatted_string(self, service, user_context):
+        ctx = await service.as_context(user_context, "AuditTrace")
         assert "Recent Sessions" in ctx
         assert "KV cache" in ctx or "Phase 0" in ctx
 
-    def test_as_context_empty_for_missing_project(self, service, user_context):
-        ctx = service.as_context(user_context, "NonExistent")
+    async def test_as_context_empty_for_missing_project(self, service, user_context):
+        ctx = await service.as_context(user_context, "NonExistent")
         assert ctx == ""
 
-    def test_as_context_includes_key_points(self, service, user_context):
-        ctx = service.as_context(user_context, "AuditTrace")
+    async def test_as_context_includes_key_points(self, service, user_context):
+        ctx = await service.as_context(user_context, "AuditTrace")
         assert "ADR-009" in ctx or "DI container" in ctx
 
-    def test_cross_user_isolation(self, empty_service, user_context):
+    async def test_cross_user_isolation(self, empty_service, user_context):
         """Phase 2 isolation contract: user B cannot read user A's sessions
         even for the same project. No admin bypass at this layer."""
         alice = replace(user_context, user_id="user-alice", is_admin=False)
         bob = replace(user_context, user_id="user-bob", is_admin=False)
-        empty_service.save_session(
+        await empty_service.save_session(
             alice, "SharedProject", "Alice summary", [], session_id="alice-cui-1"
         )
-        empty_service.save_session(
+        await empty_service.save_session(
             bob, "SharedProject", "Bob summary", [], session_id="bob-cui-1"
         )
 
-        alice_sessions = empty_service.load_sessions(alice, "SharedProject")
-        bob_sessions = empty_service.load_sessions(bob, "SharedProject")
+        alice_sessions = await empty_service.load_sessions(alice, "SharedProject")
+        bob_sessions = await empty_service.load_sessions(bob, "SharedProject")
         assert len(alice_sessions) == 1
         assert alice_sessions[0]["summary"] == "Alice summary"
         assert len(bob_sessions) == 1
         assert bob_sessions[0]["summary"] == "Bob summary"
 
-    def test_session_isolation(self, pg_factory, user_context):
+    async def test_session_isolation(self, pg_factory, user_context):
         """Each service instance sees its own committed data."""
         svc1 = PostgresConversationalService(
             session_factory=pg_factory.get_session_factory(),
@@ -268,16 +264,16 @@ class TestPostgresConversationalService:
         svc2 = PostgresConversationalService(
             session_factory=pg_factory.get_session_factory(),
         )
-        svc1.save_session(
+        await svc1.save_session(
             user_context, "Isolated", "From svc1", ["p1"], session_id="iso-1"
         )
         # svc2 should see svc1's committed data (same engine)
-        sessions = svc2.load_sessions(user_context, "Isolated")
+        sessions = await svc2.load_sessions(user_context, "Isolated")
         assert len(sessions) == 1
 
-    def test_real_sessions_flagged_synthetic_false(self, service, user_context):
+    async def test_real_sessions_flagged_synthetic_false(self, service, user_context):
         """ADR-030 Part 1: real summaries carry ``synthetic=False``."""
-        sessions = service.load_sessions(user_context, "AuditTrace")
+        sessions = await service.load_sessions(user_context, "AuditTrace")
         assert all(s["synthetic"] is False for s in sessions)
 
 
@@ -289,77 +285,77 @@ class TestHybridRecall:
     from ``interactions`` for session_ids not yet summarised by the
     background loop (ADR-030 §3)."""
 
-    @pytest.fixture
-    def hybrid_factory(self, pg_factory, pg_session):
+    @pytest_asyncio.fixture
+    async def hybrid_factory(self, pg_factory):
         """Seed a mix of real sessions + interaction-only sessions so we
         can exercise the merge path."""
-        pg_session.add_all(
-            [
-                # One real summary for session "sess-real" in project P.
-                SessionRecord(
-                    id="sess-real",
-                    project="P",
-                    date="2026-04-10T12:00:00",
-                    summary="Real summary for sess-real",
-                    key_points=json.dumps(["kp-real"]),
-                    model="mistral-7b",
-                    user_id=SENTINEL_SUBJECT,
-                ),
-                # Interactions belonging to sess-real — must NOT create a
-                # synthetic row because a real summary already exists.
-                InteractionRecord(
-                    project="P",
-                    source="test",
-                    question="Question for sess-real",
-                    answer="Answer for sess-real",
-                    timestamp="2026-04-10T11:55:00",
-                    session_id="sess-real",
-                    user_id=SENTINEL_SUBJECT,
-                ),
-                # Session "sess-draft-newer" — no real summary, most recent
-                # — should appear first after merge.
-                InteractionRecord(
-                    project="P",
-                    source="test",
-                    question="First Q in newer",
-                    answer="First A in newer",
-                    timestamp="2026-04-12T09:00:00",
-                    session_id="sess-draft-newer",
-                    user_id=SENTINEL_SUBJECT,
-                ),
-                InteractionRecord(
-                    project="P",
-                    source="test",
-                    question="Second Q in newer",
-                    answer="Last A in newer",
-                    timestamp="2026-04-12T09:30:00",
-                    session_id="sess-draft-newer",
-                    user_id=SENTINEL_SUBJECT,
-                ),
-                # Session "sess-draft-older" — no real summary, older than
-                # "sess-draft-newer".
-                InteractionRecord(
-                    project="P",
-                    source="test",
-                    question="Only Q in older",
-                    answer="Only A in older",
-                    timestamp="2026-04-11T15:00:00",
-                    session_id="sess-draft-older",
-                    user_id=SENTINEL_SUBJECT,
-                ),
-                # Orphan interaction with NULL session_id — must be ignored.
-                InteractionRecord(
-                    project="P",
-                    source="test",
-                    question="Orphan q",
-                    answer="Orphan a",
-                    timestamp="2026-04-13T10:00:00",
-                    session_id=None,
-                    user_id=SENTINEL_SUBJECT,
-                ),
-            ]
-        )
-        pg_session.commit()
+        rows = [
+            # One real summary for session "sess-real" in project P.
+            SessionRecord(
+                id="sess-real",
+                project="P",
+                date="2026-04-10T12:00:00",
+                summary="Real summary for sess-real",
+                key_points=json.dumps(["kp-real"]),
+                model="mistral-7b",
+                user_id=SENTINEL_SUBJECT,
+            ),
+            # Interactions belonging to sess-real — must NOT create a
+            # synthetic row because a real summary already exists.
+            InteractionRecord(
+                project="P",
+                source="test",
+                question="Question for sess-real",
+                answer="Answer for sess-real",
+                timestamp="2026-04-10T11:55:00",
+                session_id="sess-real",
+                user_id=SENTINEL_SUBJECT,
+            ),
+            # Session "sess-draft-newer" — no real summary, most recent
+            # — should appear first after merge.
+            InteractionRecord(
+                project="P",
+                source="test",
+                question="First Q in newer",
+                answer="First A in newer",
+                timestamp="2026-04-12T09:00:00",
+                session_id="sess-draft-newer",
+                user_id=SENTINEL_SUBJECT,
+            ),
+            InteractionRecord(
+                project="P",
+                source="test",
+                question="Second Q in newer",
+                answer="Last A in newer",
+                timestamp="2026-04-12T09:30:00",
+                session_id="sess-draft-newer",
+                user_id=SENTINEL_SUBJECT,
+            ),
+            # Session "sess-draft-older" — no real summary, older than
+            # "sess-draft-newer".
+            InteractionRecord(
+                project="P",
+                source="test",
+                question="Only Q in older",
+                answer="Only A in older",
+                timestamp="2026-04-11T15:00:00",
+                session_id="sess-draft-older",
+                user_id=SENTINEL_SUBJECT,
+            ),
+            # Orphan interaction with NULL session_id — must be ignored.
+            InteractionRecord(
+                project="P",
+                source="test",
+                question="Orphan q",
+                answer="Orphan a",
+                timestamp="2026-04-13T10:00:00",
+                session_id=None,
+                user_id=SENTINEL_SUBJECT,
+            ),
+        ]
+        async with pg_factory.get_session_factory()() as session:
+            session.add_all(rows)
+            await session.commit()
         return pg_factory
 
     @pytest.fixture
@@ -368,15 +364,17 @@ class TestHybridRecall:
             session_factory=hybrid_factory.get_session_factory(),
         )
 
-    def test_merges_real_and_synthetic(self, hybrid_service, user_context):
-        sessions = hybrid_service.load_sessions(user_context, "P")
+    async def test_merges_real_and_synthetic(self, hybrid_service, user_context):
+        sessions = await hybrid_service.load_sessions(user_context, "P")
         ids = [s["id"] for s in sessions]
         assert "sess-real" in ids
         assert "sess-draft-newer" in ids
         assert "sess-draft-older" in ids
 
-    def test_ordered_by_date_desc_across_shapes(self, hybrid_service, user_context):
-        sessions = hybrid_service.load_sessions(user_context, "P")
+    async def test_ordered_by_date_desc_across_shapes(
+        self, hybrid_service, user_context
+    ):
+        sessions = await hybrid_service.load_sessions(user_context, "P")
         # Newest first regardless of real/synthetic.
         assert sessions[0]["id"] == "sess-draft-newer"
         # sess-real (2026-04-10) comes before sess-draft-older (2026-04-11)?
@@ -384,115 +382,120 @@ class TestHybridRecall:
         assert sessions[1]["id"] == "sess-draft-older"
         assert sessions[2]["id"] == "sess-real"
 
-    def test_real_session_wins_over_interactions(self, hybrid_service, user_context):
+    async def test_real_session_wins_over_interactions(
+        self, hybrid_service, user_context
+    ):
         """Even though sess-real has an InteractionRecord, only the real
         SessionRecord should surface (no duplicate synthetic row)."""
-        sessions = hybrid_service.load_sessions(user_context, "P")
+        sessions = await hybrid_service.load_sessions(user_context, "P")
         sess_real = next(s for s in sessions if s["id"] == "sess-real")
         assert sess_real["synthetic"] is False
         assert sess_real["summary"] == "Real summary for sess-real"
 
-    def test_synthetic_flag_set(self, hybrid_service, user_context):
-        sessions = hybrid_service.load_sessions(user_context, "P")
+    async def test_synthetic_flag_set(self, hybrid_service, user_context):
+        sessions = await hybrid_service.load_sessions(user_context, "P")
         drafts = [s for s in sessions if s["id"].startswith("sess-draft-")]
         assert len(drafts) == 2
         assert all(s["synthetic"] is True for s in drafts)
 
-    def test_synthetic_summary_uses_first_q_and_last_a(
+    async def test_synthetic_summary_uses_first_q_and_last_a(
         self, hybrid_service, user_context
     ):
-        sessions = hybrid_service.load_sessions(user_context, "P")
+        sessions = await hybrid_service.load_sessions(user_context, "P")
         newer = next(s for s in sessions if s["id"] == "sess-draft-newer")
         assert "First Q in newer" in newer["summary"]
         assert "Last A in newer" in newer["summary"]
         # Middle turn's answer must NOT be used as the last_a.
         assert "First A in newer" not in newer["summary"]
 
-    def test_null_session_id_interactions_excluded(self, hybrid_service, user_context):
+    async def test_null_session_id_interactions_excluded(
+        self, hybrid_service, user_context
+    ):
         """Orphan interactions (NULL session_id) must not leak into any
         synthetic row and must not surface as a standalone match."""
-        sessions = hybrid_service.load_sessions(user_context, "P")
+        sessions = await hybrid_service.load_sessions(user_context, "P")
         for s in sessions:
             assert "Orphan" not in s["summary"]
 
-    def test_respects_n_after_merge(self, hybrid_service, user_context):
-        sessions = hybrid_service.load_sessions(user_context, "P", n=2)
+    async def test_respects_n_after_merge(self, hybrid_service, user_context):
+        sessions = await hybrid_service.load_sessions(user_context, "P", n=2)
         assert len(sessions) == 2
         # Top-2 by recency across shapes.
         assert sessions[0]["id"] == "sess-draft-newer"
         assert sessions[1]["id"] == "sess-draft-older"
 
-    def test_cross_user_isolation_on_synthetic_rows(
-        self, pg_factory, pg_session, user_context
+    async def test_cross_user_isolation_on_synthetic_rows(
+        self, pg_factory, user_context
     ):
         """Bob's interactions must not produce synthetic rows for Alice."""
-        pg_session.add(
-            InteractionRecord(
-                project="P",
-                source="test",
-                question="Bob's question",
-                answer="Bob's answer",
-                timestamp="2026-04-14T10:00:00",
-                session_id="sess-bob",
-                user_id="user-bob",
+        async with pg_factory.get_session_factory()() as session:
+            session.add(
+                InteractionRecord(
+                    project="P",
+                    source="test",
+                    question="Bob's question",
+                    answer="Bob's answer",
+                    timestamp="2026-04-14T10:00:00",
+                    session_id="sess-bob",
+                    user_id="user-bob",
+                )
             )
-        )
-        pg_session.commit()
+            await session.commit()
         svc = PostgresConversationalService(
             session_factory=pg_factory.get_session_factory(),
         )
         alice = replace(user_context, user_id="user-alice", is_admin=False)
-        sessions = svc.load_sessions(alice, "P")
+        sessions = await svc.load_sessions(alice, "P")
         assert all(s["id"] != "sess-bob" for s in sessions)
 
-    def test_cross_project_isolation_on_synthetic_rows(
-        self, pg_factory, pg_session, user_context
+    async def test_cross_project_isolation_on_synthetic_rows(
+        self, pg_factory, user_context
     ):
         """Interactions in project Q must not produce synthetic rows for P."""
-        pg_session.add(
-            InteractionRecord(
-                project="Q",
-                source="test",
-                question="Project Q question",
-                answer="Project Q answer",
-                timestamp="2026-04-14T10:00:00",
-                session_id="sess-q",
-                user_id=SENTINEL_SUBJECT,
+        async with pg_factory.get_session_factory()() as session:
+            session.add(
+                InteractionRecord(
+                    project="Q",
+                    source="test",
+                    question="Project Q question",
+                    answer="Project Q answer",
+                    timestamp="2026-04-14T10:00:00",
+                    session_id="sess-q",
+                    user_id=SENTINEL_SUBJECT,
+                )
             )
-        )
-        pg_session.commit()
+            await session.commit()
         svc = PostgresConversationalService(
             session_factory=pg_factory.get_session_factory(),
         )
-        sessions = svc.load_sessions(user_context, "P")
+        sessions = await svc.load_sessions(user_context, "P")
         assert all(s["id"] != "sess-q" for s in sessions)
 
-    def test_only_interactions_no_real_sessions(
-        self, pg_factory, pg_session, user_context
-    ):
+    async def test_only_interactions_no_real_sessions(self, pg_factory, user_context):
         """Cold-start case: no summaries at all, only raw interactions.
         This is the ADR-030 day-one promise — the tool must not return []."""
-        pg_session.add(
-            InteractionRecord(
-                project="NEW",
-                source="test",
-                question="Cold-start q",
-                answer="Cold-start a",
-                timestamp="2026-04-14T11:00:00",
-                session_id="sess-cold",
-                user_id=SENTINEL_SUBJECT,
+        async with pg_factory.get_session_factory()() as session:
+            session.add(
+                InteractionRecord(
+                    project="NEW",
+                    source="test",
+                    question="Cold-start q",
+                    answer="Cold-start a",
+                    timestamp="2026-04-14T11:00:00",
+                    session_id="sess-cold",
+                    user_id=SENTINEL_SUBJECT,
+                )
             )
-        )
-        pg_session.commit()
+            await session.commit()
         svc = PostgresConversationalService(
             session_factory=pg_factory.get_session_factory(),
         )
-        sessions = svc.load_sessions(user_context, "NEW")
+        sessions = await svc.load_sessions(user_context, "NEW")
         assert len(sessions) == 1
         assert sessions[0]["id"] == "sess-cold"
         assert sessions[0]["synthetic"] is True
 
-    def test_as_context_labels_synthetic(self, hybrid_service, user_context):
-        ctx = hybrid_service.as_context(user_context, "P")
+    async def test_as_context_labels_synthetic(self, hybrid_service, user_context):
+        ctx = await hybrid_service.as_context(user_context, "P")
         assert "Session (draft)" in ctx
         assert "Session" in ctx  # Real one is also rendered.

@@ -59,7 +59,7 @@ echo "[verify] === audittrace post-deploy verification ==="
 echo "[verify] namespace=$NAMESPACE release=$RELEASE"
 
 # ── 1. All chart pods Ready ──────────────────────────────────────────────────
-header "(1/10) Pod readiness"
+header "(1/14) Pod readiness"
 not_ready=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '{
         split($2, ready, "/")
@@ -73,7 +73,7 @@ else
 fi
 
 # ── 2. No CrashLoopBackOff or Error pods ────────────────────────────────────
-header "(2/10) No crashing pods"
+header "(2/14) No crashing pods"
 crashing=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '$3 == "CrashLoopBackOff" || $3 == "Error" || $3 == "ErrImagePull" {print}')
 if [ -z "$crashing" ]; then
@@ -84,7 +84,7 @@ else
 fi
 
 # ── 3. Helm release status `deployed` ───────────────────────────────────────
-header "(3/10) Helm release status"
+header "(3/14) Helm release status"
 release_status=$(helm $KUBECONFIG_FLAG status "$RELEASE" -n "$NAMESPACE" \
     -o json 2>/dev/null | jq -r '.info.status // "unknown"')
 if [ "$release_status" = "deployed" ]; then
@@ -94,7 +94,7 @@ else
 fi
 
 # ── 4. Memory-server /health returns 200 ────────────────────────────────────
-header "(4/10) Memory-server /health"
+header "(4/14) Memory-server /health"
 ms_pod=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pod \
     -l app.kubernetes.io/component=memory-server \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -109,7 +109,7 @@ else
 fi
 
 # ── 5. Memory-server /metrics reachable ─────────────────────────────────────
-header "(5/10) Memory-server /metrics"
+header "(5/14) Memory-server /metrics"
 if [ -n "$ms_pod" ] && kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
         -c memory-server \
         -- curl -s -o /dev/null -w "%{http_code}" http://localhost:8765/metrics 2>/dev/null \
@@ -121,7 +121,7 @@ else
 fi
 
 # ── 6. Postgres reachable (pg_isready from inside the pg pod) ───────────────
-header "(6/10) Postgres reachability"
+header "(6/14) Postgres reachability"
 if kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec audittrace-postgresql-0 \
         -c postgresql -- pg_isready -U postgres -d audittrace 2>&1 \
         | grep -q "accepting connections"; then
@@ -131,7 +131,7 @@ else
 fi
 
 # ── 7. Recent Tempo trace activity for audittrace-server ────────────────────
-header "(7/10) Tempo: recent traces for audittrace-server"
+header "(7/14) Tempo: recent traces for audittrace-server"
 # 30-min window; if nothing is using the system, this can legitimately be
 # empty — flag that as SKIP rather than FAIL so a quiet cluster passes.
 if ! curl --silent --connect-timeout 3 --max-time 10 \
@@ -151,7 +151,7 @@ else
 fi
 
 # ── 8. Loki: ERROR-level audittrace lines below threshold ───────────────────
-header "(8/10) Loki: audittrace ERROR rate"
+header "(8/14) Loki: audittrace ERROR rate"
 if ! curl --silent --connect-timeout 3 --max-time 10 \
         "${LOKI_URL}/ready" >/dev/null 2>&1; then
     skip "Loki unreachable at ${LOKI_URL}"
@@ -172,7 +172,7 @@ else
 fi
 
 # ── 9. Vault drift guard (ConfigMap policies/roles ⊆ actual Vault state) ───
-header "(9/10) Vault drift guard (ConfigMap ⊆ Vault)"
+header "(9/14) Vault drift guard (ConfigMap ⊆ Vault)"
 # Catches the 2026-05-03 drift class: chart adds a policy/role to
 # templates/vault/configmap-policies.yaml, operator forgets to re-run
 # `make k8s-bootstrap-secrets`, vault-agent fails authn at the next pod
@@ -247,7 +247,7 @@ else
 fi
 
 # ── 10. Vault ↔ k8s Redis password alignment (closes 2026-05-04 drift) ─────
-header "(10/10) Vault Redis-password sync"
+header "(10/14) Vault Redis-password sync"
 # v1.0.9 ADR-046 live test surfaced this drift class: Bitnami Redis
 # subchart auto-generates the password into the k8s secret
 # '${RELEASE}-redis' on first install; setup-vault.sh independently
@@ -279,6 +279,472 @@ else
         pass "Redis password aligned: k8s '${RELEASE}-redis' matches Vault kv/audittrace/redis/main"
     else
         fail "Redis password drift — k8s '${RELEASE}-redis' != Vault kv/audittrace/redis/main. Run 'make k8s-bootstrap-secrets'"
+    fi
+fi
+
+# ── 11. Keycloak realm scope drift (ConfigMap declared == live realm) ──────
+header "(11/14) Keycloak client-scope drift (declared == live)"
+# Catches the 2026-07-20 drift class (#370): the live realm granted
+# `memory:episodic:write` as a DEFAULT scope on audittrace-opencode, while
+# every declared source (both realm JSON files, both provisioning scripts,
+# and their whole git history) said OPTIONAL. Every human identity on the
+# Device Flow client was therefore receiving a WRITE scope in every token
+# without asking for it.
+#
+# Why nothing caught it: Keycloak's `--import-realm` runs on FIRST BOOT
+# ONLY. After the realm exists, the ConfigMap is inert — an edit to
+# realm-audittrace.json changes what a FRESH cluster would get and has no
+# effect on this one. tests/test_chart_drift_guards.py compares file to
+# file and structurally cannot see the live realm. This check is the only
+# place the two can be compared.
+#
+# Expected comes from the DEPLOYED ConfigMap rather than the working
+# tree, so the gate answers "does the cluster match what was shipped to
+# it" and stays correct when run from outside a git checkout.
+#
+# BOTH directions are reported, because they fail differently:
+#   over-privileged  (live default ⊅ declared)  — the security bug. A scope
+#                    nobody asked for lands in every token.
+#   under-privileged (declared default ⊄ live)  — the availability bug.
+#                    Callers that never had to ask now get 403.
+#
+# SKIPped when: the realm ConfigMap is absent (keycloak.enabled=false), no
+# admin credential is available, or the token request fails. A missing
+# credential must not fail the gate — unprivileged post-deploy runs are a
+# supported mode (mirrors checks 9/10).
+REALM_CM="${RELEASE}-keycloak-realm"
+KC_SVC="${KC_SVC:-http://${RELEASE}-keycloak:8080}"
+KC_REALM="${KC_REALM:-audittrace}"
+
+# Credential resolution order: explicit env, then the chart's secret (which
+# only exists when keycloak.auth is not Vault-backed), then give up.
+kc_admin_pw="${KEYCLOAK_ADMIN_PASSWORD:-}"
+if [ -z "$kc_admin_pw" ]; then
+    kc_admin_pw=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get secret \
+        "${RELEASE}-keycloak-secret" -o jsonpath='{.data.admin-password}' \
+        2>/dev/null | base64 -d 2>/dev/null || echo "")
+fi
+
+if ! kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get configmap "$REALM_CM" \
+        >/dev/null 2>&1; then
+    skip "ConfigMap $REALM_CM not present (keycloak.enabled=false?)"
+elif [ -z "$ms_pod" ]; then
+    skip "no memory-server pod to reach Keycloak from"
+elif [ -z "$kc_admin_pw" ]; then
+    skip "no Keycloak admin credential (set KEYCLOAK_ADMIN_PASSWORD)"
+else
+    # The password goes in on STDIN, never in argv: `kubectl exec -- env
+    # VAR=secret` publishes the value to the pod's process table, where any
+    # other process in that container can read it from /proc. Checks 9/10
+    # predate this and still use the env form; new code should not.
+    kc_curl() {  # kc_curl <curl-args...> — runs inside the memory-server pod
+        kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
+            -c memory-server -- curl -s --max-time 15 "$@" 2>/dev/null || true
+    }
+    kc_token=$(printf '%s' "$kc_admin_pw" \
+        | kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec -i "$ms_pod" \
+            -c memory-server -- sh -c "read -r PW; curl -s --max-time 15 \
+              -X POST '${KC_SVC}/realms/master/protocol/openid-connect/token' \
+              -d grant_type=password -d client_id=admin-cli -d username=admin \
+              --data-urlencode \"password=\$PW\"" 2>/dev/null \
+        | jq -r '.access_token // empty' 2>/dev/null || echo "")
+
+    if [ -z "$kc_token" ]; then
+        skip "Keycloak admin auth failed (bad credential, or Keycloak not ready)"
+    else
+        realm_json=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get configmap \
+            "$REALM_CM" -o jsonpath='{.data.realm\.json}' 2>/dev/null || echo "")
+
+        # SECOND declared source. The realm JSON is not the whole story: the
+        # ensure-memory-scopes Job binds its own SCOPES list to specific
+        # clients (CLIENT_KIND decides default vs optional) precisely BECAUSE
+        # --import-realm is inert after first boot. Those bindings are
+        # intentional and are legitimately present live while absent from the
+        # realm JSON.
+        #
+        # Ignoring the Job would make this check fail permanently on a
+        # CORRECT cluster — admin-client alone would report three phantom
+        # over-privileges forever. A guard that cries wolf gets muted, and a
+        # muted guard is worse than none: #370 got through while a green gate
+        # was running. So expected = realm JSON UNION the Job's intent.
+        scopes_cm="${RELEASE}-memory-scopes-script"
+        job_script=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get configmap \
+            "$scopes_cm" -o jsonpath='{.data.*}' 2>/dev/null || echo "")
+        job_scopes=$(echo "$job_script" | sed -n '/SCOPES=(/,/^ *)/p' \
+            | grep -oE '"[^"]+"' | tr -d '"' | sort || echo "")
+        # Only clients the ConfigMap actually declares scope sets for. No
+        # hardcoded client list — a new client in the chart is covered the
+        # day it ships, with no edit here.
+        clients=$(echo "$realm_json" \
+            | jq -r '.clients[]? | select(.defaultClientScopes != null) | .clientId' \
+            2>/dev/null | sort || echo "")
+        scope_drift=""
+        checked=0
+
+        for cid in $clients; do
+            live_uuid=$(kc_curl -H "Authorization: Bearer $kc_token" \
+                "${KC_SVC}/admin/realms/${KC_REALM}/clients?clientId=${cid}" \
+                | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+            [ -z "$live_uuid" ] && continue   # declared but not deployed
+            checked=$((checked + 1))
+
+            for kind in default optional; do
+                declared=$(echo "$realm_json" | jq -r \
+                    --arg c "$cid" --arg k "${kind}ClientScopes" \
+                    '.clients[]|select(.clientId==$c)|.[$k][]?' 2>/dev/null \
+                    | sort || echo "")
+                # Fold in the Job's intent when it targets THIS client with
+                # THIS kind. grep -F -x so a scope name is never treated as
+                # a regex (they contain ':' but a future one may not).
+                if echo "$job_script" \
+                     | grep -qF "CLIENT_KIND[\"${cid}\"]=\"${kind}\"" 2>/dev/null; then
+                    declared=$(printf '%s\n%s\n' "$declared" "$job_scopes" \
+                        | grep -v '^$' | sort -u || echo "")
+                fi
+                live=$(kc_curl -H "Authorization: Bearer $kc_token" \
+                    "${KC_SVC}/admin/realms/${KC_REALM}/clients/${live_uuid}/${kind}-client-scopes" \
+                    | jq -r '.[].name' 2>/dev/null | sort || echo "")
+
+                # comm -13 = in live only (extra); -23 = declared only (missing).
+                extra=$(comm -13 <(echo "$declared") <(echo "$live") | grep -v '^$' || true)
+                missing=$(comm -23 <(echo "$declared") <(echo "$live") | grep -v '^$' || true)
+
+                for s in $extra; do
+                    if [ "$kind" = "default" ]; then
+                        scope_drift="${scope_drift}${cid}: OVER-PRIVILEGED — '$s' is live-default but not declared-default"$'\n'
+                    else
+                        scope_drift="${scope_drift}${cid}: '$s' is live-optional but not declared-optional"$'\n'
+                    fi
+                done
+                for s in $missing; do
+                    scope_drift="${scope_drift}${cid}: '$s' is declared-${kind} but MISSING from live ${kind}"$'\n'
+                done
+            done
+        done
+
+        # ── UNDECLARED ("shadow") clients ───────────────────────────────
+        # The loop above walks DECLARED -> LIVE, so a client that exists live
+        # but is declared nowhere was never enumerated and never reported.
+        # Found 2026-07-20 (#371): audittrace-restricted was created via the
+        # admin API and this check passed it in SILENCE. Not "checked and
+        # clean" — not checked.
+        #
+        # It matters more than the scope comparison it complements. The drift
+        # this check was built for (#370) was someone CHANGING a scope on an
+        # existing client. The strictly worse move is CREATING a client with
+        # audittrace:admin as a default scope — and that is exactly the shape
+        # a declared->live walk cannot see. It is also the more attractive
+        # move, because it disturbs nothing already being watched.
+        #
+        # The allowlist is EXACT NAMES ONLY. A prefix rule such as
+        # "audittrace-*" would exempt precisely the clients most worth
+        # watching, which is the opposite of the point. Keycloak creates these
+        # six in every realm; everything else must be declared.
+        KC_BUILTIN_CLIENTS="account
+account-console
+admin-cli
+broker
+realm-management
+security-admin-console"
+        live_clients=$(kc_curl -H "Authorization: Bearer $kc_token" \
+            "${KC_SVC}/admin/realms/${KC_REALM}/clients" \
+            | jq -r '.[].clientId' 2>/dev/null | sort || echo "")
+        undeclared=$(comm -23 <(echo "$live_clients" | grep -v '^$') \
+                              <(printf '%s\n%s\n' "$clients" "$KC_BUILTIN_CLIENTS" \
+                                | grep -v '^$' | sort -u) || true)
+
+        # Rank by blast radius: a shadow client holding admin/audit, or a
+        # granular corpus-write scope (#371, ADR-062 §4 — the guard "must
+        # learn the granular corpus scopes so an undeclared holder is
+        # flagged"), as a DEFAULT scope is a different incident from one
+        # holding neither, and an operator triaging a red gate needs that
+        # distinction up front.
+        #
+        # The corpus-write glob `memory:corpus:*:write` is the SINGLE SOURCE
+        # OF TRUTH mirrored verbatim from `CORPUS_WRITE_SCOPE_GLOB` in
+        # `src/audittrace/identity.py` (cross-checked by
+        # tests/test_chart_drift_guards.py so the two cannot drift apart).
+        #
+        # Ranked PER-SCOPE (splitting `sc` on its comma delimiter), not on
+        # the whole comma-joined string: a `case ",$sc," in *,memory:corpus:*
+        # :write,*)` pattern would let the middle `*` wildcard greedily span
+        # ACROSS two unrelated scope names in the joined list (e.g.
+        # "memory:corpus:decisions:read,other:write" would falsely match),
+        # so each scope name is matched against the glob in isolation.
+        shadow_report=""
+        for cid in $undeclared; do
+            u=$(kc_curl -H "Authorization: Bearer $kc_token" \
+                "${KC_SVC}/admin/realms/${KC_REALM}/clients?clientId=${cid}" \
+                | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+            sc=$(kc_curl -H "Authorization: Bearer $kc_token" \
+                "${KC_SVC}/admin/realms/${KC_REALM}/clients/${u}/default-client-scopes" \
+                | jq -r '[.[].name]|join(",")' 2>/dev/null || echo "")
+            privileged=""
+            IFS=',' read -ra _shadow_scopes <<< "$sc"
+            for s in "${_shadow_scopes[@]}"; do
+                case "$s" in
+                    audittrace:admin|audittrace:audit|memory:corpus:*:write)
+                        privileged="$s" ;;
+                esac
+            done
+            if [ -n "$privileged" ]; then
+                shadow_report="${shadow_report}!! ${cid}: UNDECLARED and holds a privileged default scope [${sc}]"$'\n'
+            else
+                shadow_report="${shadow_report}${cid}: UNDECLARED (default scopes: ${sc:-none})"$'\n'
+            fi
+        done
+
+        if [ "$checked" -eq 0 ]; then
+            skip "no declared clients found in $REALM_CM"
+        elif [ -z "$scope_drift" ] && [ -z "$shadow_report" ]; then
+            pass "Keycloak client scopes match $REALM_CM for all $checked client(s); no undeclared clients"
+        elif [ -z "$scope_drift" ]; then
+            fail "Keycloak realm has UNDECLARED client(s) — present live, declared nowhere:"
+            echo "$shadow_report" | grep -v '^$' | sed 's/^/[verify]      - /' >&2
+            echo "[verify]      A client declared nowhere is unreviewed. Either add it" >&2
+            echo "[verify]      to the realm ConfigMap or delete it from the realm." >&2
+        else
+            fail "Keycloak realm scope drift — live realm != $REALM_CM:"
+            echo "$scope_drift" | grep -v '^$' | sed 's/^/[verify]      - /' >&2
+            if [ -n "$shadow_report" ]; then
+                echo "[verify]      PLUS undeclared client(s):" >&2
+                echo "$shadow_report" | grep -v '^$' | sed 's/^/[verify]      - /' >&2
+            fi
+            echo "[verify]      NOTE: --import-realm runs on FIRST BOOT ONLY, so" >&2
+            echo "[verify]      editing realm-audittrace.json will NOT fix a running" >&2
+            echo "[verify]      cluster. Correct the live realm via the admin API." >&2
+        fi
+    fi
+fi
+unset kc_admin_pw
+
+# ── 12. Keycloak identity-provider (IdP) drift — declared == live ──────────
+header "(12/14) Keycloak identity-provider drift (declared == live)"
+# Catches the #403 drift class: a live external IdP broker (e.g. the
+# `google-test` OIDC broker the mini UI's `kc_idp_hint` depends on —
+# webui/index.html) is added out-of-band via
+# scripts/setup-idp-federation.sh (per ADR-044 §1: "Keycloak is the broker,
+# not the source-of-truth") and never lands in the committed realm JSON.
+# --import-realm runs on FIRST BOOT ONLY (same footgun as Check 11), so a
+# cold reimport / disaster-recovery rebuild silently WIPES the live broker
+# and breaks federated login with no error anywhere in the deploy path.
+#
+# The set-comparison itself lives in scripts/idp-drift-check.sh, kept
+# free of kubectl/kcadm calls so it is unit-testable against mocked
+# declared/live alias lists without a cluster — see
+# tests/test_idp_drift_guard.py. This check supplies only the live +
+# declared data and reports the result.
+#
+# SKIPped when: the realm ConfigMap is absent, no memory-server pod to
+# reach Keycloak from, the comparison library is missing, or no admin
+# credential is available — same discipline as Check 11. Read-only: this
+# check only GETs identity-provider/instances, never writes.
+IDP_DRIFT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/idp-drift-check.sh"
+if ! kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get configmap "$REALM_CM" \
+        >/dev/null 2>&1; then
+    skip "ConfigMap $REALM_CM not present (keycloak.enabled=false?)"
+elif [ -z "$ms_pod" ]; then
+    skip "no memory-server pod to reach Keycloak from"
+elif [ ! -f "$IDP_DRIFT_LIB" ]; then
+    skip "scripts/idp-drift-check.sh not found — cannot compare IdP drift"
+else
+    kc_admin_pw="${KEYCLOAK_ADMIN_PASSWORD:-}"
+    if [ -z "$kc_admin_pw" ]; then
+        kc_admin_pw=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get secret \
+            "${RELEASE}-keycloak-secret" -o jsonpath='{.data.admin-password}' \
+            2>/dev/null | base64 -d 2>/dev/null || echo "")
+    fi
+
+    if [ -z "$kc_admin_pw" ]; then
+        skip "no Keycloak admin credential (set KEYCLOAK_ADMIN_PASSWORD)"
+    else
+        # Credential on STDIN, never argv — same discipline as Check 11.
+        kc_idp_token=$(printf '%s' "$kc_admin_pw" \
+            | kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec -i "$ms_pod" \
+                -c memory-server -- sh -c "read -r PW; curl -s --max-time 15 \
+                  -X POST '${KC_SVC}/realms/master/protocol/openid-connect/token' \
+                  -d grant_type=password -d client_id=admin-cli -d username=admin \
+                  --data-urlencode \"password=\$PW\"" 2>/dev/null \
+            | jq -r '.access_token // empty' 2>/dev/null || echo "")
+        unset kc_admin_pw
+
+        if [ -z "$kc_idp_token" ]; then
+            skip "Keycloak admin auth failed (bad credential, or Keycloak not ready)"
+        else
+            realm_json_idp=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get configmap \
+                "$REALM_CM" -o jsonpath='{.data.realm\.json}' 2>/dev/null || echo "")
+            declared_idp_aliases=$(echo "$realm_json_idp" \
+                | jq -r '.identityProviders[]?.alias' 2>/dev/null | sort -u || echo "")
+            live_idp_aliases=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
+                -c memory-server -- curl -s --max-time 15 \
+                -H "Authorization: Bearer $kc_idp_token" \
+                "${KC_SVC}/admin/realms/${KC_REALM}/identity-provider/instances" \
+                2>/dev/null | jq -r '.[].alias' 2>/dev/null | sort -u || echo "")
+            unset kc_idp_token
+
+            # shellcheck source=idp-drift-check.sh
+            . "$IDP_DRIFT_LIB"
+            if idp_drift_output=$(idp_drift_report "$declared_idp_aliases" "$live_idp_aliases"); then
+                idp_drift_rc=0
+            else
+                idp_drift_rc=$?
+            fi
+
+            if [ -z "$declared_idp_aliases" ] && [ -z "$live_idp_aliases" ]; then
+                pass "no identity providers declared or live — nothing to drift"
+            elif [ "$idp_drift_rc" -eq 0 ]; then
+                pass "Keycloak identity providers match $REALM_CM (${declared_idp_aliases:-none})"
+            else
+                fail "Keycloak identity-provider drift — live realm != $REALM_CM:"
+                echo "$idp_drift_output" | sed 's/^/[verify]      - /' >&2
+                echo "[verify]      NOTE: --import-realm runs on FIRST BOOT ONLY, so" >&2
+                echo "[verify]      editing realm-audittrace.json will NOT restore a" >&2
+                echo "[verify]      wiped live broker. Re-run" >&2
+                echo "[verify]      scripts/setup-idp-federation.sh for each missing IdP," >&2
+                echo "[verify]      or scripts/export-idp-federation.sh to capture a live" >&2
+                echo "[verify]      IdP that is not yet committed." >&2
+            fi
+        fi
+    fi
+fi
+
+# ── 13. ChromaDB persists to the PVC, not to the container overlay ─────────
+header "(13/14) ChromaDB persistence is durable"
+# Catches the 2026-07-21 class (#372), which nothing else could see:
+# ChromaDB's /config.yaml said `persist_path: /data` while the chart mounted
+# the PVC at /chroma/chroma (the 0.x convention, never updated when the image
+# moved to 1.x). Chroma wrote its whole database to the container's EPHEMERAL
+# overlay and lost it on every restart — 160 restarts before anyone noticed.
+#
+# Why every other signal stayed green:
+#   - the pod was Ready; both probes hit /api/v2/heartbeat, which does not
+#     touch persistence
+#   - an EMPTY store answers queries correctly, with zero results
+#   - so recall silently returned nothing forever, and the model read that as
+#     "the document does not exist" (#374)
+#
+# This check compares the DEVICE ID of the persist path against the device ID
+# of `/`. Same device means the persist path is on the overlay and every
+# restart is a data loss. It reads persist_path from the image's own
+# /config.yaml rather than assuming, so an image that moves the path again is
+# caught rather than trusted.
+CHROMA_POD="${CHROMA_POD:-${RELEASE}-chromadb-0}"
+if ! kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pod "$CHROMA_POD" \
+        >/dev/null 2>&1; then
+    skip "$CHROMA_POD not present (chromadb.enabled=false?)"
+else
+    chroma_persist=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$CHROMA_POD" \
+        -c chromadb -- sh -c \
+        "sed -n 's/^persist_path:[[:space:]]*//p' /config.yaml | tr -d '\"'" \
+        2>/dev/null | tr -d '\r' | head -1 || echo "")
+    if [ -z "$chroma_persist" ]; then
+        skip "could not read persist_path from /config.yaml in $CHROMA_POD"
+    else
+        dev_persist=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$CHROMA_POD" \
+            -c chromadb -- stat -c '%d' "$chroma_persist" 2>/dev/null | tr -d '\r' || echo "")
+        dev_root=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$CHROMA_POD" \
+            -c chromadb -- stat -c '%d' / 2>/dev/null | tr -d '\r' || echo "")
+        if [ -z "$dev_persist" ] || [ -z "$dev_root" ]; then
+            skip "could not stat '$chroma_persist' inside $CHROMA_POD"
+        elif [ "$dev_persist" = "$dev_root" ]; then
+            fail "ChromaDB persist_path '$chroma_persist' is on the CONTAINER OVERLAY — every restart wipes the semantic layer"
+            echo "[verify]      persist_path device = / device = $dev_root" >&2
+            echo "[verify]      The PVC is mounted somewhere else. Set" >&2
+            echo "[verify]      chromadb.persistPath to match the image's" >&2
+            echo "[verify]      /config.yaml persist_path (0.x used" >&2
+            echo "[verify]      /chroma/chroma, 1.x uses /data)." >&2
+        else
+            pass "ChromaDB persists to a real volume ('$chroma_persist', device $dev_persist != / device $dev_root)"
+        fi
+    fi
+fi
+
+# ── 13. Memory layers hold REAL DATA (not merely reachable) ────────────────
+header "(14/14) Memory layers hold real data"
+# Added 2026-07-21 after #372. Every E2E assertion we had was satisfiable by
+# an EMPTY semantic layer, so ChromaDB ran empty through 160 pod restarts and
+# nothing went red:
+#   - chat returned 200 with finish_reason=stop        -> passes when empty
+#   - prompt_tokens was large, read as "augmentation"  -> that was EPISODIC,
+#                                                         not the vector layer
+#   - tool_calls recorded recall_semantic              -> recorded even when
+#                                                         it returns nothing
+#   - Bruno evidence 17/17 corroborated tool-call COUNTS, never CONTENT
+# An empty store answers every query correctly, with zero results. So recall
+# silently returned nothing forever and the model read that as "the document
+# does not exist" (#374).
+#
+# The rule this encodes: a layer is not "working" because it responds. It is
+# working when it returns REAL DATA. Assert non-zero, per layer, and fail
+# loudly on zero rather than skipping the empty ones the way
+# ChromaSemanticService.search does (`if count == 0: continue`).
+#
+# Front door only, scoped JWT — same discipline as the rest of the evidence
+# work. SKIPs when no token is supplied so unprivileged runs still work; a
+# SKIP is NOT a pass and is reported as its own state.
+if [ -z "${AUDITTRACE_TOKEN:-}" ]; then
+    skip "AUDITTRACE_TOKEN unset — layer-content check needs a scoped JWT"
+else
+    BASE_URL="${AUDITTRACE_BASE_URL:-https://audittrace.local:30952}"
+    layer_report=""
+    layers_ok=0
+    for layer in episodic procedural; do
+        # Capture the HTTP STATUS separately from the body. Parsing alone is
+        # not enough: a 401 returns a JSON error object with no `.items`, so
+        # `jq '(.items // []) | length'` yields 0 and an AUTH FAILURE reads as
+        # an EMPTY LAYER. That is the same "absence of evidence" trap this
+        # check exists to catch, and the first version of this check fell into
+        # it — caught 2026-07-21 by running it with a deliberately invalid
+        # token instead of assuming.
+        body_file="$(mktemp)"
+        code=$(curl -sk --max-time 20 -o "$body_file" -w '%{http_code}' \
+                 "${BASE_URL}/memory/${layer}?limit=500" \
+                 -H "Authorization: Bearer ${AUDITTRACE_TOKEN}" 2>/dev/null || echo "000")
+        n=$(jq -r '(.items // []) | length' < "$body_file" 2>/dev/null || echo "")
+        rm -f "$body_file"
+        if [ "$code" != "200" ]; then
+            layer_report="${layer_report}${layer}: UNREADABLE (HTTP ${code} — auth or transport failure, NOT the same as empty)"$'\n'
+        elif [ -z "$n" ]; then
+            layer_report="${layer_report}${layer}: UNPARSEABLE response (HTTP 200 but no items field)"$'\n'
+        elif [ "$n" -eq 0 ]; then
+            layer_report="${layer_report}${layer}: EMPTY — 0 items"$'\n'
+        else
+            layers_ok=$((layers_ok + 1))
+        fi
+    done
+
+    # The vector layer is checked separately: it has its own store, and it is
+    # the one that silently emptied. Count documents across every collection.
+    chroma_docs=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
+        -c memory-server -- sh -c '
+          . /vault/secrets/env 2>/dev/null
+          python - <<PY 2>/dev/null
+import os, chromadb
+tok=os.environ.get("AUDITTRACE_CHROMA_TOKEN")
+u=os.environ.get("AUDITTRACE_CHROMA_URL","http://audittrace-chromadb:8000").split("://",1)[-1]
+h,_,p=u.partition(":")
+kw={"host":h,"port":int(p or 8000)}
+if tok: kw["headers"]={"X-Chroma-Token":tok}
+c=chromadb.HttpClient(**kw)
+print(sum(c.get_collection(getattr(x,"name",x)).count() for x in c.list_collections()))
+PY' 2>/dev/null | tr -d '\r' | tail -1 || echo "")
+
+    if [ -z "$chroma_docs" ]; then
+        layer_report="${layer_report}semantic/chroma: UNREADABLE (could not query — NOT the same as empty)"$'\n'
+    elif [ "$chroma_docs" -eq 0 ]; then
+        layer_report="${layer_report}semantic/chroma: EMPTY — 0 documents across all collections"$'\n'
+    else
+        layers_ok=$((layers_ok + 1))
+    fi
+
+    if [ -z "$layer_report" ]; then
+        pass "all $layers_ok memory layer(s) hold real data (episodic, procedural, semantic)"
+    else
+        fail "memory layer(s) not holding real data — recall will silently return nothing:"
+        echo "$layer_report" | grep -v '^$' | sed 's/^/[verify]      - /' >&2
+        echo "[verify]      An empty layer answers queries correctly with zero" >&2
+        echo "[verify]      results, so nothing else goes red. Re-index the" >&2
+        echo "[verify]      corpus; see #372 / #374." >&2
     fi
 fi
 

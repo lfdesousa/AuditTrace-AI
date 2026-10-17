@@ -1,0 +1,27 @@
+{{- if .Values.reaper.enabled }}
+# Least-privilege NAMESPACED Role for the exit-79 vault-injection reaper
+# (#384 WS4a). Deliberately NOT a ClusterRole and NOT granting any access to
+# secrets: the reaper only needs to see and delete pods in its own namespace
+# and read the vault-agent-injector Deployment to check readiness (the storm
+# guard). Nothing more. See feedback_no_security_control_shortcuts.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-pod-reaper
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pod-reaper
+rules:
+  # List/watch the memory-server pods and delete the ones carrying the
+  # exit-79 / missing-vault-sidecar signature so the ReplicaSet recreates
+  # them through a now-healthy injector.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  # Read-only on the injector Deployment for the readiness precheck (the
+  # storm guard). GET only — the reaper never mutates Deployments.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+{{- end }}

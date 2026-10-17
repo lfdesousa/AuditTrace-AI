@@ -1,0 +1,35 @@
+meta {
+  name: W5 POST expire
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/console/acl/expire
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "predicates": [
+      {"resource_type": "{{aclResourceType}}", "resource_id": "{{aclResourceId}}"}
+    ]
+  }
+}
+
+tests {
+  test("200 + counts", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().visible_matched_count).to.be.a("number");
+  });
+}
+
+docs {
+  Expire-by-predicate, caller-scoped. A predicate must name principal_id,
+  resource_id or principal_type=public.
+}

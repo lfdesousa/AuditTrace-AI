@@ -1,0 +1,21 @@
+{
+ "source": "transformers apply_chat_template, enable_thinking=False, add_generation_prompt=True",
+ "model_dir": "tev1-0.8B-experimental@6bb2dff14b38fea90ddb14d870166ccaf77374e9",
+ "cases": [
+  {
+   "content": "X",
+   "rendered": "<|im_start|>user\nX<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "sha256": "bcdab4c7016f065aea9f59eef095cb27093f6c10deb9cfbe2f797167fac71c11"
+  },
+  {
+   "content": "State:\nhello\n\nQuestion: q?\nOptions:\nA. one\nB. two\nAnswer with the option letter only.",
+   "rendered": "<|im_start|>user\nState:\nhello\n\nQuestion: q?\nOptions:\nA. one\nB. two\nAnswer with the option letter only.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "sha256": "4bf432af6c06145d6a0fa95ac201cabef85e948bccde299fed4f6226e80a7606"
+  },
+  {
+   "content": "multi\nline\n\twith tab and ünïcode",
+   "rendered": "<|im_start|>user\nmulti\nline\n\twith tab and ünïcode<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "sha256": "6604e9057d428ff13d8d8292584f422115c7fcf7626c8f0ab2179d6f3eddd9ea"
+  }
+ ]
+}

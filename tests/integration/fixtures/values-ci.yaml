@@ -25,6 +25,9 @@
 
 # Tag matches what the workflow builds + kind-loads.
 memoryServer:
+  # Single-node kind cluster — keep 1 replica (the chart default is 3 for
+  # production HA across AZs).
+  replicaCount: 1
   image:
     repository: audittrace-memory-server
     tag: ci

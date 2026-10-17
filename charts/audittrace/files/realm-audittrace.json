@@ -89,6 +89,20 @@
       }
     },
     {
+      "name": "memory:session:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:session:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
       "name": "memory:decisions:write",
       "protocol": "openid-connect",
       "attributes": {
@@ -103,7 +117,175 @@
       }
     },
     {
+      "name": "memory:corpus:decisions:read",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:corpus:decisions:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:corpus:skills:read",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:corpus:skills:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:corpus:semantic:read",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:corpus:semantic:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
       "name": "memory:upload:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:conversations:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:conversations:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:presets:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:presets:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:prompts:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:prompts:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:chat_projects:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:chat_projects:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:files:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:files:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:agents:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:agents:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:conversation_tags:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:conversation_tags:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:tool_favorites:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:tool_favorites:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:acl:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:acl:write",
       "protocol": "openid-connect",
       "attributes": {
         "include.in.token.scope": "true"
@@ -114,6 +296,108 @@
       "protocol": "openid-connect",
       "attributes": {
         "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "audittrace:assessment:ingest",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "profile",
+      "description": "M3-WU-3b (D3) — standard OIDC profile scope. --import-realm won't auto-create built-in profile/email/offline_access when clientScopes is explicit; declared here so a fresh install self-heals (see ensure-memory-scopes.sh Step 5 for existing realms).",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "given name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "firstName",
+            "claim.name": "given_name",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "family name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "lastName",
+            "claim.name": "family_name",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "email",
+      "description": "M3-WU-3b (D3) — standard OIDC email scope. See the profile scope's description above for why this is declared explicitly.",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "email",
+            "claim.name": "email",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "email verified",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "emailVerified",
+            "claim.name": "email_verified",
+            "jsonType.label": "boolean",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "offline_access",
+      "description": "M3-WU-3b (D3) — standard OIDC offline_access scope (refresh token). Bound only to audittrace-librechat, for LibreChat's OPENID_REUSE_TOKENS session-age refresh (the #1 stale-token-window mitigation).",
+      "protocol": "openid-connect",
+      "attributes": {
+        "display.on.consent.screen": "true"
       }
     }
   ],
@@ -185,7 +469,14 @@
         "memory:procedural:write",
         "memory:semantic:write"
       ],
-      "optionalClientScopes": []
+      "optionalClientScopes": [
+        "memory:corpus:decisions:read",
+        "memory:corpus:decisions:write",
+        "memory:corpus:skills:read",
+        "memory:corpus:skills:write",
+        "memory:corpus:semantic:read",
+        "memory:corpus:semantic:write"
+      ]
     },
     {
       "description": "Dev client \u2014 client_credentials grant with audience mapper (aud=audittrace-server). Secret in secrets/dev_client_secret.txt. See DESIGN \u00a716 Phase 7.",
@@ -217,6 +508,97 @@
             "included.custom.audience": "audittrace-server",
             "id.token.claim": "false",
             "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "description": "Deliberately under-privileged Device Flow client for adversarial verification (SC-09). Holds NO audit/admin scope in EITHER scope set, so its token cannot be widened by asking. Do not add one. See docs/ADR-059 and tests/test_chart_drift_guards.py.",
+      "clientId": "audittrace-restricted",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "urn:ietf:wg:oauth:2.0:oob",
+        "http://localhost:*"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true",
+        "oauth2.device.polling.interval": "5"
+      },
+      "defaultClientScopes": [
+        "audittrace:query",
+        "audittrace:context",
+        "memory:conversational:read-own"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-audittrace-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "audittrace-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "preferred-username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "email",
+            "claim.name": "email",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "given-name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "firstName",
+            "claim.name": "given_name",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "family-name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "lastName",
+            "claim.name": "family_name",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
           }
         }
       ]
@@ -256,7 +638,8 @@
         "memory:semantic:write",
         "memory:decisions:write",
         "memory:skills:write",
-        "audittrace:admin"
+        "audittrace:admin",
+        "audittrace:assessment:ingest"
       ],
       "protocolMappers": [
         {
@@ -335,12 +718,14 @@
       "serviceAccountsEnabled": false,
       "protocol": "openid-connect",
       "redirectUris": [
-{{- range $i, $uri := .Values.keycloak.webui.redirectUris }}{{ if $i }},{{ end }}
+{{- $webuiRedirectUris := concat .Values.keycloak.webui.redirectUris .Values.keycloak.webui.devRedirectUris }}
+{{- range $i, $uri := $webuiRedirectUris }}{{ if $i }},{{ end }}
         "{{ $uri }}"
 {{- end }}
       ],
       "webOrigins": [
-{{- range $i, $origin := .Values.keycloak.webui.webOrigins }}{{ if $i }},{{ end }}
+{{- $webuiWebOrigins := concat .Values.keycloak.webui.webOrigins .Values.keycloak.webui.devWebOrigins }}
+{{- range $i, $origin := $webuiWebOrigins }}{{ if $i }},{{ end }}
         "{{ $origin }}"
 {{- end }}
       ],
@@ -363,7 +748,8 @@
         "memory:semantic:write",
         "memory:decisions:write",
         "memory:skills:write",
-        "audittrace:admin"
+        "audittrace:admin",
+        "audittrace:assessment:ingest"
       ],
       "protocolMappers": [
         {
@@ -429,7 +815,167 @@
           }
         }
       ]
+    },
+    {
+      "description": "Public client for the M3 LibreChat console (Auth Code+PKCE, ADR-042). Grants per-user memory:*:write (optional) + read-own scopes (default), incl. session + conversations + presets (Mongo-repl) — see bff/exchange.py.",
+      "clientId": "audittrace-librechat",
+      "name": "AuditTrace LibreChat Console (browser auth-code flow + PKCE)",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+{{- $librechatRedirectUris := concat .Values.keycloak.librechat.redirectUris .Values.keycloak.librechat.devRedirectUris }}
+{{- range $i, $uri := $librechatRedirectUris }}{{ if $i }},{{ end }}
+        "{{ $uri }}"
+{{- end }}
+      ],
+      "webOrigins": [
+{{- $librechatWebOrigins := concat .Values.keycloak.librechat.webOrigins .Values.keycloak.librechat.devWebOrigins }}
+{{- range $i, $origin := $librechatWebOrigins }}{{ if $i }},{{ end }}
+        "{{ $origin }}"
+{{- end }}
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "token-exchange.authorized-source-client": "audittrace-librechat-bff"
+      },
+      "defaultClientScopes": [
+        "audittrace:query",
+        "audittrace:context",
+        "audittrace:audit",
+        "memory:episodic:read",
+        "memory:procedural:read",
+        "memory:conversational:read-own",
+        "memory:semantic:read",
+        "memory:session:read-own",
+        "memory:conversations:read-own",
+        "memory:presets:read-own",
+        "memory:prompts:read-own",
+        "memory:chat_projects:read-own",
+        "memory:files:read-own",
+        "memory:agents:read-own",
+        "memory:conversation_tags:read-own",
+        "memory:tool_favorites:read-own",
+        "memory:acl:read-own",
+        "profile",
+        "email"
+      ],
+      "optionalClientScopes": [
+        "offline_access",
+        "memory:episodic:write",
+        "memory:procedural:write",
+        "memory:semantic:write",
+        "memory:session:write",
+        "memory:conversations:write",
+        "memory:presets:write",
+        "memory:prompts:write",
+        "memory:chat_projects:write",
+        "memory:files:write",
+        "memory:agents:write",
+        "memory:conversation_tags:write",
+        "memory:tool_favorites:write",
+        "memory:acl:write"
+      ],
+      "protocolMappers": [
+        {
+          "name": "aud-audittrace-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "audittrace-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "preferred-username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "email",
+            "claim.name": "email",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "description": "Confidential client for the M3 LibreChat BFF (ADR-042 section 5 Option A sidecar). RFC 8693 token-exchange only: mints an aud=audittrace-server token for the caller's own sub via audittrace-librechat's scope profile.",
+      "clientId": "audittrace-librechat-bff",
+      "name": "AuditTrace LibreChat BFF (RFC 8693 token exchange)",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "protocol": "openid-connect",
+      "defaultClientScopes": [],
+      "optionalClientScopes": [],
+      "protocolMappers": []
+    }{{- if .Values.keycloak.aclE2eClient.enabled }},
+    {
+      "description": "ACL WU-2c E2E-only device-flow client (sunset: WU-4 merge, keycloak.aclE2eClient.enabled=false). Holds ONLY memory:acl:read-own + memory:acl:write; no offline_access, no refresh, consent required.",
+      "clientId": "audittrace-acl-e2e",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": true,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "urn:ietf:wg:oauth:2.0:oob"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true",
+        "oauth2.device.polling.interval": "5",
+        "oauth2.device.code.lifespan": "120",
+        "use.refresh.tokens": "false",
+        "access.token.lifespan": "900"
+      },
+      "defaultClientScopes": [
+        "memory:acl:read-own",
+        "memory:acl:write"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-audittrace-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "audittrace-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
     }
+{{- end }}
   ],
   "identityProviders": [],
   "identityProviderMappers": [],

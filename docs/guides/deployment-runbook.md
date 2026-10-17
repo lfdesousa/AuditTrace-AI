@@ -115,7 +115,7 @@ password, and approve the consent screen. Tokens are saved to
 
 **Verify:**
 ```bash
-BEARER=$(scripts/audittrace-login --show)
+BEARER=$(scripts/audittrace-login --show-unsafe)
 curl -sk -H "Authorization: Bearer $BEARER" \
     https://localhost/v1/chat/completions \
     -H "Content-Type: application/json" \
@@ -125,8 +125,8 @@ curl -sk -H "Authorization: Bearer $BEARER" \
 ## Step 9: Index ChromaDB
 
 ```bash
-# Get the user ID from the login step
-USER_ID=$(scripts/audittrace-login --show | python3 -c "
+# Get the user ID from the login step (needs the raw JWT payload, hence --show-unsafe)
+USER_ID=$(scripts/audittrace-login --show-unsafe | python3 -c "
 import sys, json, base64
 t = sys.stdin.read()
 payload = t.split('.')[1] + '=='
@@ -183,7 +183,7 @@ scripts/start-summarizer-llama.sh
 curl -sk https://localhost/health | jq .
 
 # Authenticated chat
-BEARER=$(scripts/audittrace-login --show)
+BEARER=$(scripts/audittrace-login --show-unsafe)
 curl -sk -H "Authorization: Bearer $BEARER" \
     -H "Content-Type: application/json" \
     -H "X-Project: AuditTrace-AI" \

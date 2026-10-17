@@ -41,7 +41,7 @@ from sqlalchemy import update
 from audittrace.db.models import MemoryItem
 
 if TYPE_CHECKING:
-    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from audittrace.services.scan_amqp_client import ScanAmqpClient
 
@@ -105,7 +105,7 @@ class ScanRequestPublisher:
         *,
         amqp_client: ScanAmqpClient,
         queue: asyncio.Queue[ScanRequestEnvelope],
-        session_factory: sessionmaker[Any],
+        session_factory: async_sessionmaker[AsyncSession],
     ) -> None:
         self._amqp = amqp_client
         self._queue = queue
@@ -128,14 +128,14 @@ class ScanRequestPublisher:
         # ``UPDATE … WHERE id=:scan_id AND published_at_ms IS NULL``
         # makes the marker idempotent under crash-restart races.
         try:
-            with self._session_factory() as session:
-                session.execute(
+            async with self._session_factory() as session:
+                await session.execute(
                     update(MemoryItem)
                     .where(MemoryItem.id == envelope.scan_id)
                     .where(MemoryItem.published_at_ms.is_(None))
                     .values(published_at_ms=_now_ms())
                 )
-                session.commit()
+                await session.commit()
         except Exception as exc:
             logger.error(
                 "scan_publisher.outbox_update_failed",

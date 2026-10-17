@@ -15,11 +15,30 @@ from audittrace.config import get_settings
 from audittrace.db.rls import install_rls_listener
 from audittrace.dependencies import (
     get_postgres_factory,
+    get_session_memory_service,
     register_default_dependencies,
 )
 from audittrace.logging_config import setup_logging
-from audittrace.routes import admin, audit, chat, context, health, memory, session
+from audittrace.routes import admin, audit, chat, context, health, mcp, memory, session
+from audittrace.routes.console_acl import router as console_acl_router
+from audittrace.routes.console_agents import router as console_agents_router
+from audittrace.routes.console_chat_projects import (
+    router as console_chat_projects_router,
+)
+from audittrace.routes.console_conversation_tags import (
+    router as console_conversation_tags_router,
+)
+from audittrace.routes.console_conversations import (
+    router as console_conversations_router,
+)
+from audittrace.routes.console_files import router as console_files_router
+from audittrace.routes.console_presets import router as console_presets_router
+from audittrace.routes.console_prompts import router as console_prompts_router
+from audittrace.routes.console_tool_favorites import (
+    router as console_tool_favorites_router,
+)
 from audittrace.routes.memory_upload import router as memory_upload_status_router
+from audittrace.services.session_gc_janitor import SessionGCJanitor
 from audittrace.services.session_summarizer import SessionSummarizer
 
 logger = getLogger(__name__)
@@ -139,6 +158,232 @@ def make_httpx_async_peer_service_hook(
     return _hook
 
 
+async def _connect_scan_amqp_or_degrade(client: Any) -> bool:
+    """Eagerly open the scan-pipeline AMQP connection, failing OPEN.
+
+    The memory-server's core value (recall + memory) needs neither the
+    broker nor the scan pipeline, so an unreachable RabbitMQ at startup
+    MUST NOT crash the lifespan (#384 WS3, invariant I2). On a cold
+    reboot the broker is often not AMQP-ready inside
+    ``ScanAmqpClient``'s connect budget; the client then raises
+    ``RuntimeError("scan_amqp.connect failed after N attempts …")``.
+
+    Returns ``True`` when the eager connect succeeded, ``False`` when the
+    budget was exhausted and we degrade to lazy — the publisher and both
+    consumers self-connect in their own ``run()`` loops once RabbitMQ is
+    up, with zero operator touch. Only the "connect failed after N
+    attempts" RuntimeError is swallowed; any other error (e.g. a genuine
+    misconfiguration) propagates so it still fails loudly.
+    """
+    try:
+        await client.ensure_connected()
+    except RuntimeError as exc:
+        if "connect failed after" not in str(exc):
+            raise
+        logger.warning(
+            "scan_amqp.eager_connect_degraded_to_lazy",
+            extra={"reason": str(exc)},
+        )
+        return False
+    return True
+
+
+async def _bootstrap_scan_pipeline(app: FastAPI, settings: Any) -> Any:
+    """Start the ADR-048 scan-request pipeline, failing OPEN on a broker
+    that is not reachable at startup (#384 WS3).
+
+    Construction of ``ScanAmqpClient`` is cheap/sync (no broker I/O); it
+    is registered for cleanup and only THEN eagerly connected via
+    ``_connect_scan_amqp_or_degrade`` (which degrades to lazy instead of
+    raising). The publisher, janitor, and both consumers are created
+    regardless of the eager-connect outcome — each self-connects in its
+    own ``run()`` loop, so the pipeline attaches with zero operator touch
+    once the broker is up. ``app.state.scan_queue`` is always set so the
+    ``/memory/upload`` route handler can enqueue immediately.
+
+    SPEC #387 Phase 1 additionally starts ``IndexWorker`` + ``IndexJanitor``
+    here — the place→index leg of the pipeline, one hop after
+    place→publish. ``ScanVerdictConsumer`` is wired with the new
+    ``index_queue`` so a ``scanned_clean`` verdict enqueues an
+    auto-index request with zero operator touch (closes GAP-1).
+
+    Returns the ``AsyncExitStack`` owning broker-close + task-cancel, to
+    be unwound on shutdown.
+    """
+    import contextlib  # noqa: PLC0415 — local to keep import surface tight
+
+    from audittrace.services.index_janitor import IndexJanitor  # noqa: PLC0415
+    from audittrace.services.index_worker import (  # noqa: PLC0415
+        IndexRequestEnvelope,
+        IndexWorker,
+    )
+    from audittrace.services.scan_amqp_client import ScanAmqpClient  # noqa: PLC0415
+    from audittrace.services.scan_audit_consumer import (  # noqa: PLC0415
+        ScanAuditConsumer,
+    )
+    from audittrace.services.scan_request_janitor import (  # noqa: PLC0415
+        ScanRequestJanitor,
+    )
+    from audittrace.services.scan_request_publisher import (  # noqa: PLC0415
+        ScanRequestEnvelope,
+        ScanRequestPublisher,
+    )
+    from audittrace.services.scan_verdict_consumer import (  # noqa: PLC0415
+        ScanVerdictConsumer,
+    )
+
+    stack = contextlib.AsyncExitStack()
+    # Construct (cheap, no I/O) → register cleanup → THEN eager-connect.
+    # Separating construction from ``ensure_connected`` is what lets the
+    # connect fail OPEN while the client is still registered for aclose
+    # and still available to the publisher for lazy self-connect.
+    scan_amqp_client = ScanAmqpClient(settings)
+    stack.push_async_callback(scan_amqp_client.aclose)
+    await _connect_scan_amqp_or_degrade(scan_amqp_client)
+
+    scan_queue: asyncio.Queue[ScanRequestEnvelope] = asyncio.Queue(maxsize=10000)
+    scan_session_factory = get_postgres_factory().get_session_factory()
+    scan_publisher_task = asyncio.create_task(
+        ScanRequestPublisher(
+            amqp_client=scan_amqp_client,
+            queue=scan_queue,
+            session_factory=scan_session_factory,
+        ).run(),
+        name="scan-request-publisher",
+    )
+    scan_janitor_task = asyncio.create_task(
+        ScanRequestJanitor(
+            settings=settings,
+            session_factory=scan_session_factory,
+            queue=scan_queue,
+        ).run(),
+        name="scan-request-janitor",
+    )
+    # ─── SPEC #387 Phase 1 — auto-index outbox (WU-1/WU-2/WU-3) ───────────
+    # One hop after the scan outbox: ``IndexWorker`` drains the queue
+    # ``ScanVerdictConsumer`` feeds on every ``scanned_clean`` verdict
+    # (WU-1 wiring — passed as ``index_queue=`` below); ``IndexJanitor``
+    # re-drives any ``indexed_at_ms IS NULL`` row past the grace window.
+    # Same supervised create_task + AsyncExitStack-cancel shape as the
+    # scan pipeline above, gated by the same ``scan_pipeline_enabled``
+    # flag (indexing only matters once the scan pipeline is active).
+    index_queue: asyncio.Queue[IndexRequestEnvelope] = asyncio.Queue(maxsize=10000)
+    index_worker_task = asyncio.create_task(
+        IndexWorker(
+            settings=settings,
+            session_factory=scan_session_factory,
+            queue=index_queue,
+        ).run(),
+        name="index-worker",
+    )
+    index_janitor_task = asyncio.create_task(
+        IndexJanitor(
+            settings=settings,
+            session_factory=scan_session_factory,
+            queue=index_queue,
+        ).run(),
+        name="index-janitor",
+    )
+
+    verdict_consumer = ScanVerdictConsumer(
+        settings=settings,
+        session_factory=scan_session_factory,
+        index_queue=index_queue,
+    )
+    stack.push_async_callback(verdict_consumer.aclose)
+    audit_consumer = ScanAuditConsumer(
+        settings=settings, session_factory=scan_session_factory
+    )
+    stack.push_async_callback(audit_consumer.aclose)
+    scan_verdict_task = asyncio.create_task(
+        verdict_consumer.run(), name="scan-verdict-consumer"
+    )
+    scan_audit_task = asyncio.create_task(
+        audit_consumer.run(), name="scan-audit-consumer"
+    )
+
+    async def _cancel_scan_tasks() -> None:
+        tasks = (
+            scan_publisher_task,
+            scan_janitor_task,
+            scan_verdict_task,
+            scan_audit_task,
+            index_worker_task,
+            index_janitor_task,
+        )
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(t, timeout=5.0)
+
+    stack.push_async_callback(_cancel_scan_tasks)
+    # Stash on app.state so the route handler reaches the queue.
+    app.state.scan_queue = scan_queue
+    logger.info(
+        "Scan-request pipeline scheduled — exchange=%s routing_key=%s "
+        "(publisher + janitor + verdict-consumer + audit-consumer + "
+        "index-worker + index-janitor)",
+        settings.scan_request_exchange,
+        settings.scan_request_routing_key,
+    )
+    return stack
+
+
+def _maybe_start_session_gc_janitor(
+    settings: Any, service: Any
+) -> asyncio.Task[None] | None:
+    """Schedule ``SessionGCJanitor.run()`` iff ``settings.session_gc_enabled``
+    (WU-6 Part A) AND a real database is configured, else return ``None``.
+    Extracted from ``lifespan`` as a small, pure-ish function — unlike the
+    ``scan_pipeline_enabled`` / ``summarizer_enabled`` gates above (each
+    entangled with broker connections, dedicated Postgres factories, or
+    other lifespan-only setup that make them ``# pragma: no cover — live-
+    startup path``), this gate's ONLY inputs are ``settings`` + an
+    already-constructed ``SessionMemoryService`` — decoupled enough from
+    the rest of lifespan startup to be exercised directly by a fast async
+    unit test (see
+    ``tests/test_session_gc_janitor.py::TestMaybeStartSessionGcJanitor``).
+
+    The ``settings.database_url`` half of the gate mirrors
+    ``summarizer_enabled and summarizer_db_url`` above exactly (both
+    default-True flags that additionally require a REAL Postgres to be
+    configured before actually scheduling their task) — it is what keeps
+    this janitor dormant in the unit-test suite's ``AUDITTRACE_ENV=test``
+    default (``database_url`` is ``None`` there), which matters because
+    the test suite's ``InMemoryPostgresFactory`` (aiosqlite) engine is
+    NOT safe to touch from two different event loops at once: the
+    ``TestClient`` lifespan runs on its own anyio-portal thread/loop,
+    while async test bodies run on pytest-asyncio's loop, and aiosqlite's
+    background-thread bridge is loop-bound — confirmed live (a bare
+    ``AUDITTRACE_SESSION_GC_ENABLED=true`` default with no DB-configured
+    gate deadlocked ``tests/test_routes.py::test_list_interactions_
+    returns_seeded_rows`` the instant this janitor's first sweep ran on
+    the portal loop while the test seeded a row on its own loop).
+
+    This is the exact guard spec §2.5 guard 4 names: neuter the ``if``
+    check below (schedule the task unconditionally) and
+    ``test_does_not_start_when_disabled`` goes RED.
+    """
+    if not settings.session_gc_enabled or not settings.database_url:
+        logger.info(
+            "Session GC janitor NOT started (enabled=%s, db=%s)",
+            settings.session_gc_enabled,
+            "yes" if settings.database_url else "no",
+        )
+        return None
+    task = asyncio.create_task(
+        SessionGCJanitor(settings=settings, service=service).run(),
+        name="session-gc-janitor",
+    )
+    logger.info(
+        "Session GC janitor scheduled — interval=%ds retention=%dh",
+        settings.session_gc_interval_seconds,
+        settings.session_retention_hours,
+    )
+    return task
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     """Application lifespan handler - startup and shutdown."""
@@ -220,8 +465,11 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     # Without a dedicated URL (tests, single-tenant dev), falls back
     # to the main factory — RLS is then the caller's problem.
     summarizer_task: asyncio.Task[None] | None = None
+    # asyncpg-normalised (config.summarizer_database_url) — URLPostgresFactory
+    # builds an async engine, which rejects a raw psycopg2 URL.
+    summarizer_db_url = settings.summarizer_database_url
     if (
-        settings.summarizer_enabled and settings.summarizer_database_url
+        settings.summarizer_enabled and summarizer_db_url
     ):  # pragma: no cover - live-startup path
         if (
             settings.summarizer_postgres_url
@@ -229,9 +477,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         ):
             from audittrace.db.postgres import URLPostgresFactory
 
-            summarizer_factory = URLPostgresFactory(
-                settings.summarizer_postgres_url, pool_size=2
-            )
+            summarizer_factory = URLPostgresFactory(summarizer_db_url, pool_size=2)
             summarizer_session_factory = summarizer_factory.get_session_factory()
             logger.info("Session summariser: using dedicated owner-role connection")
         else:
@@ -291,6 +537,20 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     else:
         logger.info("Async-persist consumer NOT started (async_persist_enabled=False)")
 
+    # ─── WU-6 (Sovereign-Attach EPIC, Part A) — session-memory GC janitor ─
+    # Per-pod background task, same simple flag-gated shape as the
+    # summariser/async-persist tasks above (not tied to
+    # ``scan_pipeline_enabled`` — the session layer has nothing to do with
+    # the scan/index outbox). The gate itself is extracted into
+    # ``_maybe_start_session_gc_janitor`` (below) so it is directly
+    # pytest-unit-testable without mocking the rest of lifespan's startup
+    # sequence (ChromaDB/MinIO/telemetry init) — the non-vacuity guard
+    # spec §2.5 guard 4 names: neuter that helper's ``if`` check to always
+    # schedule the task and ``test_does_not_start_when_disabled`` goes RED.
+    session_gc_task = _maybe_start_session_gc_janitor(
+        settings, get_session_memory_service()
+    )
+
     # ─── ADR-048 PR-B3 — scan-request producer + janitor ──────────────
     # Background tasks owning the Hohpe outbox. The route handler
     # in routes/memory.py only enqueues; these two drain the queue
@@ -303,94 +563,11 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 
     scan_pipeline_stack: contextlib.AsyncExitStack | None = None
     if settings.scan_pipeline_enabled:  # pragma: no cover — live-startup path
-        # ``get_postgres_factory`` is already imported at module scope
-        # (line 17 — used by the summariser block above).
-        from audittrace.services.scan_amqp_client import ScanAmqpClient  # noqa: PLC0415
-        from audittrace.services.scan_audit_consumer import (  # noqa: PLC0415
-            ScanAuditConsumer,
-        )
-        from audittrace.services.scan_request_janitor import (  # noqa: PLC0415
-            ScanRequestJanitor,
-        )
-        from audittrace.services.scan_request_publisher import (  # noqa: PLC0415
-            ScanRequestEnvelope,
-            ScanRequestPublisher,
-        )
-        from audittrace.services.scan_verdict_consumer import (  # noqa: PLC0415
-            ScanVerdictConsumer,
-        )
-
-        scan_pipeline_stack = contextlib.AsyncExitStack()
-        # Compose the broker first — its aclose runs LAST on unwind,
-        # after both background tasks have been cancelled.
-        scan_amqp_client = await scan_pipeline_stack.enter_async_context(
-            ScanAmqpClient(settings)
-        )
-        scan_queue: asyncio.Queue[ScanRequestEnvelope] = asyncio.Queue(maxsize=10000)
-        scan_session_factory = get_postgres_factory().get_session_factory()
-        scan_publisher_task = asyncio.create_task(
-            ScanRequestPublisher(
-                amqp_client=scan_amqp_client,
-                queue=scan_queue,
-                session_factory=scan_session_factory,
-            ).run(),
-            name="scan-request-publisher",
-        )
-        scan_janitor_task = asyncio.create_task(
-            ScanRequestJanitor(
-                settings=settings,
-                session_factory=scan_session_factory,
-                queue=scan_queue,
-            ).run(),
-            name="scan-request-janitor",
-        )
-        # PR-B4 — verdict + audit consumers live in the same
-        # AsyncExitStack so their aclose hooks run after the cancel
-        # callback. ``enter_async_context`` registers the
-        # close-on-exit; the consumer instances are then turned into
-        # asyncio Tasks, with the cancel callback below covering
-        # all four (publisher, janitor, verdict, audit).
-        verdict_consumer = ScanVerdictConsumer(
-            settings=settings, session_factory=scan_session_factory
-        )
-        scan_pipeline_stack.push_async_callback(verdict_consumer.aclose)
-        audit_consumer = ScanAuditConsumer(
-            settings=settings, session_factory=scan_session_factory
-        )
-        scan_pipeline_stack.push_async_callback(audit_consumer.aclose)
-        scan_verdict_task = asyncio.create_task(
-            verdict_consumer.run(), name="scan-verdict-consumer"
-        )
-        scan_audit_task = asyncio.create_task(
-            audit_consumer.run(), name="scan-audit-consumer"
-        )
-
-        async def _cancel_scan_tasks() -> None:
-            for t in (
-                scan_publisher_task,
-                scan_janitor_task,
-                scan_verdict_task,
-                scan_audit_task,
-            ):
-                t.cancel()
-            for t in (
-                scan_publisher_task,
-                scan_janitor_task,
-                scan_verdict_task,
-                scan_audit_task,
-            ):
-                with contextlib.suppress(TimeoutError, asyncio.CancelledError):
-                    await asyncio.wait_for(t, timeout=5.0)
-
-        scan_pipeline_stack.push_async_callback(_cancel_scan_tasks)
-        # Stash on app.state so the route handler reaches the queue.
-        app.state.scan_queue = scan_queue
-        logger.info(
-            "Scan-request pipeline scheduled — exchange=%s routing_key=%s "
-            "(publisher + janitor + verdict-consumer + audit-consumer)",
-            settings.scan_request_exchange,
-            settings.scan_request_routing_key,
-        )
+        # ``_bootstrap_scan_pipeline`` fails OPEN on an unreachable broker
+        # (#384 WS3): it degrades the eager AMQP connect to lazy instead
+        # of raising, so the audit plane still starts and serves recall
+        # while RabbitMQ is down. The tasks self-connect once it is up.
+        scan_pipeline_stack = await _bootstrap_scan_pipeline(app, settings)
     else:
         app.state.scan_queue = None
         logger.info("Scan-request pipeline NOT started (scan_pipeline_enabled=False)")
@@ -406,6 +583,10 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         async_persist_task.cancel()
         with contextlib.suppress(TimeoutError, asyncio.CancelledError):
             await asyncio.wait_for(async_persist_task, timeout=5.0)
+    if session_gc_task is not None:  # pragma: no cover - paired with startup
+        session_gc_task.cancel()
+        with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(session_gc_task, timeout=5.0)
     if scan_pipeline_stack is not None:  # pragma: no cover - paired with startup
         await scan_pipeline_stack.aclose()
     telemetry.shutdown()
@@ -449,20 +630,41 @@ OPENAPI_TAGS: list[dict[str, str]] = [
     {
         "name": "context",
         "description": (
-            "Build the augmented system context across all four memory layers "
-            "(episodic, procedural, conversational, semantic) without going "
-            "through chat completions. Used by the webui memory tab and by "
-            "external agents that want to inspect what would be injected."
+            "Build the augmented system context across the four per-user "
+            "memory layers (episodic, procedural, conversational, semantic) "
+            "without going through chat completions — this is the "
+            "``memory_mode=inject`` aggregator (ADR-025) and does NOT include "
+            "Layer 5, the Shared Corpus (production runs "
+            "``memory_mode=tools``, where recall — including Layer 5 — happens "
+            "via the ``recall_*`` tools inside the chat-completions tool-call "
+            "loop instead; see the top-level API description). Used by the "
+            "webui memory tab and by external agents that want to inspect "
+            "what would be injected."
         ),
     },
     {
         "name": "memory",
         "description": (
-            "CRUD over the four memory layers. Episodic = ADRs, "
-            "Procedural = skill files, Conversational = past sessions "
-            "(read-only), Semantic = ChromaDB-backed RAG. Each write is "
-            "scoped to the caller's Keycloak ``sub`` and gated by RLS at the "
-            "Postgres + ChromaDB layers."
+            "Backoffice CRUD over the five-layer memory model (ADR-062) — "
+            "this is the operator/audit management surface, NOT where LLM "
+            "recall happens (see the top-level API description for that). "
+            "Episodic = ADRs, Procedural = skill files, Conversational = "
+            "past sessions (read-only), Semantic = ChromaDB-backed RAG. "
+            "Layers 1-4 are designed per-user-isolated (episodic/procedural "
+            "S3-tier wiring + semantic per-user source vectors ship in ADR-062 "
+            "Phase B; conversational RLS and semantic recall filtering are "
+            "already live). ``POST /memory/index`` bulk-rebuilds Layer 5 (the "
+            "Shared Corpus — decisions/skills/semantic collections) and is "
+            "admin-only. Every operation here — read, list, write, delete — "
+            "emits a first-class audit row (``event_class=memory_access``, "
+            "``GET /interactions``), owner-scoped and trace-linked (ADR-062 "
+            "§5). Deletes default to soft-delete (manifest tombstone, the "
+            "authoritative + recoverable + recall-honoured state for corpus "
+            "content per ADR-062 §6); ``?hard=true`` additionally purges the "
+            "underlying S3 object / ChromaDB vector and requires "
+            "``audittrace:admin``. Each write is scoped to the caller's "
+            "Keycloak ``sub`` and gated by RLS at the Postgres + ChromaDB "
+            "layers."
         ),
     },
     {
@@ -490,6 +692,23 @@ OPENAPI_TAGS: list[dict[str, str]] = [
             "state alongside the standard component checks."
         ),
     },
+    {
+        "name": "mcp",
+        "description": (
+            "ADR-063 Phase 1 — the read/recall memory tools exposed over a "
+            "standard MCP transport (streamable-HTTP, JSON-RPC 2.0 on "
+            "``POST /mcp``) so any MCP-speaking agent can use the audited "
+            "tool backend without giving up the audit trail. Purely "
+            "additive to ``/v1/chat/completions``. Every ``tools/call`` is "
+            "authorized per-tool against the caller's Keycloak scopes, "
+            "executed under the caller's isolated RLS context, and recorded "
+            "through the SAME tamper-evident audit path the chat tool loop "
+            "uses (ADR-037/058) — one interaction + one tool_calls row per "
+            "call. No write/curation tools are ever listed or callable "
+            "here, regardless of caller privilege; later phases add those "
+            "under operator-tier scopes."
+        ),
+    },
 ]
 
 
@@ -499,12 +718,23 @@ def create_app() -> FastAPI:
         title="AuditTrace-AI",
         description=(
             "EU-AI-Act-aligned audit trail for LLM workloads. "
-            "OpenAI-compatible ``/v1/chat/completions`` proxy with 4-layer memory "
-            "augmentation (episodic + procedural + conversational + semantic), "
-            "Keycloak-delegated identity, Postgres RLS per-user isolation, and "
-            "opt-in Redis-Streams async persistence (ADR-046).\n\n"
+            "OpenAI-compatible ``/v1/chat/completions`` proxy over a five-layer "
+            "memory model (ADR-062): four per-user-isolated layers — episodic, "
+            "procedural, conversational, semantic — plus Layer 5, the Shared "
+            "Corpus (org-wide knowledge, shared-read, operator/curator-tier "
+            "write). Keycloak-delegated identity, Postgres RLS per-user "
+            "isolation, opt-in Redis-Streams async persistence (ADR-046), and "
+            "a first-class audit event on every memory read/list/write/delete "
+            "(ADR-062 §5 — ``event_class=memory_access`` on ``GET "
+            "/interactions``).\n\n"
+            "Recall (the LLM reading its own memory) happens through the "
+            "``recall_*`` tools inside the ``/v1/chat/completions`` tool-call "
+            "loop (ADR-025) and through ``POST /context`` (the legacy "
+            "``inject``-mode aggregator) — NOT through the ``memory`` tag's "
+            "backoffice CRUD endpoints, which are the operator/audit surface "
+            "for managing memory content directly.\n\n"
             "See ``docs/architecture/`` for C4 + sequence diagrams; the ADR set "
-            "(014–046) is the source of truth for design decisions."
+            "(014–062) is the source of truth for design decisions."
         ),
         version=_resolve_version(),
         openapi_tags=OPENAPI_TAGS,
@@ -551,6 +781,96 @@ def create_app() -> FastAPI:
     # `/memory`), so it adds the status endpoint without forcing the
     # upload-POST surface to fork.
     app.include_router(memory_upload_status_router, tags=["memory"])
+    # WU-1 (MongoDB-elimination EPIC) — the console-conversations store's
+    # REST surface (create/list/get/delete/messages), RLS-isolated by
+    # the caller's token sub. Additive-only, distinct from /memory/*.
+    app.include_router(
+        console_conversations_router,
+        prefix="/console/conversations",
+        tags=["console-conversations"],
+    )
+    # WU-presets (MongoDB-elimination EPIC) — the console-presets store's
+    # REST surface (create/list/get/delete), RLS-isolated by the
+    # caller's token sub. Additive-only, distinct from /memory/* and
+    # /console/conversations.
+    app.include_router(
+        console_presets_router,
+        prefix="/console/presets",
+        tags=["console-presets"],
+    )
+    # WU-prompts (MongoDB-elimination EPIC) — the console-prompts
+    # store's REST surface (group CRUD + nested versions/production),
+    # RLS-isolated by the caller's token sub. Additive-only, distinct
+    # from /memory/*, /console/conversations, and /console/presets.
+    app.include_router(
+        console_prompts_router,
+        prefix="/console/prompts",
+        tags=["console-prompts"],
+    )
+    # Chat-Projects domain (MongoDB-elimination EPIC) — the console-
+    # chat-projects store's REST surface (create/list/get/delete),
+    # RLS-isolated by the caller's token sub. Additive-only, distinct
+    # from /memory/*, /console/conversations, /console/presets, and
+    # /console/prompts.
+    app.include_router(
+        console_chat_projects_router,
+        prefix="/console/chat-projects",
+        tags=["console-chat-projects"],
+    )
+    # Files-metadata domain (MongoDB-elimination EPIC) — the
+    # console-files store's REST surface (upsert/list/get/delete +
+    # batch-get-by-ids), RLS-isolated by the caller's token sub.
+    # METADATA ONLY — the file bytes stay in object storage
+    # (feedback_storage_always_s3). Additive-only, distinct from
+    # /memory/* (including the pre-existing ephemeral-ingest
+    # /memory/upload path), /console/conversations, /console/presets,
+    # /console/prompts, and /console/chat-projects.
+    app.include_router(
+        console_files_router,
+        prefix="/console/files",
+        tags=["console-files"],
+    )
+    # Agents domain (MongoDB-elimination EPIC) — the console-agents
+    # store's REST surface (upsert/list/get/delete + batch-get-by-ids),
+    # RLS-isolated by the caller's token sub. Own-agents-only v1
+    # (sharing/marketplace out of scope). Additive-only, distinct from
+    # every other /console/* mount above.
+    app.include_router(
+        console_agents_router,
+        prefix="/console/agents",
+        tags=["console-agents"],
+    )
+    # Conversation-Tags domain (MongoDB-elimination EPIC) — the
+    # console-conversation-tags store's REST surface (upsert/list/get/
+    # delete), RLS-isolated by the caller's token sub. Own-tags-only v1.
+    # Additive-only, distinct from every other /console/* mount above.
+    app.include_router(
+        console_conversation_tags_router,
+        prefix="/console/conversation-tags",
+        tags=["console-conversation-tags"],
+    )
+    # Tool-Favorites domain (MongoDB-elimination EPIC) — the
+    # console-tool-favorites store's REST surface (add/list/remove),
+    # RLS-isolated by the caller's token sub. Own-favorites-only v1
+    # (sharing/marketplace out of scope), MAX_TOOL_FAVORITES enforced
+    # server-side. Additive-only, distinct from every other /console/*
+    # mount above.
+    app.include_router(
+        console_tool_favorites_router,
+        prefix="/console/tool-favorites",
+        tags=["console-tool-favorites"],
+    )
+    # Sovereign Authorization Layer EPIC, WU-1 (READ PATH ONLY) — the
+    # console-ACL store's REST surface (effective-permissions/has-
+    # permission/accessible/public/sole-owned), RLS-isolated. Every
+    # answer is scoped to the caller's own resolved principal set (self
+    # + public); no write route exists yet (WU-2). Additive-only,
+    # distinct from every other /console/* mount above.
+    app.include_router(
+        console_acl_router,
+        prefix="/console/acl",
+        tags=["console-acl"],
+    )
     # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
     # under the same Istio gateway (templates/istio/virtualservice-
     # keycloak.yaml routes `/admin` to keycloak's REST API). ADR-052
@@ -559,6 +879,10 @@ def create_app() -> FastAPI:
     # operator-admin endpoints.
     app.include_router(admin.router, prefix="/system", tags=["system"])
     app.include_router(health.router, tags=["health"])
+    # ADR-063 Phase 1 — additive MCP entry-interface. Owns its own path
+    # (POST /mcp) alongside /v1/chat/completions, never inside it
+    # (feedback_openai_schema_inviolate). Read/recall tools only.
+    app.include_router(mcp.router, tags=["mcp"])
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(  # pyright: ignore[reportUnusedFunction]
@@ -672,6 +996,15 @@ _PER_LAYER_OR_SCOPES: dict[tuple[str, str], list[list[str]]] = {
     ("post", "/memory/index"): [
         ["memory:episodic:write"],
         ["memory:procedural:write"],
+        ["audittrace:admin"],
+    ],
+    # /memory/promote (WU-4, Sovereign-Attach EPIC) — the durable target
+    # is a runtime-validated body field (episodic/semantic only, no
+    # procedural — see routes/memory_promote.py's frozenset), never
+    # session (the source layer is never a valid promote destination).
+    ("post", "/memory/promote"): [
+        ["memory:episodic:write"],
+        ["memory:semantic:write"],
         ["audittrace:admin"],
     ],
 }

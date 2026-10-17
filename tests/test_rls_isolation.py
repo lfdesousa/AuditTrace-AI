@@ -46,7 +46,6 @@ the session, so RLS actually applies to the test queries.
 from __future__ import annotations
 
 import os
-import socket
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -55,6 +54,23 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from audittrace.db.rls import install_rls_listener, set_current_user_id
+from tests._pg_ephemeral import start_ephemeral_postgres
+
+# ───────────────────── Ephemeral Postgres scaffolding ───────────────────────
+# Classic setup/teardown: RLS needs a REAL Postgres (SQLite has no
+# row-level-security / set_config GUCs). SPEC v3 §8 (fast neuter harness):
+# the throwaway-container bring-up itself now lives in the shared
+# `tests/_pg_ephemeral.py` helper (all three RLS-proof files apply the same
+# non-durable flags there); container name and DSN shape are unchanged --
+# the same bring-up -> validate -> destroy discipline as the cloud rigs,
+# zero leftover state.
+
+# Standard local test-PG container (audittrace-test-pg) credentials:
+# postgres/test-pg-pass on :15432, DB audittrace. Used as the fallback
+# when neither the env var nor secrets/postgres_password.txt is present.
+_DEFAULT_TEST_PG_URL = (
+    "postgresql+psycopg2://postgres:test-pg-pass@localhost:15432/audittrace"
+)
 
 
 def _resolve_test_postgres_url() -> str | None:
@@ -80,20 +96,25 @@ def _resolve_test_postgres_url() -> str | None:
     if env_url:
         return env_url
 
-    # Legacy docker-compose path.
-    try:
-        with socket.create_connection(("localhost", 15432), timeout=1):
-            pass
-    except OSError:
-        return None
+    # No explicit DSN → bring up a throwaway postgres:16 container (setup),
+    # torn down at session end (teardown). Returns None when Docker is
+    # unavailable so the suite degrades to skip, never to a false failure
+    # against whatever happens to be squatting on :15432.
+    return start_ephemeral_postgres(
+        "audittrace-rls-pg-",
+        "rls_ephemeral_pw",  # noqa: S106 - throwaway container credential
+        "audittrace_rls",
+    )
 
-    from pathlib import Path
 
-    pw_file = Path(__file__).parent.parent / "secrets" / "postgres_password.txt"
-    if not pw_file.exists():
-        return None
-    pw = pw_file.read_text().strip()
-    return f"postgresql+psycopg2://audittrace:{pw}@localhost:15432/audittrace"
+# Default test-PG container (audittrace-test-pg) credentials. The legacy
+# branch above requires secrets/postgres_password.txt + an ``audittrace``
+# role; the standard local container exposes ``postgres``/``test-pg-pass``
+# on :15432 with DB ``audittrace``. Fall back to it so the RLS integration
+# tests run against the live container without extra wiring.
+_DEFAULT_TEST_PG_URL = (
+    "postgresql+psycopg2://postgres:test-pg-pass@localhost:15432/audittrace"
+)
 
 
 _RESOLVED_URL = _resolve_test_postgres_url()

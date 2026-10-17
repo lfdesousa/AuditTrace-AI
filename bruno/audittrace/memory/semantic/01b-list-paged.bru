@@ -1,0 +1,53 @@
+meta {
+  name: GET /memory/semantic — list (paged, reviewer helper)
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/memory/semantic?include_deleted=false&collection={{exampleCollection}}&limit={{listLimit}}&offset={{listOffset}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  include_deleted: false
+  collection: {{exampleCollection}}
+  limit: {{listLimit}}
+  offset: {{listOffset}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("body has items + total", function() {
+    const body = res.getBody();
+    expect(body.items).to.be.an("array");
+    expect(body.total).to.be.a("number");
+  });
+}
+
+docs {
+  Reviewer-added (ADR-059 loop, 2026-08-02): a paginated variant of
+  01-list.bru so an independent recall can page past the 100-item
+  default when a collection (e.g. decisions, 201 items) exceeds one
+  page. Same endpoint, adds limit/offset as env vars instead of
+  hardcoding a single page.
+
+  Aligned 2026-08-03 (backlog #15 residual, #375 /
+  RECALL-PAGINATION-20260803): this endpoint's `_sort_and_paginate` is
+  now a thin wrapper over the shared
+  `audittrace.services.pagination.sort_and_paginate` core — the same
+  core the recall TOOLS' new `offset`/`sort`/`order` pagination
+  (`ChromaSemanticService.search_page`) uses. This request's shape
+  (`items`/`total`/`limit`/`offset`) is unchanged by that refactor. See
+  `02-recall-paged.bru` in this same folder for the recall-tool
+  equivalent — that surface has no direct REST endpoint (it's invoked by
+  the LLM inside the chat-completions tool-call loop), so it's exercised
+  via a templated chat-completions call instead.
+}

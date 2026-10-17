@@ -7,19 +7,34 @@ into the system entry. These tests assert that pass-through holds for
 regression that triggered ADR-024.
 """
 
+import os
 from datetime import date
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlsplit
 
 import pytest
+from sqlalchemy import select
 
 from audittrace.identity import SENTINEL_SUBJECT
 from audittrace.routes.chat import (
     _apply_thinking_mode,
     _compute_session_id,
     _resolve_project,
+    _resolve_session_id,
     _resolve_thinking,
 )
 from audittrace.services.context_builder import PROFILE_SECTION_HEADER
+
+# Langfuse ingestion endpoint path. Tests filter recorded POSTs by the URL's
+# parsed PATH component (not a substring `in url` test) so the check is exact —
+# clears CodeQL py/incomplete-url-substring-sanitization and is stricter.
+_INGESTION_PATH = "/api/public/ingestion"
+
+
+def _is_ingestion_url(url: str) -> bool:
+    """True iff *url*'s path is exactly the Langfuse ingestion endpoint."""
+    return urlsplit(url).path == _INGESTION_PATH
+
 
 # ──────────────────────────── httpx.AsyncClient fakes ────────────────────────
 #
@@ -48,6 +63,7 @@ class _FakeAsyncClient:
         self.last_post_json: dict | None = None
         self.last_stream_json: dict | None = None
         self.last_post_url: str | None = None
+        self.last_get_url: str | None = None
         # Full call history — useful when a single request fans out to multiple
         # POSTs (LLM upstream + Langfuse ingestion).
         self.post_calls: list[dict] = []
@@ -70,6 +86,7 @@ class _FakeAsyncClient:
         return resp
 
     async def get(self, url, **kwargs):
+        self.last_get_url = url
         resp = MagicMock()
         resp.status_code = 200
         resp.json.return_value = self._get_json
@@ -78,6 +95,34 @@ class _FakeAsyncClient:
     def stream(self, method, url, json=None, **kwargs):
         self.last_stream_json = json
         return _FakeStreamCtx(self._stream_lines)
+
+    # ── build_request / send (WU-1, #458) ──────────────────────────────────
+    #
+    # The keep-alive-from-t=0 race (``_stream_upstream_with_keepalive_from_t0``)
+    # sends via ``client.build_request(...)`` + ``client.send(req,
+    # stream=True)`` instead of ``client.stream(...)`` — real
+    # ``httpx.AsyncClient.stream()`` is itself sugar over exactly those two
+    # calls. Delegating ``send()`` to ``self.stream(...)`` means every
+    # subclass below, which only overrides ``.stream()``, keeps working
+    # unchanged (their ``last_stream_json`` / ``stream_calls`` bookkeeping
+    # still fires) while production code exercises the new call shape.
+    def build_request(self, method, url, json=None, **kwargs):
+        return _FakeHttpxRequest(method, url, json)
+
+    async def send(self, request, *, stream=False, **kwargs):
+        cm = self.stream(request.method, request.url, json=request.json)
+        return await cm.__aenter__()
+
+
+class _FakeHttpxRequest:
+    """Minimal stand-in for ``httpx.Request`` — only the attributes
+    ``_FakeAsyncClient.send`` reads. (Distinct from ``_FakeRequest``
+    elsewhere in this module, which stands in for ``fastapi.Request``.)"""
+
+    def __init__(self, method: str, url: str, json: dict | None) -> None:
+        self.method = method
+        self.url = url
+        self.json = json
 
 
 class _FakeStreamCtx:
@@ -101,6 +146,11 @@ class _FakeStreamResponse:
     async def aiter_lines(self):
         for line in self._lines:
             yield line
+
+    async def aclose(self):
+        """No-op — the fake holds no real socket. Present so production's
+        ``contextlib.aclosing(resp)`` (WU-1) has something to call."""
+        return None
 
 
 def _patch_async_client(fake: _FakeAsyncClient):
@@ -148,6 +198,247 @@ def _patch_tool_loop_client(fake):
     )
 
 
+# ── Streaming fakes for the tools-mode per-turn streaming loop (#299) ────────
+#
+# The tools-mode streaming path (``_stream_memory_tool_loop``) opens one
+# ``client.stream(...)`` per loop turn and forwards content deltas live. These
+# fakes return a DIFFERENT set of SSE lines per ``.stream()`` call (one per
+# turn) and, on the buffered tool-parse-500 fallback, a ``.post()`` body.
+
+
+def _sse_line(obj: dict) -> str:
+    """Encode one OpenAI ``chat.completion.chunk`` dict as an SSE data line."""
+    import json as _j
+
+    return "data: " + _j.dumps(obj)
+
+
+def _sse_content_lines(pieces: list[str], model: str = "qwen3.5-35b") -> list[str]:
+    """SSE data lines streaming *pieces* of content then finish_reason=stop."""
+    lines = [
+        _sse_line(
+            {
+                "id": "cmpl-s",
+                "created": 1,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": p}}],
+            }
+        )
+        for p in pieces
+    ]
+    lines.append(
+        _sse_line(
+            {
+                "id": "cmpl-s",
+                "created": 1,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 8,
+                    "total_tokens": 28,
+                },
+            }
+        )
+    )
+    lines.append("data: [DONE]")
+    return lines
+
+
+def _sse_tool_call_lines(
+    tool_name: str, args_json: str, call_id: str = "call_1", model: str = "qwen3.5-35b"
+) -> list[str]:
+    """SSE data lines for a streamed tool_calls turn (think text + tool_call)."""
+    return [
+        _sse_line(
+            {
+                "id": "cmpl-s",
+                "created": 1,
+                "model": model,
+                "choices": [
+                    {"index": 0, "delta": {"content": "<think>recall</think>"}}
+                ],
+            }
+        ),
+        _sse_line(
+            {
+                "id": "cmpl-s",
+                "created": 1,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": args_json,
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ],
+            }
+        ),
+        _sse_line(
+            {
+                "id": "cmpl-s",
+                "created": 1,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            }
+        ),
+        "data: [DONE]",
+    ]
+
+
+class _SeqStreamResponse:
+    def __init__(self, lines, status=200, body=None):
+        self._lines = lines
+        self.status_code = status
+        self._body = body or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import httpx
+
+            raise httpx.HTTPStatusError(
+                "upstream error", request=MagicMock(), response=self
+            )
+        return None
+
+    async def aread(self):
+        return b""
+
+    def json(self):
+        return self._body
+
+    @property
+    def text(self):
+        import json as _j
+
+        return _j.dumps(self._body)
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+    async def aclose(self):
+        """No-op — the fake holds no real socket. Present so production's
+        ``contextlib.aclosing(resp)`` (WU-1) has something to call."""
+        return None
+
+
+class _SeqStreamCtx:
+    def __init__(self, lines, status=200, body=None):
+        self._lines = lines
+        self._status = status
+        self._body = body
+
+    async def __aenter__(self):
+        return _SeqStreamResponse(self._lines, self._status, self._body)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _SequencedStreamClient(_FakeAsyncClient):
+    """``_FakeAsyncClient`` whose ``.stream()`` returns a different SSE
+    line-set per call (one per loop turn), plus ``.post()`` for the buffered
+    tool-parse-500 fallback. ``stream_status``/``stream_bodies`` (parallel to
+    ``stream_turns``) drive error/fallback turns."""
+
+    def __init__(
+        self,
+        stream_turns: list[list[str]],
+        post_responses: list[dict] | None = None,
+        stream_status: list[int] | None = None,
+        stream_bodies: list[dict] | None = None,
+    ):
+        super().__init__()
+        self._turns = stream_turns
+        self._si = 0
+        self._post_responses = post_responses or []
+        self._pi = 0
+        self._stream_status = stream_status or []
+        self._stream_bodies = stream_bodies or []
+        self.stream_calls: list[dict] = []
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        self.stream_calls.append({"url": url, "json": json})
+        idx = min(self._si, len(self._turns) - 1)
+        lines = self._turns[idx]
+        status = self._stream_status[idx] if idx < len(self._stream_status) else 200
+        body = self._stream_bodies[idx] if idx < len(self._stream_bodies) else None
+        self._si += 1
+        return _SeqStreamCtx(lines, status, body)
+
+    async def post(self, url, json=None, **kwargs):
+        self.last_post_url = url
+        self.last_post_json = json
+        self.post_calls.append({"url": url, "json": json, "kwargs": kwargs})
+        body = self._post_responses[min(self._pi, len(self._post_responses) - 1)]
+        self._pi += 1
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = body
+        return resp
+
+
+def _parse_sse_deltas(raw: str) -> list[dict]:
+    """Parse an SSE body into the list of decoded ``data:`` JSON chunks
+    (skipping ``[DONE]`` and keep-alive comment frames)."""
+    import json as _j
+
+    out: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload == "[DONE]":
+            continue
+        try:
+            out.append(_j.loads(payload))
+        except _j.JSONDecodeError:
+            continue
+    return out
+
+
+class _RaisingStreamCtx:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aenter__(self):
+        raise self._exc
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _RaisingStreamClient(_FakeAsyncClient):
+    """``.stream()`` raises *exc* when the streaming context is entered —
+    models llama-server being unreachable / timing out / blowing up mid-open."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+
+    def stream(self, method, url, json=None, **kwargs):
+        return _RaisingStreamCtx(self._exc)
+
+
 # ─────────────────────────────── Session id ─────────────────────────────────
 
 
@@ -193,6 +484,39 @@ class _FakeRequest:
 
     def __init__(self, headers: dict[str, str] | None = None) -> None:
         self.headers = headers or {}
+
+
+class TestResolveSessionId:
+    """FLEET-ROUTE Gate #6 — client-settable run id (unit level).
+
+    The probe found ``X-Session-Id`` was IGNORED; ``_resolve_session_id``
+    honours it when present and falls through to ``_compute_session_id``
+    (byte-for-byte) when absent — per-agent-run reconstruction depends on
+    this so ``GET /interactions?session_id=<run>`` returns exactly one
+    OpenCode fleet-agent run."""
+
+    def test_header_present_wins_over_computed(self):
+        req = _FakeRequest({"x-session-id": "agent-run-42"})
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == "agent-run-42"
+
+    def test_header_is_whitespace_trimmed(self):
+        req = _FakeRequest({"x-session-id": "  agent-run-42  "})
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == "agent-run-42"
+
+    def test_header_absent_falls_through_to_computed_byte_for_byte(self):
+        """Gate #6, absence side: identical to today's exact behaviour —
+        the resolved session_id must equal ``_compute_session_id`` called
+        with the same inputs, not merely 'be present'."""
+        req = _FakeRequest()
+        expected = _compute_session_id("opencode", "hello", "user-1")
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == expected
+
+    def test_blank_header_falls_through_to_computed(self):
+        """An empty/whitespace-only header is treated as absent, same
+        honesty model as ``_resolve_project``."""
+        req = _FakeRequest({"x-session-id": "   "})
+        expected = _compute_session_id("opencode", "hello", "user-1")
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == expected
 
 
 class TestResolveProject:
@@ -441,6 +765,165 @@ class TestChatProxy:
         assert body["object"] == "list"
         assert body["data"][0]["id"] == "qwen3.5"
 
+    def test_models_endpoint_routes_by_optional_model_query_param(self, client):
+        """FLEET-ROUTE: ?model=mistral is additive — old callers that omit
+        it keep hitting llama_url unchanged (default-unchanged, invariant
+        1); a caller that names a routed model gets that engine's
+        /models list."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        os.environ["AUDITTRACE_MODEL_ROUTES"] = (
+            '{"qwen":"http://q.test:11435/v1","mistral":"http://m.test:11438/v1"}'
+        )
+        config_mod.get_settings.cache_clear()
+        try:
+            fake = _FakeAsyncClient(get_json={"object": "list", "data": []})
+            with _patch_async_client(fake):
+                response = client.get("/v1/models", params={"model": "mistral-small"})
+            assert response.status_code == 200
+            assert fake.last_get_url == "http://m.test:11438/v1/models"
+        finally:
+            del os.environ["AUDITTRACE_MODEL_ROUTES"]
+            config_mod.get_settings.cache_clear()
+
+    # ─────────────────────────── FLEET-ROUTE ────────────────────────────────
+
+    def _with_model_routes(self, routes_json: str):
+        """Set AUDITTRACE_MODEL_ROUTES for the duration of one test,
+        clearing the @lru_cache'd get_settings before and after (same
+        pattern as TestToolsModeIntegration._flip_to_tools_mode)."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        os.environ["AUDITTRACE_MODEL_ROUTES"] = routes_json
+        config_mod.get_settings.cache_clear()
+
+    def _clear_model_routes(self):
+        from audittrace import config as config_mod
+
+        del os.environ["AUDITTRACE_MODEL_ROUTES"]
+        config_mod.get_settings.cache_clear()
+
+    def test_default_unchanged_when_model_routes_empty(self, client):
+        """SPEC invariant 1: with model_routes at its default ({}), every
+        request — regardless of model — resolves to llama_url, byte-for-
+        byte identical to today's single-upstream URL."""
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mistral-small-3.1-24b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        assert response.status_code == 200
+        assert (
+            fake.last_post_url
+            == "http://host.docker.internal:11435/v1/chat/completions"
+        )
+
+    def test_routes_to_mistral_when_model_matches(self, client):
+        """SPEC invariant 2: model=mistral-... resolves to the configured
+        Mistral upstream, not the default llama_url."""
+        self._with_model_routes(
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}'
+        )
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "mistral-small-3.1-24b",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            assert (
+                fake.last_post_url
+                == "http://host.docker.internal:11438/v1/chat/completions"
+            )
+        finally:
+            self._clear_model_routes()
+
+    def test_routes_to_qwen_when_model_matches(self, client):
+        """SPEC invariant 2, other side of the laptop map."""
+        self._with_model_routes(
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}'
+        )
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "qwen3.6-35b-a3b",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            assert (
+                fake.last_post_url
+                == "http://host.docker.internal:11435/v1/chat/completions"
+            )
+        finally:
+            self._clear_model_routes()
+
+    def test_unknown_model_falls_back_to_default_never_crashes(self, client):
+        """SPEC invariant 3: a model that matches no configured prefix
+        (e.g. a plain OpenAI-shaped client default) falls back to
+        llama_url — no 500, no dropped request."""
+        self._with_model_routes(
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}'
+        )
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "gpt-4o",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            assert (
+                fake.last_post_url
+                == "http://host.docker.internal:11435/v1/chat/completions"
+            )
+        finally:
+            self._clear_model_routes()
+
+    def test_openai_response_shape_unchanged_when_routed(self, client):
+        """SPEC invariant 5: routing changes WHERE the request goes, never
+        the request/response body shape. The response still parses as a
+        standard OpenAI chat.completion object."""
+        self._with_model_routes('{"mistral":"http://host.docker.internal:11438/v1"}')
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("routed ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "mistral-small-3.1-24b",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["choices"][0]["message"]["role"] == "assistant"
+            assert body["choices"][0]["message"]["content"] == "routed ok"
+            # No new required field leaked into the forwarded request body.
+            forwarded_keys = set(fake.last_post_json.keys())
+            assert forwarded_keys.issubset({"model", "messages", "stream", "project"})
+        finally:
+            self._clear_model_routes()
+
     # ──────────────────────────── Streaming branch ─────────────────────────
 
     def test_chat_proxy_streams_when_stream_true(self, client):
@@ -490,7 +973,7 @@ class TestChatProxy:
         assert usage_chunk["usage"]["total_tokens"] == 962
         assert body.rfind("[DONE]") > body.rfind('"usage"')
 
-    def test_chat_proxy_streams_tool_call_deltas(self, client):
+    async def test_chat_proxy_streams_tool_call_deltas(self, client):
         """ADR-024 regression: streamed delta.tool_calls must be (a) forwarded
         byte-equal so OpenCode sees them, (b) accumulated by index so the
         persisted answer reflects the tool call, not an empty string."""
@@ -535,15 +1018,59 @@ class TestChatProxy:
         # (b) persisted answer includes the rendered tool_call line so the
         # audit trail is meaningful even when the model emits zero text content
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            rows = db.query(InteractionRecord).all()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
         assert rows, "interaction was not persisted"
         latest = rows[-1]
         assert "[tool_call]" in latest.answer
         assert "bash" in latest.answer
         assert "wc -l" in latest.answer
 
-    def test_chat_proxy_persists_interaction(self, client):
+    async def test_chat_proxy_streaming_persists_request_alias_not_upstream_echo(
+        self, client
+    ):
+        """FLEET-ROUTE Gate #5 (inject-mode, STREAMING path): the streamed
+        SSE chunk's ``model`` field echoes a GGUF path, different from the
+        request alias. The persisted row must record the request alias,
+        never ``state.model``."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        stream_lines = [
+            'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+            "",
+            'data: {"choices":[{"finish_reason":"stop","delta":{}}],'
+            f'"model":"{upstream_echo}",'
+            '"timings":{"cache_n":100,"prompt_n":50,"predicted_n":2}}',
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        fake = _FakeAsyncClient(stream_lines=stream_lines)
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        _ = response.content  # drain the stream so the generator finalises
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = rows[-1]
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
+
+    async def test_chat_proxy_persists_interaction(self, client):
         """A successful chat completion writes a row to interactions."""
         from audittrace.db.models import InteractionRecord
         from audittrace.dependencies import get_postgres_factory
@@ -578,8 +1105,8 @@ class TestChatProxy:
 
         assert response.status_code == 200
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            rows = db.query(InteractionRecord).all()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
         assert len(rows) >= 1
         latest = rows[-1]
         assert latest.project == "AuditTrace"
@@ -591,6 +1118,112 @@ class TestChatProxy:
         assert latest.model == "qwen3.5-35b"
         # Phase 2: every audit row carries the sentinel user_id in bypass mode.
         assert latest.user_id == SENTINEL_SUBJECT
+
+    async def test_chat_proxy_persists_request_alias_not_upstream_echo(self, client):
+        """FLEET-ROUTE Gate #5 (non-streaming, inject-mode path): the
+        interactions row must record the request alias FLEET-ROUTE routed
+        on, NOT llama.cpp's echoed GGUF path. ``_ok_chat_response`` hardcodes
+        the mock upstream ``model``, which never surfaces this divergence —
+        so this test uses a DIFFERENT model on the request than the mocked
+        upstream echoes."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        fake = _FakeAsyncClient(
+            post_json={
+                "id": "cmpl-divergent",
+                "model": upstream_echo,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hi there!"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 4,
+                    "total_tokens": 16,
+                },
+            }
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "Persist this"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = rows[-1]
+        # The divergence assertion: recorded model is the REQUEST alias,
+        # never the upstream's echoed GGUF path.
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
+
+    async def test_chat_proxy_x_session_id_header_becomes_persisted_session_id(
+        self, client
+    ):
+        """FLEET-ROUTE Gate #6: a caller-supplied ``X-Session-Id`` becomes
+        the persisted ``session_id`` verbatim, so ``GET
+        /interactions?session_id=<run>`` reconstructs exactly that agent
+        run."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"X-Session-Id": "fleet-run-2026-08-06-001"},
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert rows[-1].session_id == "fleet-run-2026-08-06-001"
+
+    async def test_chat_proxy_without_x_session_id_preserves_computed_session_id(
+        self, client
+    ):
+        """Gate #6, absence side: byte-for-byte the prior computed
+        behaviour — the persisted session_id equals
+        ``_compute_session_id(source, first_user_message, user_id)``."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+        from audittrace.identity import SENTINEL_SUBJECT as _SENTINEL
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "no header here"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        expected = _compute_session_id("unknown", "no header here", _SENTINEL)
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert rows[-1].session_id == expected
 
     def test_chat_proxy_with_project(self, client):
         fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
@@ -606,7 +1239,7 @@ class TestChatProxy:
 
         assert response.status_code == 200
 
-    def test_chat_proxy_x_project_header_wins_over_body(self, client):
+    async def test_chat_proxy_x_project_header_wins_over_body(self, client):
         """ADR-029: X-Project header is authoritative over body.project."""
         from audittrace.db.models import InteractionRecord
         from audittrace.dependencies import get_postgres_factory
@@ -624,16 +1257,20 @@ class TestChatProxy:
             )
         assert response.status_code == 200
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
+        async with pg.get_session_factory()() as db:
             row = (
-                db.query(InteractionRecord)
-                .order_by(InteractionRecord.id.desc())
+                (
+                    await db.execute(
+                        select(InteractionRecord).order_by(InteractionRecord.id.desc())
+                    )
+                )
+                .scalars()
                 .first()
             )
         assert row is not None
         assert row.project == "HeaderProject"
 
-    def test_chat_proxy_metadata_project_used_when_no_header(self, client):
+    async def test_chat_proxy_metadata_project_used_when_no_header(self, client):
         """ADR-029: body.metadata.project is the second-tier source."""
         from audittrace.db.models import InteractionRecord
         from audittrace.dependencies import get_postgres_factory
@@ -650,16 +1287,20 @@ class TestChatProxy:
             )
         assert response.status_code == 200
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
+        async with pg.get_session_factory()() as db:
             row = (
-                db.query(InteractionRecord)
-                .order_by(InteractionRecord.id.desc())
+                (
+                    await db.execute(
+                        select(InteractionRecord).order_by(InteractionRecord.id.desc())
+                    )
+                )
+                .scalars()
                 .first()
             )
         assert row is not None
         assert row.project == "FromMetadata"
 
-    def test_chat_proxy_defaults_project_when_none_provided(self, client):
+    async def test_chat_proxy_defaults_project_when_none_provided(self, client):
         """ADR-029: project defaults to "default" (not "unknown") when caller omits it."""
         from audittrace.db.models import InteractionRecord
         from audittrace.dependencies import get_postgres_factory
@@ -675,10 +1316,14 @@ class TestChatProxy:
             )
         assert response.status_code == 200
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
+        async with pg.get_session_factory()() as db:
             row = (
-                db.query(InteractionRecord)
-                .order_by(InteractionRecord.id.desc())
+                (
+                    await db.execute(
+                        select(InteractionRecord).order_by(InteractionRecord.id.desc())
+                    )
+                )
+                .scalars()
                 .first()
             )
         assert row is not None
@@ -704,7 +1349,7 @@ class TestChatProxy:
         )
         assert response.status_code == 422
 
-    def test_chat_proxy_renders_tool_calls_in_non_streaming(self, client):
+    async def test_chat_proxy_renders_tool_calls_in_non_streaming(self, client):
         """Non-streaming branch must render tool_calls into the persisted answer."""
         from audittrace.db.models import InteractionRecord
         from audittrace.dependencies import get_postgres_factory
@@ -752,8 +1397,8 @@ class TestChatProxy:
 
         assert response.status_code == 200
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            rows = db.query(InteractionRecord).all()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
         latest = rows[-1]
         assert "[tool_call]" in latest.answer
         assert "bash" in latest.answer
@@ -821,9 +1466,7 @@ class TestChatProxy:
         config_mod.get_settings.cache_clear()
 
         assert response.status_code == 200
-        ingestion_calls = [
-            c for c in fake.post_calls if "/api/public/ingestion" in c["url"]
-        ]
+        ingestion_calls = [c for c in fake.post_calls if _is_ingestion_url(c["url"])]
         assert ingestion_calls, "Langfuse ingestion endpoint was not called"
         call = ingestion_calls[0]
         assert call["url"].startswith("http://lf.test")
@@ -874,9 +1517,7 @@ class TestChatProxy:
         config_mod.get_settings.cache_clear()
 
         assert response.status_code == 200
-        ingestion_calls = [
-            c for c in fake.post_calls if "/api/public/ingestion" in c["url"]
-        ]
+        ingestion_calls = [c for c in fake.post_calls if _is_ingestion_url(c["url"])]
         assert ingestion_calls
         body = ingestion_calls[0]["json"]["batch"][0]["body"]
         captured = body["input"]
@@ -984,11 +1625,11 @@ class TestChatProxy:
 #     user_id, and flushes ToolCall audit rows after the interaction lands.
 
 
-def _tools_mode_response_text(text: str = "done") -> dict:
+def _tools_mode_response_text(text: str = "done", model: str = "qwen3.5-35b") -> dict:
     return {
         "id": "cmpl-test",
         "object": "chat.completion",
-        "model": "qwen3.5-35b",
+        "model": model,
         "choices": [
             {
                 "index": 0,
@@ -1050,7 +1691,9 @@ class TestToolsModeIntegration:
         """Flip AUDITTRACE_MEMORY_MODE=tools for the duration of a test."""
         yield from self._flip_to_tools_mode(monkeypatch)
 
-    def test_tools_mode_trivial_prompt_single_llama_call(self, client, _tools_mode):
+    async def test_tools_mode_trivial_prompt_single_llama_call(
+        self, client, _tools_mode
+    ):
         """A prompt that doesn't trigger any tool_calls results in exactly
         one POST to llama-server and no ToolCall audit rows."""
         from audittrace.db.models import InteractionRecord, ToolCall
@@ -1086,14 +1729,51 @@ class TestToolsModeIntegration:
 
         # Interaction persisted with user_id, no ToolCall rows (trivial).
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            interactions = db.query(InteractionRecord).all()
-            tool_calls_rows = db.query(ToolCall).all()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+            tool_calls_rows = (await db.execute(select(ToolCall))).scalars().all()
         assert len(interactions) >= 1
         assert interactions[-1].user_id == SENTINEL_SUBJECT
         assert tool_calls_rows == []
 
-    def test_tools_mode_memory_prompt_fires_loop_and_audits(self, client, _tools_mode):
+    async def test_tools_mode_routes_to_mistral_when_model_matches(
+        self, client, _tools_mode, monkeypatch
+    ):
+        """FLEET-ROUTE SPEC invariant 2/5, tools-mode side: the
+        proxy-internal loop POSTs to the RESOLVED upstream, not the bare
+        llama_url, when the request model matches a configured route —
+        while the OpenAI request/response shape is untouched."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv(
+            "AUDITTRACE_MODEL_ROUTES",
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}',
+        )
+        config_mod.get_settings.cache_clear()
+
+        fake = _SequencedClient([_tools_mode_response_text("Just text.")])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mistral-small-3.1-24b",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        assert (
+            fake.post_calls[0]["url"]
+            == "http://host.docker.internal:11438/v1/chat/completions"
+        )
+        assert response.json()["choices"][0]["message"]["role"] == "assistant"
+
+    async def test_tools_mode_memory_prompt_fires_loop_and_audits(
+        self, client, _tools_mode
+    ):
         """Prompt that triggers recall_decisions: TWO POSTs, final text
         answer, ToolCall audit row written with user_id + granted_scope."""
         from audittrace.db.models import InteractionRecord, ToolCall
@@ -1125,9 +1805,9 @@ class TestToolsModeIntegration:
 
         # Interaction row persisted + ONE ToolCall audit row
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            interactions = db.query(InteractionRecord).all()
-            tool_calls_rows = db.query(ToolCall).all()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+            tool_calls_rows = (await db.execute(select(ToolCall))).scalars().all()
         assert len(interactions) >= 1
         latest_interaction = interactions[-1]
         assert latest_interaction.user_id == SENTINEL_SUBJECT
@@ -1140,13 +1820,271 @@ class TestToolsModeIntegration:
         assert tc_row.error is None
         assert tc_row.interaction_id == latest_interaction.id
 
+    async def test_tools_mode_persists_request_alias_not_upstream_echo(
+        self, client, _tools_mode
+    ):
+        """FLEET-ROUTE Gate #5 (tools-mode, non-streaming path):
+        ``_tools_mode_response_text`` accepts a ``model=`` override so this
+        test can make the mocked upstream echo a DIFFERENT model (a GGUF
+        path) than the request alias — the divergence that hardcoding both
+        to the same string would hide. The persisted row must record the
+        request alias FLEET-ROUTE routed on, not the upstream echo."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        fake = _SequencedClient(
+            [_tools_mode_response_text("Just text.", model=upstream_echo)]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = interactions[-1]
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
+
+    def test_tools_mode_streams_content_token_by_token(self, client, _tools_mode):
+        """#299: stream=true must stream the answer as MULTIPLE content
+        deltas (real token-by-token), not one buffered chunk. The pieces
+        concatenate to the full answer and the stream ends with [DONE]."""
+        fake = _SequencedStreamClient([_sse_content_lines(["Hel", "lo ", "world"])])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "event-stream" in response.headers.get("content-type", "")
+        raw = response.content.decode()
+        assert "[DONE]" in raw
+        chunks = _parse_sse_deltas(raw)
+        # Multiple content deltas — the whole point of #299 (was one chunk).
+        content_pieces = [
+            c["choices"][0]["delta"]["content"]
+            for c in chunks
+            if c.get("choices") and c["choices"][0].get("delta", {}).get("content")
+        ]
+        assert content_pieces == ["Hel", "lo ", "world"]
+        # Exactly one streaming POST (single terminal turn).
+        assert len(fake.stream_calls) == 1
+        # A finish_reason=stop frame is present.
+        assert any(
+            c.get("choices") and c["choices"][0].get("finish_reason") == "stop"
+            for c in chunks
+        )
+
+    async def test_tools_mode_streaming_persists_streamed_answer(
+        self, client, _tools_mode
+    ):
+        """ADR-049 reconstructibility: the persisted answer equals exactly
+        what was streamed to the user (single generation, no double-gen)."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        fake = _SequencedStreamClient(
+            [_sse_content_lines(["The ", "answer ", "is 42."])]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "q"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        _ = response.content  # drain the stream so the generator finalises
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert len(interactions) >= 1
+        latest = interactions[-1]
+        assert latest.answer == "The answer is 42."
+        assert latest.user_id == SENTINEL_SUBJECT
+
+    async def test_tools_mode_streaming_persists_request_alias_not_upstream_echo(
+        self, client, _tools_mode
+    ):
+        """FLEET-ROUTE Gate #5 (tools-mode, STREAMING path): the streamed
+        SSE turn echoes a different model (a GGUF path) than the request
+        alias. The persisted row must record the request alias, never the
+        streamed ``result.model`` echo."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        fake = _SequencedStreamClient(
+            [_sse_content_lines(["The ", "answer ", "is 42."], model=upstream_echo)]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "q"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        _ = response.content  # drain the stream so the generator finalises
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = interactions[-1]
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
+
+    async def test_tools_mode_streaming_through_memory_tool_loop(
+        self, client, _tools_mode
+    ):
+        """A memory tool turn streams (think forwarded, tool_call swallowed),
+        the tool executes + audits, then the final answer streams. The
+        internal memory tool_call must NOT leak to the client as tool_calls."""
+        from audittrace.db.models import ToolCall
+        from audittrace.dependencies import get_postgres_factory
+
+        fake = _SequencedStreamClient(
+            [
+                _sse_tool_call_lines(
+                    "recall_decisions", '{"query": "cache compression"}'
+                ),
+                _sse_content_lines(["Based on ", "ADR-009."]),
+            ]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "what about KV cache?"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        chunks = _parse_sse_deltas(raw)
+        # TWO streaming turns (tool turn + answer turn).
+        assert len(fake.stream_calls) == 2
+        # The memory tool_call was NOT forwarded to the client.
+        assert not any(
+            c.get("choices") and c["choices"][0].get("delta", {}).get("tool_calls")
+            for c in chunks
+        )
+        # The final answer streamed.
+        joined = "".join(
+            c["choices"][0]["delta"].get("content", "")
+            for c in chunks
+            if c.get("choices") and c["choices"][0].get("delta")
+        )
+        assert "ADR-009." in joined
+        # The memory tool executed and was audited.
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            tool_calls_rows = (await db.execute(select(ToolCall))).scalars().all()
+        assert len(tool_calls_rows) == 1
+        assert tool_calls_rows[0].tool_name == "recall_decisions"
+
+    def test_tools_mode_streaming_forwards_external_tool_call(
+        self, client, _tools_mode
+    ):
+        """An external (non-memory) tool call is forwarded to the client so
+        the agentic loop (OpenCode) can execute it, with finish_reason
+        tool_calls — the proxy does not try to run it itself."""
+        fake = _SequencedStreamClient(
+            [_sse_tool_call_lines("read_file", '{"path": "/etc/hosts"}')]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "read a file"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        chunks = _parse_sse_deltas(response.content.decode())
+        # Exactly one streaming turn — the external call terminates the loop.
+        assert len(fake.stream_calls) == 1
+        # The external tool_call IS forwarded to the client.
+        forwarded = [
+            tc
+            for c in chunks
+            if c.get("choices")
+            for tc in (c["choices"][0].get("delta", {}).get("tool_calls") or [])
+        ]
+        assert len(forwarded) == 1
+        assert forwarded[0]["function"]["name"] == "read_file"
+        assert any(
+            c.get("choices") and c["choices"][0].get("finish_reason") == "tool_calls"
+            for c in chunks
+        )
+
+    def test_tools_mode_streaming_tool_parse_500_falls_back(self, client, _tools_mode):
+        """Resilience port: a tool-parse 500 on the streamed turn falls back
+        to the buffered retry/no-tools path and still streams an answer."""
+        parse_err_body = {
+            "error": {
+                "code": 500,
+                "type": "server_error",
+                "message": (
+                    "Failed to parse tool call arguments as JSON: "
+                    "[json.exception.parse_error.101]"
+                ),
+            }
+        }
+        fake = _SequencedStreamClient(
+            stream_turns=[["data: [DONE]"]],  # unused — status 500 short-circuits
+            stream_status=[500],
+            stream_bodies=[parse_err_body],
+            post_responses=[_tools_mode_response_text("Recovered answer.")],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "trigger parse error"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert "Recovered answer." in raw
+        assert "[DONE]" in raw
+        # Fallback used the buffered .post() path at least once.
+        assert len(fake.post_calls) >= 1
+
     def test_tools_mode_streams_synthesized_sse_when_stream_true(
         self, client, _tools_mode
     ):
-        """When the client asks for stream=true, tools-mode synthesises an
-        SSE response from the final non-streamed body (the loop itself is
-        always non-streaming because it has to inspect tool_calls)."""
-        fake = _SequencedClient([_tools_mode_response_text("Streamed text.")])
+        """Smoke: stream=true returns an event-stream that carries the
+        answer text and terminates with [DONE] (back-compat wire shape)."""
+        fake = _SequencedStreamClient([_sse_content_lines(["Streamed text."])])
         with _patch_tool_loop_client(fake), _patch_async_client(fake):
             response = client.post(
                 "/v1/chat/completions",
@@ -1162,6 +2100,187 @@ class TestToolsModeIntegration:
         body = response.content.decode()
         assert "Streamed text." in body
         assert "[DONE]" in body
+
+    async def test_tools_mode_streaming_connect_error_persists_failed(
+        self, client, _tools_mode
+    ):
+        """A connect error mid-stream emits an SSE error frame and persists a
+        failed-interaction audit row (same contract as the inject path)."""
+        import httpx
+
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        fake = _RaisingStreamClient(httpx.ConnectError("down"))
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert "unreachable" in raw
+        assert "[DONE]" in raw
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert interactions[-1].status == "failed"
+
+    def test_tools_mode_streaming_timeout_emits_error_frame(self, client, _tools_mode):
+        """A read timeout mid-stream emits the 504 idle-timeout error frame."""
+        import httpx
+
+        fake = _RaisingStreamClient(httpx.ReadTimeout("slow"))
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        assert "idle timeout" in response.content.decode()
+
+    def test_tools_mode_streaming_generic_exception_emits_error_frame(
+        self, client, _tools_mode
+    ):
+        """An unexpected error mid-stream emits the internal-error frame."""
+        fake = _RaisingStreamClient(ValueError("boom"))
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        assert "Internal error during streaming." in response.content.decode()
+
+    def test_tools_mode_streaming_non_parse_500_emits_502(self, client, _tools_mode):
+        """A non-tool-parse upstream 500 surfaces a 502 error frame (no
+        retry/fallback — only the Qwen tool-args parse error falls back)."""
+        fake = _SequencedStreamClient(
+            stream_turns=[["data: [DONE]"]],
+            stream_status=[500],
+            stream_bodies=[{"error": {"message": "CUDA OOM"}}],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        assert "status 500" in response.content.decode()
+        # No buffered fallback attempted for a non-parse error.
+        assert fake.post_calls == []
+
+    async def test_tools_mode_streaming_fallback_executes_memory_tool(
+        self, client, _tools_mode
+    ):
+        """tool-parse 500 whose buffered fallback returns a MEMORY tool_call:
+        execute it, then keep streaming the next turn to a final answer."""
+        from audittrace.db.models import ToolCall
+        from audittrace.dependencies import get_postgres_factory
+
+        parse_err = {
+            "error": {
+                "message": "Failed to parse tool call arguments as JSON: "
+                "[json.exception.parse_error.101]"
+            }
+        }
+        fake = _SequencedStreamClient(
+            stream_turns=[["unused"], _sse_content_lines(["Final answer."])],
+            stream_status=[500, 200],
+            stream_bodies=[parse_err, None],
+            post_responses=[
+                _tools_mode_tool_call_response("recall_decisions", '{"query": "x"}')
+            ],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert "Final answer." in raw
+        # The buffered fallback executed the memory tool and audited it.
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            tool_calls_rows = (await db.execute(select(ToolCall))).scalars().all()
+        assert len(tool_calls_rows) == 1
+        assert tool_calls_rows[0].tool_name == "recall_decisions"
+
+    def test_tools_mode_streaming_repeated_signature_exits_early(
+        self, client, _tools_mode
+    ):
+        """ADR-030: identical memory tool_calls two turns running → the
+        streaming loop exits early instead of spinning to the cap."""
+        fake = _SequencedStreamClient(
+            [
+                _sse_tool_call_lines("recall_decisions", '{"query": "x"}', "c1"),
+                _sse_tool_call_lines("recall_decisions", '{"query": "x"}', "c2"),
+            ]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        # Two streamed turns, then early exit — not the 5-iteration cap.
+        assert len(fake.stream_calls) == 2
+
+    def test_tools_mode_streaming_hits_iteration_cap(
+        self, client, _tools_mode, monkeypatch
+    ):
+        """Distinct memory tool_calls every turn → the loop stops at the
+        configured iteration cap and still closes the stream cleanly."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS", "2")
+
+        fake = _SequencedStreamClient(
+            [
+                _sse_tool_call_lines("recall_decisions", '{"query": "a"}', "c1"),
+                _sse_tool_call_lines("recall_decisions", '{"query": "b"}', "c2"),
+                _sse_tool_call_lines("recall_decisions", '{"query": "c"}', "c3"),
+            ]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        assert "[DONE]" in response.content.decode()
+        # Exactly the cap — 2 streamed turns, not 3.
+        assert len(fake.stream_calls) == 2
 
     def test_tools_mode_records_langfuse_output_when_configured(
         self, client, _tools_mode, monkeypatch
@@ -1207,9 +2326,7 @@ class TestToolsModeIntegration:
 
         # The ingestion POST flows through the same patched client as the
         # llama-server POST (both go via chat.py's httpx.AsyncClient).
-        ingestion_calls = [
-            c for c in fake.post_calls if "/api/public/ingestion" in c["url"]
-        ]
+        ingestion_calls = [c for c in fake.post_calls if _is_ingestion_url(c["url"])]
         assert ingestion_calls, (
             "tools-mode did not POST to Langfuse /api/public/ingestion — "
             "prompts and replies will be invisible in the Langfuse UI"
@@ -1223,7 +2340,9 @@ class TestToolsModeIntegration:
         assert body["metadata"]["prompt_tokens"] == 20
         assert body["metadata"]["completion_tokens"] == 8
 
-    def test_tools_mode_passes_through_external_tool_call(self, client, _tools_mode):
+    async def test_tools_mode_passes_through_external_tool_call(
+        self, client, _tools_mode
+    ):
         """A `bash` tool call from the client must reach the client
         unchanged — the proxy cannot execute bash, and the loop's
         external-tool exit branch must kick in. Zero ToolCall audit
@@ -1294,8 +2413,8 @@ class TestToolsModeIntegration:
         )
         # Zero memory tool_calls rows — nothing was dispatched
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            tool_calls_rows = db.query(ToolCall).all()
+        async with pg.get_session_factory()() as db:
+            tool_calls_rows = (await db.execute(select(ToolCall))).scalars().all()
         assert tool_calls_rows == []
 
 
@@ -1353,3 +2472,1497 @@ class TestApplyThinkingMode:
         _apply_thinking_mode(payload, "deep")
         assert payload["chat_template_kwargs"]["some_other_flag"] == 42
         assert payload["chat_template_kwargs"]["enable_thinking"] is True
+
+
+# ───────────────────────── Stream chunk accumulation ────────────────────────
+
+
+class TestAccumulateChunk:
+    """``_accumulate_chunk`` is the only place a streamed answer is
+    reconstructed. Whatever it accumulates becomes the persisted
+    ``interactions.answer`` and the token counts on the audit row, so a
+    mis-parse here silently corrupts the audit trail rather than raising.
+    """
+
+    def test_usage_only_chunk_without_choices_records_tokens(self):
+        """llama-server ends a stream with a usage-only chunk that carries
+        ``choices: []``. Indexing ``choices[0]`` unguarded would raise inside
+        the streaming generator — the response has already started, so the
+        client would see a truncated stream and the audit row would carry
+        zero tokens. Usage must be read from a choice-less chunk."""
+        from audittrace.routes.chat import _accumulate_chunk, _StreamState
+
+        state = _StreamState()
+        _accumulate_chunk(
+            state,
+            {
+                "id": "cmpl-usage",
+                "model": "qwen3.5-35b",
+                "choices": [],
+                "usage": {"prompt_tokens": 31, "completion_tokens": 7},
+            },
+        )
+        assert state.prompt_tokens == 31
+        assert state.completion_tokens == 7
+        assert state.chunks == []
+        assert state.finish_reason is None
+
+    def test_tool_call_fragment_without_arguments_keeps_accumulated_args(self):
+        """Streamed ``function.arguments`` arrive as fragments across chunks,
+        and llama-server interleaves fragments that carry only ``name``. If a
+        name-only fragment reset or appended to the buffer, the tool-call
+        audit row would record malformed JSON — the tool_calls table is the
+        record of what the model actually asked for (ADR-025)."""
+        from audittrace.routes.chat import _accumulate_chunk, _StreamState
+
+        state = _StreamState()
+        for delta in (
+            {"index": 0, "id": "call_1", "function": {"name": "recall_decisions"}},
+            {"index": 0, "function": {"arguments": '{"query":'}},
+            # Name repeated, no arguments — must not disturb the buffer.
+            {"index": 0, "function": {"name": "recall_decisions"}},
+            {"index": 0, "function": {"arguments": '"rls"}'}},
+        ):
+            _accumulate_chunk(state, {"choices": [{"delta": {"tool_calls": [delta]}}]})
+
+        acc = state.tool_calls_acc[0]
+        assert acc["id"] == "call_1"
+        assert acc["function"]["name"] == "recall_decisions"
+        assert acc["function"]["arguments"] == '{"query":"rls"}'
+
+    def test_timings_do_not_override_authoritative_usage(self):
+        """llama-server sends BOTH an OpenAI ``usage`` block and a
+        llama-specific ``timings`` block. ``timings.cache_n`` counts cached
+        prompt tokens and would double-count against ``usage.prompt_tokens``.
+        The usage block wins; timings are only a fallback for backends that
+        omit it. Getting this wrong inflates every billed/audited token
+        count on a cache-hit request."""
+        from audittrace.routes.chat import _accumulate_chunk, _StreamState
+
+        state = _StreamState()
+        _accumulate_chunk(
+            state,
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+                "timings": {"cache_n": 900, "prompt_n": 100, "predicted_n": 20},
+            },
+        )
+        assert state.prompt_tokens == 100
+        assert state.completion_tokens == 20
+
+    def test_timings_fill_in_when_usage_absent(self):
+        """The complementary case: no ``usage`` block at all, so the audit
+        row would record 0/0 tokens unless timings are used."""
+        from audittrace.routes.chat import _accumulate_chunk, _StreamState
+
+        state = _StreamState()
+        _accumulate_chunk(
+            state,
+            {
+                "choices": [],
+                "timings": {"cache_n": 90, "prompt_n": 10, "predicted_n": 4},
+            },
+        )
+        assert state.prompt_tokens == 100  # cache_n + prompt_n
+        assert state.completion_tokens == 4
+
+
+class TestAssistantMsgFromStreamState:
+    """The streamed turn is replayed into the tool-loop conversation
+    history. The reconstructed message must be a legal OpenAI assistant
+    message or the NEXT llama call 400s mid-loop."""
+
+    def test_no_tool_calls_key_when_none_were_streamed(self):
+        """OpenAI rejects ``tool_calls: []`` — the key must be absent, not
+        empty, on a plain-text turn. A stray empty array breaks the second
+        iteration of the memory tool loop."""
+        from audittrace.routes.chat import (
+            _assistant_msg_from_stream_state,
+            _StreamState,
+        )
+
+        state = _StreamState(chunks=["Hello ", "world"])
+        msg = _assistant_msg_from_stream_state(state)
+        assert msg == {"role": "assistant", "content": "Hello world"}
+        assert "tool_calls" not in msg
+
+
+class TestRenderToolCallsText:
+    """``_render_tool_calls_text`` produces the ``answer`` text persisted for
+    a turn that ended in tool_calls — the only human-readable record of what
+    the model asked for when the client (not us) executes the tool."""
+
+    def test_non_string_arguments_are_json_encoded(self):
+        """Some clients hand back already-parsed ``arguments`` as a dict.
+        Slicing a dict with ``[:500]`` raises ``TypeError``, which inside the
+        streaming tail would lose the audit row entirely (ADR-033)."""
+        from audittrace.routes.chat import _render_tool_calls_text
+
+        text = _render_tool_calls_text(
+            {
+                0: {
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"path": "/etc/hosts"},
+                    }
+                }
+            }
+        )
+        assert text == '[tool_call] read_file({"path": "/etc/hosts"})'
+
+
+class TestDetectSource:
+    """``_detect_source`` decides the ``source`` column on every audit row
+    and the prefix of every ``session_id``. If it mis-classifies, traces
+    for the same client scatter across different session ids and the
+    grouping the reconstructibility walkthrough relies on is lost."""
+
+    def test_valid_x_source_header_is_honoured(self):
+        """Browser clients all send ``Mozilla/5.0 ...`` and would otherwise
+        collapse to ``"unknown"``. The explicit header is what lets the SPA
+        self-identify and keep a stable, readable session_id prefix."""
+        from audittrace.routes.chat import _compute_session_id, _detect_source
+
+        req = _FakeRequest(
+            {"x-source": "audittrace-webui", "user-agent": "Mozilla/5.0"}
+        )
+        source = _detect_source(req)
+        assert source == "audittrace-webui"
+        assert _compute_session_id(source, "hi", "user-1").startswith(
+            "audittrace-webui-"
+        )
+
+    def test_invalid_x_source_header_is_rejected_and_falls_through_to_ua(self):
+        """``source`` is concatenated into ``session_id`` and stored, so an
+        unvalidated header is a caller-controlled value flowing into an
+        identifier. Anything failing ``[a-z0-9][a-z0-9_-]{0,31}`` must be
+        discarded, not sanitised-and-kept."""
+        from audittrace.routes.chat import _detect_source
+
+        req = _FakeRequest(
+            {"x-source": "evil source/../../etc", "user-agent": "curl/8.5.0"}
+        )
+        assert _detect_source(req) == "curl"
+
+    def test_over_long_x_source_header_is_rejected(self):
+        """32-char cap: an unbounded source would produce unbounded
+        session_id values on an indexed column."""
+        from audittrace.routes.chat import _detect_source
+
+        req = _FakeRequest({"x-source": "a" * 33, "user-agent": "unmatched-agent"})
+        assert _detect_source(req) == "unknown"
+
+    def test_user_agent_marker_identifies_terminal_clients(self):
+        """OpenCode and friends cannot set headers; UA substring matching is
+        the only way their traffic is attributable in the audit trail."""
+        from audittrace.routes.chat import _detect_source
+
+        assert (
+            _detect_source(_FakeRequest({"user-agent": "opencode/1.2"})) == "opencode"
+        )
+        assert (
+            _detect_source(_FakeRequest({"user-agent": "python-httpx/0.27"})) == "httpx"
+        )
+
+    def test_unrecognised_client_falls_back_to_unknown(self):
+        """The fallback must be a constant, never a reflected UA string."""
+        from audittrace.routes.chat import _detect_source
+
+        assert _detect_source(_FakeRequest({"user-agent": "Mozilla/5.0"})) == "unknown"
+
+
+class TestExtractQueryEdgeCases:
+    """The extracted query is what gets embedded for memory retrieval AND
+    what lands in ``interactions.question``. A wrong extraction retrieves
+    the wrong context and files the interaction under the wrong question."""
+
+    def test_returns_empty_string_when_no_user_message_present(self):
+        """A tool-result-only continuation turn (system + assistant + tool)
+        has no user message. Returning "" keeps the request on the normal
+        path; anything raising here would 500 a legal OpenAI request."""
+        from audittrace.routes.chat import _extract_query
+
+        payload = {
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "assistant", "content": "calling tool"},
+                {"role": "tool", "tool_call_id": "c1", "content": "result"},
+            ]
+        }
+        assert _extract_query(payload) == ""
+
+    def test_skips_user_message_whose_content_is_neither_str_nor_list(self):
+        """OpenAI permits ``content: null`` on a message. The scan must keep
+        walking backwards to the last usable user turn instead of returning
+        an unusable value — otherwise memory retrieval runs on an empty
+        query and the answer silently loses its context."""
+        from audittrace.routes.chat import _extract_query
+
+        payload = {
+            "messages": [
+                {"role": "user", "content": "what changed in RLS?"},
+                {"role": "assistant", "content": "..."},
+                {"role": "user", "content": None},
+            ]
+        }
+        assert _extract_query(payload) == "what changed in RLS?"
+
+
+class TestRecordLangfuseOutputBody:
+    """``_record_langfuse_output`` is the ONLY writer of trace-level
+    input/output/user/session in Langfuse. Langfuse ``trace-create`` is an
+    upsert, so a key present-but-null overwrites; a key absent leaves the
+    existing value alone. These tests pin which keys the helper emits."""
+
+    @pytest.fixture
+    def _langfuse_env(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_HOST", "http://lf.test")
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_SECRET_KEY", "sk-test")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    @pytest.mark.asyncio
+    async def test_absent_trace_id_makes_no_ingestion_call(self, _langfuse_env):
+        """Langfuse is unreachable or the SDK is not installed on some
+        deployments, so ``trace_id`` is legitimately ``None``. Posting
+        anyway would create an orphan trace keyed on ``output-None`` and
+        every request would collide onto that one row."""
+        from audittrace.routes.chat import _record_langfuse_output
+
+        fake = _FakeAsyncClient()
+        with _patch_async_client(fake):
+            await _record_langfuse_output(
+                trace_id=None,
+                answer="hello",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+                tool_calls=None,
+                session_id="sess-1",
+                model="qwen3.5-35b",
+                user_id="user-1",
+                input_messages=[{"role": "user", "content": "hi"}],
+            )
+        assert fake.post_calls == []
+
+    @pytest.mark.asyncio
+    async def test_tool_calls_are_summarised_into_trace_metadata(self, _langfuse_env):
+        """A turn that ends in ``tool_calls`` has no answer text, so without
+        the metadata summary the Langfuse trace shows an empty output and an
+        auditor cannot see which tools the model reached for. Name + id are
+        the join keys back to the ``tool_calls`` Postgres rows."""
+        from audittrace.routes.chat import _record_langfuse_output
+
+        fake = _FakeAsyncClient()
+        with _patch_async_client(fake):
+            await _record_langfuse_output(
+                trace_id="trace-tc-1",
+                answer="",
+                prompt_tokens=10,
+                completion_tokens=2,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    {"id": "call_a", "function": {"name": "read_file"}},
+                    {"id": "call_b", "function": {"name": "recall_decisions"}},
+                ],
+                session_id="sess-1",
+                model="qwen3.5-35b",
+                user_id="user-1",
+                input_messages=[{"role": "user", "content": "hi"}],
+            )
+
+        ingestion = [c for c in fake.post_calls if _is_ingestion_url(c["url"])]
+        assert len(ingestion) == 1
+        metadata = ingestion[0]["json"]["batch"][0]["body"]["metadata"]
+        assert metadata["has_tool_calls"] is True
+        assert metadata["tool_calls"] == [
+            {"name": "read_file", "id": "call_a"},
+            {"name": "recall_decisions", "id": "call_b"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_optional_identity_fields_are_omitted_not_nulled(self, _langfuse_env):
+        """``user_id``, ``session_id`` and ``input_messages`` are optional on
+        this helper. When a caller has none of them the body must OMIT the
+        corresponding keys: ``trace-create`` is an upsert, so emitting
+        ``userId: null`` would erase the attribution an earlier write already
+        put on the trace (EU AI Act Art. 12 — the trace must stay tied to a
+        user). Absent keys leave the stored value intact."""
+        from audittrace.routes.chat import _record_langfuse_output
+
+        fake = _FakeAsyncClient()
+        with _patch_async_client(fake):
+            await _record_langfuse_output(
+                trace_id="trace-min-1",
+                answer="hello",
+                prompt_tokens=5,
+                completion_tokens=1,
+                finish_reason=None,
+                tool_calls=None,
+                session_id=None,
+                model=None,
+            )
+
+        ingestion = [c for c in fake.post_calls if _is_ingestion_url(c["url"])]
+        assert len(ingestion) == 1
+        body = ingestion[0]["json"]["batch"][0]["body"]
+        assert body["output"] == "hello"
+        assert "input" not in body
+        assert "userId" not in body
+        assert "sessionId" not in body
+        # Unknown-but-present is how the dashboards read a missing backend /
+        # finish_reason — never a null that breaks the metadata filters.
+        assert body["metadata"]["finish_reason"] == "unknown"
+        assert body["metadata"]["model_backend"] == "unknown"
+        assert body["metadata"]["has_tool_calls"] is False
+        assert "tool_calls" not in body["metadata"]
+
+
+class TestLangfuseUnavailableDegradesGracefully:
+    """Langfuse is a sibling Docker-Compose stack, not part of the k8s
+    deployment. When it is down or the SDK is not installed the chat hot
+    path must still answer — observability degrades, the service does not.
+    """
+
+    class _StubContextBuilder:
+        async def build_system_context(self, user_context, project=None, query=None):
+            return "## Memory\ncontext"
+
+    @pytest.mark.asyncio
+    async def test_inject_mode_returns_context_and_null_trace_id_when_sdk_absent(self):
+        """``_LANGFUSE_AVAILABLE`` is False on any install without the
+        langfuse package. The memory context must still be built and
+        returned; only ``trace_id`` goes ``None`` (the caller then skips
+        the ingestion update)."""
+        from audittrace.identity import sentinel_user_context
+        from audittrace.routes.chat import _build_memory_context_with_trace
+
+        with patch("audittrace.routes.chat._LANGFUSE_AVAILABLE", False):
+            context, trace_id = await _build_memory_context_with_trace(
+                self._StubContextBuilder(),
+                {"messages": [{"role": "user", "content": "hi"}]},
+                "hi",
+                "sess-1",
+                "curl",
+                sentinel_user_context(),
+            )
+        assert context == "## Memory\ncontext"
+        assert trace_id is None
+
+    @pytest.mark.asyncio
+    async def test_inject_mode_survives_langfuse_client_being_none(self):
+        """``_lf_get_client()`` returns ``None`` when the SDK is importable
+        but unconfigured (no keys). Neither the trace-id read nor the span
+        update may be attempted on ``None`` — an AttributeError here would
+        abort the request before the LLM is ever called."""
+        from audittrace.identity import sentinel_user_context
+        from audittrace.routes.chat import _build_memory_context_with_trace
+
+        with (
+            patch("audittrace.routes.chat._LANGFUSE_AVAILABLE", True),
+            patch("audittrace.routes.chat._lf_get_client", return_value=None),
+        ):
+            context, trace_id = await _build_memory_context_with_trace(
+                self._StubContextBuilder(),
+                {"messages": [{"role": "user", "content": "hi"}]},
+                "hi",
+                "sess-1",
+                "curl",
+                sentinel_user_context(),
+            )
+        assert context == "## Memory\ncontext"
+        assert trace_id is None
+
+    def test_tools_mode_still_advertises_tools_when_sdk_absent(self):
+        """Tools mode must not lose its tool list because observability is
+        down — a silently empty ``tools`` array would make the model answer
+        without ever calling memory, and the degradation would be invisible."""
+        from audittrace.identity import sentinel_user_context
+        from audittrace.routes.chat import _prepare_tools_mode_trace
+
+        with patch("audittrace.routes.chat._LANGFUSE_AVAILABLE", False):
+            tools, trace_id = _prepare_tools_mode_trace(
+                {"messages": [{"role": "user", "content": "hi"}]},
+                "hi",
+                "sess-1",
+                "curl",
+                sentinel_user_context(),
+            )
+        assert trace_id is None
+        assert tools, "tools must still be advertised with Langfuse unavailable"
+
+    def test_tools_mode_survives_langfuse_client_being_none(self):
+        """Same guard on the tools-mode branch: an unconfigured Langfuse
+        client must not be dereferenced."""
+        from audittrace.identity import sentinel_user_context
+        from audittrace.routes.chat import _prepare_tools_mode_trace
+
+        with (
+            patch("audittrace.routes.chat._LANGFUSE_AVAILABLE", True),
+            patch("audittrace.routes.chat._lf_get_client", return_value=None),
+        ):
+            tools, trace_id = _prepare_tools_mode_trace(
+                {"messages": [{"role": "user", "content": "hi"}]},
+                "hi",
+                "sess-1",
+                "curl",
+                sentinel_user_context(),
+            )
+        assert trace_id is None
+        assert tools
+
+
+def _j_loads(frame: bytes) -> dict:
+    """Decode one ``data: {...}`` SSE frame emitted by the chat route."""
+    import json as _j
+
+    text = frame.decode().strip()
+    assert text.startswith("data: "), text
+    return _j.loads(text[6:])
+
+
+class TestResolveTurnBufferedIdentity:
+    """``_resolve_turn_buffered`` is the recovery path taken when a streamed
+    turn hits the Qwen tool-args-malformed-JSON 500. It emits frames into a
+    stream that has ALREADY started, so it inherits the stream's identity
+    instead of introducing its own."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_keeps_the_identity_already_recorded_for_the_turn(self):
+        """``_ToolsStreamResult`` carries the ``id``/``created``/``model``
+        that the post-stream code persists to ``interactions`` and pushes to
+        Langfuse. When the fallback fires on turn 2+, those fields are
+        already populated from turn 1 and MUST NOT be re-stamped with the
+        recovery call's own values — the audit row and the trace would then
+        point at a completion the client never saw as turn 1. An absent
+        ``model`` on the fallback body likewise must not blank the model
+        already recorded."""
+        from audittrace.identity import sentinel_user_context
+        from audittrace.routes.chat import _resolve_turn_buffered, _ToolsStreamResult
+
+        result = _ToolsStreamResult()
+        result.resp_id = "cmpl-turn-1"
+        result.created = 1111
+        result.model = "qwen3.5-35b"
+        result.answer_text = "Thinking. "
+
+        fallback_body = {
+            "id": "cmpl-fallback-9",
+            "created": 9999,
+            # No "model" key — llama-server omits it on the no-tools retry.
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "I need the file.",
+                        "tool_calls": [
+                            {
+                                "id": "call_x",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"path": "/tmp/x"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+        }
+        fake = _FakeAsyncClient(post_json=fallback_body)
+
+        frames, terminal = await _resolve_turn_buffered(
+            fake,
+            "http://llama.test/v1/chat/completions",
+            {"model": "qwen3.5-35b", "messages": []},
+            [],
+            sentinel_user_context(),
+            "sess-1",
+            result,
+        )
+
+        # Identity of the in-flight stream is preserved, not overwritten.
+        assert result.resp_id == "cmpl-turn-1"
+        assert result.created == 1111
+        assert result.model == "qwen3.5-35b"
+
+        # An external tool call terminates the loop and is forwarded to the
+        # client, which is the party that executes it.
+        assert terminal is True
+        assert result.finish_reason == "tool_calls"
+        assert [tc["function"]["name"] for tc in result.external_tool_calls] == [
+            "read_file"
+        ]
+
+        chunks = [_j_loads(f) for f in frames]
+        forwarded = [
+            tc
+            for c in chunks
+            for tc in (c["choices"][0].get("delta") or {}).get("tool_calls") or []
+        ]
+        assert [tc["function"]["name"] for tc in forwarded] == ["read_file"]
+        # The recovered content reaches the client too, not just the audit row.
+        assert any(
+            (c["choices"][0].get("delta") or {}).get("content") == "I need the file."
+            for c in chunks
+        ), chunks
+
+        # The tool request is rendered into the answer text so the audit row
+        # records WHAT was asked for, not just that the turn ended.
+        assert "[tool_call] read_file(" in result.answer_text
+        assert result.answer_text.startswith("Thinking. ")
+
+
+# ─────────────── Streaming: keep-alive, metadata-only turns, [DONE] ──────────
+
+
+class _DelayedStreamResponse(_FakeStreamResponse):
+    """``_FakeStreamResponse`` that stalls *delay* seconds before the first
+    line — long enough for ``_iter_with_idle_timeout`` to emit keep-alives."""
+
+    def __init__(self, lines: list[str], delay: float) -> None:
+        super().__init__(lines)
+        self._delay = delay
+
+    async def aiter_lines(self):
+        import asyncio as _a
+
+        await _a.sleep(self._delay)
+        for line in self._lines:
+            yield line
+
+
+class _DelayedStreamCtx:
+    def __init__(self, lines: list[str], delay: float) -> None:
+        self._lines = lines
+        self._delay = delay
+
+    async def __aenter__(self):
+        return _DelayedStreamResponse(self._lines, self._delay)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _DelayedStreamClient(_FakeAsyncClient):
+    """Client whose stream stalls before producing any SSE line."""
+
+    def __init__(self, lines: list[str], delay: float) -> None:
+        super().__init__()
+        self._lines = lines
+        self._delay = delay
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        return _DelayedStreamCtx(self._lines, self._delay)
+
+
+class _DelayedSeqStreamResponse(_SeqStreamResponse):
+    """``_SeqStreamResponse`` (which carries ``status_code``, needed by the
+    tools loop) that stalls before yielding its first line."""
+
+    def __init__(self, lines, delay: float) -> None:
+        super().__init__(lines)
+        self._delay = delay
+
+    async def aiter_lines(self):
+        import asyncio as _a
+
+        await _a.sleep(self._delay)
+        for line in self._lines:
+            yield line
+
+
+class _DelayedSeqStreamCtx(_SeqStreamCtx):
+    def __init__(self, lines, delay: float) -> None:
+        super().__init__(lines)
+        self._delay = delay
+
+    async def __aenter__(self):
+        return _DelayedSeqStreamResponse(self._lines, self._delay)
+
+
+class _DelayedSeqStreamClient(_SequencedStreamClient):
+    """Tools-mode variant: each turn's stream stalls before its first line."""
+
+    def __init__(self, stream_turns, delay: float) -> None:
+        super().__init__(stream_turns)
+        self._delay = delay
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        self.stream_calls.append({"url": url, "json": json})
+        idx = min(self._si, len(self._turns) - 1)
+        self._si += 1
+        return _DelayedSeqStreamCtx(self._turns[idx], self._delay)
+
+
+# ────────── keep-alive from t=0 across the upstream header-await (#458) ──────
+#
+# Unlike the ``_Delayed*`` fakes above (which stall ``aiter_lines`` — a quiet
+# period AFTER headers already arrived), these stall the STREAM CONTEXT
+# MANAGER'S ``__aenter__`` itself, i.e. header arrival — the exact shape of
+# llama.cpp withholding HTTP headers until the first token (prompt-eval).
+# ``_FakeAsyncClient.send()`` (added for WU-1) delegates to
+# ``self.stream(...).__aenter__()``, so delaying ``__aenter__`` here delays
+# the race helper's ``client.send(..., stream=True)`` exactly the same way a
+# slow-first-token upstream would.
+
+
+class _HeaderDelayedStreamCtx:
+    def __init__(self, lines, delay: float, status: int = 200, body=None) -> None:
+        self._lines = lines
+        self._delay = delay
+        self._status = status
+        self._body = body
+
+    async def __aenter__(self):
+        import asyncio as _a
+
+        await _a.sleep(self._delay)
+        return _SeqStreamResponse(self._lines, self._status, self._body)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _HeaderDelayedStreamClient(_FakeAsyncClient):
+    """Client whose header arrival (``__aenter__``, reached via the new
+    ``send()`` → ``stream().__aenter__()`` path) stalls *delay* seconds
+    before the response object exists — models llama.cpp withholding HTTP
+    headers until the first token, i.e. the full prompt-eval window."""
+
+    def __init__(self, lines: list[str], delay: float) -> None:
+        super().__init__()
+        self._lines = lines
+        self._delay = delay
+        self.stream_calls: list[dict] = []
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        self.stream_calls.append({"url": url, "json": json})
+        return _HeaderDelayedStreamCtx(self._lines, self._delay)
+
+
+# ───────── aclose() spies — resource-cleanup guard #5 (review REJECT) ────────
+#
+# 2026-08-16 independent review (WU-1, #458): ``async with
+# contextlib.aclosing(resp):`` at BOTH streaming call sites was replaced by a
+# no-op ``contextlib.AsyncExitStack()`` and all 124 pre-existing streaming
+# tests stayed green — none of them ever asserted the resolved upstream
+# response's ``.aclose()`` was actually invoked. ``_FakeStreamResponse`` and
+# ``_SeqStreamResponse``'s own ``aclose()`` methods are explicit no-ops (see
+# their docstrings) present only so the wrapper "has something to call" —
+# proving nothing. These subclasses turn that into an assertable fact.
+
+
+class _AcloseSpyResponse(_FakeStreamResponse):
+    """``_FakeStreamResponse`` (non-tool-loop call site,
+    ``chat.py:~2008``) whose ``.aclose()`` records that it fired, and which
+    can also be made to fail ``raise_for_status()`` (a 4xx/5xx upstream) so
+    the spy covers the error exit path too, not just the happy path."""
+
+    def __init__(self, lines: list[str], status_code: int = 200) -> None:
+        super().__init__(lines)
+        self.status_code = status_code
+        self.aclose_called = False
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            import httpx as _httpx
+
+            raise _httpx.HTTPStatusError(
+                "upstream error", request=MagicMock(), response=self
+            )
+        return None
+
+    async def aread(self) -> bytes:
+        return b""
+
+    async def aclose(self) -> None:
+        self.aclose_called = True
+        await super().aclose()
+
+
+class _AcloseSpyCtx:
+    """Async context manager that always resolves to the *response* it was
+    built with — lets a test hold a direct reference to the exact object the
+    route will (or won't) close."""
+
+    def __init__(self, response: _AcloseSpyResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _AcloseSpyResponse:
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _AcloseSpyClient(_FakeAsyncClient):
+    """Client whose ``.stream()`` always resolves to the single *response*
+    supplied at construction — the non-tool-loop streaming call site,
+    ``chat.py:~2008``."""
+
+    def __init__(self, response: _AcloseSpyResponse) -> None:
+        super().__init__()
+        self._response = response
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        return _AcloseSpyCtx(self._response)
+
+
+class _AcloseSpyStreamResponse(_SeqStreamResponse):
+    """``_SeqStreamResponse`` (tools-loop call site,
+    ``_stream_memory_tool_loop``, ``chat.py:~1214``) whose ``.aclose()``
+    records that it fired."""
+
+    def __init__(self, lines, status: int = 200, body: dict | None = None) -> None:
+        super().__init__(lines, status, body)
+        self.aclose_called = False
+
+    async def aclose(self) -> None:
+        self.aclose_called = True
+        await super().aclose()
+
+
+class _AcloseSpyStreamCtx(_SeqStreamCtx):
+    """``_SeqStreamCtx`` that builds an ``_AcloseSpyStreamResponse`` and
+    stashes it on ``self.response`` so the owning client (and, through it,
+    the test) can reach the exact resolved object after the request
+    completes."""
+
+    def __init__(self, lines, status: int = 200, body: dict | None = None) -> None:
+        super().__init__(lines, status, body)
+        self.response: _AcloseSpyStreamResponse | None = None
+
+    async def __aenter__(self) -> _AcloseSpyStreamResponse:
+        self.response = _AcloseSpyStreamResponse(self._lines, self._status, self._body)
+        return self.response
+
+
+class _AcloseSpyStreamClient(_SequencedStreamClient):
+    """``_SequencedStreamClient`` whose per-turn ``.stream()`` calls return
+    aclose-spying responses, one ``_AcloseSpyStreamCtx`` per turn, recorded
+    on ``self.stream_ctxs`` — covers the tools-loop call site across its
+    three exit shapes: normal completion, the tool-parse-500 buffered
+    fallback (reuses the base class's ``.post()``), and a non-parse
+    4xx/5xx (``raise_for_status()`` failure)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.stream_ctxs: list[_AcloseSpyStreamCtx] = []
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        self.stream_calls.append({"url": url, "json": json})
+        idx = min(self._si, len(self._turns) - 1)
+        lines = self._turns[idx]
+        status = self._stream_status[idx] if idx < len(self._stream_status) else 200
+        body = self._stream_bodies[idx] if idx < len(self._stream_bodies) else None
+        self._si += 1
+        ctx = _AcloseSpyStreamCtx(lines, status, body)
+        self.stream_ctxs.append(ctx)
+        return ctx
+
+
+class TestKeepaliveFromT0AcrossHeaderAwait:
+    """WU-1 falsifiable acceptance (spec 2026-08-16-SPEC-sse-keepalive-
+    upstream-window.md, #458), exercised through the full route on BOTH
+    streaming call sites — ``_stream_memory_tool_loop`` (tools mode) and the
+    non-tool-loop streaming branch (inject mode, default). Covers the exact
+    regression the MoE could never catch: a slow-first-token upstream must
+    not leave the client byte-starved before ``_iter_with_idle_timeout``'s
+    existing (post-header) keep-alive loop ever starts."""
+
+    @pytest.fixture
+    def _fast_keepalive(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_SSE_KEEPALIVE_INTERVAL", "1")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    @pytest.fixture
+    def _tools_mode_fast_keepalive(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        monkeypatch.setenv("AUDITTRACE_SSE_KEEPALIVE_INTERVAL", "1")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    def test_inject_mode_emits_keepalive_before_first_upstream_byte(
+        self, client, _fast_keepalive
+    ):
+        """Non-tool-loop streaming path (``chat.py:~1927``). Headers
+        delayed past the keepalive interval (1.4s > 1s) must yield ≥1
+        ``: keep-alive`` frame BEFORE the first upstream ``data:`` byte.
+
+        Neuter the t=0 ticker and this goes RED — before WU-1 the client
+        got zero bytes for the full 1.4s header-await; only the
+        POST-header ``_iter_with_idle_timeout`` loop ever emitted
+        keep-alives, too late for a header-await this long.
+        """
+        fake = _HeaderDelayedStreamClient(
+            [
+                'data: {"id":"cmpl-h","created":9,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"slow-first-token"}}]}',
+                "data: [DONE]",
+            ],
+            delay=1.4,
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "think very hard"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        keepalive_pos = raw.find(": keep-alive")
+        data_pos = raw.find("data: ")
+        assert keepalive_pos != -1, "no keep-alive frame emitted at all"
+        assert data_pos != -1, "no data frame emitted"
+        assert keepalive_pos < data_pos, (
+            "keep-alive must precede the first upstream data byte — this is"
+            " the t=0 window WU-1 closes"
+        )
+        assert "slow-first-token" in raw
+
+    def test_tools_mode_emits_keepalive_before_first_upstream_byte(
+        self, client, _tools_mode_fast_keepalive
+    ):
+        """Tools-loop streaming path (``_stream_memory_tool_loop``,
+        ``chat.py:~1146``). Same guarantee, same neuter-to-RED contract as
+        the inject-mode sibling above, on the OTHER call site — proves the
+        single factored helper is actually wired into both."""
+        fake = _HeaderDelayedStreamClient(
+            _sse_content_lines(["slow-first-token"]),
+            delay=1.4,
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "think very hard"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        keepalive_pos = raw.find(": keep-alive")
+        data_pos = raw.find("data: ")
+        assert keepalive_pos != -1, "no keep-alive frame emitted at all"
+        assert data_pos != -1, "no data frame emitted"
+        assert keepalive_pos < data_pos, (
+            "keep-alive must precede the first upstream data byte — this is"
+            " the t=0 window WU-1 closes"
+        )
+        assert "slow-first-token" in raw
+
+    def test_inject_mode_fast_path_no_spurious_keepalive_frame(self, client):
+        """Spec sub-decision #4: when the upstream returns headers before
+        the first keepalive tick (the MoE, the overwhelming common case),
+        output must be byte-identical to today — no early keep-alive frame
+        just because the race helper is now in the path.
+
+        Neuter the fast-path guard (e.g. always emit a frame regardless of
+        timing) and this goes RED.
+        """
+        fake = _FakeAsyncClient(
+            stream_lines=[
+                'data: {"id":"cmpl-f","created":1,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"fast"}}]}',
+                "data: [DONE]",
+            ]
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "fast"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert ": keep-alive" not in raw
+        assert "fast" in raw
+
+    def test_tools_mode_fast_path_no_spurious_keepalive_frame(
+        self, client, monkeypatch
+    ):
+        """Sub-decision #4 on the tools-loop call site."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        fake = _SequencedStreamClient([_sse_content_lines(["fast"])])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "fast"}],
+                    "stream": True,
+                },
+            )
+        config_mod.get_settings.cache_clear()
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert ": keep-alive" not in raw
+        assert "fast" in raw
+
+
+class TestStreamingQuietPeriodsAndTermination:
+    """ADR-034: a reasoning model can go quiet for minutes inside
+    ``<think>``. Intermediate proxies (Istio, Caddy, corporate egress) drop
+    an idle connection, so the route must emit SSE comment frames during the
+    silence — and those frames must be comments, invisible to a JSON parser,
+    or every OpenAI client would choke on them."""
+
+    @pytest.fixture
+    def _fast_keepalive(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_SSE_KEEPALIVE_INTERVAL", "1")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    @pytest.fixture
+    def _tools_mode_fast_keepalive(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        monkeypatch.setenv("AUDITTRACE_SSE_KEEPALIVE_INTERVAL", "1")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    def test_inject_mode_emits_comment_frames_during_a_quiet_period(
+        self, client, _fast_keepalive
+    ):
+        """The keep-alive must be an SSE *comment* (``: ...``), never a
+        ``data:`` line — a data line would be parsed as a malformed chunk by
+        every OpenAI SDK. The real answer must still arrive afterwards."""
+        fake = _DelayedStreamClient(
+            [
+                'data: {"id":"cmpl-k","created":5,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"answer"}}]}',
+                "data: [DONE]",
+            ],
+            delay=1.4,
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "think hard"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert ": keep-alive" in raw
+        # Comment frames carry no payload a JSON parser would see.
+        assert "data: : keep-alive" not in raw
+        assert "answer" in raw
+        assert raw.rstrip().endswith("[DONE]")
+
+    def test_tools_mode_emits_comment_frames_during_a_quiet_period(
+        self, client, _tools_mode_fast_keepalive
+    ):
+        """Same guarantee on the tools-mode loop, which opens a fresh
+        upstream stream per turn and so has its own idle window."""
+        fake = _DelayedSeqStreamClient(
+            [_sse_content_lines(["done"])],
+            delay=1.4,
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "think hard"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert ": keep-alive" in raw
+        assert "data: : keep-alive" not in raw
+        assert "done" in raw
+
+    def test_done_is_echoed_not_synthesised(self, client):
+        """``[DONE]`` is upstream's end-of-stream marker and the proxy only
+        re-emits it AFTER the synthetic usage chunk. When llama-server dies
+        mid-generation the socket closes without ``[DONE]``, and the proxy
+        must not manufacture one: a fabricated terminator makes a truncated
+        answer look like a clean completion to the client. This is the same
+        failure shape as the ``finish_reason="length"`` truncation bug."""
+        fake = _FakeAsyncClient(
+            stream_lines=[
+                'data: {"id":"cmpl-t","created":5,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"half an ans"}}],'
+                '"usage":{"prompt_tokens":9,"completion_tokens":3}}',
+                # Upstream vanishes here — no [DONE].
+            ]
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert "half an ans" in raw
+        assert "[DONE]" not in raw
+        # The usage chunk is still emitted so the token accounting the audit
+        # row and the client both rely on is not lost with the connection.
+        chunks = _parse_sse_deltas(raw)
+        usage_chunks = [c for c in chunks if c.get("usage")]
+        assert usage_chunks, chunks
+        assert usage_chunks[-1]["usage"]["prompt_tokens"] == 9
+
+
+class TestToolsModeMetadataOnlyTurn:
+    """ADR-033: every request gets an audit row. The degenerate upstream
+    turn — SSE frames that carry only metadata, no content, no usage, no
+    model, no tool calls — is exactly the shape that used to escape without
+    a row, because nothing in the turn looked like a result."""
+
+    @pytest.fixture
+    def _tools_mode(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    async def test_content_free_turn_still_persists_an_auditable_row(
+        self, client, _tools_mode
+    ):
+        """The turn yields a non-``data:`` SSE line and one choice-less
+        chunk, then ends. The request must complete, and the audit row must
+        record the empty answer honestly plus the model the CALLER asked
+        for — upstream never sent one, and a null model on the row would
+        make the interaction unattributable to a model version."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        turn = [
+            "event: ping",  # SSE comment/event line — must be skipped, not parsed
+            'data: {"id":"cmpl-empty","created":42,"choices":[]}',
+            "data: [DONE]",
+        ]
+        fake = _SequencedStreamClient([turn])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        chunks = _parse_sse_deltas(response.content.decode())
+        assert not [
+            c
+            for c in chunks
+            if (c.get("choices") or [{}])[0].get("delta", {}).get("content")
+        ], "no content was streamed upstream, none may be invented"
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.answer == ""
+        assert row.model == "qwen3.5-35b"
+        assert row.user_id == SENTINEL_SUBJECT
+        assert row.prompt_tokens == 0
+
+
+class TestUpstreamResponseClosedOnAllExitPaths:
+    """WU-1 guard #5 (resource cleanup, #458 review REJECT 2026-08-16): the
+    resolved upstream ``httpx.Response`` must actually be closed — not just
+    wrapped in something that LOOKS like ``contextlib.aclosing(resp)`` —
+    at BOTH streaming call sites, on every exit path (normal completion,
+    the tool-parse-500 buffered fallback, and a plain ``raise_for_status()``
+    failure). The prior suite never asserted this: swapping
+    ``contextlib.aclosing(resp)`` for a no-op ``contextlib.AsyncExitStack()``
+    at both call sites left all 124 streaming tests green, because the fakes'
+    own ``aclose()`` were no-ops nobody polled afterwards
+    (``feedback_vacuous_neuter_test_antipattern``). These tests spy on
+    ``.aclose()`` directly and go RED under that exact neuter — proven by
+    hand during this build (neuter → RED, restore → GREEN, see build
+    record)."""
+
+    @pytest.fixture
+    def _tools_mode(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    # ── non-tool-loop call site — chat.py:~2008 ───────────────────────────
+
+    def test_inject_mode_normal_completion_closes_upstream_response(self, client):
+        """Happy path: streaming completes normally, the resolved response
+        must still be closed once the ``async with`` body exits."""
+        response_obj = _AcloseSpyResponse(
+            [
+                'data: {"id":"cmpl-a","created":1,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"hi"}}]}',
+                "data: [DONE]",
+            ]
+        )
+        fake = _AcloseSpyClient(response_obj)
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "hi" in response.content.decode()
+        assert response_obj.aclose_called is True, (
+            "resolved upstream response was never closed — a real"
+            " httpx.AsyncClient would leak the open stream"
+        )
+
+    def test_inject_mode_error_response_closes_upstream_response(self, client):
+        """Error path: ``resp.raise_for_status()`` raises on a 4xx/5xx —
+        the response must be closed even though the ``async with`` body
+        exits via exception, not a normal return."""
+        response_obj = _AcloseSpyResponse([], status_code=503)
+        fake = _AcloseSpyClient(response_obj)
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "503" in response.content.decode()
+        assert response_obj.aclose_called is True, (
+            "resolved upstream response was never closed on the"
+            " raise_for_status() error exit path"
+        )
+
+    # ── tools-loop call site — _stream_memory_tool_loop, chat.py:~1214 ────
+
+    def test_tools_mode_normal_completion_closes_upstream_response(
+        self, client, _tools_mode
+    ):
+        """Happy path on the OTHER call site: a single streamed turn with
+        no tool calls — proves the guard is wired into both sites, not
+        just the simpler non-tool-loop one."""
+        fake = _AcloseSpyStreamClient([_sse_content_lines(["done"])])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "done" in response.content.decode()
+        assert len(fake.stream_ctxs) == 1
+        assert fake.stream_ctxs[0].response is not None
+        assert fake.stream_ctxs[0].response.aclose_called is True, (
+            "resolved upstream response was never closed — a real"
+            " httpx.AsyncClient would leak the open stream"
+        )
+
+    def test_tools_mode_tool_parse_500_fallback_closes_upstream_response(
+        self, client, _tools_mode
+    ):
+        """The tool-parse-500 branch: the errored streamed response that
+        triggers the buffered retry/no-tools fallback must ITSELF be
+        closed — it is read via ``resp.aread()`` then discarded, never
+        iterated, so this is the exit path most likely to leak if
+        ``contextlib.aclosing(resp)`` were ever dropped."""
+        parse_err_body = {
+            "error": {
+                "code": 500,
+                "type": "server_error",
+                "message": (
+                    "Failed to parse tool call arguments as JSON: "
+                    "[json.exception.parse_error.101]"
+                ),
+            }
+        }
+        fake = _AcloseSpyStreamClient(
+            stream_turns=[["unused"]],  # short-circuited by status 500
+            stream_status=[500],
+            stream_bodies=[parse_err_body],
+            post_responses=[_tools_mode_response_text("Recovered answer.")],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "trigger parse error"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "Recovered answer." in response.content.decode()
+        assert len(fake.stream_ctxs) == 1
+        assert fake.stream_ctxs[0].response is not None
+        assert fake.stream_ctxs[0].response.aclose_called is True, (
+            "the tool-parse-500 response was never closed before falling"
+            " back to the buffered retry path"
+        )
+
+    def test_tools_mode_non_parse_500_closes_upstream_response(
+        self, client, _tools_mode
+    ):
+        """A non-tool-parse 500 falls through to ``resp.raise_for_status()``
+        — the response must be closed even though the ``async with`` body
+        exits via exception (no buffered fallback for this shape)."""
+        fake = _AcloseSpyStreamClient(
+            stream_turns=[["unused"]],
+            stream_status=[500],
+            stream_bodies=[{"error": {"message": "CUDA OOM"}}],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "status 500" in response.content.decode()
+        assert len(fake.stream_ctxs) == 1
+        assert fake.stream_ctxs[0].response is not None
+        assert fake.stream_ctxs[0].response.aclose_called is True, (
+            "resolved upstream response was never closed on the"
+            " raise_for_status() error exit path"
+        )
+
+
+# ──────────────── llama httpx keep-alive-race fix (SPEC 2026-08-16) ─────────
+#
+# llama.cpp FIN-closes an idle connection after ``Keep-Alive: timeout=5``
+# (confirmed live via tcpdump); httpx's own default pool keepalive (~5 s)
+# races that close and reuses the dead socket, raising
+# ``httpx.RemoteProtocolError: Server disconnected`` on the next call. The
+# fix caps every llama-facing ``httpx.AsyncClient``'s ``limits=`` at
+# ``keepalive_expiry=2.0`` (well under llama's 5 s) via one shared
+# ``LLAMA_HTTPX_LIMITS`` constant (#371 single-source-of-truth lockstep).
+#
+# These tests assert the ACTUAL kwarg passed to the ``httpx.AsyncClient``
+# constructor at each llama-facing call site — not just that the shared
+# constant has the right value — so dropping ``limits=`` at any ONE site
+# regresses that site's test to RED even though the constant itself is
+# still correct everywhere else (non-vacuous per site).
+
+
+class TestLlamaHttpxKeepaliveLimits:
+    """Every llama-facing ``httpx.AsyncClient`` caps keepalive below llama's
+    5 s server-side close, via the single shared ``LLAMA_HTTPX_LIMITS``."""
+
+    @pytest.fixture
+    def _tools_mode_fixture(self, monkeypatch):
+        """Flip AUDITTRACE_MEMORY_MODE=tools for the duration of a test.
+
+        Mirrors ``TestToolsModeIntegration._tools_mode`` (not reused
+        directly — that fixture is scoped to its own class)."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    def test_shared_constant_caps_keepalive_below_llama_five_seconds(self):
+        """The single source of truth itself: below llama's 5 s Keep-Alive,
+        so httpx discards an idle pooled connection before llama can."""
+        from audittrace.routes import _llama_client, _memory_tool_loop, chat
+
+        limits = _llama_client.LLAMA_HTTPX_LIMITS
+        assert limits.keepalive_expiry is not None
+        assert limits.keepalive_expiry < 5.0
+        assert limits.keepalive_expiry == 2.0
+        # No per-site literals (#371 lockstep) — every consumer imports the
+        # exact SAME object, not a copy with the same value.
+        assert chat.LLAMA_HTTPX_LIMITS is limits
+        assert _memory_tool_loop.LLAMA_HTTPX_LIMITS is limits
+
+    def test_non_streaming_chat_completions_client_capped(self, client):
+        """Inject-mode non-streaming branch (``chat_completions``)."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_streaming_chat_completions_client_capped(self, client):
+        """Inject-mode streaming branch (``_iter_and_capture``)."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        stream_lines = [
+            'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        fake = _FakeAsyncClient(stream_lines=stream_lines)
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_models_endpoint_client_capped(self, client):
+        """``GET /v1/models`` proxy client."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _FakeAsyncClient(get_json={"object": "list", "data": []})
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.get("/v1/models")
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_tools_mode_streaming_client_capped(self, client, _tools_mode_fixture):
+        """Tools-mode streaming turn (``_stream_memory_tool_loop``) — this
+        client is constructed in ``chat.py`` itself, so only
+        ``_patch_async_client`` is needed (see the buffered-loop test above
+        for why stacking both patches would be misleading — they resolve to
+        the SAME underlying ``httpx.AsyncClient`` attribute)."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _SequencedStreamClient([_sse_content_lines(["Hi"])])
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_tools_mode_buffered_loop_client_capped(self, client, _tools_mode_fixture):
+        """Tools-mode buffered turn (``_memory_tool_loop.run_memory_tool_loop``)
+        — the client is constructed in a DIFFERENT module
+        (``_memory_tool_loop.py``) than the streaming site above, proving the
+        fix reached that module too, not just ``chat.py``'s own call sites.
+
+        Patches ONLY ``_memory_tool_loop.httpx.AsyncClient`` (not also
+        ``chat.httpx.AsyncClient``) — both dotted paths resolve to the SAME
+        underlying ``httpx.AsyncClient`` attribute (a single shared ``httpx``
+        module), so stacking both patches would just have the second one
+        silently clobber the first's mock, making this assertion vacuously
+        pass against whichever one survived. Langfuse ingestion — the only
+        other ``httpx.AsyncClient()`` construction on this path — is a no-op
+        here (Langfuse disabled in tests, ``_record_langfuse_output`` returns
+        early), so exactly one call reaches this mock.
+        """
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _SequencedClient([_tools_mode_response_text("Just text.")])
+        with _patch_tool_loop_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_langfuse_ingestion_client_left_alone(self, client):
+        """The Langfuse ingestion client (``_record_langfuse_output``) is
+        NOT llama-facing — it must keep using plain ``httpx.AsyncClient()``
+        defaults, not ``LLAMA_HTTPX_LIMITS``. Proves the fix is targeted,
+        not a blanket change to every AsyncClient in the module."""
+        import inspect
+
+        from audittrace.routes import chat as chat_mod
+
+        source = inspect.getsource(chat_mod._record_langfuse_output)
+        assert "httpx.AsyncClient(timeout=5)" in source
+        assert "LLAMA_HTTPX_LIMITS" not in source

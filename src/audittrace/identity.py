@@ -15,6 +15,14 @@ This module exports:
 - ``hash_token`` — sha256 hex helper. Used as the cache key so the
   raw token never reaches Redis, logs, or memory dumps.
 - ``is_admin_scope`` — checks whether a scope tuple grants admin.
+- ``is_privileged_scope`` — checks whether a scope tuple grants admin
+  OR a granular ``memory:corpus:*:write`` scope (ADR-062 §4). Used for
+  shadow-client blast-radius ranking, deliberately distinct from
+  ``is_admin_scope`` (app-layer authz).
+- ``CORPUS_WRITE_SCOPE_GLOB`` — the single-source-of-truth glob string
+  for a corpus-write scope, mirrored verbatim in
+  ``scripts/post-deploy-verify.sh`` Check 11 and cross-checked by
+  ``tests/test_chart_drift_guards.py``.
 - ``sentinel_user_context`` — bypass-mode UserContext for the
   ``AUDITTRACE_AUTH_REQUIRED=false`` migration window.
 - ``TokenCache`` — Redis-backed sha256→UserContext store with TTL.
@@ -32,10 +40,12 @@ with other users of the same Redis instance.
 
 from __future__ import annotations
 
+import contextvars
+import fnmatch
 import hashlib
 import json
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -43,6 +53,138 @@ if TYPE_CHECKING:
     from redis import Redis
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────── Request-credential registry (SEC-JWT-IN-LANGFUSE-SPAN) ──
+#
+# D3 — the equality pin. The bearer token has exactly one process entry
+# point: the OAuth2 scheme's ``__call__`` (``audittrace.auth`` — see
+# ``_RegisteringOAuth2Scheme``). It registers the raw value here, in a
+# request-scoped ContextVar, BEFORE returning it to any ``Depends(...)``
+# consumer — so the value is visible to every ``@log_call`` target that
+# might observe it in the same task, including ``require_user`` itself.
+# ``logging_config.scrub_text`` reads this registry by VALUE EQUALITY
+# (longest-first, so a shorter registered value can never leave a
+# dangling suffix of a longer one unredacted) and is the primary
+# redaction mechanism; the shape net (JWT/Bearer/Basic regexes) is the
+# secondary, enumeration-class layer for whatever bypasses this path.
+#
+# A ContextVar, not a module global: concurrent requests (threadpool +
+# asyncio tasks) must never see each other's secrets, and a value must
+# never leak across requests. ``contextvars.copy_context()`` semantics
+# mean a child task spawned from a context that already registered a
+# secret inherits a COPY of the registry — mutating it there does not
+# leak back to the parent, which is the same precedent as
+# ``db.rls.set_current_user_id``.
+#
+# SCRUB-EVENT-LOOP-STALL (v1.29.4, R1/S4 — ratified ADDENDUM A1 §9) — the
+# registry holds ONE ContextVar of ``(value, window_index)`` pairs, not two
+# separate ContextVars. Two independent ContextVars could diverge (a reset
+# that clears one but not the other, or a future direct writer of just the
+# values) and ``request_secret_index`` would silently fall back to an
+# uncached rebuild on every call — safe (redaction still holds) but the
+# v1.29.3 event-loop stall this WU fixes would come back on any path the
+# fallback is reached from. One ContextVar makes that divergence
+# unrepresentable: ``reset_request_secrets`` clears both facts in the same
+# ``.set(())`` call, by construction.
+_REQUEST_SECRETS: contextvars.ContextVar[
+    tuple[tuple[str, Mapping[str, tuple[int, ...]]], ...]
+] = contextvars.ContextVar("audittrace_request_secrets", default=())
+
+# Never register a value shorter than this — avoids an accidental scrub of
+# a common short string (a one-word query, a short id) that happens to
+# equal some unrelated registered value. The shape net (D4) covers short
+# or malformed credentials this floor excludes.
+_MIN_REGISTERED_SECRET_LEN = 16
+
+# SCRUB-EVENT-LOOP-STALL (R1) — moved here from ``logging_config`` (pure
+# string code, no imports) together with ``build_secret_window_index``
+# below. Re-exported from ``logging_config`` under its original name
+# (``_FRAGMENT_WINDOW_LEN``) so no existing import site moves.
+_FRAGMENT_WINDOW_LEN = 16
+
+
+def build_secret_window_index(secret: str) -> Mapping[str, tuple[int, ...]]:
+    """Map every ``_FRAGMENT_WINDOW_LEN``-char window of ``secret`` to the
+    tuple of start offsets within ``secret`` where that window occurs
+    (handles a secret with internal repeats).
+
+    SCRUB-EVENT-LOOP-STALL (v1.29.4, R1) — moved here, unchanged in
+    behaviour, from ``logging_config._secret_window_index`` (still
+    re-exported there under that name). The ratified fix for the
+    v1.29.3 event-loop stall is calling this function ONCE per
+    registered secret, at registration (``register_request_secret``
+    below), instead of once per scrubbed string leaf
+    (``logging_config._scrub_secret_fragments`` /
+    ``logging_config.secret_leaks_into`` now read the pre-built result
+    via ``request_secret_index`` below, O(1), rather than rebuilding it
+    on every call).
+    """
+    index: dict[str, list[int]] = {}
+    for i in range(0, len(secret) - _FRAGMENT_WINDOW_LEN + 1):
+        index.setdefault(secret[i : i + _FRAGMENT_WINDOW_LEN], []).append(i)
+    return {k: tuple(v) for k, v in index.items()}
+
+
+def register_request_secret(value: str) -> None:
+    """Register ``value`` as a secret to redact for the rest of this request.
+
+    Idempotent (registering the same value twice is a no-op beyond the
+    dedup) and additive — multiple secrets (e.g. a bearer token AND a
+    downstream-minted token) can be registered in the same request. Values
+    shorter than ``_MIN_REGISTERED_SECRET_LEN`` are silently ignored (D3).
+
+    SCRUB-EVENT-LOOP-STALL (v1.29.4, R1) — builds the 16-char window index
+    for ``value`` exactly ONCE, here, and stores it alongside the value.
+    Every later reader (``request_secret_index`` below) gets that one
+    object back in O(1) instead of rebuilding it on every scrubbed string
+    leaf — the per-leaf rebuild was the v1.29.3 event-loop-stall defect.
+    """
+    if not value or len(value) < _MIN_REGISTERED_SECRET_LEN:
+        return
+    current = _REQUEST_SECRETS.get()
+    if any(existing == value for existing, _ in current):
+        return
+    index = build_secret_window_index(value)
+    _REQUEST_SECRETS.set((*current, (value, index)))
+
+
+def request_secrets() -> tuple[str, ...]:
+    """Return every secret registered so far in the current request context.
+
+    Empty tuple when nothing has been registered (unauthenticated routes,
+    bypass mode, unit tests without a request scope) — callers must treat
+    that as "nothing to scrub by equality", not an error.
+    """
+    return tuple(value for value, _ in _REQUEST_SECRETS.get())
+
+
+def request_secret_index(secret: str) -> Mapping[str, tuple[int, ...]]:
+    """Return the registered window index for ``secret`` in O(1).
+
+    SCRUB-EVENT-LOOP-STALL (v1.29.4, R1) — the production read path:
+    ``secret`` was registered via ``register_request_secret`` above, so
+    its index was already built once, at registration, and is returned
+    here by identity (not rebuilt). For a ``secret`` that is NOT
+    registered (the redaction-net's registered-value leg in
+    ``tests/conftest.py`` calls ``secret_leaks_into`` with an explicit
+    secret that may never have gone through ``register_request_secret``)
+    this builds one uncached — correct, just not memoised, and the
+    registry is never widened to cache it (no module-level cache: a
+    ``lru_cache`` here would retain a secret's windows for the process
+    lifetime, long past the request that registered it — rejected by the
+    ratified spec, G-P6).
+    """
+    for value, index in _REQUEST_SECRETS.get():
+        if value == secret:
+            return index
+    return build_secret_window_index(secret)
+
+
+def reset_request_secrets() -> None:
+    """Clear the registry. Test-only — production requests get a fresh
+    ContextVar value for free because each request runs in its own task."""
+    _REQUEST_SECRETS.set(())
 
 
 # ─────────────────────────── Sentinel for bypass mode ────────────────────────
@@ -131,6 +273,52 @@ def is_admin_scope(scopes: Iterable[str]) -> bool:
     return any(
         s in ("audittrace:admin", "memory:admin") or s.startswith("admin:")
         for s in scopes
+    )
+
+
+# The single source of truth for "what is a corpus-write scope" (#371,
+# ADR-062 §4: "memory:corpus:<collection>:write" per recall collection,
+# {decisions, skills, semantic}). This EXACT string is mirrored verbatim in
+# the shell `case` pattern in `scripts/post-deploy-verify.sh` Check 11
+# (shell glob syntax happens to be `fnmatch`-compatible), and
+# `tests/test_chart_drift_guards.py::TestPrivilegedCorpusScopeSingleSourceOfTruth`
+# reads both files and asserts they still agree — so the app classifier and
+# the shell guard cannot silently drift apart the way #370/#371 drifted.
+CORPUS_WRITE_SCOPE_GLOB = "memory:corpus:*:write"
+
+
+def is_privileged_scope(scopes: Iterable[str]) -> bool:
+    """True iff any scope is admin OR a granular corpus-write scope.
+
+    Recognises everything ``is_admin_scope`` does, PLUS the granular
+    ``memory:corpus:<collection>:write`` scopes named in ADR-062 §4
+    (``docs/ADR-062-five-layer-memory-model.md:266-269``): "the scope-drift
+    guard must learn the granular corpus scopes so an undeclared holder is
+    flagged." Corpus write is operator/curator-tier access to the shared
+    corpus (Layer 5) — an UNDECLARED client holding one is exactly the
+    shadow-writer threat #371 exists to catch, so it is ranked ``!!``
+    (privileged blast radius) by ``scripts/post-deploy-verify.sh`` Check 11.
+
+    Deliberately does **not** fold plain ``memory:<layer>:write`` (e.g.
+    ``memory:episodic:write``) in here — that is the ordinary per-user
+    writer scope every legitimate client (webui, opencode) holds, and
+    flagging it would make the shadow-client guard cry wolf on every normal
+    deployment. Only the granular ``memory:corpus:*:write`` form counts.
+    Read scopes (``memory:corpus:<collection>:read``) are likewise never
+    privileged — read access to the shared corpus is not the elevation this
+    guards against.
+
+    Kept SEPARATE from ``is_admin_scope`` on purpose: this function drives
+    shadow-client blast-radius RANKING only. Folding a corpus-write scope
+    into ``is_admin_scope`` would silently grant a Layer-5 writer the RLS
+    bypass and every other admin-gated app capability via
+    ``UserContext.is_admin`` — ADR-062 §4 calls corpus write
+    "operator/curator-tier", not app-admin-tier, so ``is_admin_scope``
+    (and therefore ``UserContext.is_admin``) must stay untouched by this
+    change.
+    """
+    return is_admin_scope(scopes) or any(
+        fnmatch.fnmatchcase(s, CORPUS_WRITE_SCOPE_GLOB) for s in scopes
     )
 
 

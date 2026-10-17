@@ -39,6 +39,13 @@
 # `kc.sh start --import-realm` overwrites the live realm. If the
 # realm was wiped + reimported, every brokered IdP needs to be
 # re-installed by re-running this script for each one.
+#
+# Round-trip counterpart (#403): scripts/export-idp-federation.sh
+# captures whatever this script has installed LIVE back into version
+# control (secrets externalized to the same Vault path convention
+# used above), so a wipe isn't a total loss of the brokering config.
+# scripts/post-deploy-verify.sh Check 12 drift-guards the two against
+# each other post-deploy.
 
 set -euo pipefail
 

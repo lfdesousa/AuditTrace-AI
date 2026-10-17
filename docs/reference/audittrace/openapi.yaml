@@ -8,6 +8,138 @@
 # tests/test_openapi_drift.py is the gate.
 components:
   schemas:
+    AssessmentDeferral:
+      description: One deferred / out-of-scope item in a recorded self-assessment (ADR-058).
+      properties:
+        item:
+          description: What was deferred or left out of scope
+          title: Item
+          type: string
+        reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Why it was deferred
+          title: Reason
+      required:
+      - item
+      title: AssessmentDeferral
+      type: object
+    AssessmentFinding:
+      description: One finding in a recorded self-assessment (ADR-058).
+      properties:
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Fuller description
+          title: Detail
+        finding_id:
+          description: Stable id for this finding
+          title: Finding Id
+          type: string
+        severity:
+          description: critical | high | medium | low | info
+          title: Severity
+          type: string
+        title:
+          description: One-line finding title
+          title: Title
+          type: string
+      required:
+      - finding_id
+      - severity
+      - title
+      title: AssessmentFinding
+      type: object
+    AssessmentIngestRequest:
+      description: 'Request body for ``POST /audit/assessments`` (ADR-058 recursive self-audit).
+
+
+        One assessment fans out to a single ``assessment_header`` row plus N
+
+        child rows (question / finding / deferral), all correlated by
+
+        ``assessment_id`` and owner-scoped to the authenticated assessor.'
+      properties:
+        assessment_id:
+          description: Stable id correlating the header and its child rows
+          title: Assessment Id
+          type: string
+        deferrals:
+          items:
+            $ref: '#/components/schemas/AssessmentDeferral'
+          title: Deferrals
+          type: array
+        findings:
+          items:
+            $ref: '#/components/schemas/AssessmentFinding'
+          title: Findings
+          type: array
+        frameworks:
+          description: Frameworks the assessment ran against (OWASP, ASVS, ...)
+          items:
+            type: string
+          title: Frameworks
+          type: array
+        project:
+          default: self-audit
+          description: Audit project namespace
+          title: Project
+          type: string
+        questions:
+          items:
+            $ref: '#/components/schemas/AssessmentQuestion'
+          title: Questions
+          type: array
+        rules_of_engagement:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: The fixed RoE the assessment ran under
+          title: Rules Of Engagement
+        source:
+          default: security-assessment
+          description: Audit source tag
+          title: Source
+          type: string
+        teardown:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Teardown / environment-destroyed evidence
+          title: Teardown
+      required:
+      - assessment_id
+      title: AssessmentIngestRequest
+      type: object
+    AssessmentQuestion:
+      description: 'One adversary question in a recorded self-assessment (ADR-058).
+
+
+        Maps to an ``assessment_question`` child row when the assessment is
+
+        recorded through ``POST /audit/assessments``.'
+      properties:
+        method:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: How the question was tested (method / RoE)
+          title: Method
+        question:
+          description: The adversary question that was asked
+          title: Question
+          type: string
+        verdict:
+          description: The result, e.g. 'pass' or 'low'
+          title: Verdict
+          type: string
+      required:
+      - question
+      - verdict
+      title: AssessmentQuestion
+      type: object
     Body_upload_memory_file_memory_upload_post:
       properties:
         file:
@@ -17,6 +149,1672 @@ components:
       required:
       - file
       title: Body_upload_memory_file_memory_upload_post
+      type: object
+    ConsoleAclBatchPermissionsRequest:
+      additionalProperties: false
+      description: 'Request body for ``POST /console/acl/{resource_type}/
+
+        permissions/batch`` — bounded at 200 ids, same cap as every other
+
+        console-* batch route.'
+      properties:
+        resource_ids:
+          items:
+            type: string
+          maxItems: 200
+          minItems: 1
+          title: Resource Ids
+          type: array
+      required:
+      - resource_ids
+      title: ConsoleAclBatchPermissionsRequest
+      type: object
+    ConsoleAclBatchPermissionsResponse:
+      description: 'Response from the batch-permissions route. ``permissions`` omits
+
+        any ``resource_id`` with no matching, non-expired grant (never
+
+        present with value ``0``) — mirrors the service layer''s ``Map``
+
+        semantics.'
+      properties:
+        permissions:
+          additionalProperties:
+            type: integer
+          title: Permissions
+          type: object
+      title: ConsoleAclBatchPermissionsResponse
+      type: object
+    ConsoleAclBulkRequest:
+      additionalProperties: false
+      description: 'Body of ``POST /console/acl/{type}/{id}/grants/bulk``. The route
+
+        stamps the PATH''s resource into every op — an op cannot name another
+
+        resource.'
+      properties:
+        ops:
+          items:
+            $ref: '#/components/schemas/ConsoleAclGrantRequest'
+          maxItems: 200
+          minItems: 1
+          title: Ops
+          type: array
+      required:
+      - ops
+      title: ConsoleAclBulkRequest
+      type: object
+    ConsoleAclBulkResponse:
+      description: Response of W4.
+      properties:
+        acl_entry_ids:
+          items:
+            type: string
+          title: Acl Entry Ids
+          type: array
+        expired_ids:
+          items:
+            type: string
+          title: Expired Ids
+          type: array
+        trace_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Trace Id
+      title: ConsoleAclBulkResponse
+      type: object
+    ConsoleAclEffectivePermissionsResponse:
+      description: 'Response from ``GET /console/acl/{resource_type}/{resource_id}/
+
+        permissions`` — the CALLER''s combined (bitwise-OR''d) effective
+
+        permission bitmask on the resource. ``0`` means no matching,
+
+        non-expired grant exists (deny-by-default).'
+      properties:
+        perm_bits:
+          minimum: 0.0
+          title: Perm Bits
+          type: integer
+      required:
+      - perm_bits
+      title: ConsoleAclEffectivePermissionsResponse
+      type: object
+    ConsoleAclEntryItem:
+      description: 'One ACL row as answered by a write route. ``user_sub`` is
+
+        deliberately NOT echoed (it equals the caller).'
+      properties:
+        bits:
+          additionalProperties:
+            type: boolean
+          title: Bits
+          type: object
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        expired_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Expired At Ms
+        granted_at_ms:
+          title: Granted At Ms
+          type: integer
+        granted_by:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Granted By
+        id:
+          title: Id
+          type: string
+        inherited_from:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Inherited From
+        perm_bits:
+          title: Perm Bits
+          type: integer
+        principal_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Principal Id
+        principal_model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Principal Model
+        principal_type:
+          title: Principal Type
+          type: string
+        resource_id:
+          title: Resource Id
+          type: string
+        resource_type:
+          title: Resource Type
+          type: string
+        role_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Role Id
+        tenant_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Tenant Id
+        trace_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Trace Id
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - id
+      - principal_type
+      - resource_type
+      - resource_id
+      - perm_bits
+      - bits
+      - granted_at_ms
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleAclEntryItem
+      type: object
+    ConsoleAclExpireRequest:
+      additionalProperties: false
+      description: Body of ``POST /console/acl/expire``.
+      properties:
+        predicates:
+          items:
+            $ref: '#/components/schemas/ConsoleAclPredicate'
+          maxItems: 200
+          minItems: 1
+          title: Predicates
+          type: array
+      required:
+      - predicates
+      title: ConsoleAclExpireRequest
+      type: object
+    ConsoleAclExpireResponse:
+      description: 'Response of W2/W5. An empty ``expired_ids`` is the idempotent
+
+        answer, never a 404.'
+      properties:
+        expired_ids:
+          items:
+            type: string
+          title: Expired Ids
+          type: array
+        trace_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Trace Id
+        visible_matched_count:
+          default: 0
+          title: Visible Matched Count
+          type: integer
+      title: ConsoleAclExpireResponse
+      type: object
+    ConsoleAclGrantRequest:
+      additionalProperties: false
+      description: 'Body of ``POST /console/acl/{type}/{id}/grants`` and of each
+
+        bulk op. Carries no identity/audit field — those are token-derived.'
+      properties:
+        expired_at_ms:
+          anyOf:
+          - maximum: 9.223372036854776e+18
+            minimum: 0.0
+            type: integer
+          - type: 'null'
+          title: Expired At Ms
+        perm_bits:
+          maximum: 15.0
+          minimum: 0.0
+          title: Perm Bits
+          type: integer
+        principal_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Principal Id
+        principal_type:
+          enum:
+          - user
+          - public
+          - role
+          title: Principal Type
+          type: string
+        role_id:
+          anyOf:
+          - maxLength: 36
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Role Id
+        tenant_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Tenant Id
+      required:
+      - principal_type
+      - perm_bits
+      title: ConsoleAclGrantRequest
+      type: object
+    ConsoleAclHasPermissionResponse:
+      description: 'Response from ``GET /console/acl/{resource_type}/{resource_id}/
+
+        has-permission``.'
+      properties:
+        has_permission:
+          title: Has Permission
+          type: boolean
+      required:
+      - has_permission
+      title: ConsoleAclHasPermissionResponse
+      type: object
+    ConsoleAclModifyRequest:
+      additionalProperties: false
+      description: Body of ``PATCH /console/acl/{type}/{id}/grants``.
+      properties:
+        add_bits:
+          anyOf:
+          - maximum: 15.0
+            minimum: 0.0
+            type: integer
+          - type: 'null'
+          title: Add Bits
+        principal_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Principal Id
+        principal_type:
+          enum:
+          - user
+          - public
+          - role
+          title: Principal Type
+          type: string
+        remove_bits:
+          anyOf:
+          - maximum: 15.0
+            minimum: 0.0
+            type: integer
+          - type: 'null'
+          title: Remove Bits
+        tenant_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Tenant Id
+      required:
+      - principal_type
+      title: ConsoleAclModifyRequest
+      type: object
+    ConsoleAclPredicate:
+      additionalProperties: false
+      description: 'One ``POST /console/acl/expire`` predicate — the five optional
+
+        keys the service accepts.'
+      properties:
+        principal_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Principal Id
+        principal_type:
+          anyOf:
+          - enum:
+            - user
+            - public
+            - role
+            type: string
+          - type: 'null'
+          title: Principal Type
+        resource_id:
+          anyOf:
+          - maxLength: 36
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Resource Id
+        resource_type:
+          anyOf:
+          - enum:
+            - agent
+            - mcpServer
+            - promptGroup
+            - remoteAgent
+            - sharedLink
+            - skill
+            type: string
+          - type: 'null'
+          title: Resource Type
+        tenant_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Tenant Id
+      title: ConsoleAclPredicate
+      type: object
+    ConsoleAclResourceIdsResponse:
+      description: 'Response shape shared by the accessible/public/sole-owned
+
+        resource-id routes.'
+      properties:
+        resource_ids:
+          items:
+            type: string
+          title: Resource Ids
+          type: array
+      title: ConsoleAclResourceIdsResponse
+      type: object
+    ConsoleAgentBatchGetRequest:
+      description: 'Request body for ``POST /console/agents/batch-get`` — fetch the
+
+        caller''s OWN agents for a batch of ``agent_id``s in one round trip.
+
+        Capped at ``MAX_LIST_LIMIT`` (200) — same bound as the
+
+        cursor-paginated list route, so a hostile caller cannot force an
+
+        unbounded ``IN (...)`` query.'
+      properties:
+        agent_ids:
+          items:
+            type: string
+          maxItems: 200
+          minItems: 1
+          title: Agent Ids
+          type: array
+      required:
+      - agent_ids
+      title: ConsoleAgentBatchGetRequest
+      type: object
+    ConsoleAgentBatchGetResponse:
+      description: 'Response from ``POST /console/agents/batch-get``. ``items`` omits
+
+        any requested ``agent_id`` that doesn''t exist, is soft-deleted, or
+
+        belongs to another user — same not-found-vs-403 discipline as
+
+        ``GET /console/agents/{agent_id}`` (never leaks existence), just
+
+        batched: the caller cannot distinguish "not mine" from "never
+
+        existed" from the response shape alone.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleAgentItem'
+          title: Items
+          type: array
+      title: ConsoleAgentBatchGetResponse
+      type: object
+    ConsoleAgentItem:
+      description: One agent row, as returned by the console-agents API.
+      properties:
+        agent_id:
+          title: Agent Id
+          type: string
+        artifacts:
+          additionalProperties: true
+          title: Artifacts
+          type: object
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        description:
+          title: Description
+          type: string
+        end_after_tools:
+          default: false
+          title: End After Tools
+          type: boolean
+        instructions:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Instructions
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+        model_parameters:
+          additionalProperties: true
+          title: Model Parameters
+          type: object
+        name:
+          title: Name
+          type: string
+        project_ids:
+          items:
+            type: string
+          title: Project Ids
+          type: array
+        provider:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Provider
+        tools:
+          items: {}
+          title: Tools
+          type: array
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - agent_id
+      - name
+      - description
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleAgentItem
+      type: object
+    ConsoleAgentListResponse:
+      description: 'Response from ``GET /console/agents`` — cursor-paginated,
+
+        newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleAgentItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsoleAgentListResponse
+      type: object
+    ConsoleAgentUpsertRequest:
+      description: 'Request body for ``POST /console/agents`` — create/update the
+
+        caller''s own agent (upsert by ``agent_id``).'
+      properties:
+        agent_id:
+          maxLength: 255
+          minLength: 1
+          title: Agent Id
+          type: string
+        artifacts:
+          additionalProperties: true
+          title: Artifacts
+          type: object
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        end_after_tools:
+          default: false
+          title: End After Tools
+          type: boolean
+        instructions:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Instructions
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Model
+        model_parameters:
+          additionalProperties: true
+          title: Model Parameters
+          type: object
+        name:
+          maxLength: 512
+          minLength: 1
+          title: Name
+          type: string
+        project_ids:
+          items:
+            type: string
+          title: Project Ids
+          type: array
+        provider:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Provider
+        tools:
+          items: {}
+          title: Tools
+          type: array
+      required:
+      - agent_id
+      - name
+      title: ConsoleAgentUpsertRequest
+      type: object
+    ConsoleChatProjectItem:
+      description: 'One chat-project row, as returned by the console-chat-projects
+
+        API.'
+      properties:
+        chat_project_id:
+          title: Chat Project Id
+          type: string
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        description:
+          title: Description
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        name:
+          title: Name
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - chat_project_id
+      - name
+      - description
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleChatProjectItem
+      type: object
+    ConsoleChatProjectListResponse:
+      description: 'Response from ``GET /console/chat-projects`` — cursor-paginated,
+
+        newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleChatProjectItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsoleChatProjectListResponse
+      type: object
+    ConsoleChatProjectUpsertRequest:
+      description: 'Request body for ``POST /console/chat-projects`` — create/update
+
+        the caller''s own chat-project (upsert by ``chat_project_id``).'
+      properties:
+        chat_project_id:
+          maxLength: 255
+          minLength: 1
+          title: Chat Project Id
+          type: string
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        name:
+          maxLength: 512
+          minLength: 1
+          title: Name
+          type: string
+      required:
+      - chat_project_id
+      - name
+      title: ConsoleChatProjectUpsertRequest
+      type: object
+    ConsoleConversationItem:
+      description: One conversation row, as returned by the console-conversations API.
+      properties:
+        agent_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Agent Id
+        chat_project_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Chat Project Id
+        conversation_id:
+          title: Conversation Id
+          type: string
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        endpoint:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Endpoint
+        is_temporary:
+          default: false
+          title: Is Temporary
+          type: boolean
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+        title:
+          title: Title
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - conversation_id
+      - title
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleConversationItem
+      type: object
+    ConsoleConversationListResponse:
+      description: 'Response from ``GET /console/conversations`` — cursor-paginated,
+
+        newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleConversationItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsoleConversationListResponse
+      type: object
+    ConsoleConversationTagItem:
+      description: 'One conversation-tag row, as returned by the console-
+
+        conversation-tags API.'
+      properties:
+        count:
+          title: Count
+          type: integer
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        description:
+          title: Description
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        position:
+          title: Position
+          type: integer
+        tag:
+          title: Tag
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - tag
+      - description
+      - count
+      - position
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleConversationTagItem
+      type: object
+    ConsoleConversationTagListResponse:
+      description: 'Response from ``GET /console/conversation-tags`` —
+
+        cursor-paginated, newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleConversationTagItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsoleConversationTagListResponse
+      type: object
+    ConsoleConversationTagUpsertRequest:
+      description: 'Request body for ``POST /console/conversation-tags`` — create/
+
+        update the caller''s own conversation-tag (upsert by ``tag``).'
+      properties:
+        count:
+          default: 0
+          minimum: 0.0
+          title: Count
+          type: integer
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        position:
+          default: 0
+          title: Position
+          type: integer
+        tag:
+          maxLength: 512
+          minLength: 1
+          title: Tag
+          type: string
+      required:
+      - tag
+      title: ConsoleConversationTagUpsertRequest
+      type: object
+    ConsoleConversationTitleUpdateRequest:
+      description: Request body for ``PATCH /console/conversations/{conversation_id}``.
+      properties:
+        title:
+          maxLength: 512
+          minLength: 1
+          title: Title
+          type: string
+      required:
+      - title
+      title: ConsoleConversationTitleUpdateRequest
+      type: object
+    ConsoleConversationUpsertRequest:
+      description: 'Request body for ``POST /console/conversations`` — create/update
+
+        the caller''s own conversation (upsert by ``conversation_id``).'
+      properties:
+        agent_id:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Agent Id
+        chat_project_id:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Chat Project Id
+        conversation_id:
+          maxLength: 255
+          minLength: 1
+          title: Conversation Id
+          type: string
+        endpoint:
+          anyOf:
+          - maxLength: 64
+            type: string
+          - type: 'null'
+          title: Endpoint
+        is_temporary:
+          default: false
+          title: Is Temporary
+          type: boolean
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - maxLength: 128
+            type: string
+          - type: 'null'
+          title: Model
+        title:
+          anyOf:
+          - maxLength: 512
+            type: string
+          - type: 'null'
+          title: Title
+      required:
+      - conversation_id
+      title: ConsoleConversationUpsertRequest
+      type: object
+    ConsoleFileBatchGetRequest:
+      description: 'Request body for ``POST /console/files/batch-get`` — fetch the
+
+        caller''s OWN file-metadata records for a batch of ``file_id``s in
+
+        one round trip (the fork resolves a conversation''s attachments this
+
+        way). Capped at ``MAX_LIST_LIMIT`` (200) — same bound as the
+
+        cursor-paginated list route, so a hostile caller cannot force an
+
+        unbounded ``IN (...)`` query.'
+      properties:
+        file_ids:
+          items:
+            type: string
+          maxItems: 200
+          minItems: 1
+          title: File Ids
+          type: array
+      required:
+      - file_ids
+      title: ConsoleFileBatchGetRequest
+      type: object
+    ConsoleFileBatchGetResponse:
+      description: 'Response from ``POST /console/files/batch-get``. ``items`` omits
+
+        any requested ``file_id`` that doesn''t exist, is soft-deleted, or
+
+        belongs to another user — same not-found-vs-403 discipline as
+
+        ``GET /console/files/{file_id}`` (never leaks existence), just
+
+        batched: the caller cannot distinguish "not mine" from "never
+
+        existed" from the response shape alone.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleFileItem'
+          title: Items
+          type: array
+      title: ConsoleFileBatchGetResponse
+      type: object
+    ConsoleFileItem:
+      description: One file-metadata row, as returned by the console-files API.
+      properties:
+        bytes:
+          title: Bytes
+          type: integer
+        context:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Context
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        embedded:
+          default: false
+          title: Embedded
+          type: boolean
+        file_id:
+          title: File Id
+          type: string
+        filename:
+          title: Filename
+          type: string
+        height:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Height
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        object_key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Object Key
+        temp_file_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Temp File Id
+        type:
+          title: Type
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+        usage:
+          additionalProperties: true
+          title: Usage
+          type: object
+        width:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Width
+      required:
+      - file_id
+      - filename
+      - type
+      - bytes
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleFileItem
+      type: object
+    ConsoleFileListResponse:
+      description: 'Response from ``GET /console/files`` — cursor-paginated,
+
+        newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleFileItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsoleFileListResponse
+      type: object
+    ConsoleFileUpsertRequest:
+      description: 'Request body for ``POST /console/files`` — create/update the
+
+        caller''s own file-metadata record (upsert by ``file_id``).'
+      properties:
+        bytes:
+          default: 0
+          minimum: 0.0
+          title: Bytes
+          type: integer
+        context:
+          anyOf:
+          - maxLength: 128
+            type: string
+          - type: 'null'
+          title: Context
+        embedded:
+          default: false
+          title: Embedded
+          type: boolean
+        file_id:
+          maxLength: 255
+          minLength: 1
+          title: File Id
+          type: string
+        filename:
+          maxLength: 512
+          minLength: 1
+          title: Filename
+          type: string
+        height:
+          anyOf:
+          - minimum: 0.0
+            type: integer
+          - type: 'null'
+          title: Height
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        object_key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Object Key
+        temp_file_id:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Temp File Id
+        type:
+          maxLength: 255
+          minLength: 1
+          title: Type
+          type: string
+        usage:
+          additionalProperties: true
+          title: Usage
+          type: object
+        width:
+          anyOf:
+          - minimum: 0.0
+            type: integer
+          - type: 'null'
+          title: Width
+      required:
+      - file_id
+      - filename
+      - type
+      title: ConsoleFileUpsertRequest
+      type: object
+    ConsoleMessageEditRequest:
+      description: 'Request body for
+
+        ``PATCH /console/conversations/{conversation_id}/messages/{message_id}``.
+
+        Both fields optional — only the ones supplied are updated.'
+      properties:
+        metadata:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Metadata
+        text:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Text
+      title: ConsoleMessageEditRequest
+      type: object
+    ConsoleMessageItem:
+      description: One message row, as returned by the console-conversations API.
+      properties:
+        conversation_id:
+          title: Conversation Id
+          type: string
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        endpoint:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Endpoint
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        is_created_by_user:
+          title: Is Created By User
+          type: boolean
+        message_id:
+          title: Message Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+        parent_message_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parent Message Id
+        sender:
+          title: Sender
+          type: string
+        text:
+          title: Text
+          type: string
+        token_count:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Token Count
+      required:
+      - message_id
+      - conversation_id
+      - sender
+      - text
+      - is_created_by_user
+      - created_at_ms
+      title: ConsoleMessageItem
+      type: object
+    ConsoleMessageListResponse:
+      description: 'Response from
+
+        ``GET /console/conversations/{conversation_id}/messages`` — the full
+
+        message tree, chronological (``created_at_ms`` ASC).'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleMessageItem'
+          title: Items
+          type: array
+      title: ConsoleMessageListResponse
+      type: object
+    ConsoleMessageUpsertRequest:
+      description: 'Request body for
+
+        ``POST /console/conversations/{conversation_id}/messages`` —
+
+        create/update the caller''s own message (upsert by ``message_id``).'
+      properties:
+        endpoint:
+          anyOf:
+          - maxLength: 64
+            type: string
+          - type: 'null'
+          title: Endpoint
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        is_created_by_user:
+          title: Is Created By User
+          type: boolean
+        message_id:
+          maxLength: 255
+          minLength: 1
+          title: Message Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - maxLength: 128
+            type: string
+          - type: 'null'
+          title: Model
+        parent_message_id:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Parent Message Id
+        sender:
+          maxLength: 64
+          minLength: 1
+          title: Sender
+          type: string
+        text:
+          title: Text
+          type: string
+        token_count:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Token Count
+      required:
+      - message_id
+      - sender
+      - text
+      - is_created_by_user
+      title: ConsoleMessageUpsertRequest
+      type: object
+    ConsolePresetItem:
+      description: One preset row, as returned by the console-presets API.
+      properties:
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        data:
+          additionalProperties: true
+          title: Data
+          type: object
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        preset_id:
+          title: Preset Id
+          type: string
+        title:
+          title: Title
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - preset_id
+      - title
+      - created_at_ms
+      - updated_at_ms
+      title: ConsolePresetItem
+      type: object
+    ConsolePresetListResponse:
+      description: 'Response from ``GET /console/presets`` — cursor-paginated,
+
+        newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsolePresetItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsolePresetListResponse
+      type: object
+    ConsolePresetUpsertRequest:
+      description: 'Request body for ``POST /console/presets`` — create/update the
+
+        caller''s own preset (upsert by ``preset_id``).'
+      properties:
+        data:
+          additionalProperties: true
+          title: Data
+          type: object
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        preset_id:
+          maxLength: 255
+          minLength: 1
+          title: Preset Id
+          type: string
+        title:
+          anyOf:
+          - maxLength: 512
+            type: string
+          - type: 'null'
+          title: Title
+      required:
+      - preset_id
+      title: ConsolePresetUpsertRequest
+      type: object
+    ConsolePromptGroupItem:
+      description: 'One prompt-group row (summary shape, no versions), as returned
+
+        by the list-groups API.'
+      properties:
+        category:
+          title: Category
+          type: string
+        command:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Command
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        group_id:
+          title: Group Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        name:
+          title: Name
+          type: string
+        oneliner:
+          title: Oneliner
+          type: string
+        production_prompt_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Production Prompt Id
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - group_id
+      - name
+      - category
+      - oneliner
+      - created_at_ms
+      - updated_at_ms
+      title: ConsolePromptGroupItem
+      type: object
+    ConsolePromptGroupListResponse:
+      description: 'Response from ``GET /console/prompts`` — cursor-paginated,
+
+        newest-first, summary shape (no versions per row).'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsolePromptGroupItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsolePromptGroupListResponse
+      type: object
+    ConsolePromptGroupUpsertRequest:
+      description: 'Request body for ``POST /console/prompts`` — create/update the
+
+        caller''s own prompt group (upsert by ``group_id``).'
+      properties:
+        category:
+          anyOf:
+          - maxLength: 128
+            type: string
+          - type: 'null'
+          title: Category
+        command:
+          anyOf:
+          - maxLength: 128
+            type: string
+          - type: 'null'
+          title: Command
+        group_id:
+          maxLength: 255
+          minLength: 1
+          title: Group Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        name:
+          maxLength: 512
+          minLength: 1
+          title: Name
+          type: string
+        oneliner:
+          anyOf:
+          - maxLength: 4096
+            type: string
+          - type: 'null'
+          title: Oneliner
+      required:
+      - group_id
+      - name
+      title: ConsolePromptGroupUpsertRequest
+      type: object
+    ConsolePromptGroupWithVersionsItem:
+      description: 'The full group shape, INCLUDING its version history — returned
+
+        by ``GET /console/prompts/{group_id}`` and
+
+        ``PATCH /console/prompts/{group_id}/production``.'
+      properties:
+        category:
+          title: Category
+          type: string
+        command:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Command
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        group_id:
+          title: Group Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        name:
+          title: Name
+          type: string
+        oneliner:
+          title: Oneliner
+          type: string
+        production_prompt_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Production Prompt Id
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+        versions:
+          items:
+            $ref: '#/components/schemas/ConsolePromptVersionItem'
+          title: Versions
+          type: array
+      required:
+      - group_id
+      - name
+      - category
+      - oneliner
+      - created_at_ms
+      - updated_at_ms
+      title: ConsolePromptGroupWithVersionsItem
+      type: object
+    ConsolePromptSetProductionRequest:
+      description: 'Request body for ``PATCH /console/prompts/{group_id}/production``
+
+        — mark ``prompt_id`` (an existing version of the group) as the
+
+        group''s production version.'
+      properties:
+        prompt_id:
+          maxLength: 255
+          minLength: 1
+          title: Prompt Id
+          type: string
+      required:
+      - prompt_id
+      title: ConsolePromptSetProductionRequest
+      type: object
+    ConsolePromptVersionItem:
+      description: One prompt-version row, as returned by the console-prompts API.
+      properties:
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        group_id:
+          title: Group Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        prompt_id:
+          title: Prompt Id
+          type: string
+        text:
+          title: Text
+          type: string
+        type:
+          title: Type
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+        version:
+          title: Version
+          type: integer
+      required:
+      - prompt_id
+      - group_id
+      - text
+      - type
+      - version
+      - created_at_ms
+      - updated_at_ms
+      title: ConsolePromptVersionItem
+      type: object
+    ConsolePromptVersionUpsertRequest:
+      description: 'Request body for ``POST /console/prompts/{group_id}/versions`` —
+
+        create/update the caller''s own prompt version (upsert by
+
+        ``prompt_id``) attached to ``group_id``.'
+      properties:
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        prompt_id:
+          maxLength: 255
+          minLength: 1
+          title: Prompt Id
+          type: string
+        text:
+          minLength: 1
+          title: Text
+          type: string
+        type:
+          default: text
+          enum:
+          - text
+          - chat
+          title: Type
+          type: string
+      required:
+      - prompt_id
+      - text
+      title: ConsolePromptVersionUpsertRequest
+      type: object
+    ConsoleToolFavoriteAddRequest:
+      description: 'Request body for ``POST /console/tool-favorites`` — add (or
+
+        idempotently re-affirm) the caller''s own tool-favorite.'
+      properties:
+        item_id:
+          maxLength: 256
+          minLength: 1
+          title: Item Id
+          type: string
+        item_type:
+          enum:
+          - builtin
+          - tool
+          - mcp
+          - skill
+          title: Item Type
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        tenant_id:
+          anyOf:
+          - maxLength: 256
+            type: string
+          - type: 'null'
+          title: Tenant Id
+      required:
+      - item_type
+      - item_id
+      title: ConsoleToolFavoriteAddRequest
+      type: object
+    ConsoleToolFavoriteItem:
+      description: 'One tool-favorite row, as returned by the console-tool-favorites
+
+        API.'
+      properties:
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        item_id:
+          title: Item Id
+          type: string
+        item_type:
+          title: Item Type
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        tenant_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Tenant Id
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - item_type
+      - item_id
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleToolFavoriteItem
+      type: object
+    ConsoleToolFavoriteListResponse:
+      description: 'Response from ``GET /console/tool-favorites`` — the caller''s
+
+        ENTIRE favorites list (no pagination; bounded by
+
+        ``MAX_TOOL_FAVORITES``), oldest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleToolFavoriteItem'
+          title: Items
+          type: array
+      title: ConsoleToolFavoriteListResponse
       type: object
     ContextBuildResponse:
       description: Response schema for /context endpoint (4-layer assembled context).
@@ -289,6 +2087,16 @@ components:
           default: 0
           title: Completion Tokens
           type: integer
+        content_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Content Hash
+        created_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Created At
         duration_ms:
           anyOf:
           - type: integer
@@ -299,6 +2107,11 @@ components:
           - type: string
           - type: 'null'
           title: Error Detail
+        event_class:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Event Class
         failure_class:
           anyOf:
           - type: string
@@ -435,6 +2248,7 @@ components:
       enum:
       - episodic
       - procedural
+      - session
       title: MemoryLayer
       type: string
     MetricsResponse:
@@ -494,6 +2308,11 @@ components:
           - type: string
           - type: 'null'
           title: Summary
+        trace_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Trace Id
         user_id:
           anyOf:
           - type: string
@@ -627,6 +2446,103 @@ components:
       - project
       title: SessionSummaryResponse
       type: object
+    ToolCallListItem:
+      description: 'One row in ``GET /interactions/{id}/tool-calls`` (#363 / RF-10).
+
+
+        Mirrors the ``tool_calls`` columns. ``granted_scope`` is the field
+
+        that answers "who was allowed to call what" under audit: a REFUSED
+
+        call is recorded with ``granted_scope=""`` and an ``error``, which is
+
+        what makes a genuine zero-tool interaction distinguishable from one
+
+        where the calls went missing.'
+      properties:
+        agent_type:
+          title: Agent Type
+          type: string
+        args:
+          title: Args
+          type: string
+        duration_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Duration Ms
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        granted_scope:
+          title: Granted Scope
+          type: string
+        id:
+          title: Id
+          type: string
+        interaction_id:
+          title: Interaction Id
+          type: integer
+        result_summary:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Result Summary
+        started_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Started At
+        tool_name:
+          title: Tool Name
+          type: string
+        user_id:
+          title: User Id
+          type: string
+      required:
+      - id
+      - interaction_id
+      - user_id
+      - agent_type
+      - tool_name
+      - args
+      - granted_scope
+      title: ToolCallListItem
+      type: object
+    ToolCallListResponse:
+      description: 'Response from ``GET /interactions/{id}/tool-calls``.
+
+
+        ``total`` is deliberately the count of rows returned for THIS
+
+        interaction rather than a paginated grand total: the per-interaction
+
+        fan-out is bounded (one row per tool the model invoked in a single
+
+        completion), so a caller counting tool calls for cross-store
+
+        corroboration gets the whole set in one response and never has to
+
+        reason about whether a zero means "none" or "next page".'
+      properties:
+        interaction_id:
+          title: Interaction Id
+          type: integer
+        tool_calls:
+          items:
+            $ref: '#/components/schemas/ToolCallListItem'
+          title: Tool Calls
+          type: array
+        total:
+          default: 0
+          title: Total
+          type: integer
+      required:
+      - interaction_id
+      title: ToolCallListResponse
+      type: object
     ValidationError:
       properties:
         ctx:
@@ -661,38 +2577,2078 @@ components:
           scopes:
             audittrace:admin: 'Operator-grade administration: /memory/upload, /memory/index, hard-delete, configuration introspection.
               Optional scope on user-facing clients; never granted by default.'
+            audittrace:assessment:ingest: Record a security self-assessment as audit events (ADR-058 recursive self-audit);
+              a write grant distinct from the broad :audit read scope
             audittrace:audit: Read interactions, sessions, and tool-call audit rows
             audittrace:context: Read context-builder output for a query
             audittrace:index: Trigger semantic-store reindex (legacy dev client)
             audittrace:query: Issue chat completions and inference queries
             audittrace:scan:retrigger: Force a re-scan of an object in the ingestion content-control pipeline (ADR-048 operator
               surface). Admin-grade; never granted by default.
+            memory:acl:read-own: Read effective permissions, accessible/public/sole-owned resource ids from the console-ACL
+              store (Sovereign Authorization Layer EPIC, WU-1 — READ PATH ONLY) — the RLS-isolated store backing LibreChat's
+              AclEntry records. Every answer is scoped to the CALLER's own resolved principal set (self + public); group principals
+              are disabled at the schema level. This scope grants no write path (see memory:acl:write) and no access to any
+              other memory layer.
+            memory:acl:write: 'Write ACL grants through the console-ACL routes (Sovereign Authorization Layer EPIC, WU-2c):
+              grant, revoke, modify, bulk and expire-by-predicate on the CALLER''s own resources. The database (RLS, migration
+              032) decides who may write — a non-owner is refused and the refusal is audited. Does not open the read routes
+              (memory:acl:read-own) and grants no access to any other memory layer.'
+            memory:agents:read-own: 'Read your own agents (and batch-get-by-ids) from the console-agents store (Agents domain,
+              MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat''s Agent records. Own-agents-only: sharing/marketplace
+              is out of scope. Grants no access to another user''s agents or to any other memory layer.'
+            memory:agents:write: Create/update/delete your own agents in the console-agents store (Agents domain, MongoDB-elimination
+              EPIC). Grants no access to another user's agents (RLS-enforced) and no access to any other memory layer.
+            memory:chat_projects:read-own: Read your own first-class chat-projects from the console-chat-projects store (Chat-Projects
+              domain, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat's chat-project groupings of conversations.
+              Grants no access to another user's chat-projects or to any other memory layer.
+            memory:chat_projects:write: Create/update/delete your own chat-projects in the console-chat-projects store (Chat-Projects
+              domain, MongoDB-elimination EPIC). Grants no access to another user's chat-projects (RLS-enforced) and no access
+              to any other memory layer.
+            memory:conversation_tags:read-own: 'Read your own conversation-tags from the console-conversation-tags store (Conversation-Tags
+              domain, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat''s conversationTag records. Own-tags-only:
+              sharing/marketplace is out of scope. Grants no access to another user''s conversation-tags or to any other memory
+              layer.'
+            memory:conversation_tags:write: Create/update/delete your own conversation-tags in the console-conversation-tags
+              store (Conversation-Tags domain, MongoDB-elimination EPIC). Grants no access to another user's conversation-tags
+              (RLS-enforced) and no access to any other memory layer.
             memory:conversational:read-own: Read your own past conversations from the conversational layer
+            memory:conversations:read-own: Read your own conversations + messages from the console-conversations store (WU-1,
+              MongoDB-elimination EPIC) — the RLS-isolated, message-tree-shaped store backing LibreChat's sidebar/history.
+              Distinct from memory:conversational:read-own, which reads the older per-session SUMMARY layer, not a message
+              tree.
+            memory:conversations:write: Create/update/delete your own conversations + messages in the console-conversations
+              store (WU-1, MongoDB-elimination EPIC). Grants no access to another user's conversations or messages (RLS-enforced)
+              and no access to any other memory layer.
+            memory:corpus:decisions:read: Read the shared-corpus ``decisions`` collection (Layer 5, ADR-062 §4) — distinct
+              from the per-user memory:semantic:read.
+            memory:corpus:decisions:write: Create/update/delete documents in the shared-corpus ``decisions`` collection (Layer
+              5, ADR-062 §4). Operator/curator-tier; never granted by default.
+            memory:corpus:semantic:read: Read the shared-corpus ``semantic`` collection (Layer 5, ADR-062 §4) — distinct from
+              the per-user memory:semantic:read.
+            memory:corpus:semantic:write: Create/update/delete documents in the shared-corpus ``semantic`` collection (Layer
+              5, ADR-062 §4). Operator/curator-tier; never granted by default.
+            memory:corpus:skills:read: Read the shared-corpus ``skills`` collection (Layer 5, ADR-062 §4) — distinct from
+              the per-user memory:semantic:read.
+            memory:corpus:skills:write: Create/update/delete documents in the shared-corpus ``skills`` collection (Layer 5,
+              ADR-062 §4). Operator/curator-tier; never granted by default.
             memory:decisions:write: Create/update/delete documents in the ``decisions`` ChromaDB collection (ADR/decision
               records — vector-searchable via /memory/index single-file mode and recall_semantic).
             memory:episodic:read: Read episodic-layer (ADR-style) documents
             memory:episodic:write: Create/update/delete episodic-layer documents
+            memory:files:read-own: 'Read your own file-metadata records (and batch-get-by-ids) from the console-files store
+              (Files-metadata domain, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat''s file records.
+              METADATA ONLY: the file bytes stay in object storage. Grants no access to another user''s file records or to
+              any other memory layer.'
+            memory:files:write: Create/update/delete your own file-metadata records in the console-files store (Files-metadata
+              domain, MongoDB-elimination EPIC). Grants no access to another user's file records (RLS-enforced), no access
+              to any other memory layer, and no access to the file BYTES themselves (object storage is a separate concern).
+            memory:presets:read-own: Read your own saved model/endpoint presets from the console-presets store (Mongo-repl
+              WU-presets, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat's saved presets. Grants no
+              access to another user's presets or to any other memory layer.
+            memory:presets:write: Create/update/delete your own presets in the console-presets store (Mongo-repl WU-presets,
+              MongoDB-elimination EPIC). Grants no access to another user's presets (RLS-enforced) and no access to any other
+              memory layer.
             memory:procedural:read: Read procedural-layer (SKILL-style) documents
             memory:procedural:write: Create/update/delete procedural-layer documents
+            memory:prompts:read-own: Read your own saved prompt groups + versions from the console-prompts store (Mongo-repl
+              WU-prompts, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat's saved prompts. Grants no
+              access to another user's prompts or to any other memory layer.
+            memory:prompts:write: Create/update/delete your own prompt groups + versions in the console-prompts store (Mongo-repl
+              WU-prompts, MongoDB-elimination EPIC). Grants no access to another user's prompts (RLS-enforced) and no access
+              to any other memory layer.
             memory:semantic:read: Read semantic-layer (vector) documents
             memory:semantic:write: Create/update/delete semantic-layer documents
+            memory:session:read-own: Read your own recently attached files/notes from the per-user EPHEMERAL session memory
+              layer (WU-5, Sovereign-Attach EPIC, same-turn recall — recall_attachments). Read-own only, same family as memory:conversational:read-own
+              — grants no access to another user's session uploads, and no access to episodic, procedural, semantic, or corpus
+              layers.
+            memory:session:write: Create documents in the per-user EPHEMERAL session memory layer ONLY (WU-1, Sovereign-Attach
+              EPIC) — NOT durable memory. Grants no access to episodic, procedural, semantic, or corpus layers. Promoting
+              session content to a durable layer requires a separate durable memory:<layer>:write scope via the explicit promote
+              action (deferred; WU-4).
             memory:skills:write: Create/update/delete documents in the ``skills`` ChromaDB collection (SKILL/procedural records
               — vector-searchable via /memory/index single-file mode and recall_semantic).
+            memory:tool_favorites:read-own: 'Read your own tool-favorites from the console-tool-favorites store (Tool-Favorites
+              domain, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat''s ToolFavorite records. Own-favorites-only:
+              sharing/marketplace is out of scope. Grants no access to another user''s tool-favorites or to any other memory
+              layer.'
+            memory:tool_favorites:write: Add/remove your own tool-favorites in the console-tool-favorites store (Tool-Favorites
+              domain, MongoDB-elimination EPIC), subject to the MAX_TOOL_FAVORITES per-user cap. Grants no access to another
+              user's tool-favorites (RLS-enforced) and no access to any other memory layer.
             memory:upload:write: Upload bytes (PDFs, etc.) into the ingestion content-control pipeline (ADR-048). Distinct
               from memory:episodic:write because uploads land in a quarantine prefix the memory-server cannot read; promotion
               to episodic/papers/ happens only after a scanner verdict.
           tokenUrl: /protocol/openid-connect/token
       type: oauth2
 info:
-  description: 'EU-AI-Act-aligned audit trail for LLM workloads. OpenAI-compatible ``/v1/chat/completions`` proxy with 4-layer
-    memory augmentation (episodic + procedural + conversational + semantic), Keycloak-delegated identity, Postgres RLS per-user
-    isolation, and opt-in Redis-Streams async persistence (ADR-046).
+  description: 'EU-AI-Act-aligned audit trail for LLM workloads. OpenAI-compatible ``/v1/chat/completions`` proxy over a five-layer
+    memory model (ADR-062): four per-user-isolated layers — episodic, procedural, conversational, semantic — plus Layer 5,
+    the Shared Corpus (org-wide knowledge, shared-read, operator/curator-tier write). Keycloak-delegated identity, Postgres
+    RLS per-user isolation, opt-in Redis-Streams async persistence (ADR-046), and a first-class audit event on every memory
+    read/list/write/delete (ADR-062 §5 — ``event_class=memory_access`` on ``GET /interactions``).
 
 
-    See ``docs/architecture/`` for C4 + sequence diagrams; the ADR set (014–046) is the source of truth for design decisions.'
+    Recall (the LLM reading its own memory) happens through the ``recall_*`` tools inside the ``/v1/chat/completions`` tool-call
+    loop (ADR-025) and through ``POST /context`` (the legacy ``inject``-mode aggregator) — NOT through the ``memory`` tag''s
+    backoffice CRUD endpoints, which are the operator/audit surface for managing memory content directly.
+
+
+    See ``docs/architecture/`` for C4 + sequence diagrams; the ADR set (014–062) is the source of truth for design decisions.'
   title: AuditTrace-AI
 openapi: 3.1.0
 paths:
+  /assessments:
+    post:
+      description: 'Record a security self-assessment as first-class audit events (ADR-058).
+
+
+        The recorder becomes a witness to its own governability: the assessment
+
+        is written through the recorder''s own front door, under a dedicated
+
+        least-privilege scope (``audittrace:assessment:ingest``, distinct from
+
+        the broad ``audittrace:audit`` read scope), as owner-scoped,
+
+        trace-linked ``assessment`` rows. Recording it this way IS the
+
+        assessment''s rules-of-engagement evidence.'
+      operationId: create_assessment_assessments_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssessmentIngestRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                title: Response Create Assessment Assessments Post
+                type: object
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - audittrace:assessment:ingest
+      summary: Create Assessment
+      tags:
+      - audit
+  /console/acl/expire:
+    post:
+      description: 'Expire-by-predicate, caller-scoped (the fork''s
+
+        ``removeAllPermissions`` / revoke-list shapes).'
+      operationId: expire_by_predicate_console_acl_expire_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAclExpireRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclExpireResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:write
+      summary: Expire By Predicate
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/accessible:
+    get:
+      description: 'Resource ids the CALLER can access with at least ``bit``
+
+        (self + public), unbounded (no ``resource_ids`` candidate filter
+
+        at this route — the full-scan form).'
+      operationId: find_accessible_resources_console_acl__resource_type__accessible_get
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: query
+        name: bit
+        required: true
+        schema:
+          maximum: 15
+          minimum: 1
+          title: Bit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclResourceIdsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Find Accessible Resources
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/permissions/batch:
+    post:
+      description: 'Batch form of :func:`get_effective_permissions` — one round
+
+        trip for many resource ids. A POST (not a GET with repeated query
+
+        params) so the (potentially large) id list travels in the body;
+
+        this is a READ operation despite the verb, gated on the READ
+
+        scope, never a write scope (WU-1 has none).'
+      operationId: get_effective_permissions_batch_console_acl__resource_type__permissions_batch_post
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAclBatchPermissionsRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclBatchPermissionsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Get Effective Permissions Batch
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/public:
+    get:
+      description: 'Resource ids PUBLICLY accessible with at least ``bit`` — the
+
+        same answer for any authenticated caller.'
+      operationId: find_public_resource_ids_console_acl__resource_type__public_get
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: query
+        name: bit
+        required: true
+        schema:
+          maximum: 15
+          minimum: 1
+          title: Bit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclResourceIdsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Find Public Resource Ids
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/sole-owned:
+    get:
+      description: Resource ids where the CALLER is the SOLE holder of DELETE.
+      operationId: get_sole_owned_resource_ids_console_acl__resource_type__sole_owned_get
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclResourceIdsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Get Sole Owned Resource Ids
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/{resource_id}/grants:
+    delete:
+      description: 'Expire the caller''s active grant at the key. 200 with empty ids is
+
+        the idempotent answer (an unowned row is omitted by 032, not refused).'
+      operationId: revoke_console_acl__resource_type___resource_id__grants_delete
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          maxLength: 36
+          minLength: 1
+          title: Resource Id
+          type: string
+      - in: query
+        name: principal_type
+        required: true
+        schema:
+          enum:
+          - user
+          - public
+          - role
+          title: Principal Type
+          type: string
+      - in: query
+        name: principal_id
+        required: false
+        schema:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Principal Id
+      - in: query
+        name: tenant_id
+        required: false
+        schema:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Tenant Id
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclExpireResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:write
+      summary: Revoke
+      tags:
+      - console-acl
+    patch:
+      description: 'Recompute the bits of the active grant (expire-and-insert). 404
+
+        (with the success row''s trace_id) when no active grant matched.'
+      operationId: modify_grant_console_acl__resource_type___resource_id__grants_patch
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          maxLength: 36
+          minLength: 1
+          title: Resource Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAclModifyRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclEntryItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:write
+      summary: Modify Grant
+      tags:
+      - console-acl
+    post:
+      description: Grant (expire-and-insert) on the resource as the CALLER.
+      operationId: grant_console_acl__resource_type___resource_id__grants_post
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          maxLength: 36
+          minLength: 1
+          title: Resource Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAclGrantRequest'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclEntryItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:write
+      summary: Grant
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/{resource_id}/grants/bulk:
+    post:
+      description: All-or-nothing batch of grants on ONE resource (the path's).
+      operationId: bulk_grants_console_acl__resource_type___resource_id__grants_bulk_post
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          maxLength: 36
+          minLength: 1
+          title: Resource Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAclBulkRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclBulkResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:write
+      summary: Bulk Grants
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/{resource_id}/has-permission:
+    get:
+      description: 'Whether the CALLER holds AT LEAST ``bit`` (containment, never
+
+        equality) on the resource.'
+      operationId: has_permission_console_acl__resource_type___resource_id__has_permission_get
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          title: Resource Id
+          type: string
+      - in: query
+        name: bit
+        required: true
+        schema:
+          maximum: 15
+          minimum: 1
+          title: Bit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclHasPermissionResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Has Permission
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/{resource_id}/permissions:
+    get:
+      description: 'The CALLER''s combined effective permission bitmask on the
+
+        resource. ``0`` (never an error) when no matching, non-expired
+
+        grant exists — deny-by-default.'
+      operationId: get_effective_permissions_console_acl__resource_type___resource_id__permissions_get
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          title: Resource Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclEffectivePermissionsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Get Effective Permissions
+      tags:
+      - console-acl
+  /console/agents:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) agents, newest-first,
+
+        cursor-paginated. Never returns another user''s agent — RLS plus the
+
+        service''s own explicit ``user_sub`` filter.'
+      operationId: list_agents_console_agents_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAgentListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:agents:read-own
+      summary: List Agents
+      tags:
+      - console-agents
+    post:
+      description: 'Create or update the CALLER''s OWN agent (upsert by ``agent_id``).
+
+        ``user_sub`` is stamped from ``user`` — the body carries no such
+
+        field to override it with.'
+      operationId: upsert_agent_console_agents_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAgentUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAgentItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:agents:write
+      summary: Upsert Agent
+      tags:
+      - console-agents
+  /console/agents/batch-get:
+    post:
+      description: 'Fetch the CALLER''s OWN agents for a batch of ``agent_id``s in one
+
+        round trip. A POST (not a GET with repeated query params) so the
+
+        request body — not the URL — carries the (potentially large) id
+
+        list; this is a READ operation despite the verb (same rationale as
+
+        the console-files batch-get route), gated on the READ scope, never
+
+        the write scope.'
+      operationId: batch_get_agents_console_agents_batch_get_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAgentBatchGetRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAgentBatchGetResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:agents:read-own
+      summary: Batch Get Agents
+      tags:
+      - console-agents
+  /console/agents/{agent_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN agent. 404 if not found/not
+
+        owned/already deleted.'
+      operationId: delete_agent_console_agents__agent_id__delete
+      parameters:
+      - in: path
+        name: agent_id
+        required: true
+        schema:
+          title: Agent Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:agents:write
+      summary: Delete Agent
+      tags:
+      - console-agents
+    get:
+      description: 'Fetch the CALLER''s OWN agent. 404 if it doesn''t exist, is
+
+        deleted, or belongs to another user — never 403 (would leak
+
+        existence to a caller probing foreign agent ids). ``:path`` on the
+
+        route param — LibreChat agent ids can carry a ``/`` (e.g. provider-
+
+        prefixed ids).'
+      operationId: get_agent_console_agents__agent_id__get
+      parameters:
+      - in: path
+        name: agent_id
+        required: true
+        schema:
+          title: Agent Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAgentItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:agents:read-own
+      summary: Get Agent
+      tags:
+      - console-agents
+  /console/chat-projects:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) chat-projects, newest-first,
+
+        cursor-paginated. Never returns another user''s chat-project — RLS
+
+        plus the service''s own explicit ``user_sub`` filter.'
+      operationId: list_chat_projects_console_chat_projects_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleChatProjectListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:chat_projects:read-own
+      summary: List Chat Projects
+      tags:
+      - console-chat-projects
+    post:
+      description: 'Create or update the CALLER''s OWN chat-project (upsert by
+
+        ``chat_project_id``). ``user_sub`` is stamped from ``user`` — the
+
+        body carries no such field to override it with.'
+      operationId: upsert_chat_project_console_chat_projects_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleChatProjectUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleChatProjectItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:chat_projects:write
+      summary: Upsert Chat Project
+      tags:
+      - console-chat-projects
+  /console/chat-projects/{chat_project_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN chat-project. 404 if not found/not
+
+        owned/already deleted.'
+      operationId: delete_chat_project_console_chat_projects__chat_project_id__delete
+      parameters:
+      - in: path
+        name: chat_project_id
+        required: true
+        schema:
+          title: Chat Project Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:chat_projects:write
+      summary: Delete Chat Project
+      tags:
+      - console-chat-projects
+    get:
+      description: 'Fetch the CALLER''s OWN chat-project. 404 if it doesn''t exist, is
+
+        deleted, or belongs to another user — never 403 (would leak
+
+        existence to a caller probing foreign chat-project ids).'
+      operationId: get_chat_project_console_chat_projects__chat_project_id__get
+      parameters:
+      - in: path
+        name: chat_project_id
+        required: true
+        schema:
+          title: Chat Project Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleChatProjectItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:chat_projects:read-own
+      summary: Get Chat Project
+      tags:
+      - console-chat-projects
+  /console/conversation-tags:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) conversation-tags, newest-
+
+        first, cursor-paginated. Never returns another user''s tag — RLS
+
+        plus the service''s own explicit ``user_sub`` filter.'
+      operationId: list_conversation_tags_console_conversation_tags_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationTagListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversation_tags:read-own
+      summary: List Conversation Tags
+      tags:
+      - console-conversation-tags
+    post:
+      description: 'Create or update the CALLER''s OWN conversation-tag (upsert by
+
+        ``tag``). ``user_sub`` is stamped from ``user`` — the body carries
+
+        no such field to override it with.'
+      operationId: upsert_conversation_tag_console_conversation_tags_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleConversationTagUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationTagItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversation_tags:write
+      summary: Upsert Conversation Tag
+      tags:
+      - console-conversation-tags
+  /console/conversation-tags/{tag}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN conversation-tag. 404 if not
+
+        found/not owned/already deleted.'
+      operationId: delete_conversation_tag_console_conversation_tags__tag__delete
+      parameters:
+      - in: path
+        name: tag
+        required: true
+        schema:
+          title: Tag
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversation_tags:write
+      summary: Delete Conversation Tag
+      tags:
+      - console-conversation-tags
+    get:
+      description: 'Fetch the CALLER''s OWN conversation-tag. 404 if it doesn''t exist,
+
+        is deleted, or belongs to another user — never 403 (would leak
+
+        existence to a caller probing foreign tag names).'
+      operationId: get_conversation_tag_console_conversation_tags__tag__get
+      parameters:
+      - in: path
+        name: tag
+        required: true
+        schema:
+          title: Tag
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationTagItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversation_tags:read-own
+      summary: Get Conversation Tag
+      tags:
+      - console-conversation-tags
+  /console/conversations:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) conversations, newest-first,
+
+        cursor-paginated. Never returns another user''s conversation — RLS
+
+        plus the service''s own explicit ``user_sub`` filter.'
+      operationId: list_conversations_console_conversations_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:read-own
+      summary: List Conversations
+      tags:
+      - console-conversations
+    post:
+      description: 'Create or update the CALLER''s OWN conversation (upsert by
+
+        ``conversation_id``). ``user_sub`` is stamped from ``user`` — the
+
+        body carries no such field to override it with.'
+      operationId: upsert_conversation_console_conversations_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleConversationUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Upsert Conversation
+      tags:
+      - console-conversations
+  /console/conversations/{conversation_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN conversation AND its messages. 404 if
+
+        not found/not owned/already deleted.'
+      operationId: delete_conversation_console_conversations__conversation_id__delete
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Delete Conversation
+      tags:
+      - console-conversations
+    get:
+      description: 'Fetch the CALLER''s OWN conversation. 404 if it doesn''t exist, is
+
+        deleted, or belongs to another user — never 403 (would leak
+
+        existence to a caller probing foreign conversation ids).'
+      operationId: get_conversation_console_conversations__conversation_id__get
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:read-own
+      summary: Get Conversation
+      tags:
+      - console-conversations
+    patch:
+      description: Rename the CALLER's OWN conversation. 404 if not found/not owned.
+      operationId: update_conversation_title_console_conversations__conversation_id__patch
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleConversationTitleUpdateRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Update Conversation Title
+      tags:
+      - console-conversations
+  /console/conversations/{conversation_id}/messages:
+    get:
+      description: 'Return the full message TREE for the CALLER''s OWN conversation,
+
+        chronological (``created_at_ms`` ASC). 404 if the conversation
+
+        itself doesn''t exist/isn''t owned by the caller — checked via
+
+        :func:`get_conversation` first so an empty-but-owned conversation
+
+        (200, empty list) is distinguishable from a not-found/foreign one
+
+        (404).'
+      operationId: get_messages_console_conversations__conversation_id__messages_get
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleMessageListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:read-own
+      summary: Get Messages
+      tags:
+      - console-conversations
+    post:
+      description: 'Create or update the CALLER''s OWN message (upsert by
+
+        ``message_id``). ``user_sub`` is stamped from ``user`` — the body
+
+        carries no such field to override it with.'
+      operationId: upsert_message_console_conversations__conversation_id__messages_post
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleMessageUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleMessageItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Upsert Message
+      tags:
+      - console-conversations
+  /console/conversations/{conversation_id}/messages/{message_id}:
+    delete:
+      description: Delete the CALLER's OWN message. 404 if not found/not owned.
+      operationId: delete_message_console_conversations__conversation_id__messages__message_id__delete
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      - in: path
+        name: message_id
+        required: true
+        schema:
+          title: Message Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Delete Message
+      tags:
+      - console-conversations
+    patch:
+      description: Edit the CALLER's OWN message. 404 if not found/not owned.
+      operationId: edit_message_console_conversations__conversation_id__messages__message_id__patch
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      - in: path
+        name: message_id
+        required: true
+        schema:
+          title: Message Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleMessageEditRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleMessageItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Edit Message
+      tags:
+      - console-conversations
+  /console/files:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) file-metadata records,
+
+        newest-first, cursor-paginated. Never returns another user''s file —
+
+        RLS plus the service''s own explicit ``user_sub`` filter.'
+      operationId: list_files_console_files_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleFileListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:files:read-own
+      summary: List Files
+      tags:
+      - console-files
+    post:
+      description: 'Create or update the CALLER''s OWN file-metadata record (upsert by
+
+        ``file_id``). ``user_sub`` is stamped from ``user`` — the body
+
+        carries no such field to override it with.'
+      operationId: upsert_file_console_files_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleFileUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleFileItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:files:write
+      summary: Upsert File
+      tags:
+      - console-files
+  /console/files/batch-get:
+    post:
+      description: 'Fetch the CALLER''s OWN file-metadata records for a batch of
+
+        ``file_id``s in one round trip. A POST (not a GET with repeated
+
+        query params) so the request body — not the URL — carries the
+
+        (potentially large) id list; this is a READ operation despite the
+
+        verb (same rationale as the fork''s own attachment-resolution
+
+        calls), gated on the READ scope, never the write scope.'
+      operationId: batch_get_files_console_files_batch_get_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleFileBatchGetRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleFileBatchGetResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:files:read-own
+      summary: Batch Get Files
+      tags:
+      - console-files
+  /console/files/{file_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN file-metadata record. 404 if not
+
+        found/not owned/already deleted.'
+      operationId: delete_file_console_files__file_id__delete
+      parameters:
+      - in: path
+        name: file_id
+        required: true
+        schema:
+          title: File Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:files:write
+      summary: Delete File
+      tags:
+      - console-files
+    get:
+      description: 'Fetch the CALLER''s OWN file-metadata record. 404 if it doesn''t
+
+        exist, is deleted, or belongs to another user — never 403 (would
+
+        leak existence to a caller probing foreign file ids).'
+      operationId: get_file_console_files__file_id__get
+      parameters:
+      - in: path
+        name: file_id
+        required: true
+        schema:
+          title: File Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleFileItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:files:read-own
+      summary: Get File
+      tags:
+      - console-files
+  /console/presets:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) presets, newest-first,
+
+        cursor-paginated. Never returns another user''s preset — RLS plus
+
+        the service''s own explicit ``user_sub`` filter.'
+      operationId: list_presets_console_presets_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePresetListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:presets:read-own
+      summary: List Presets
+      tags:
+      - console-presets
+    post:
+      description: 'Create or update the CALLER''s OWN preset (upsert by
+
+        ``preset_id``). ``user_sub`` is stamped from ``user`` — the body
+
+        carries no such field to override it with.'
+      operationId: upsert_preset_console_presets_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsolePresetUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePresetItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:presets:write
+      summary: Upsert Preset
+      tags:
+      - console-presets
+  /console/presets/{preset_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN preset. 404 if not found/not
+
+        owned/already deleted.'
+      operationId: delete_preset_console_presets__preset_id__delete
+      parameters:
+      - in: path
+        name: preset_id
+        required: true
+        schema:
+          title: Preset Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:presets:write
+      summary: Delete Preset
+      tags:
+      - console-presets
+    get:
+      description: 'Fetch the CALLER''s OWN preset. 404 if it doesn''t exist, is
+
+        deleted, or belongs to another user — never 403 (would leak
+
+        existence to a caller probing foreign preset ids).'
+      operationId: get_preset_console_presets__preset_id__get
+      parameters:
+      - in: path
+        name: preset_id
+        required: true
+        schema:
+          title: Preset Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePresetItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:presets:read-own
+      summary: Get Preset
+      tags:
+      - console-presets
+  /console/prompts:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) prompt groups, newest-first,
+
+        cursor-paginated (summary shape, no versions per row). Never
+
+        returns another user''s group — RLS plus the service''s own explicit
+
+        ``user_sub`` filter.'
+      operationId: list_groups_console_prompts_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePromptGroupListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:read-own
+      summary: List Groups
+      tags:
+      - console-prompts
+    post:
+      description: 'Create or update the CALLER''s OWN prompt group (upsert by
+
+        ``group_id``). ``user_sub`` is stamped from ``user`` — the body
+
+        carries no such field to override it with.'
+      operationId: upsert_group_console_prompts_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsolePromptGroupUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePromptGroupItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:write
+      summary: Upsert Group
+      tags:
+      - console-prompts
+  /console/prompts/{group_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN prompt group AND its versions. 404
+
+        if not found/not owned/already deleted.'
+      operationId: delete_group_console_prompts__group_id__delete
+      parameters:
+      - in: path
+        name: group_id
+        required: true
+        schema:
+          title: Group Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:write
+      summary: Delete Group
+      tags:
+      - console-prompts
+    get:
+      description: 'Fetch the CALLER''s OWN prompt group INCLUDING its full version
+
+        history. 404 if it doesn''t exist, is deleted, or belongs to
+
+        another user — never 403 (would leak existence to a caller probing
+
+        foreign group ids).'
+      operationId: get_group_console_prompts__group_id__get
+      parameters:
+      - in: path
+        name: group_id
+        required: true
+        schema:
+          title: Group Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePromptGroupWithVersionsItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:read-own
+      summary: Get Group
+      tags:
+      - console-prompts
+  /console/prompts/{group_id}/production:
+    patch:
+      description: 'Mark ``body.prompt_id`` as the production version of the
+
+        CALLER''s OWN ``group_id``. 404 if the group doesn''t exist/isn''t
+
+        owned, OR the named version doesn''t exist/isn''t owned/doesn''t
+
+        belong to this group — a hostile caller can never point
+
+        ``production_prompt_id`` at another user''s version or at a
+
+        version from a different group.'
+      operationId: set_production_console_prompts__group_id__production_patch
+      parameters:
+      - in: path
+        name: group_id
+        required: true
+        schema:
+          title: Group Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsolePromptSetProductionRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePromptGroupWithVersionsItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:write
+      summary: Set Production
+      tags:
+      - console-prompts
+  /console/prompts/{group_id}/versions:
+    post:
+      description: 'Create or update the CALLER''s OWN prompt version (upsert by
+
+        ``prompt_id``), attached to the CALLER''s OWN ``group_id``. 404 if
+
+        the group doesn''t exist/isn''t owned by the caller — a hostile
+
+        caller can never attach a version to another user''s group by
+
+        guessing its ``group_id``.'
+      operationId: upsert_version_console_prompts__group_id__versions_post
+      parameters:
+      - in: path
+        name: group_id
+        required: true
+        schema:
+          title: Group Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsolePromptVersionUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePromptVersionItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:write
+      summary: Upsert Version
+      tags:
+      - console-prompts
+  /console/tool-favorites:
+    get:
+      description: 'List ALL of the CALLER''s OWN (non-deleted) tool-favorites,
+
+        oldest-first. Never returns another user''s favorite — RLS plus the
+
+        service''s own explicit ``user_sub`` filter.'
+      operationId: list_tool_favorites_console_tool_favorites_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleToolFavoriteListResponse'
+          description: Successful Response
+      security:
+      - audittrace-oauth2:
+        - memory:tool_favorites:read-own
+      summary: List Tool Favorites
+      tags:
+      - console-tool-favorites
+    post:
+      description: 'Add (or idempotently re-affirm) the CALLER''s OWN tool-favorite.
+
+        ``user_sub`` is stamped from ``user`` — the body carries no such
+
+        field to override it with. 409 if the caller already owns
+
+        ``MAX_TOOL_FAVORITES`` active favorites and this pair is a new one.'
+      operationId: add_tool_favorite_console_tool_favorites_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleToolFavoriteAddRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleToolFavoriteItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:tool_favorites:write
+      summary: Add Tool Favorite
+      tags:
+      - console-tool-favorites
+  /console/tool-favorites/{item_type}/{item_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN tool-favorite. 404 if not
+
+        found/not owned/already removed.'
+      operationId: remove_tool_favorite_console_tool_favorites__item_type___item_id__delete
+      parameters:
+      - in: path
+        name: item_type
+        required: true
+        schema:
+          title: Item Type
+          type: string
+      - in: path
+        name: item_id
+        required: true
+        schema:
+          title: Item Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:tool_favorites:write
+      summary: Remove Tool Favorite
+      tags:
+      - console-tool-favorites
   /context:
     post:
       description: Retrieve relevant context from all 4 memory layers.
@@ -812,6 +4768,37 @@ paths:
           description: 'Filter by status: ''success'' or ''failed'' (migration 007 / ADR-033). Use ''failed'' to enumerate
             rows where the chat path errored out.'
           title: Status
+      - description: 'Filter by event_class: ''interaction'' | ''security'' | ''assessment'' | ''memory_access'' | ''acl_authz''
+          (ADR-048 / ADR-058 / ADR-062 §5 / the Sovereign Authorization Layer EPIC). Pull a whole recorded self-assessment
+          with event_class=assessment & session_id=<assessment_id>; pull every /memory/* access with event_class=memory_access;
+          pull every sovereign ACL write attempt (granted or denied) with event_class=acl_authz.'
+        in: query
+        name: event_class
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: 'Filter by event_class: ''interaction'' | ''security'' | ''assessment'' | ''memory_access'' | ''acl_authz''
+            (ADR-048 / ADR-058 / ADR-062 §5 / the Sovereign Authorization Layer EPIC). Pull a whole recorded self-assessment
+            with event_class=assessment & session_id=<assessment_id>; pull every /memory/* access with event_class=memory_access;
+            pull every sovereign ACL write attempt (granted or denied) with event_class=acl_authz.'
+          title: Event Class
+      - description: Filter by OpenTelemetry trace_id (32 lowercase hex). Narrows *within* the caller's own RLS-scoped rows;
+          composes with every other filter.
+        in: query
+        name: trace_id
+        required: false
+        schema:
+          anyOf:
+          - maxLength: 32
+            minLength: 32
+            pattern: ^[0-9a-f]{32}$
+            type: string
+          - type: 'null'
+          description: Filter by OpenTelemetry trace_id (32 lowercase hex). Narrows *within* the caller's own RLS-scoped rows;
+            composes with every other filter.
+          title: Trace Id
       - description: Max rows (1-1000).
         in: query
         name: limit
@@ -893,6 +4880,103 @@ paths:
       summary: Create Interaction
       tags:
       - audit
+  /interactions/{interaction_id}/tool-calls:
+    get:
+      description: 'List the tool calls recorded for one interaction (RLS-scoped).
+
+
+        Closes RF-10: ``tool_calls`` was written on every model tool
+
+        invocation but reachable through no API surface, so an auditor
+
+        holding a scoped JWT could not ask the system of record how many
+
+        tools a given decision invoked. Cross-store corroboration was
+
+        therefore limited to the two observability stores (Langfuse, Tempo),
+
+        both fed by the same process — they could agree with each other but
+
+        neither could be checked against Postgres.
+
+
+        **Zero versus missing.** A tool the model was refused is recorded at
+
+        dispatch with ``granted_scope=""`` and an ``error``, so an empty list
+
+        here means the model invoked nothing — not that the record was lost.
+
+        That distinction is the whole point of the endpoint.
+
+
+        **Isolation.** ``tool_calls`` carries the same migration-005 RLS
+
+        policy as ``interactions`` (``ENABLE`` + ``FORCE ROW LEVEL SECURITY``,
+
+        ``tenant_isolation_tool_calls`` comparing ``user_id`` to the
+
+        ``app.current_user_id`` GUC). So no service-layer ``WHERE user_id``
+
+        is needed or wanted: RLS is the enforcement boundary, and a caller
+
+        asking for another user''s ``interaction_id`` gets an empty list
+
+        rather than a leak.
+
+
+        A 404 is deliberately NOT raised for an unknown or unreadable
+
+        ``interaction_id``: distinguishing "does not exist" from "exists but
+
+        is not yours" would turn this endpoint into an existence oracle for
+
+        other users'' rows. Both cases return an empty list.'
+      operationId: list_tool_calls_interactions__interaction_id__tool_calls_get
+      parameters:
+      - in: path
+        name: interaction_id
+        required: true
+        schema:
+          title: Interaction Id
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolCallListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - audittrace:audit
+      summary: List Tool Calls
+      tags:
+      - audit
+  /mcp:
+    post:
+      description: 'Single streamable-HTTP entry point for the MCP JSON-RPC methods
+
+        Phase 1 supports: ``initialize``, ``notifications/initialized``,
+
+        ``tools/list``, ``tools/call``, ``ping``.'
+      operationId: mcp_endpoint_mcp_post
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      security:
+      - audittrace-oauth2: []
+      summary: Mcp Endpoint
+      tags:
+      - mcp
   /memory/conversational:
     get:
       description: 'List the caller''s own chat sessions, ordered by date DESC.
@@ -1030,18 +5114,37 @@ paths:
       - memory
   /memory/episodic:
     get:
-      description: 'List ADRs. Merges manifest rows with S3 objects so pre-PR-A
+      description: 'List ADRs / decision records. Merges manifest rows with S3 objects so
 
-        content (uploaded via /memory/upload or seeded via index-chromadb)
+        content uploaded via /memory/upload or seeded via index-chromadb surfaces
 
-        surfaces alongside operator-created items.
+        alongside operator-created items.
 
 
-        ``include_deleted=true`` returns soft-deleted manifest rows; it
+        ``include_deleted=true`` returns soft-deleted manifest rows; it has no
 
-        has no effect on discovered entries (they have no soft-delete
+        effect on discovered entries (they have no soft-delete state).
 
-        state).'
+        ``sort``/``order``/``limit``/``offset`` page the merged set (backlog #15,
+
+        R5); ``total`` is the full pre-limit count.
+
+
+        ADR-062 Phase B (WU-B4): manifest-tracked rows are scoped to the
+
+        caller''s own private tier ∪ corpus (``list_for_layer(caller=user)``)
+
+        — a non-admin caller never sees another user''s private manifest
+
+        row. No corpus-read scope gate applies to this layer (episodic has
+
+        no declared ``memory:corpus:episodic:read`` — the ADR-062 §4
+
+        frozenset covers only decisions/skills/semantic); corpus content
+
+        stays visible to any ``memory:episodic:read`` holder, same as
+
+        before this PR.'
       operationId: list_episodic_memory_episodic_get
       parameters:
       - in: query
@@ -1051,6 +5154,53 @@ paths:
           default: false
           title: Include Deleted
           type: boolean
+      - description: 'Sort field: created_at | modified_at | key | size.'
+        in: query
+        name: sort
+        required: false
+        schema:
+          default: created_at
+          description: 'Sort field: created_at | modified_at | key | size.'
+          enum:
+          - created_at
+          - modified_at
+          - key
+          - size
+          title: Sort
+          type: string
+      - description: Sort direction. Default desc (most-recent-first).
+        in: query
+        name: order
+        required: false
+        schema:
+          default: desc
+          description: Sort direction. Default desc (most-recent-first).
+          enum:
+          - asc
+          - desc
+          title: Order
+          type: string
+      - description: Page size (max 500).
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          description: Page size (max 500).
+          maximum: 500
+          minimum: 1
+          title: Limit
+          type: integer
+      - description: Zero-based pagination offset.
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: Zero-based pagination offset.
+          minimum: 0
+          title: Offset
+          type: integer
       responses:
         '200':
           content:
@@ -1078,8 +5228,34 @@ paths:
 
         Idempotent on the manifest: re-creating a soft-deleted item revives
 
-        it (clearing ``deleted_at_ms``) and bumps ``modified_at_ms``.'
+        it (clearing ``deleted_at_ms``) and bumps ``modified_at_ms``.
+
+
+        ADR-062 Phase B (WU-B5): every write lands in the caller''s PRIVATE
+
+        tier (``tier="private"``, owner=caller) — ``service.write`` already
+
+        only ever targets the private bucket (WU-B2); this just stamps the
+
+        manifest row to match. Episodic has no corpus-write scope in the
+
+        ADR-062 §4 catalogue, so a ``tier=corpus``/``?promote=corpus``
+
+        request is rejected (400) rather than silently downgraded.'
       operationId: create_episodic_memory_episodic_post
+      parameters:
+      - description: Set to 'corpus' to request a corpus-tier write. Episodic has no corpus-write scope declared (ADR-062
+          §4) — any corpus request here returns 400, not a partial/soft acceptance.
+        in: query
+        name: promote
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Set to 'corpus' to request a corpus-tier write. Episodic has no corpus-write scope declared (ADR-062
+            §4) — any corpus request here returns 400, not a partial/soft acceptance.
+          title: Promote
       requestBody:
         content:
           application/json:
@@ -1112,7 +5288,18 @@ paths:
       - memory
   /memory/episodic/{filename}:
     delete:
-      description: Soft-delete by default; ``?hard=true`` also purges the S3 object.
+      description: 'Soft-delete by default; ``?hard=true`` also purges the S3 object.
+
+
+        ADR-062 §6 (WU-A5): the manifest soft-delete is authoritative for
+
+        corpus content — ``?hard=true`` is NOT the default delete path (the
+
+        ``hard`` query param defaults to ``False`` and additionally requires
+
+        ``audittrace:admin``), and a hard purge is audited with
+
+        ``detail_extra={"hard": True}`` same as every other delete.'
       operationId: delete_episodic_memory_episodic__filename__delete
       parameters:
       - in: path
@@ -1152,7 +5339,29 @@ paths:
       tags:
       - memory
     get:
-      description: Read ADR content + manifest metadata.
+      description: 'Read ADR content + manifest metadata.
+
+
+        ADR-062 Phase B (WU-B4): the content itself was already resolved
+
+        private-first-then-corpus by ``service.read`` (WU-B2), so a 404
+
+        here means genuinely missing (not a cross-user disclosure). The
+
+        manifest metadata block is additionally scoped by
+
+        ``_manifest_visible`` — see its docstring for why.
+
+
+        WU-1 (2026-09-17, closes D15 item 4): the path parameter is
+
+        ``{filename:path}`` (accepts embedded ``/``) and
+
+        ``_strip_known_key_prefixes`` normalizes an upload/index-shaped key
+
+        (``"{user_id}/episodic/{name}"`` or ``"episodic/{name}"``) down to the
+
+        bare filename BEFORE validation — see that helper''s docstring.'
       operationId: read_episodic_memory_episodic__filename__get
       parameters:
       - in: path
@@ -1324,9 +5533,16 @@ paths:
       - memory
   /memory/procedural:
     get:
-      description: 'List SKILLs. Same merge-with-S3 semantics as `/memory/episodic`
+      description: 'List SKILLs. Same merge-with-S3 + sort/paginate semantics as
 
-        so pre-PR-A items appear alongside operator-created ones.'
+        `/memory/episodic` so all ``.md`` items appear alongside
+
+        operator-created ones (backlog #15).
+
+
+        ADR-062 Phase B (WU-B4): same owner-or-corpus manifest scoping as
+
+        ``list_episodic`` — see its docstring.'
       operationId: list_procedural_memory_procedural_get
       parameters:
       - in: query
@@ -1336,6 +5552,53 @@ paths:
           default: false
           title: Include Deleted
           type: boolean
+      - description: 'Sort field: created_at | modified_at | key | size.'
+        in: query
+        name: sort
+        required: false
+        schema:
+          default: created_at
+          description: 'Sort field: created_at | modified_at | key | size.'
+          enum:
+          - created_at
+          - modified_at
+          - key
+          - size
+          title: Sort
+          type: string
+      - description: Sort direction. Default desc (most-recent-first).
+        in: query
+        name: order
+        required: false
+        schema:
+          default: desc
+          description: Sort direction. Default desc (most-recent-first).
+          enum:
+          - asc
+          - desc
+          title: Order
+          type: string
+      - description: Page size (max 500).
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          description: Page size (max 500).
+          maximum: 500
+          minimum: 1
+          title: Limit
+          type: integer
+      - description: Zero-based pagination offset.
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: Zero-based pagination offset.
+          minimum: 0
+          title: Offset
+          type: integer
       responses:
         '200':
           content:
@@ -1358,8 +5621,28 @@ paths:
       tags:
       - memory
     post:
-      description: Create a SKILL document. Body shape mirrors POST /memory/episodic.
+      description: 'Create a SKILL document. Body shape mirrors POST /memory/episodic.
+
+
+        ADR-062 Phase B (WU-B5): default write is PRIVATE-tier, owner=caller;
+
+        see ``create_episodic``''s docstring for the corpus-promotion rejection
+
+        rationale (identical for procedural).'
       operationId: create_procedural_memory_procedural_post
+      parameters:
+      - description: Set to 'corpus' to request a corpus-tier write. Procedural has no corpus-write scope declared (ADR-062
+          §4) — any corpus request here returns 400.
+        in: query
+        name: promote
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Set to 'corpus' to request a corpus-tier write. Procedural has no corpus-write scope declared (ADR-062
+            §4) — any corpus request here returns 400.
+          title: Promote
       requestBody:
         content:
           application/json:
@@ -1392,6 +5675,9 @@ paths:
       - memory
   /memory/procedural/{filename}:
     delete:
+      description: 'Soft-delete by default; ``?hard=true`` also purges the S3 object
+
+        (ADR-062 §6 — same discipline as ``delete_episodic``).'
       operationId: delete_procedural_memory_procedural__filename__delete
       parameters:
       - in: path
@@ -1429,6 +5715,13 @@ paths:
       tags:
       - memory
     get:
+      description: 'ADR-062 Phase B (WU-B4): same manifest-visibility scoping as
+
+        ``read_episodic`` — see its docstring. WU-1 (2026-09-17, D15 item 4):
+
+        same key-shape tolerance as ``read_episodic`` — see
+
+        ``_strip_known_key_prefixes``.'
       operationId: read_procedural_memory_procedural__filename__get
       parameters:
       - in: path
@@ -1497,13 +5790,140 @@ paths:
       summary: Update Procedural
       tags:
       - memory
+  /memory/promote:
+    post:
+      description: 'Promote (COPY, never move) the caller''s own ephemeral ``session``
+
+        document into a durable memory layer — WU-4 of the Sovereign-Attach
+
+        EPIC''s explicit "keep this" action.
+
+
+        Body: ``{"filename": <session doc reference>, "target_layer":
+
+        <"episodic"|"semantic", default "episodic">, "collection": <optional,
+
+        semantic only>, "title": <optional>}``. ``target_layer`` outside the
+
+        durable set (``session``/``conversational``/anything unknown) is
+
+        rejected 422 — never silently coerced.
+
+
+        Authorization: the caller''s JWT must carry
+
+        ``memory:<target_layer>:write`` (or ``audittrace:admin``) — a token
+
+        holding ONLY ``memory:session:write`` (everything WU-1/2/3 grant by
+
+        default) gets 403 here. Ownership of the session doc is enforced by
+
+        ``SessionMemoryService.read_own`` (404 if not the caller''s own).
+
+
+        The implementation lives in ``audittrace.routes.memory_promote`` —
+
+        see that module''s docstring for the full step-by-step + why the
+
+        logic is split out of this (already >3000 LOC) file.'
+      operationId: promote_memory_memory_promote_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              additionalProperties: true
+              description: '{filename, target_layer?, collection?, title?}'
+              title: Payload
+              type: object
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                title: Response Promote Memory Memory Promote Post
+                type: object
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:episodic:write
+      - audittrace-oauth2:
+        - memory:semantic:write
+      - audittrace-oauth2:
+        - audittrace:admin
+      summary: Promote Memory
+      tags:
+      - memory
   /memory/semantic:
     get:
       description: 'List semantic-layer items. Merges the manifest with ChromaDB
 
-        discovery so pre-PR-A vectors (seeded via index-chromadb.py)
+        discovery so pre-PR-A vectors (seeded via index-chromadb.py) surface
 
-        surface alongside operator-created ones.'
+        alongside operator-created ones. Sort/paginate mirror the other layer
+
+        lists for consistency (backlog #15, R5).
+
+
+        ADR-062 WU-A1: requires an authenticated user like every sibling
+
+        list/read handler (closes the CS-4 anomaly of a memory-list endpoint
+
+        with no identity at all, so a future audit event can attribute the
+
+        read).
+
+
+        ADR-062 Phase B (WU-B3): the ChromaDB-DISCOVERED rows (untracked in
+
+        the manifest) are filtered — non-admin sees only its own
+
+        private-tier rows plus corpus-tier rows (`_merge_semantic_with_chroma`
+
+        §3 hole 2).
+
+
+        ADR-062 Phase B (WU-B4): manifest-TRACKED rows (`entries` below) are
+
+        now ALSO owner-or-corpus scoped (`list_for_layer(caller=user)`) —
+
+        closes the gap the previous docstring flagged as deferred. On top
+
+        of ownership scoping, D3''s operator/curator-tier gate additionally
+
+        drops any CORPUS-tier item (tracked or discovered) the caller
+
+        lacks ``memory:corpus:<collection>:read`` for
+
+        (`_filter_corpus_read_gate`).
+
+
+        WU-1 (2026-09-17, closes D15 — see ``routes/memory_semantic_documents``
+
+        module docstring for the full defect writeup): the merged chunk-level
+
+        ``items`` are de-duplicated (two discovery paths can otherwise surface
+
+        the SAME physical ChromaDB row under two differently-prefixed keys) and
+
+        then, by default, grouped by document (``title``) BEFORE
+
+        ``_sort_and_paginate`` runs — so ``limit``/``offset``/``total`` all
+
+        operate on documents, not chunks. The response always reports BOTH
+
+        ``total_documents`` and ``total_chunks`` regardless of ``granularity``,
+
+        so a caller can tell the two numbers apart (the exact confusion that
+
+        caused the D15 defect: 25 chunks silently meant 4 documents).'
       operationId: list_semantic_memory_semantic_get
       parameters:
       - description: Filter to a single collection if set.
@@ -1523,6 +5943,71 @@ paths:
           default: false
           title: Include Deleted
           type: boolean
+      - description: 'Sort field: created_at | modified_at | key | size.'
+        in: query
+        name: sort
+        required: false
+        schema:
+          default: created_at
+          description: 'Sort field: created_at | modified_at | key | size.'
+          enum:
+          - created_at
+          - modified_at
+          - key
+          - size
+          title: Sort
+          type: string
+      - description: Sort direction. Default desc (most-recent-first).
+        in: query
+        name: order
+        required: false
+        schema:
+          default: desc
+          description: Sort direction. Default desc (most-recent-first).
+          enum:
+          - asc
+          - desc
+          title: Order
+          type: string
+      - description: Page size (max 500).
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          description: Page size (max 500).
+          maximum: 500
+          minimum: 1
+          title: Limit
+          type: integer
+      - description: Zero-based pagination offset.
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: Zero-based pagination offset.
+          minimum: 0
+          title: Offset
+          type: integer
+      - description: '''document'' (default, WU-1 2026-09-17 — closes D15): de-duplicate chunk rows by their shared ''title''
+          before sort/paginate, so ''limit'' means N DOCUMENTS, not N chunks — a multi-chunk record used to crowd smaller/older
+          ones out of the same limit window. ''chunk'' restores the pre-WU-1 raw per-ChromaDB-row view (one row per physical
+          id) for callers that walk rows individually, e.g. scripts/curator/runner.py''s intake.'
+        in: query
+        name: granularity
+        required: false
+        schema:
+          default: document
+          description: '''document'' (default, WU-1 2026-09-17 — closes D15): de-duplicate chunk rows by their shared ''title''
+            before sort/paginate, so ''limit'' means N DOCUMENTS, not N chunks — a multi-chunk record used to crowd smaller/older
+            ones out of the same limit window. ''chunk'' restores the pre-WU-1 raw per-ChromaDB-row view (one row per physical
+            id) for callers that walk rows individually, e.g. scripts/curator/runner.py''s intake.'
+          enum:
+          - document
+          - chunk
+          title: Granularity
+          type: string
       responses:
         '200':
           content:
@@ -1547,14 +6032,46 @@ paths:
     post:
       description: 'Upsert a semantic-layer document. The collection''s embedding
 
-        function (configured at chart install time) handles vectorisation.'
+        function (configured at chart install time) handles vectorisation.
+
+
+        ADR-062 Phase B (WU-B5): default write lands in the caller''s PRIVATE
+
+        tier (``tier="private"``, owner=caller — ``ChromaSemanticService.
+
+        upsert``''s own default). An explicit ``"tier": "corpus"`` body field
+
+        or ``?promote=corpus`` query param routes the write to the shared
+
+        corpus collection instead, but ONLY if the caller holds
+
+        ``memory:corpus:<collection>:write`` (or ``audittrace:admin`` /
+
+        admin) — this is the scope gate WU-B3 wired the write TARGET for but
+
+        deliberately left unenforced (see ``ChromaSemanticService.upsert``''s
+
+        docstring).'
       operationId: create_semantic_memory_semantic_post
+      parameters:
+      - description: Set to 'corpus' to write into the shared corpus collection instead of the caller's private tier. Requires
+          memory:corpus:<collection>:write (or audittrace:admin).
+        in: query
+        name: promote
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Set to 'corpus' to write into the shared corpus collection instead of the caller's private tier. Requires
+            memory:corpus:<collection>:write (or audittrace:admin).
+          title: Promote
       requestBody:
         content:
           application/json:
             schema:
               additionalProperties: true
-              description: '{collection, document_id, text, metadata?, title?}'
+              description: '{collection, document_id, text, metadata?, title?, tier?}'
               title: Payload
               type: object
         required: true
@@ -1581,6 +6098,13 @@ paths:
       - memory
   /memory/semantic/{collection}/{document_id}:
     delete:
+      description: 'Soft-delete by default; ``?hard=true`` also purges the Chroma
+
+        vector (ADR-062 §6 — same discipline as ``delete_episodic``). The
+
+        manifest tombstone alone is what ``search()``/``search_page()``
+
+        consult to keep a soft-deleted item out of recall (WU-A5).'
       operationId: delete_semantic_memory_semantic__collection___document_id__delete
       parameters:
       - in: path
@@ -1624,6 +6148,19 @@ paths:
       tags:
       - memory
     get:
+      description: 'ADR-062 Phase B: ``service.get_document`` already applies the
+
+        owner-or-corpus predicate (WU-B3 §3 hole 1) — a cross-user private
+
+        doc is a 404, same as a genuine miss (no existence disclosure). On
+
+        top of that, D3 (WU-B4) requires ``memory:corpus:<collection>:read``
+
+        to read a CORPUS-tier doc through this backoffice route — a 403 (not
+
+        404: corpus existence isn''t user-specific, so there''s nothing to
+
+        hide by returning a miss instead).'
       operationId: read_semantic_memory_semantic__collection___document_id__get
       parameters:
       - in: path
@@ -1638,6 +6175,23 @@ paths:
         schema:
           title: Document Id
           type: string
+      - description: 'WU-1 (2026-09-17, closes D15 item 2): when true, reconstruct and return EVERY chunk of this document
+          (starting from chunk 0 / the front matter, via the deterministic chunk-id sequence keyed off the document''s title)
+          instead of just the single chunk at ''document_id'' — the documented whole-document read mode. ''content'' becomes
+          the chunks joined in order; ''metadata''/''manifest'' describe chunk 0. Default false preserves the pre-WU-1 single-chunk
+          response.'
+        in: query
+        name: whole_document
+        required: false
+        schema:
+          default: false
+          description: 'WU-1 (2026-09-17, closes D15 item 2): when true, reconstruct and return EVERY chunk of this document
+            (starting from chunk 0 / the front matter, via the deterministic chunk-id sequence keyed off the document''s title)
+            instead of just the single chunk at ''document_id'' — the documented whole-document read mode. ''content'' becomes
+            the chunks joined in order; ''metadata''/''manifest'' describe chunk 0. Default false preserves the pre-WU-1 single-chunk
+            response.'
+          title: Whole Document
+          type: boolean
       responses:
         '200':
           content:
@@ -1660,6 +6214,25 @@ paths:
       tags:
       - memory
     put:
+      description: 'ADR-062 Phase B (WU-B5 review fix, 2026-08-04): ``metadata`` is
+
+        sanitized the same way as ``create_semantic`` — a caller-supplied
+
+        ``tier``/``user_id`` in the body''s ``metadata`` field is stripped
+
+        before it reaches the service, and ``ChromaSemanticService.upsert``
+
+        additionally stamps both unconditionally regardless. This route
+
+        does not accept a promote request at all (no ``tier``/``?promote=``
+
+        parsing) — every update stays private-tier, matching the pre-review
+
+        WU-B5 scope decision (updates were never in the promote-gate call
+
+        site list); the fix here closes the metadata-forgery bypass, not a
+
+        missing feature.'
       operationId: update_semantic_memory_semantic__collection___document_id__put
       parameters:
       - in: path
@@ -1711,10 +6284,25 @@ paths:
         \ flow:\n  bytes land in ``quarantine/<user>/<scan_id>/<file>`` (not the\n  requested ``layer`` prefix), a ``memory_items``\
         \ row is inserted\n  with ``scan_status='pending_scan'``, and an AMQP scan-request is\n  enqueued. The response is\
         \ **HTTP 202** with a ``scan_id`` and\n  poll URL. Promotion to ``episodic/papers/`` happens\n  asynchronously in\
-        \ content-control once the verdict is clean.\n\n* **Non-PDF uploads** (markdown skills, ADRs, plain text)\n  keep\
-        \ the existing synchronous path: PUT to\n  ``{layer}/{filename}`` and return HTTP 200 with the\n  direct-write summary.\n\
-        \nAuthorization (per-layer): the caller's JWT must carry\n``memory:<layer>:write`` matching the ``layer`` query parameter\n\
-        (or ``audittrace:admin``). A token with ``memory:procedural:write``\ncannot upload to ``layer=episodic`` and vice-versa."
+        \ content-control once the verdict is clean. This\n  branch is UNCHANGED by ADR-062 Phase B — the async quarantine\
+        \ →\n  verdict → promotion pipeline is ADR-048's content-control\n  concern, out of WU-B4/WU-B5's scope.\n\n* **Non-PDF\
+        \ uploads** (markdown skills, ADRs, plain text): ADR-062\n  Phase B (WU-B5) — writes to the caller's PRIVATE tier\
+        \ via the\n  episodic/procedural service's own ``write()`` (already wired to\n  the private bucket by WU-B2), closing\
+        \ a leak where every non-PDF\n  upload used to land unconditionally in the shared/corpus bucket\n  regardless of who\
+        \ uploaded it. Neither layer has a declared\n  corpus-write scope (ADR-062 §4's frozenset is exactly\n  decisions/skills/semantic),\
+        \ so ``?promote=corpus`` is rejected\n  with 400 rather than silently accepted or silently ignored.\n\n* **``layer=session``\
+        \ uploads** (WU-1, Sovereign-Attach EPIC): a\n  THIRD case of the non-PDF branch — writes to the Postgres-backed,\n\
+        \  per-user, EPHEMERAL session layer instead of S3\n  (``services/session_memory.py``). PDF content is refused for\
+        \ this\n  layer (400) rather than routed into the quarantine pipeline above:\n  that pipeline promotes a clean verdict\
+        \ into ``episodic/papers/``\n  (DURABLE) regardless of the ``layer`` query param — silently\n  letting it through\
+        \ would let a token holding ONLY\n  ``memory:session:write`` (nothing durable) land content durably\n  anyway, defeating\
+        \ this WU's least-privilege wall.\n\nAuthorization (per-layer): the caller's JWT must carry\n``memory:<layer>:write``\
+        \ matching the ``layer`` query parameter\n(or ``audittrace:admin``). A token with ``memory:procedural:write``\ncannot\
+        \ upload to ``layer=episodic`` and vice-versa; a token with\nONLY ``memory:session:write`` cannot upload to any durable\
+        \ layer.\nThis is enforced by ``_require_layer_write`` on the first line below\n— the endpoint is **not** auth-only\
+        \ despite the static ``scopes=[]``\non the OAuth2 declaration (which exists only so the spec lists the\nsecurity scheme;\
+        \ the effective scope is dynamic in the ``layer``\nparameter, so it cannot be declared statically — same contract\
+        \ as\n``/memory/index``)."
       operationId: upload_memory_file_memory_upload_post
       parameters:
       - in: query
@@ -1730,6 +6318,18 @@ paths:
           - type: string
           - type: 'null'
           title: Filename
+      - description: Set to 'corpus' to request a corpus-tier write. Neither episodic nor procedural has a corpus-write scope
+          declared (ADR-062 §4) — any corpus request here returns 400.
+        in: query
+        name: promote
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Set to 'corpus' to request a corpus-tier write. Neither episodic nor procedural has a corpus-write
+            scope declared (ADR-062 §4) — any corpus request here returns 400.
+          title: Promote
       requestBody:
         content:
           multipart/form-data:
@@ -2026,7 +6626,8 @@ paths:
         * 401 — missing or invalid JWT.\n* 403 — JWT lacks ``audittrace:admin``.\n* 502 — Builder unavailable (pyhanko[etsi]\
         \ missing, EU LOTL\n  unreachable, XAdES verification failed). The previously-stored\n  bundle remains in place; subsequent\
         \ signature checks continue\n  to use it. Operator can retry once upstream conditions clear.\n* 500 — Provider write\
-        \ failed (MinIO down, permission issue).\n  Investigate and retry."
+        \ failed (MinIO down, permission issue), OR a\n  Builder's own code failed (``trust_store_build_internal_error``;\n\
+        \  the stored bundle is kept). Investigate and retry."
       operationId: refresh_trust_store_system_trust_store_refresh_post
       responses:
         '200':
@@ -2089,8 +6690,25 @@ paths:
 
         OpenAI-compatible clients (OpenCode, Continue) call this to discover
 
-        available models before sending chat completions.'
+        available models before sending chat completions. FLEET-ROUTE: an
+
+        optional ``?model=`` query param lets a caller ask which models a
+
+        SPECIFIC routed engine serves (e.g. ``?model=mistral`` to list the
+
+        Mistral upstream''s models) — additive, defaults to the unrouted
+
+        ``llama_url`` behaviour so existing callers are unaffected.'
       operationId: list_models_v1_models_get
+      parameters:
+      - in: query
+        name: model
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
       responses:
         '200':
           content:
@@ -2098,6 +6716,12 @@ paths:
               schema:
                 title: Response List Models V1 Models Get
           description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
       security:
       - audittrace-oauth2:
         - audittrace:query
@@ -2110,13 +6734,22 @@ tags:
     ``X-Persist-Mode: async`` header (ADR-046) routes the audit-row write through Redis Streams instead of the synchronous
     Postgres write on the response path.'
   name: chat
-- description: Build the augmented system context across all four memory layers (episodic, procedural, conversational, semantic)
-    without going through chat completions. Used by the webui memory tab and by external agents that want to inspect what
-    would be injected.
+- description: Build the augmented system context across the four per-user memory layers (episodic, procedural, conversational,
+    semantic) without going through chat completions — this is the ``memory_mode=inject`` aggregator (ADR-025) and does NOT
+    include Layer 5, the Shared Corpus (production runs ``memory_mode=tools``, where recall — including Layer 5 — happens
+    via the ``recall_*`` tools inside the chat-completions tool-call loop instead; see the top-level API description). Used
+    by the webui memory tab and by external agents that want to inspect what would be injected.
   name: context
-- description: CRUD over the four memory layers. Episodic = ADRs, Procedural = skill files, Conversational = past sessions
-    (read-only), Semantic = ChromaDB-backed RAG. Each write is scoped to the caller's Keycloak ``sub`` and gated by RLS at
-    the Postgres + ChromaDB layers.
+- description: Backoffice CRUD over the five-layer memory model (ADR-062) — this is the operator/audit management surface,
+    NOT where LLM recall happens (see the top-level API description for that). Episodic = ADRs, Procedural = skill files,
+    Conversational = past sessions (read-only), Semantic = ChromaDB-backed RAG. Layers 1-4 are designed per-user-isolated
+    (episodic/procedural S3-tier wiring + semantic per-user source vectors ship in ADR-062 Phase B; conversational RLS and
+    semantic recall filtering are already live). ``POST /memory/index`` bulk-rebuilds Layer 5 (the Shared Corpus — decisions/skills/semantic
+    collections) and is admin-only. Every operation here — read, list, write, delete — emits a first-class audit row (``event_class=memory_access``,
+    ``GET /interactions``), owner-scoped and trace-linked (ADR-062 §5). Deletes default to soft-delete (manifest tombstone,
+    the authoritative + recoverable + recall-honoured state for corpus content per ADR-062 §6); ``?hard=true`` additionally
+    purges the underlying S3 object / ChromaDB vector and requires ``audittrace:admin``. Each write is scoped to the caller's
+    Keycloak ``sub`` and gated by RLS at the Postgres + ChromaDB layers.
   name: memory
 - description: Save + summarise full chat sessions for replay and audit. Used by the OpenCode bridge to land long-running
     conversations into the conversational layer.
@@ -2127,3 +6760,10 @@ tags:
 - description: Kubernetes-grade liveness + metrics endpoints. ``/health`` surfaces the summariser ctx-window and async-persist
     runtime state alongside the standard component checks.
   name: health
+- description: ADR-063 Phase 1 — the read/recall memory tools exposed over a standard MCP transport (streamable-HTTP, JSON-RPC
+    2.0 on ``POST /mcp``) so any MCP-speaking agent can use the audited tool backend without giving up the audit trail. Purely
+    additive to ``/v1/chat/completions``. Every ``tools/call`` is authorized per-tool against the caller's Keycloak scopes,
+    executed under the caller's isolated RLS context, and recorded through the SAME tamper-evident audit path the chat tool
+    loop uses (ADR-037/058) — one interaction + one tool_calls row per call. No write/curation tools are ever listed or callable
+    here, regardless of caller privilege; later phases add those under operator-tier scopes.
+  name: mcp

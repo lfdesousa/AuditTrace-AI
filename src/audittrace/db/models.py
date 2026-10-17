@@ -23,13 +23,18 @@ from sqlalchemy import (
     CHAR,
     JSON,
     BigInteger,
+    Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -74,6 +79,14 @@ class SessionRecord(Base):
     summarized_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, index=True
     )
+    # #344 — OpenTelemetry trace_id (32-char hex) of the background
+    # summariser run that produced this row, so the persisted summary
+    # links back to its Tempo/Langfuse trace. The summariser sweep is a
+    # background task whose model call would otherwise surface as an
+    # unattributed orphan root span; capturing the trace_id closes the
+    # DB→trace correlation. NULL for rows written before this migration
+    # or when no span was active. Mirrors ``InteractionRecord.trace_id``.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
 
 
 class InteractionRecord(Base):
@@ -109,16 +122,38 @@ class InteractionRecord(Base):
     # span context; indexed because the lookup pattern is "find rows by
     # trace_id". 32-char lowercase hex string per OTel format.
     trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
-    # Migration 012 (2026-05-10, ADR-048 PR-B1): closed-set
-    # ``{"interaction", "security"}``. ``interaction`` (legacy implicit)
-    # is the chat-completion / tool-call default; ``security`` is added
-    # by PR-B4's verdict consumer to distinguish content-control verdict
+    # Migration 012 (2026-05-10, ADR-048 PR-B1): closed-set, now
+    # ``{"interaction", "security", "assessment", "memory_access",
+    # "acl_authz"}``. ``interaction`` (legacy implicit) is the
+    # chat-completion / tool-call default; ``security`` is added by
+    # PR-B4's verdict consumer to distinguish content-control verdict
     # rows from interaction rows so SOC tooling can alert on
-    # ``rejected_malware`` outcomes without scanning every row. Pinned
-    # by ``tests/test_memory_routes.py::TestEventClassValues``.
+    # ``rejected_malware`` outcomes without scanning every row.
+    # ``assessment`` (ADR-058) and ``memory_access`` (ADR-062 §5) extend
+    # the set additively. ``acl_authz`` (Sovereign Authorization Layer
+    # EPIC, ACL 2b-core-B) is every sovereign ACL write attempt —
+    # granted or denied — written by ``services/console_acl/_audit.py``.
+    # Pinned by ``tests/test_memory_routes.py::TestEventClassValues``.
     event_class: Mapped[str | None] = mapped_column(
         String(16), nullable=True, index=True
     )
+    # Migration 015 (2026-07-14, ADR-058 WS-A1): server-set
+    # contemporaneity anchor. Unlike ``timestamp`` (a String the
+    # application sets via ``datetime.now()``), ``created_at`` is
+    # assigned by Postgres at INSERT via ``server_default=now()`` — a
+    # writer-independent clock, so the record's time cannot be backdated
+    # by the caller. Indexed for "rows created since T" audit queries.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
+    # Migration 017 (2026-07-14, ADR-058 WS-A3): SHA-256 over the row's
+    # immutable content (``integrity.content_hash``). Paired with the
+    # append-only trigger (WS-A2), a post-hoc mutation is detectable by
+    # recomputation. Nullable for rows predating the column.
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class ToolCall(Base):
@@ -153,6 +188,41 @@ class ToolCall(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     granted_scope: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Migration 021 (ADR-063 Phase 2 Track B): broker provenance. NULL on
+    # every Phase 1 own-tool row (unchanged, untouched by this migration).
+    # The column is a plain nullable String(16) with no CHECK constraint.
+    # Two values are written: ``"brokered"`` by the broker path (the spec's
+    # "provenance clearly distinguishable from Phase-1 own-tool rows"
+    # requirement, enforced as a real column rather than a naming convention
+    # on ``tool_name``, which is namespaced ``broker:<server>:<tool>`` for
+    # readability), and ``"decision"`` by the #459 decision-model client
+    # (``services.decision``; ``tool_name="system_one_route"``,
+    # ``granted_scope="system:decision"``). The public audit API does not
+    # expose this column.
+    provenance: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Which half of the broker's "record(request) → forward → record
+    # (result)" sequence this row is. ``"request"`` rows are written
+    # before the outbound call to the downstream server; ``"result"``
+    # rows (success OR failure/timeout) are written after. Exactly two
+    # rows per brokered call, sharing one ``interaction_id`` (one trace).
+    # NULL on Phase 1 rows.
+    phase: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # The operator-configured downstream server name (the registry key in
+    # ``Settings.mcp_broker_servers``) — the "downstream identity" the
+    # spec requires on every brokered audit row.
+    downstream_server: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The tool name AS KNOWN TO the downstream server (before this
+    # gateway's ``broker:<server>:`` namespacing).
+    downstream_tool: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # SHA-256 hex digest of the canonicalised outbound arguments — set on
+    # BOTH the request and result row (the result row still names what was
+    # asked for), so a reviewer can confirm the two rows describe the same
+    # call without re-parsing ``args``.
+    args_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # SHA-256 hex digest of the canonicalised downstream response (or, on
+    # failure, of the error payload) — set on the result row only; NULL on
+    # the request row (the result is not known yet when it is written).
+    result_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class MemoryItem(Base):
@@ -261,6 +331,1087 @@ class MemoryItem(Base):
     # the async boundary.
     trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # ── ADR-062 Phase B (WU-B4, migration 018) — per-user tiering ──────
+    # Closed-set: ``"corpus"`` (Layer 5, shared-read) | ``"private"``
+    # (per-user, owner-only). ``server_default="corpus"`` means every row
+    # written BEFORE migration 018 reads ``tier="corpus"`` without a
+    # backfill script — D2 (2026-08-04): "existing content = corpus, new
+    # writes = private-default". The per-layer CRUD routes
+    # (create_episodic/create_procedural/create_semantic) pass an
+    # explicit ``tier`` on every new manifest row (WU-B5); this column's
+    # server-side default is a safety net for rows inserted through a
+    # path this PR does not touch (e.g. the PDF-indexing manifest writer
+    # in ``memory_pdf``, which sources bulk-reindexed shared content and
+    # is therefore correctly corpus-tier by default too).
+    tier: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="corpus"
+    )
+
+    # ── SPEC #387 Phase 1 (WU-1, migration 019) — auto-index outbox ────
+    # ``indexed_at_ms`` NULL = the manifest row's promoted, scanned-clean
+    # bytes have NOT yet been embedded + upserted into ChromaDB — the
+    # place→index leg of the pipeline is still pending. Mirrors
+    # ``published_at_ms`` 1:1 (same Hohpe Transactional Outbox shape, one
+    # hop later): ``ScanVerdictConsumer`` stamps it NULL and enqueues an
+    # ``IndexRequestEnvelope`` on every ``scanned_clean`` verdict;
+    # ``IndexWorker`` sets it on success (idempotent ``WHERE
+    # indexed_at_ms IS NULL``); ``IndexJanitor`` re-drives any row still
+    # NULL past the grace window — closes GAP-1 (no auto-index trigger)
+    # with the same durability guarantee already proven for
+    # place→publish. Nullable so every pre-migration-019 row (and every
+    # non-PDF / non-scanned row, which never populates ``scan_status``
+    # either) reads NULL forever, which is correct — nothing outside the
+    # scan pipeline claims to have been auto-indexed.
+    indexed_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    # ── SPEC #450 (WU-1, migration 020) — index dead-letter state ──────
+    # Adds the THIRD state the ``indexed_at_ms`` outbox above never had:
+    # "will never succeed" — a corrupt/unindexable PDF must stop being
+    # re-enqueued by ``IndexJanitor`` forever. ``index_attempts`` counts
+    # every failed ``IndexWorker`` pass (0 = never attempted or never
+    # failed); ``index_failed_at_ms`` NULL = still retryable, a
+    # timestamp = terminally dead-lettered; ``index_failure_code`` names
+    # WHY — either a permanent structural code from
+    # ``PERMANENT_INDEX_FAILURE_CODES`` (routes/memory_pdf/classification.py)
+    # or ``"max_attempts_exceeded"`` once ``index_attempts`` reaches
+    # ``Settings.index_max_attempts``. All three nullable/defaulted so
+    # every pre-migration-020 row reads NULL/0 — additive, backward
+    # compatible, no backfill. Mirrors the two terminal patterns already
+    # proven elsewhere in this codebase: ``async_persist.py``
+    # max-deliveries→DLQ and ``scan_verdict_consumer.py`` DLX +
+    # ``row_missing`` no-requeue.
+    index_attempts: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default="0"
+    )
+    index_failed_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    index_failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     __table_args__ = (
         UniqueConstraint("layer", "key", name="uq_memory_items_layer_key"),
+    )
+
+
+class SessionMemoryItem(Base):
+    """The ``session`` memory layer — WU-1 of the Sovereign-Attach EPIC
+    (migration 022): a per-user, EPHEMERAL ingest tier, distinct from the
+    S3-backed ``episodic``/``procedural`` layers above.
+
+    Unlike ``MemoryItem`` (an operator-global manifest describing bytes
+    that live in S3/ChromaDB), this table IS the content — there is no
+    corpus/shared tier for this layer (WU-1's ephemeral-default decision
+    deliberately excludes promotion; that is WU-4's job) and no listing/
+    recall surface yet (WU-5), so a lightweight, GC-friendly (WU-6)
+    Postgres row is the natural fit rather than an S3 object plus a
+    manifest row.
+
+    RLS (migration 022, mirrors migration 005's shape exactly): a
+    Postgres policy compares ``user_id`` against
+    ``current_setting('app.current_user_id', true)``. On SQLite (the
+    unit-test suite) RLS is a no-op — ``PostgresSessionMemoryService``
+    additionally filters every query by ``user_id`` explicitly at the
+    SERVICE layer so a dropped filter is still caught by SQLite unit
+    tests instead of only by a live-Postgres integration run
+    (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "session_memory_items"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    # Keycloak ``sub`` claim — no FK, same rationale as every other
+    # user_id column in this module (§15 — identity is Keycloak-owned).
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Unix epoch milliseconds UTC — same convention as MemoryItem's
+    # created_at_ms (sub-second ordering, matches Date.now()/time.time()*1000).
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # W3C-traceparent-derived trace_id from the originating request, when
+    # a span is active — same convention as MemoryItem.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+
+# JSONB on Postgres, plain JSON (TEXT under the hood) on SQLite — same
+# portability rationale as ``_PdfWarningsType`` above, reused generically
+# for the console-conversations ``metadata`` columns below (WU-1,
+# MongoDB-elimination EPIC).
+_ConsoleMetadataType = JSON().with_variant(JSONB(), "postgresql")
+
+
+class ConsoleConversation(Base):
+    """The ``console_conversations`` store — WU-1 of the MongoDB-
+    elimination EPIC (migration 023): AuditTrace's first-party,
+    RLS-isolated replacement for LibreChat's Mongo ``Conversation``
+    collection (``packages/data-schemas/src/schema/convo.ts``).
+
+    ``conversation_id`` is a CLIENT-SUPPLIED STRING (LibreChat mints its
+    own, not an ObjectId) — the internal PK ``id`` is a separate
+    server-generated UUID so ``conversation_id`` collisions across users
+    (two different subs both minting the same client id) can coexist,
+    disambiguated only by ``(user_sub, conversation_id)`` — see the
+    unique constraint below.
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN at
+    the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 023, mirrors migration 022's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id', true)``.
+    On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleConversationsService`` additionally filters every
+    query by ``user_sub`` explicitly at the SERVICE layer, so a dropped
+    filter is caught by the SQLite unit suite too
+    (feedback_unit_tests_miss_rls).
+
+    Distinct from the existing ``conversational`` layer
+    (``PostgresConversationalService`` / ``SessionRecord``): that table
+    stores ONE per-session SUMMARY, not a message tree — see the WU-1
+    spec's "EPIC CORRECTION" for why a new store was needed rather than
+    reusing it.
+    """
+
+    __tablename__ = "console_conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    conversation_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(512), nullable=False, default="New Chat")
+    endpoint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    is_temporary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    agent_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Reserved for the later chat-projects domain (DESIGN §WU breakdown,
+    # not built here) — carried now so a future migration doesn't need to
+    # widen this table's shape again.
+    chat_project_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as MemoryItem.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # SessionMemoryItem.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub", "conversation_id", name="uq_console_conversations_user_convo"
+        ),
+    )
+
+
+class ConsoleMessage(Base):
+    """The ``console_messages`` store — WU-1 of the MongoDB-elimination
+    EPIC (migration 023): the message-tree rows a conversation's
+    ``parent_message_id`` chain reconstructs (LibreChat's Mongo
+    ``Message`` collection, ``message.ts``).
+
+    ``conversation_id`` is a plain string column (the same client-
+    supplied key as ``ConsoleConversation.conversation_id``), not a hard
+    SQLAlchemy ``ForeignKey`` — the practical uniqueness constraint that
+    matters for RLS isolation is ``(user_sub, message_id)`` below, and a
+    composite FK against ``(user_sub, conversation_id)`` would add
+    migration complexity for no isolation benefit (the service layer
+    always filters by ``user_sub`` AND ``conversation_id`` together, so
+    an orphaned ``conversation_id`` is a not-found, not a leak).
+
+    Same RLS + explicit-filter discipline as :class:`ConsoleConversation`
+    above.
+    """
+
+    __tablename__ = "console_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True
+    )
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    # The tree link — NULL for the first message in a conversation.
+    parent_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sender: Mapped[str] = mapped_column(String(64), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    is_created_by_user: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    endpoint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id (EU AI Act Art 12 traceability).
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub", "message_id", name="uq_console_messages_user_message"
+        ),
+    )
+
+
+class ConsolePreset(Base):
+    """The ``console_presets`` store — WU-presets of the MongoDB-
+    elimination EPIC (migration 024): AuditTrace's first-party,
+    RLS-isolated replacement for LibreChat's Mongo ``Preset`` collection
+    (``packages/data-schemas/src/schema/preset.ts``) — the user's saved
+    model/endpoint presets.
+
+    ``preset_id`` is a CLIENT-SUPPLIED STRING (LibreChat mints its own),
+    same pattern as :attr:`ConsoleConversation.conversation_id` — the
+    internal PK ``id`` is a separate server-generated UUID so
+    ``preset_id`` collisions across users can coexist, disambiguated
+    only by ``(user_sub, preset_id)`` (the unique constraint below).
+
+    The preset's config (``endpoint``/``model``/``temperature``/... —
+    the large, loosely-typed field set on the fork's ``IPreset``
+    interface) is carried as a single ``data`` jsonb blob rather than
+    one column per field: the fork's own schema treats these as an open
+    index-signature bag (``...conversationPreset`` spread), so promoting
+    each field to a typed column here would need re-widening on every
+    upstream fork change for no isolation or query benefit — only
+    ``title``/``preset_id`` are promoted to first-class columns because
+    the console's list view sorts/displays by them directly.
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN at
+    the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 024, mirrors migrations 022/023's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id', true)``.
+    On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsolePresetsService`` additionally filters every query by
+    ``user_sub`` explicitly at the SERVICE layer, so a dropped filter is
+    caught by the SQLite unit suite too (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "console_presets"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    preset_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(512), nullable=False, default="New Chat")
+    # The preset config blob (endpoint/model/temperature/... — see the
+    # class docstring for why this is one jsonb column, not many).
+    data: Mapped[dict[str, Any]] = mapped_column(
+        _ConsoleMetadataType, nullable=False, default=dict
+    )
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as MemoryItem.deleted_at_ms /
+    # ConsoleConversation.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleConversation.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub", "preset_id", name="uq_console_presets_user_preset"
+        ),
+    )
+
+
+class ConsolePromptGroup(Base):
+    """The ``console_prompt_groups`` store — WU-prompts of the MongoDB-
+    elimination EPIC (migration 025): AuditTrace's first-party,
+    RLS-isolated replacement for LibreChat's Mongo ``PromptGroup``
+    collection (``packages/data-schemas/src/schema/promptGroup.ts``).
+
+    Model shape RESOLVED per the ratified spec's design note: LibreChat
+    ships TWO Mongo collections (``PromptGroup`` + ``Prompt``, one row
+    per version); this is modelled here the same way console-
+    conversations models convo/message — a group row
+    (:class:`ConsolePromptGroup`) plus one row per prompt VERSION
+    (:class:`ConsolePromptVersion`), linked by the client-supplied
+    string ``group_id`` (mirrors :attr:`ConsoleMessage.conversation_id`
+    — no hard SQLAlchemy ``ForeignKey``, since the isolation invariant
+    that matters is ``(user_sub, group_id)``/``(user_sub, prompt_id)``,
+    not a database-level cascade). This preserves LibreChat's
+    versioning + ``productionId`` semantics: each edit is a NEW,
+    immutable version row, and ``production_prompt_id`` below points at
+    whichever version is "live" — exactly like ``PromptGroup
+    .productionId`` referencing a specific ``Prompt`` document.
+
+    ``group_id`` is CLIENT-SUPPLIED (LibreChat mints its own, not an
+    ObjectId) — the internal PK ``id`` is a separate server-generated
+    UUID so ``group_id`` collisions across users can coexist,
+    disambiguated only by ``(user_sub, group_id)`` (the unique
+    constraint below) — same pattern as
+    :attr:`ConsoleConversation.conversation_id`.
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN
+    at the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 025, mirrors migration 023's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsolePromptsService`` additionally filters every query
+    by ``user_sub`` explicitly at the SERVICE layer, so a dropped
+    filter is caught by the SQLite unit suite too
+    (feedback_unit_tests_miss_rls).
+
+    ``author``/``authorName`` on the fork's schema are not modelled as
+    separate columns here — in this single-tenant-per-user store the
+    owning ``user_sub`` already IS the sole author (no cross-user
+    sharing of a prompt group exists), so promoting a redundant author
+    column would carry no isolation or query benefit (same rationale
+    as :class:`ConsolePreset` declining to widen its ``data`` blob into
+    typed columns).
+    """
+
+    __tablename__ = "console_prompt_groups"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    group_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(512), nullable=False)
+    category: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    oneliner: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    command: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Client-supplied `prompt_id` of the version currently marked
+    # "production" for this group (LibreChat's `PromptGroup.productionId`).
+    # Plain string, not a FK — same rationale as `group_id` above; the
+    # service layer verifies the target version exists AND belongs to
+    # this (user_sub, group_id) before ever writing this column.
+    production_prompt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsoleConversation.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleConversation.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub", "group_id", name="uq_console_prompt_groups_user_group"
+        ),
+    )
+
+
+class ConsolePromptVersion(Base):
+    """The ``console_prompt_versions`` store — WU-prompts of the
+    MongoDB-elimination EPIC (migration 025): the per-version rows a
+    prompt group's history is built from (LibreChat's Mongo ``Prompt``
+    collection, ``prompt.ts`` — one document per version, ``groupId``
+    FK + ``type`` ``text``/``chat``).
+
+    ``group_id`` is a plain string column (the same client-supplied key
+    as :attr:`ConsolePromptGroup.group_id`), not a hard SQLAlchemy
+    ``ForeignKey`` — same rationale as :attr:`ConsoleMessage
+    .conversation_id`: the practical uniqueness constraint that matters
+    for RLS isolation is ``(user_sub, prompt_id)`` below, and the
+    service layer always filters by ``user_sub`` AND ``group_id``
+    together when listing a group's versions, so an orphaned
+    ``group_id`` is a not-found, not a leak.
+
+    Immutable-by-convention: each edit the caller makes is a NEW
+    version row (the ``upsert_version`` service method updates an
+    EXISTING row only when the caller re-submits the SAME ``prompt_id``
+    — same idempotent-upsert-by-client-id shape as every other Mongo-
+    repl WU, not a "create a new version on every PATCH" free-for-all).
+
+    Same RLS + explicit-filter discipline as :class:`ConsolePromptGroup`
+    above.
+    """
+
+    __tablename__ = "console_prompt_versions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    prompt_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    group_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # LibreChat's Prompt.type enum — enforced at the Pydantic request-
+    # model layer (Literal["text", "chat"]), stored here as a plain
+    # string column (same portability rationale as every enum-shaped
+    # column in this module — SQLite has no native CHECK-enum type
+    # worth fighting).
+    type: Mapped[str] = mapped_column(String(16), nullable=False, default="text")
+    # 1-based, monotonically increasing per (user_sub, group_id) —
+    # assigned by the service at creation (max existing + 1), never
+    # caller-supplied (a hostile caller cannot renumber another
+    # version by racing this field in the request body — no such field
+    # exists on the upsert-version request model).
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsolePromptGroup.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub", "prompt_id", name="uq_console_prompt_versions_user_prompt"
+        ),
+    )
+
+
+class ConsoleChatProject(Base):
+    """The ``console_chat_projects`` store — the Chat-Projects domain of
+    the MongoDB-elimination EPIC (migration 026): AuditTrace's
+    first-party, RLS-isolated replacement for LibreChat's Mongo
+    ``ChatProject`` collection
+    (``packages/data-schemas/src/schema/chatProject.ts``) — a
+    first-class, user-created grouping of conversations.
+
+    ``chat_project_id`` is a CLIENT-SUPPLIED STRING (LibreChat mints its
+    own), same pattern as :attr:`ConsolePreset.preset_id` — the internal
+    PK ``id`` is a separate server-generated UUID so ``chat_project_id``
+    collisions across users can coexist, disambiguated only by
+    ``(user_sub, chat_project_id)`` (the unique constraint below).
+
+    **Design note — reconciling the two pre-existing "project" seams**
+    (per the ratified spec's design note): ``src/audittrace/models.py``
+    already carries an unrelated ``project`` field (a memory-context/
+    audit-namespace string, e.g. default ``"self-audit"``) — that field
+    is NOT touched by this WU and remains exactly what it was; it is a
+    namespacing label, not a first-class store. Separately,
+    :class:`ConsoleConversation` (migration 023, WU-1) already reserved
+    a NULLABLE ``chat_project_id`` column on the conversations table in
+    anticipation of this store landing later — THIS table is what that
+    reserved column will eventually reference (by client-supplied string
+    key, same non-FK convention as every other cross-table reference in
+    this module — e.g. :attr:`ConsolePromptVersion.group_id` — since the
+    isolation invariant that matters is ``(user_sub, chat_project_id)``,
+    not a database-level cascade). Wiring
+    ``ConsoleConversation.chat_project_id`` to validate against this
+    table is explicitly OUT OF SCOPE for this WU (a later WU, per the
+    spec's "Out of scope" section).
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN at
+    the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 026, mirrors migrations 022/023/024/025's shape exactly)
+    compares ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleChatProjectsService`` additionally filters every
+    query by ``user_sub`` explicitly at the SERVICE layer, so a dropped
+    filter is caught by the SQLite unit suite too
+    (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "console_chat_projects"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    chat_project_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(512), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsolePreset.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsolePreset.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub",
+            "chat_project_id",
+            name="uq_console_chat_projects_user_project",
+        ),
+    )
+
+
+class ConsoleFile(Base):
+    """The ``console_files`` store — the Files-metadata domain of the
+    MongoDB-elimination EPIC (migration 027): AuditTrace's first-party,
+    RLS-isolated replacement for LibreChat's Mongo ``File`` collection
+    (``packages/data-schemas/src/schema/file.ts``) — the file METADATA
+    record only.
+
+    **Scope boundary (the ratified spec's design note).** This table
+    owns the metadata record; the file BYTES stay in object storage
+    (S3/MinIO, ``feedback_storage_always_s3``) — no code path in this
+    module reads or writes bytes. :attr:`object_key` is the pointer
+    into that store, not the payload.
+
+    **Naming resolution — ``object_key`` vs the fork's ``source``/
+    ``filepath`` pair.** LibreChat's Mongo schema splits the storage
+    reference across ``source`` (backend enum, e.g. ``"local"``/
+    ``"s3"``) and ``filepath``/``storageKey`` (the path within that
+    backend). The ratified spec names this column ambiguously
+    (``object_key``/``source``) and leaves the exact shape to the
+    builder. RESOLVED here as a single ``object_key`` column — the one
+    fact this store needs to reference the bytes-at-rest location
+    (which object-storage backend it lives in is an operator-wide
+    config concern, not a per-file fact, per the portability
+    invariant) — nullable, since a file record can exist
+    (upload-in-flight, or promoted-but-not-yet-relocated) before its
+    final object key is known.
+
+    ``file_id`` is a CLIENT-SUPPLIED STRING (LibreChat mints its own),
+    same pattern as :attr:`ConsoleChatProject.chat_project_id` — the
+    internal PK ``id`` is a separate server-generated UUID so
+    ``file_id`` collisions across users can coexist, disambiguated only
+    by ``(user_sub, file_id)`` (the unique constraint below).
+
+    ``usage`` is modelled as a jsonb column (not the fork's numeric
+    counter) per the ratified spec's explicit text ("`usage` jsonb") —
+    a structured bag for forward compatibility (e.g. per-purpose usage
+    counts), distinct from :attr:`metadata` (the generic free-form
+    bag every console-* table carries).
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN
+    at the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 027, mirrors migrations 022-026's shape exactly)
+    compares ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleFilesService`` additionally filters every query by
+    ``user_sub`` explicitly at the SERVICE layer, so a dropped filter is
+    caught by the SQLite unit suite too (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "console_files"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    file_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    type: Mapped[str] = mapped_column(String(255), nullable=False)
+    bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # The object-storage pointer — see the class docstring's naming
+    # resolution note. Nullable: a record can exist before its final
+    # key is known.
+    object_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    context: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    usage_json: Mapped[dict[str, Any]] = mapped_column(
+        "usage", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    embedded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    temp_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsoleChatProject.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleChatProject.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub",
+            "file_id",
+            name="uq_console_files_user_file",
+        ),
+    )
+
+
+class ConsoleAgent(Base):
+    """The ``console_agents`` store — the Agents domain of the
+    MongoDB-elimination EPIC (migration 028): AuditTrace's first-party,
+    RLS-isolated replacement for LibreChat's Mongo ``Agent`` collection
+    (``packages/data-schemas/src/schema/agent.ts``).
+
+    **Own-agents-only v1 (the ratified spec's scope boundary).** LibreChat
+    supports agent SHARING/marketplace (an ``author`` owner field plus
+    global/shared agents visible to other users). That is explicitly OUT
+    OF SCOPE here — every row is owned by exactly one ``user_sub`` (the
+    unique constraint below), and there is no "shared"/"global" row
+    concept in this table. Cross-user sharing is a later WU, per the
+    spec's "Out of scope" section.
+
+    ``agent_id`` is a CLIENT-SUPPLIED STRING (LibreChat mints its own),
+    same pattern as :attr:`ConsoleFile.file_id` — the internal PK ``id``
+    is a separate server-generated UUID so ``agent_id`` collisions across
+    users can coexist, disambiguated only by ``(user_sub, agent_id)``
+    (the unique constraint below).
+
+    ``tools``/``model_parameters``/``artifacts`` are stored as opaque
+    jsonb blobs per the ratified spec's explicit text — this store
+    persists the agent record; it never executes or validates the tools
+    a row references (that stays entirely client-side / a later WU).
+
+    ``project_ids`` is a jsonb array of :attr:`ConsoleChatProject.
+    chat_project_id` STRING keys — no FK, same non-FK cross-table-
+    reference convention as every other console-* domain in this module
+    (e.g. :attr:`ConsoleConversation.chat_project_id`), since the
+    isolation invariant that matters is ``(user_sub, agent_id)``, not a
+    database-level cascade. Validating that a referenced chat-project
+    exists/is owned by the same user is explicitly OUT OF SCOPE for this
+    WU.
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN
+    at the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 028, mirrors migrations 022-027's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleAgentsService`` additionally filters every query by
+    ``user_sub`` explicitly at the SERVICE layer, so a dropped filter is
+    caught by the SQLite unit suite too (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "console_agents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    agent_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(512), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    model_parameters_json: Mapped[dict[str, Any]] = mapped_column(
+        "model_parameters", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    tools_json: Mapped[list[Any]] = mapped_column(
+        "tools", _ConsoleMetadataType, nullable=False, default=list
+    )
+    artifacts_json: Mapped[dict[str, Any]] = mapped_column(
+        "artifacts", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    end_after_tools: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    project_ids_json: Mapped[list[str]] = mapped_column(
+        "project_ids", _ConsoleMetadataType, nullable=False, default=list
+    )
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsoleFile.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleFile.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub",
+            "agent_id",
+            name="uq_console_agents_user_agent",
+        ),
+    )
+
+
+class ConsoleConversationTag(Base):
+    """The ``console_conversation_tags`` store — the Conversation-Tags
+    domain of the MongoDB-elimination EPIC (migration 029): AuditTrace's
+    first-party, RLS-isolated replacement for LibreChat's Mongo
+    ``ConversationTag`` collection
+    (``packages/data-schemas/src/schema/conversationTag.ts``).
+
+    **Own-tags-only v1 (the ratified spec's scope boundary).** Every row
+    is owned by exactly one ``user_sub`` (the unique constraint below) —
+    there is no shared/global tag concept in this table (mirrors every
+    other console-* domain's own-scoped v1: presets/prompts/chat-projects/
+    files/agents).
+
+    ``tag`` is a CLIENT-SUPPLIED STRING (LibreChat mints its own, e.g.
+    "work" or "urgent"), same pattern as :attr:`ConsoleAgent.agent_id` —
+    the internal PK ``id`` is a separate server-generated UUID so ``tag``
+    collisions across users can coexist, disambiguated only by
+    ``(user_sub, tag)`` (the unique constraint below).
+
+    ``count`` (number of conversations carrying this tag) and
+    ``position`` (sort order) are plain caller-maintained integers — this
+    store persists whatever the caller upserts; it never independently
+    recomputes ``count`` by cross-referencing conversations (that
+    reconciliation, if ever needed, is a later WU, same "opaque blob,
+    not enforced" discipline as :attr:`ConsoleAgent.tools_json`).
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN at
+    the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 029, mirrors migrations 022-028's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleConversationTagsService`` additionally filters every
+    query by ``user_sub`` explicitly at the SERVICE layer, so a dropped
+    filter is caught by the SQLite unit suite too
+    (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "console_conversation_tags"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    tag: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsoleAgent.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleAgent.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub",
+            "tag",
+            name="uq_console_conversation_tags_user_tag",
+        ),
+    )
+
+
+class ConsoleToolFavorite(Base):
+    """The ``console_tool_favorites`` store — the Tool-Favorites domain
+    of the MongoDB-elimination EPIC (migration 030): AuditTrace's
+    first-party, RLS-isolated replacement for LibreChat's Mongo
+    ``ToolFavorite`` collection
+    (``packages/data-schemas/src/schema/favorite.ts``).
+
+    **Own-favorites-only v1.** Every row is owned by exactly one
+    ``user_sub`` — there is no shared/global favorite concept (mirrors
+    every other console-* domain's own-scoped v1: presets/prompts/
+    chat-projects/files/agents/conversation-tags).
+
+    ``item_type``/``item_id`` are the CLIENT-SUPPLIED composite key the
+    fork mints (e.g. ``itemType="tool"``, ``itemId="web-search"``) — the
+    internal PK ``id`` is a separate server-generated UUID so the same
+    ``(item_type, item_id)`` pair can coexist across users,
+    disambiguated only by ``(user_sub, item_type, item_id)`` (the unique
+    constraint below, mirroring the fork's own
+    ``{ user: 1, itemType: 1, itemId: 1 }`` unique index).
+
+    ``tenant_id`` is the grounding schema's 4th field
+    (``packages/data-schemas/src/schema/favorite.ts``'s optional
+    ``tenantId``) — persisted as an opaque, caller-supplied string, never
+    interpreted by this store (own-scoped v1 has no multi-tenant
+    concept; this column exists purely for schema fidelity with the
+    fork's Mongo document).
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN at
+    the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 030, mirrors migrations 022-029's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleToolFavoritesService`` additionally filters every
+    query by ``user_sub`` explicitly at the SERVICE layer, so a dropped
+    filter is caught by the SQLite unit suite too
+    (``feedback_unit_tests_miss_rls``).
+
+    Soft-delete + re-create discipline (the D13 quirk this domain
+    deliberately AVOIDS): the service's existence lookup for an ACTIVE
+    row filters ``deleted_at_ms IS NULL``; re-favoriting a previously
+    unfavorited ``(item_type, item_id)`` pair clears the tombstone on
+    the SAME row (the unique constraint below forbids a second row for
+    that key) rather than leaving it soft-deleted under an
+    apparently-successful upsert.
+    """
+
+    __tablename__ = "console_tool_favorites"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    item_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    item_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    tenant_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsoleConversationTag.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleConversationTag.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub",
+            "item_type",
+            "item_id",
+            name="uq_console_tool_favorites_user_item",
+        ),
+    )
+
+
+class ConsoleAclEntry(Base):
+    """The ``console_acl_entries`` store — WU-1 (read path only) of the
+    Sovereign Authorization Layer EPIC (migration 031): AuditTrace's
+    first-party, RLS-isolated replacement for LibreChat's Mongo
+    ``AclEntry`` collection
+    (``packages/data-schemas/src/schema/aclEntry.ts``), per the ratified
+    spec (``2026-09-17-SPEC-sovereign-authorization-layer-acl-WU0-
+    ratified-candidate.md``) and its operator ratification
+    (``2026-09-18-SPEC-ADDENDUM-I-...``).
+
+    **READ PATH ONLY.** No write method touches this table in WU-1 — no
+    row exists until WU-2 lands ``grantPermission``/etc. This model and
+    migration exist so the read methods (``services/console_acl.py``)
+    have a real table + RLS policy to query against.
+
+    **RELATIONAL, never JSONB, for every access-decision column** — the
+    epic's data-modelling rule (RLS needs a real column; "prove who
+    could see this on date X" is an indexed query; a JSONB containment
+    scan cannot be shown to a regulator as an enforced control). There
+    is deliberately NO ``metadata`` JSONB column — ungrounded in the
+    live schema/any method signature (Deliverable 3).
+
+    **`principal_type` EXCLUDES ``group`` — enforced by
+    ``ck_console_acl_entries_principal_type``, a DB-level CHECK, not an
+    application-code branch** (operator ADDENDUM I ruling 1: "no
+    group-principal grant may be created or honoured on the sovereign
+    path until group membership is itself sovereign" — a config flag is
+    not an enforced control, ``feedback_config_flag_not_enforced_
+    control``). An INSERT attempting ``principal_type='group'`` is
+    refused by Postgres itself, fails closed and loudly (a raw
+    ``IntegrityError``, never a silent no-op).
+
+    **`principal_id` is polymorphic in the SOURCE** (Mongo
+    ``Schema.Types.Mixed`` — ObjectId for users, canonical string for
+    roles) — stored here as ``text`` holding the canonical string form,
+    with ``principal_model`` as the discriminator
+    (``ck_console_acl_entries_principal_model_matches_type`` pins the
+    pairing so a ROLE can never coerce into a USER row or vice versa —
+    Deliverable 4 finding #2).
+
+    **``PrincipalType.PUBLIC`` rows carry NO principal id** — modelled
+    as an explicit ``NULL`` under
+    ``ck_console_acl_entries_public_principal_null`` (never "key
+    absent" — "key missing" and "deliberately public" must be
+    distinguishable at the schema level, Deliverable 4 finding #1) PLUS
+    a partial unique index (``uq_console_acl_entries_public_resource``)
+    so at most one PUBLIC row exists per ``(resource_type,
+    resource_id)``.
+
+    **``perm_bits`` is an INTEGER bitmask** (``MAX_PERM_BITS`` = 15 =
+    ``VIEW|EDIT|DELETE|SHARE``), range-checked by
+    ``ck_console_acl_entries_perm_bits_range``. Every read method uses
+    native ``&`` containment (``(perm_bits & :bit) = :bit``) — NEVER
+    ``=`` for containment (Deliverable 4 finding #3; the live Mongo
+    ``ownerContact.js`` anti-pattern this fixes). The single documented,
+    deliberate exception is the byte-for-byte ``aggregateAclEntries``
+    site-1 fold (``get_owner_principal_ids`` in the service module),
+    which preserves the live Mongo pipeline's own exact-equality
+    semantics pending an explicit, separate operator decision — see
+    that method's docstring.
+
+    **``expired_at_ms``: filtered on read, NEVER purged** (operator
+    ADDENDUM I ruling 2). Mongo carries a live TTL index
+    (``expireAfterSeconds: 0``) with no Postgres-native equivalent; the
+    operator ruled against a scheduled purge — the retained row IS the
+    audit trail. Every AUTHORIZATION-DECISION read method (
+    ``has_permission``/``get_effective_permissions*``/
+    ``find_accessible_resources``/``find_public_resource_ids``/
+    ``get_sole_owned_resource_ids``/``get_owner_principal_ids``) filters
+    ``expired_at_ms IS NULL OR expired_at_ms > :now_ms``; the AUDIT-read
+    methods (``find_entries_by_*``) deliberately do NOT — an expired
+    grant must stay queryable for audit while being excluded from every
+    authorization decision, and those are two different queries, tested
+    separately (``tests/test_console_acl_service.py``). **Growth
+    expectation:** rows accumulate by design — no CronJob, no TTL
+    emulation, no chart change (there is deliberately no downgrade path
+    back to a purge job; a future purge would need its own, separately
+    ratified spec). ``ix_console_acl_entries_expired_at`` keeps the
+    expiry filter cheap as the table grows.
+
+    **No soft-delete column — but NOT a hard delete either (superseded
+    by ADDENDUM I ruling 2 / ACL 2b-core-A migration 033).** The live
+    Mongo schema has no soft-delete field and ``deleteAclEntries`` is a
+    real ``deleteMany`` there; the sovereign store deliberately does
+    NOT mirror that. ``revoke_permission``/``delete_acl_entries`` (2b-
+    core-A2) EXPIRE the row (``expired_at_ms`` set, Q-4) and RETAIN it —
+    the row IS the audit trail (ruling 2), not a separate tombstone.
+    Migration 033 additionally makes a real ``DELETE`` against this
+    table impossible on Postgres (a ``BEFORE DELETE`` trigger reusing
+    016's ``audittrace_append_only()``), so "hard delete" is not just
+    unused by application code, it is refused at the database.
+
+    **RLS is NOT "owner-only"** (unlike every other console-* domain in
+    this module) — ACL rows exist precisely to let ANOTHER principal see
+    something, so the ``USING`` clause (migration 031) is:
+    ``user_sub = current_user_id() OR (principal_type='user' AND
+    principal_id = current_user_id()) OR principal_type='public'``.
+    ``tenant_id`` is carried as an ADDITIONAL column, never the isolation
+    boundary by itself (Deliverable 4 finding #4 — two users sharing a
+    ``tenant_id`` with no row naming either as owner/principal/public
+    must both see zero rows for each other's resources). The ``WITH
+    CHECK`` clause stays owner-only (``user_sub = current_user_id()``)
+    since only the resource owner may create a grant (WU-2). SQLite
+    (unit tests) has no RLS — ``PostgresConsoleAclEntriesService``
+    mirrors the SAME OR-predicate explicitly at the service layer so a
+    dropped filter is caught by the SQLite suite too
+    (``feedback_unit_tests_miss_rls``).
+
+    ``resource_id``/``resource_type`` carry no FK — same non-FK
+    cross-table-reference convention as every other console-* domain
+    (e.g. ``ConsoleAgent.project_ids``); the resource itself may live in
+    ``console_agents``, a future ``console_prompt_groups``, etc., and
+    validating the reference is explicitly out of this WU's scope.
+    """
+
+    __tablename__ = "console_acl_entries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    # Resource OWNER's Keycloak `sub` — the RLS anchor. No FK, same
+    # rationale as every other user_id/user_sub column in this module
+    # (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    # 'user' | 'public' | 'role' — NEVER 'group' (CHECK below).
+    principal_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Canonical string form of the principal id (ObjectId-shaped for
+    # users, a role name for roles). NULL only for PUBLIC.
+    principal_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 'User' | 'Role' discriminator — NULL only for PUBLIC. Pins the
+    # principal_id round-trip so a USER and a ROLE with a
+    # textually-identical id can never coerce into one another
+    # (Deliverable 4 finding #2).
+    principal_model: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    perm_bits: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # FK-by-convention only (no real FK — AccessRole is a WU-3 store).
+    role_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # Sparse — flagged by WU-0 as "confirm dead-or-live"; carried
+    # forward unused pending that confirmation, never dropped silently.
+    inherited_from: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # The acting principal's sub at grant time — ALWAYS equal to
+    # user_sub (2b-core-A never models "grant on another user's
+    # behalf"; S-2/§3.2 — token-derived, never a request-body
+    # parameter). Carried as its own column rather than reusing
+    # user_sub because the audit-trail precedent
+    # (services/console_acl/_audit.py) names both independently.
+    granted_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    granted_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # NULL = never expires. Filtered on every authorization-decision
+    # read (see class docstring); never purged (ruling 2).
+    expired_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as every other
+    # console-* domain.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "principal_type IN ('user', 'public', 'role')",
+            name="ck_console_acl_entries_principal_type",
+        ),
+        CheckConstraint(
+            "(principal_type = 'public' AND principal_id IS NULL "
+            "AND principal_model IS NULL) OR "
+            "(principal_type != 'public' AND principal_id IS NOT NULL "
+            "AND principal_model IS NOT NULL)",
+            name="ck_console_acl_entries_public_principal_null",
+        ),
+        CheckConstraint(
+            "(principal_type = 'user' AND principal_model = 'User') OR "
+            "(principal_type = 'role' AND principal_model = 'Role') OR "
+            "(principal_type = 'public' AND principal_model IS NULL)",
+            name="ck_console_acl_entries_principal_model_matches_type",
+        ),
+        CheckConstraint(
+            "perm_bits >= 0 AND perm_bits <= 15",
+            name="ck_console_acl_entries_perm_bits_range",
+        ),
+        Index(
+            "uq_console_acl_entries_public_resource",
+            "resource_type",
+            "resource_id",
+            unique=True,
+            postgresql_where=text("principal_type = 'public'"),
+            sqlite_where=text("principal_type = 'public'"),
+        ),
+        Index(
+            "ix_console_acl_entries_principal_resource",
+            "principal_id",
+            "principal_type",
+            "resource_type",
+            "resource_id",
+            "tenant_id",
+        ),
+        Index(
+            "ix_console_acl_entries_resource_principal",
+            "resource_id",
+            "principal_type",
+            "principal_id",
+            "tenant_id",
+        ),
+        Index(
+            "ix_console_acl_entries_principal_permbits",
+            "principal_id",
+            "perm_bits",
+            "resource_type",
+            "tenant_id",
+        ),
+        Index(
+            "ix_console_acl_entries_public_lookup",
+            "principal_type",
+            "resource_type",
+            "perm_bits",
+            "resource_id",
+        ),
+        Index(
+            "ix_console_acl_entries_expired_at",
+            "expired_at_ms",
+        ),
+        # O-3 (ACL 2b-core-A1, migration 033) — at most one ACTIVE grant
+        # per (principal_type, principal_id, resource_type, resource_id,
+        # tenant_id); an EXPIRED row (Q-4) never counts. See migration
+        # 033's docstring for the NULLS NOT DISTINCT / aiosqlite caveat.
+        Index(
+            "uq_console_acl_entries_active_grant",
+            "principal_type",
+            "principal_id",
+            "resource_type",
+            "resource_id",
+            "tenant_id",
+            unique=True,
+            postgresql_where=text("expired_at_ms IS NULL"),
+            sqlite_where=text("expired_at_ms IS NULL"),
+            postgresql_nulls_not_distinct=True,
+        ),
     )

@@ -7,6 +7,13 @@ metadata:
     app.kubernetes.io/component: memory-server
 spec:
   replicas: {{ .Values.memoryServer.replicaCount }}
+  # Surge-safe rollout (default maxSurge=0/maxUnavailable=1). Guarded `with`
+  # so an operator can set `memoryServer.strategy: null` to fall back to the
+  # k8s default (maxSurge=25%) — unsafe on a single node, see values.yaml.
+  {{- with .Values.memoryServer.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "audittrace.selectorLabels" . | nindent 6 }}
@@ -23,6 +30,17 @@ spec:
         {{- include "audittrace.vaultAnnotations.memoryServer" . | nindent 8 }}
         {{- end }}
     spec:
+      # Spread replicas across zones (one per AZ on a 3-AZ cloud) for HA.
+      # ScheduleAnyway (not DoNotSchedule) so single-node dev / laptop k3s
+      # still schedules every replica — no anti-affinity deadlock.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "audittrace.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: memory-server
       {{- if .Values.memoryServer.serviceAccount.create }}
       serviceAccountName: {{ .Values.memoryServer.serviceAccount.name }}
       {{- end }}
@@ -127,10 +145,24 @@ spec:
               value: "audittrace-server"
             - name: AUDITTRACE_LLAMA_URL
               value: "http://{{ .Release.Name }}-llm-chat:{{ .Values.externalLLM.chat.port }}/v1"
+            # ADR-047 — embedding always runs on the dedicated nomic server
+            # (the gateway hosts no in-process model). 768-dim.
             - name: AUDITTRACE_EMBED_URL
               value: "http://{{ .Release.Name }}-llm-embed:{{ .Values.externalLLM.embed.port }}/v1"
             - name: AUDITTRACE_SUMMARIZER_URL
               value: "http://{{ .Release.Name }}-llm-summarizer:{{ .Values.externalLLM.summarizer.port }}/v1"
+            # FLEET-ROUTE (Phase 1) + FLEET-ROUTE-ENABLE (2026-08-06):
+            # model-field routing for the chat path. JSON object,
+            # prefix-matched against the request `model` by
+            # routes/_model_route.py::resolve_chat_upstream — first match
+            # wins, no match / empty model → AUDITTRACE_LLAMA_URL above.
+            # Computed by the audittrace.modelRoutes helper
+            # (templates/_helpers.tpl): starts from the operator-provided
+            # memoryServer.modelRoutes map (default {} — byte-preserves
+            # today's single-upstream behaviour) and layers in the mesh-
+            # routed `mistral` upstream when externalLLM.mistral.enabled.
+            - name: AUDITTRACE_MODEL_ROUTES
+              value: {{ include "audittrace.modelRoutes" . | quote }}
             - name: AUDITTRACE_OTLP_ENDPOINT
               value: "http://{{ .Release.Name }}-otel-collector:4318"
             # AUDITTRACE_LANGFUSE_HOST is rendered only when
@@ -239,8 +271,11 @@ spec:
           # liveness probe's 45 s budget is too tight for that — the
           # kubelet would kill the pod mid-retry on a cold cluster.
           # startupProbe gives 150 s (5 s × 30) before failing,
-          # which comfortably covers the AMQP retry budget AND keeps
-          # liveness tight (45 s) for catching real post-boot hangs.
+          # which comfortably covers the AMQP retry budget. Liveness +
+          # readiness carry EXPLICIT timeoutSeconds + failureThreshold: the
+          # k8s implicit defaults (1 s / 3) can kill a busy-but-alive pod
+          # whose event loop is briefly slow under load. Relaxed to ~90 s
+          # liveness grace; startupProbe (150 s) still covers cold start.
           # Anchor: ~/work/audittrace-evidence/20260515-memory-server-startup-race/STARTUP-PROFILE.md.
           startupProbe:
             httpGet:
@@ -256,12 +291,16 @@ spec:
               port: http
             initialDelaySeconds: 15
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           readinessProbe:
             httpGet:
               path: /health
               port: http
             initialDelaySeconds: 10
             periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.memoryServer.resources | nindent 12 }}
       volumes:

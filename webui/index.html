@@ -88,7 +88,7 @@
     .chip.warn { background: #3a311f; color: #e0c067; }
     /* signature_status chips — distinct hue per audit class so a
        quick scroll surfaces the cluster of expired/untrusted/etc.
-       Mirrors the 9-class taxonomy (ADR-052 §1 + ADR-054 §1). */
+       Mirrors the 10-class taxonomy (ADR-052 §1 + ADR-054 §1 + #460). */
     .chip.sig-valid { background: #1f3a26; color: var(--ok); }
     .chip.sig-invalid { background: #3a1f25; color: var(--err); }
     .chip.sig-tampered { background: #4a1f25; color: #ff5e72; font-weight: 600; }
@@ -715,7 +715,7 @@ function renderList(items) {
   } else {
     // Episodic/procedural/semantic — show signature_status when
     // present so the audit class is visible in the list itself
-    // (no per-row drill-down needed). ADR-052 + ADR-054 9-class
+    // (no per-row drill-down needed). ADR-052 + ADR-054 + #460 10-class
     // taxonomy.
     thead.innerHTML = `
       <th>Key</th>
@@ -784,11 +784,11 @@ function escapeHtml(s) {
 }
 function escapeAttr(s) { return escapeHtml(s); }
 
-// signature_status → coloured chip per the 9-class taxonomy (ADR-052
-// §1 + ADR-054 §1). PDFs not yet indexed (or non-PDF rows) carry a
+// signature_status → coloured chip per the 10-class taxonomy (ADR-052
+// §1 + ADR-054 §1 + #460). PDFs not yet indexed (or non-PDF rows) carry a
 // null signature_status — show nothing rather than a misleading
 // "unknown" chip. Operational/runtime classes (check_skipped /
-// check_unavailable / check_failed) collapse to a neutral chip — the
+// check_unavailable / check_failed / check_error) collapse to a neutral chip — the
 // audit class is "we couldn't verdict", not a verdict itself.
 function signatureChip(status) {
   if (status == null) return '';
@@ -802,6 +802,7 @@ function signatureChip(status) {
     case 'check_skipped':
     case 'check_unavailable':
     case 'check_failed':
+    case 'check_error':
       return '<span class="chip sig-runtime">' + escapeHtml(status) + '</span>';
     default:
       return '<span class="chip">' + escapeHtml(status) + '</span>';

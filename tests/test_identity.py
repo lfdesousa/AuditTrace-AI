@@ -22,12 +22,14 @@ import fakeredis
 import pytest
 
 from audittrace.identity import (
+    CORPUS_WRITE_SCOPE_GLOB,
     SENTINEL_SUBJECT,
     SENTINEL_USERNAME,
     TokenCache,
     UserContext,
     hash_token,
     is_admin_scope,
+    is_privileged_scope,
     sentinel_user_context,
 )
 
@@ -133,6 +135,73 @@ class TestIsAdminScope:
         assert is_admin_scope([]) is False
 
 
+class TestIsPrivilegedScope:
+    """#371 — the residual gap: ``memory:corpus:*:write`` must rank as
+    privileged (ADR-062 §4), but MUST NOT be folded into ``is_admin_scope``
+    (app-layer authz stays untouched by this change).
+
+    Each corpus-write case below is written to be individually falsifiable:
+    delete the ``fnmatch`` clause (or shrink ``CORPUS_WRITE_SCOPE_GLOB`` to
+    something that no longer matches) and every ``is True`` assertion here
+    goes RED, because ``is_privileged_scope`` would fall back to
+    ``is_admin_scope`` alone.
+    """
+
+    @pytest.mark.parametrize(
+        "collection", ["decisions", "skills", "semantic", "some-future-collection"]
+    )
+    def test_corpus_write_scope_is_privileged(self, collection):
+        assert is_privileged_scope([f"memory:corpus:{collection}:write"]) is True
+
+    @pytest.mark.parametrize(
+        "collection", ["decisions", "skills", "semantic", "some-future-collection"]
+    )
+    def test_corpus_read_scope_is_not_privileged(self, collection):
+        assert is_privileged_scope([f"memory:corpus:{collection}:read"]) is False
+
+    def test_plain_layer_write_scope_is_not_privileged(self):
+        """``memory:episodic:write`` etc. are ordinary per-user writer
+        scopes every legitimate client holds (webui, opencode) — folding
+        them in here would make the shadow-client guard cry wolf on every
+        normal deployment (ADR-062 §4 distinguishes granular corpus scopes
+        from the per-user ``memory:<layer>:*`` scopes)."""
+        assert is_privileged_scope(["memory:episodic:write"]) is False
+        assert is_privileged_scope(["memory:semantic:write"]) is False
+
+    def test_admin_scope_is_also_privileged(self):
+        """``is_privileged_scope`` is a superset of ``is_admin_scope``."""
+        assert is_privileged_scope(["audittrace:admin"]) is True
+        assert is_privileged_scope(["memory:admin"]) is True
+
+    def test_mixed_scopes_any_privileged_wins(self):
+        assert (
+            is_privileged_scope(["memory:read", "memory:corpus:decisions:write"])
+            is True
+        )
+
+    def test_empty_scopes_is_not_privileged(self):
+        assert is_privileged_scope([]) is False
+
+    def test_read_scopes_alone_are_not_privileged(self):
+        assert is_privileged_scope(["memory:read", "session:read-own"]) is False
+
+    def test_corpus_write_does_not_become_admin_scope(self):
+        """Kept SEPARATE from ``is_admin_scope`` on purpose (ADR-062 §4:
+        corpus write is operator/curator-tier, not app-admin-tier) —
+        a corpus-write holder must rank privileged for shadow-client
+        ranking WITHOUT gaining ``is_admin_scope`` / the RLS bypass."""
+        scopes = ["memory:corpus:decisions:write"]
+        assert is_privileged_scope(scopes) is True
+        assert is_admin_scope(scopes) is False
+
+    def test_glob_constant_shape(self):
+        """Pin the exact literal the shell guard mirrors verbatim — a
+        change here without updating ``post-deploy-verify.sh`` is caught by
+        ``TestPrivilegedCorpusScopeSingleSourceOfTruth`` in
+        ``tests/test_chart_drift_guards.py``."""
+        assert CORPUS_WRITE_SCOPE_GLOB == "memory:corpus:*:write"
+
+
 class TestSentinelUserContext:
     def test_default_is_admin_for_dev(self):
         ctx = sentinel_user_context()
@@ -202,6 +271,87 @@ class TestTokenCacheBasic:
 
     def test_size_empty_cache(self, cache):
         assert cache.size() == 0
+
+
+class _PagingRedis:
+    """Redis stub whose ``SCAN`` returns one page at a time, including an
+    empty page mid-scan.
+
+    ``fakeredis`` holds so few keys in these tests that SCAN always
+    completes in a single call with ``count=100``, so the multi-page loop in
+    ``TokenCache.clear``/``size`` never runs against it. A real Redis with a
+    populated keyspace behaves as modelled here: SCAN returns a *partial*
+    batch plus a non-zero continuation cursor, and a batch may legitimately
+    be empty when the slots visited in that COUNT window hold no matching
+    keys. Everything other than ``scan`` delegates to the real fake.
+    """
+
+    def __init__(self, inner, pages: list[list[str]]):
+        self._inner = inner
+        self._pages = pages
+        self.delete_calls: list[tuple[str, ...]] = []
+
+    def scan(self, cursor=0, match=None, count=None):
+        page = self._pages[cursor]
+        # Cursor 0 is the "scan complete" sentinel, so it can only be
+        # returned from the final page.
+        next_cursor = cursor + 1 if cursor + 1 < len(self._pages) else 0
+        return next_cursor, list(page)
+
+    def delete(self, *keys):
+        self.delete_calls.append(keys)
+        return self._inner.delete(*keys)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class TestTokenCacheScanPaging:
+    """The SCAN loops must drain *every* page, not just the first.
+
+    A revocation that only clears page one leaves valid-looking cached
+    ``UserContext`` entries behind, so a revoked token keeps authenticating
+    until its TTL expires — the exact failure mode SCAN-based clear() exists
+    to avoid.
+    """
+
+    def test_clear_drains_every_scan_page(self, fake_redis):
+        pages = [
+            ["audittrace:token:hash-1"],
+            [],  # empty mid-scan page — must not terminate the loop
+            ["audittrace:token:hash-2", "audittrace:token:hash-3"],
+        ]
+        paging = _PagingRedis(fake_redis, pages)
+        cache = TokenCache(paging, default_ttl_seconds=300)
+        for h in ("hash-1", "hash-2", "hash-3"):
+            cache.put(h, _user_ctx(user_id=h))
+        fake_redis.set("not-our-key", "should-survive")
+
+        cache.clear()
+
+        # Every page's keys are gone, including the two behind the empty page.
+        assert cache.get("hash-1") is None
+        assert cache.get("hash-2") is None
+        assert cache.get("hash-3") is None
+        assert fake_redis.get("not-our-key") == "should-survive"
+        # The empty page must not have issued DELETE with zero arguments —
+        # real Redis rejects that with "wrong number of arguments".
+        assert paging.delete_calls == [
+            ("audittrace:token:hash-1",),
+            ("audittrace:token:hash-2", "audittrace:token:hash-3"),
+        ]
+
+    def test_size_counts_across_scan_pages(self, fake_redis):
+        """size() must sum every page, else the /metrics gauge under-reports
+        cache occupancy by however much SCAN left on later pages."""
+        pages = [
+            ["audittrace:token:hash-1"],
+            [],
+            ["audittrace:token:hash-2", "audittrace:token:hash-3"],
+        ]
+        cache = TokenCache(_PagingRedis(fake_redis, pages), default_ttl_seconds=300)
+
+        assert cache.size() == 3
 
 
 class TestTokenCacheTTL:

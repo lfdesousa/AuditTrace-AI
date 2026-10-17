@@ -52,7 +52,7 @@ For cluster-deploy work see `docs/guides/deployment-runbook.md` and
 ## Test Strategy
 - **Coverage:** 90% **per-file** gate (every file stands on its own, not the
   average). Enforced via `scripts/check-per-file-coverage.py` in `make test`.
-- **850+ tests** across the suite (current count via `make test`; pinned
+- **2,790+ tests** across the suite (current count via `make test`; pinned
   numbers drift, so cite the script). Session-scoped
   `configure_observability` sets DEBUG logging + no-op OTel. Per-test
   `_reset_global_container` autouse fixture isolates DI state.
@@ -109,7 +109,9 @@ For cluster-deploy work see `docs/guides/deployment-runbook.md` and
   — retained as-is per ADR-035 amendment for backwards-compat with existing
   dashboards.
 - **Routes:** `/v1/chat/completions`, `/v1/models`, `/context`,
-  `/interactions`, `/session/save`, `/session/summary`, `/memory/*`,
+  `/interactions`, `/session/save`, `/session/summary`, `/memory/*`
+  (`/memory/{upload,index,episodic,procedural,semantic,conversational}`),
+  `/assessments` (ADR-058 recursive self-audit read surface),
   `/health`, `/metrics`
 
 ## Identity + multi-user (ADR-026 §15, §16; ADR-032; ADR-044)
@@ -236,7 +238,18 @@ scripts/audittrace-login`, not a workaround.
   `.github/workflows/ci.yml`) — parses the PR body via `gh api`;
   fails the check if the **Verification** / **Validation** /
   **Reconstruction** sections are missing or empty. Branch
-  protection enforces it for merges to `main`.
+  protection enforces it for merges to `main`. The parser is now
+  `scripts/adr049_evidence_check.py` (single source of truth); the
+  job just calls it.
+- **Local pre-PR mirror** — the CI-Agent's pre-PR gate MUST run
+  `make check-pr-body BODY=<pr-body.md>` before any push that will
+  open a PR, and refuse to hand over a PR whose body fails. This is
+  the local mirror of the CI `evidence-check` job (same
+  `scripts/adr049_evidence_check.py` parser, so no drift), so an
+  unfilled section is caught on the laptop, not after push
+  (#396, `feedback_mirror_every_ci_gate_locally`). Write the PR body
+  to a file (`feedback_gh_pr_body_from_file`), run the check, fix any
+  reported section, THEN push.
 - **PR template** (`.github/pull_request_template.md`) —
   pre-populates every new PR with the three required sections so
   the requirement is visible from the moment the PR opens.
@@ -353,7 +366,8 @@ path; the Helm chart in `charts/audittrace/` remains canonical.
 After B7 step 1 the compose stack pulls the SAME images Helm
 deploys in prod: `ghcr.io/lfdesousa/audittrace-{postgresql,redis,
 rabbitmq}` (B1.5 / B1.6 frozen Bitnami), `chromadb/chroma:1.5.7`
-(chart pin), `quay.io/keycloak/keycloak:24.0`, `minio/minio:latest`,
+(chart pin), `quay.io/keycloak/keycloak:24.0`,
+`quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z`,
 `docker.io/lfds/audittrace-memory-server:1.0.22` (published).
 Configuration follows Bitnami conventions (`POSTGRESQL_*`,
 `REDIS_*`, `RABBITMQ_*` env vars; `/bitnami/{postgresql,redis,
@@ -483,9 +497,25 @@ PVCs) but exploded on prod's existing data — see
 - [ADR-033](docs/ADR-033-three-audience-error-envelope.md) — Three-audience error envelope
 - [ADR-034](docs/ADR-034-long-running-generation.md) — Long-running generation
 - [ADR-035](docs/ADR-035-package-rename.md) — **Package rename + retention exceptions**
+- [ADR-037](docs/ADR-037-agent-tool-audit-boundary.md) — **Agent-tool audit boundary** (record only memory-server-executed tools)
 - [ADR-041](docs/ADR-041-product-boundary-and-dependencies.md) — Product boundary
 - [ADR-042](docs/ADR-042-oidc-authorization-code-pkce.md) — OIDC AuthCode PKCE
 - [ADR-043](docs/ADR-043-vault-as-sole-secret-store.md) — Vault as sole secret store
 - [ADR-044](docs/ADR-044-external-idp-federation.md) — External IdP federation (Accepted, Google live)
 - [ADR-045](docs/ADR-045-laptop-first-no-lan-hardcodes.md) — Laptop-first, no LAN hardcodes
 - [ADR-046](docs/ADR-046-async-chat-persistence.md) — Async chat persistence (Proposed)
+- [ADR-047](docs/ADR-047-server-side-embedding.md) — Server-side embedding (off the request path, nomic-embed)
+- [ADR-048](docs/ADR-048-ingestion-content-control.md) — Ingestion content-control service
+- [ADR-049](docs/ADR-049-test-evidence-and-reconstructibility-gate.md) — **Test, Evidence & Reconstructibility Gate**
+- [ADR-050](docs/ADR-050-pdf-ingestion-tier-b.md) — PDF ingestion robustness (tier-B)
+- [ADR-052](docs/ADR-052-pades-trust-store-and-taxonomy.md) — PAdES trust store + 8-class signature taxonomy
+- [ADR-053](docs/ADR-053-swiss-federal-tsl-and-composite-trust-store.md) — Swiss federal Trusted List + composite trust store
+- [ADR-054](docs/ADR-054-pades-as-of-signing-time-validation.md) — PAdES as-of-signing-time validation
+- [ADR-055](docs/ADR-055-eliminate-version-pin-litany.md) — **Eliminate the version-pin litany** (`make release`)
+- [ADR-056](docs/ADR-056-pdf-tier-c-batch.md) — PDF tier-C batch (TOC / metadata / LTV / PDF-A / per-doc audit)
+- [ADR-057](docs/ADR-057-scan-control-broker-rabbitmq.md) — Scan-control broker = RabbitMQ
+- [ADR-058](docs/ADR-058-recursive-self-audit.md) — **Recursive self-audit** (the recorder records its own review)
+- [ADR-060](docs/ADR-060-record-recall-by-id-and-cache-hits.md) — Record recall by durable id (incl cache hits)
+- [ADR-061](docs/ADR-061-safe-deploy-and-independent-verification.md) — **Safe deploys + independent deploy verification**
+- [ADR-062](docs/ADR-062-five-layer-memory-model.md) — **Five-layer memory model** (4 per-user isolated + 1 shared corpus, audited)
+- [ADR-063](docs/ADR-063-mcp-entry-interface.md) — MCP entry-interface (the audit layer as an MCP server)

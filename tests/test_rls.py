@@ -214,3 +214,59 @@ class TestRequireUserPopulatesContextVar:
         finally:
             set_current_user_id(None)
             get_settings.cache_clear()
+
+
+# ───────────── Async set_rls_user_id (explicit-AsyncSession path) ────────────
+
+
+class TestSetRlsUserIdAsync:
+    """``set_rls_user_id`` is the async counterpart to the ``after_begin``
+    listener for code paths that hold an :class:`AsyncSession` directly
+    (the RLS integration tests, and any future route that scopes a session
+    explicitly). Postgres-only; no-op elsewhere; ``None`` → empty sentinel.
+
+    Driven via ``asyncio.run`` in sync test bodies (not pytest-asyncio's
+    loop) so coverage's ``greenlet`` concurrency tracer reliably attributes
+    the awaited lines.
+    """
+
+    def test_emits_set_config_on_postgres(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from audittrace.db.rls import set_rls_user_id
+
+        db = MagicMock()
+        db.get_bind.return_value.dialect.name = "postgresql"
+        db.execute = AsyncMock()
+        asyncio.run(set_rls_user_id(db, "user-alice"))
+        db.execute.assert_awaited_once()
+        args, _ = db.execute.call_args
+        assert "set_config" in str(args[0]).lower()
+        assert args[1].get("uid") == "user-alice"
+
+    def test_noop_on_non_postgres(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from audittrace.db.rls import set_rls_user_id
+
+        db = MagicMock()
+        db.get_bind.return_value.dialect.name = "sqlite"
+        db.execute = AsyncMock()
+        asyncio.run(set_rls_user_id(db, "user-alice"))
+        db.execute.assert_not_awaited()
+
+    def test_none_user_sets_empty_sentinel(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from audittrace.db.rls import set_rls_user_id
+
+        db = MagicMock()
+        db.get_bind.return_value.dialect.name = "postgresql"
+        db.execute = AsyncMock()
+        asyncio.run(set_rls_user_id(db, None))
+        db.execute.assert_awaited_once()
+        args, _ = db.execute.call_args
+        assert args[1].get("uid") == ""
