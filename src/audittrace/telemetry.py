@@ -34,11 +34,118 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
+from opentelemetry import context as otel_context
+from opentelemetry import propagate, trace
+from opentelemetry.context import Context
+from opentelemetry.propagators.textmap import (
+    CarrierT,
+    Getter,
+    Setter,
+    TextMapPropagator,
+    default_getter,
+    default_setter,
+)
+from opentelemetry.trace import SpanContext
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
 if TYPE_CHECKING:
     from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
     from opentelemetry.sdk.trace.export import SpanExportResult
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# TRACEPARENT-TRUST: the server mints the trace identity of every request.
+#
+# An inbound W3C ``traceparent`` is untrusted caller input. It is parsed and
+# validated, then kept ONLY as a span link plus two attributes on the server
+# span; it is never the parent, never decides sampling and never reaches an
+# audit row, a log line or an outbound call. ``tracestate`` and ``baggage``
+# are neither adopted nor forwarded (baggage carried forged
+# ``langfuse_user_id`` / ``langfuse_session_id`` onto every span).
+#
+# Falsifiability: tests/test_traceparent_trust.py. Replacing this propagator
+# with the default composite (neuter N1) reddens the identity, sampling, join,
+# outbound-hygiene and collision cells; dropping the hook (N2) reddens only
+# the link cell.
+# ---------------------------------------------------------------------------
+_INBOUND_SPAN_CONTEXT_KEY = "audittrace.inbound_span_context"
+INBOUND_LINK_ATTRIBUTES = {"audittrace.link": "inbound_traceparent"}
+
+
+class ServerMintedTraceContext(TextMapPropagator):
+    """Global textmap that never adopts an inbound trace context.
+
+    ``extract`` parses the carrier with the W3C propagator into a *separate*
+    context. When the parsed span context is valid it is stored under a
+    private context key on the incoming context; the incoming context
+    otherwise passes through (no parent, no baggage, no trace state).
+    ``inject`` writes the W3C ``traceparent`` of the current server-minted
+    span only: no ``baggage`` propagator exists in either direction.
+    """
+
+    def __init__(self) -> None:
+        self._trace_context = TraceContextTextMapPropagator()
+
+    def extract(
+        self,
+        carrier: CarrierT,
+        context: Context | None = None,
+        getter: Getter[CarrierT] = default_getter,
+    ) -> Context:
+        ctx = context if context is not None else otel_context.get_current()
+        parsed = self._trace_context.extract(carrier, Context(), getter=getter)
+        span_context = trace.get_current_span(parsed).get_span_context()
+        if span_context.is_valid:
+            ctx = otel_context.set_value(_INBOUND_SPAN_CONTEXT_KEY, span_context, ctx)
+        return ctx
+
+    def inject(
+        self,
+        carrier: CarrierT,
+        context: Context | None = None,
+        setter: Setter[CarrierT] = default_setter,
+    ) -> None:
+        self._trace_context.inject(carrier, context=context, setter=setter)
+
+    @property
+    def fields(self) -> set[str]:
+        return set(self._trace_context.fields)
+
+
+def install_trace_context_policy() -> None:
+    """Install :class:`ServerMintedTraceContext` as the global textmap.
+
+    Idempotent. Called unconditionally from ``create_app()`` (never gated on
+    ``tracing_enabled``, never inside a swallowing ``try``): a failure here
+    must stop the app rather than leave the default, parent-adopting
+    propagator in place.
+    """
+    if not isinstance(propagate.get_global_textmap(), ServerMintedTraceContext):
+        propagate.set_global_textmap(ServerMintedTraceContext())
+
+
+def inbound_trace_context_hook(span: Any, scope: Any) -> None:
+    """``server_request_hook``: record the caller's claim as a link.
+
+    The instrumentor wraps hooks in ``failsafe``, so no blanket ``except``
+    here. Malformed, all-zero or absent headers never produced a stashed
+    context (see ``ServerMintedTraceContext.extract``): no link, no attribute.
+    ``tracestate`` is never recorded; the attribute is re-serialised from the
+    parsed context, never the raw header bytes.
+    """
+    inbound = otel_context.get_value(_INBOUND_SPAN_CONTEXT_KEY)
+    if not isinstance(inbound, SpanContext) or not span.is_recording():
+        return
+    trace_id_hex = format(inbound.trace_id, "032x")
+    span.add_link(inbound, dict(INBOUND_LINK_ATTRIBUTES))
+    span.set_attribute(
+        "audittrace.inbound.traceparent",
+        f"00-{trace_id_hex}-{format(inbound.span_id, '016x')}"
+        f"-{format(inbound.trace_flags, '02x')}",
+    )
+    span.set_attribute("audittrace.inbound.trace_id", trace_id_hex)
+
 
 _initialized = False
 _tracer = None
