@@ -23,7 +23,7 @@ identity is now delegated entirely to Keycloak.
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from fastapi import Depends, HTTPException, Request
@@ -32,6 +32,7 @@ from fastapi.security import (
     SecurityScopes,
 )
 from jose import JWTError, jwt
+from starlette.requests import HTTPConnection
 
 from audittrace.config import get_settings
 from audittrace.db.rls import set_current_user_id
@@ -339,8 +340,12 @@ class _RegisteringOAuth2Scheme(OAuth2AuthorizationCodeBearer):
     existing extraction already performed by the base class's ``__call__``.
     """
 
-    async def __call__(self, request: Request) -> str | None:
-        token = await super().__call__(request)
+    async def __call__(self, request: HTTPConnection) -> str | None:
+        # fastapi <= 0.143.0 types the base __call__ as Request, >= 0.144.0 as
+        # HTTPConnection (measured on oauth2.py); Request is a subclass so
+        # this cast is sound on both
+        # and the base only reads request.headers (present on HTTPConnection).
+        token = await super().__call__(cast(Request, request))
         if token:
             register_request_secret(token)
         return token
