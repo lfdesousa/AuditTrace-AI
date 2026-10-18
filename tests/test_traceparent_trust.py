@@ -51,6 +51,9 @@ import contextlib
 import io
 import json
 import logging
+import os
+import subprocess
+import sys
 import textwrap
 import threading
 from collections.abc import Iterator
@@ -70,6 +73,8 @@ from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from opentelemetry.instrumentation.urllib3 import URLLib3Instrumentor
 from opentelemetry.propagators.composite import CompositePropagator
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -81,7 +86,7 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 from audittrace import config as config_mod
 from audittrace import telemetry
 from audittrace.identity import sentinel_user_context
-from audittrace.logging_config import StructuredFormatter
+from audittrace.logging_config import setup_logging
 from audittrace.routes.chat import _current_trace_id_hex as chat_tid
 from audittrace.routes.memory_pdf.signature import _current_trace_id as sig_tid
 from audittrace.routes.memory_upload.handler import _current_traceparent as upload_tp
@@ -212,17 +217,27 @@ def _load_should_export() -> Any:
     return ns["_should_export_span"]
 
 
-def _log_capture() -> tuple[logging.Logger, io.StringIO]:
+_PROBE_LOG = logging.getLogger("audittrace.test.traceparent_trust")
+
+
+@contextlib.contextmanager
+def _product_root_logging() -> Iterator[io.StringIO]:
+    """Install the PRODUCT's root handler (``setup_logging``, structured JSON)
+    with its stdout bound to a buffer, and restore the previous root state.
+
+    AC7a must observe what the product's logging path writes, so it must not use
+    a private logger/handler (reviewer B1).
+    """
+    root = logging.getLogger()
+    saved_handlers, saved_level = list(root.handlers), root.level
     buf = io.StringIO()
-    log = logging.getLogger("audittrace.test.traceparent_trust")
-    log.setLevel(logging.INFO)
-    log.propagate = False
-    for h in list(log.handlers):
-        log.removeHandler(h)
-    handler = logging.StreamHandler(buf)
-    handler.setFormatter(StructuredFormatter())
-    log.addHandler(handler)
-    return log, buf
+    with contextlib.redirect_stdout(buf):
+        setup_logging(level="INFO", structured=True)
+    try:
+        yield buf
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
 
 
 class _Harness:
@@ -238,7 +253,6 @@ class _Harness:
         self.loopback = loopback
         self.seen: dict[str, Any] = {}
         self.amqp = _StubExchange()
-        self.log, self.log_buf = _log_capture()
         app = create_app()
         FastAPIInstrumentor.uninstrument_app(app)
         # uninstrument_app() caches a BUILT middleware stack; reset it so the
@@ -266,10 +280,7 @@ class _Harness:
             trace_id=None,
             detail_extra=None,
         )
-        self.log.info("measure.line")
-        line = self.log_buf.getvalue().strip().splitlines()[-1]
-        self.log_buf.seek(0)
-        self.log_buf.truncate(0)
+        _PROBE_LOG.info("measure.line")
         self.seen.update(
             {
                 "chat": chat_tid(),
@@ -279,7 +290,6 @@ class _Harness:
                 "summariser": summ_tid(span),
                 "row": row.trace_id,
                 "upload": list(upload_tp()),
-                "log_line": line,
                 "baggage": dict(baggage.get_all()),
             }
         )
@@ -386,6 +396,14 @@ def _sdk_provider(
     return provider, exporter
 
 
+def _restore_instrumentor(inst: Any, was_instrumented: bool) -> None:
+    """Leave a global instrumentor as the fixture found it (S3)."""
+    if inst.is_instrumented_by_opentelemetry:
+        inst.uninstrument()
+    if was_instrumented:
+        inst.instrument()
+
+
 def _hex(n: int) -> str:
     return format(n, "032x")
 
@@ -399,10 +417,11 @@ def matrix(sandbox: None) -> Iterator[dict[str, dict[str, Any]]]:
     provider, exporter = _sdk_provider()
     with _Loopback() as loopback, contextlib.ExitStack() as stack:
         for inst in (HTTPXClientInstrumentor(), URLLib3Instrumentor()):
-            if inst.is_instrumented_by_opentelemetry:
+            was = inst.is_instrumented_by_opentelemetry
+            if was:
                 inst.uninstrument()
             inst.instrument(tracer_provider=provider)
-            stack.callback(inst.uninstrument)
+            stack.callback(_restore_instrumentor, inst, was)
         h = _Harness(provider, exporter, loopback)
         results["_install"] = {
             "textmap": propagate.get_global_textmap(),
@@ -524,8 +543,11 @@ def test_ac3_all_derivations_equal_the_minted_root(
     assert matrix["tp01"]["seen"]["chat"] != T
 
 
-def test_ac3_pin_can_fail(matrix: dict[str, dict[str, Any]]) -> None:
-    """Gate C5 neuter for AC3: one divergent derivation turns the pin RED."""
+def test_ac3_assertion_helper_selftest(matrix: dict[str, dict[str, Any]]) -> None:
+    """HELPER SELF-TEST, not a neuter of the subject: feeds the AC3 comparison a
+    synthetic divergent derivation and checks the helper reports it. The
+    subject-level neuters for AC3 (a derivation function returning a fixed id)
+    are src patches recorded in the build record (run_neuters.py N12/N13)."""
     res = matrix["tp01"]
     assert _derivation_mismatches(res) == []
     diverged = {**res, "seen": {**res["seen"], "console": "f" * 32}}
@@ -630,9 +652,11 @@ def test_ac6_upload_snapshot_has_sampled_flags_even_for_inbound_00(
     assert int(traceparent.rsplit("-", 1)[1], 16) & 1
 
 
-def test_ac6_pin_can_fail(matrix: dict[str, dict[str, Any]]) -> None:
-    """Gate C5 neuter for AC6 (traceparent == minted): a rewritten inject, or an
-    adopted id, turns the helper RED."""
+def test_ac6_assertion_helper_selftest(matrix: dict[str, dict[str, Any]]) -> None:
+    """HELPER SELF-TEST, not a neuter of the subject: an adopted id or an added
+    tracestate/baggage makes the outbound-hygiene helper fail. Subject-level
+    neuters (inject rewritten; AMQP header/payload additions) are src patches
+    recorded in the build record (run_neuters.py N10/N14/N15)."""
     res = matrix["tp01"]
     root = _hex(_root(res).context.trace_id)
     good = res["seen"]["outbound"]["httpx"]
@@ -671,61 +695,122 @@ def test_ac9_two_requests_with_the_same_inbound_id_get_distinct_server_ids(
 
 
 # ------------------------------------------------------------------- AC7 ----
-def _log_line(
-    harness: _Harness, headers: dict[str, str], inject_trace_context: bool
-) -> tuple[dict[str, Any], str]:
+def _log_run(
+    headers: dict[str, str], *, inject_trace_context: bool | None
+) -> tuple[dict[str, Any], str, str]:
+    """Run one request with the PRODUCT root handler capturing.
+
+    ``inject_trace_context=None`` -> the product's own instrumentation call
+    (``telemetry.instrument_log_correlation``). ``True`` -> a forward-protection
+    variant with trace injection on. Returns (probe line, whole captured text,
+    minted root id).
+    """
+    provider, exporter = _sdk_provider()
+    harness = _Harness(provider, exporter)
     inst = LoggingInstrumentor()
     was = inst.is_instrumented_by_opentelemetry
     if was:
         inst.uninstrument()
-    inst.instrument(set_logging_format=False, inject_trace_context=inject_trace_context)
+    if inject_trace_context is None:
+        telemetry.instrument_log_correlation()
+    else:
+        inst.instrument(
+            set_logging_format=False, inject_trace_context=inject_trace_context
+        )
     try:
-        res = harness.run("GET", "/__m/ok", headers)
+        with _product_root_logging() as buf:
+            res = harness.run("GET", "/__m/ok", headers)
+            captured = buf.getvalue()
     finally:
         inst.uninstrument()
         if was:
-            inst.instrument(set_logging_format=False)  # product configuration
-    return json.loads(res["seen"]["log_line"]), _hex(_root(res).context.trace_id)
+            telemetry.instrument_log_correlation()
+    probe = [ln for ln in captured.splitlines() if "measure.line" in ln]
+    assert len(probe) == 1, captured  # positive control: the product path logged
+    return json.loads(probe[0]), captured, _hex(_root(res).context.trace_id)
 
 
-def test_ac7a_product_configuration_logs_none_of_the_callers_values(
+def test_ac7a_product_logging_path_writes_none_of_the_callers_values(
     sandbox: None,
 ) -> None:
-    """AC7a (gate C6). Product config (``set_logging_format=False`` only): the
-    structured line contains neither the inbound trace id nor any tracestate /
-    baggage value. Today the line has no ``trace_id`` at all (Loki: 0/500).
+    """AC7a (gate C6a, reviewer B1). Capture through the root handler that the
+    product's ``setup_logging()`` installs, with the product's own
+    ``telemetry.instrument_log_correlation()`` (the call ``init_telemetry``
+    makes). No captured line may contain the inbound trace id, tracestate or
+    baggage values.
 
-    Neuters: N1 alone stays GREEN here (no trace id is stamped on the record);
-    it reddens only together with the log-trace-id fix, which is why AC7b
-    exists. Recorded honestly in the build record.
+    This CAN fail, on the product path. Neuters (src patches, each alone, see
+    run_neuters.py): L1 default propagator + ``inject_trace_context=True`` in
+    ``instrument_log_correlation``; L2 default propagator + a
+    ``TraceContextFilter`` on the ``setup_logging`` handler (the LOG-TRACE-ID
+    D1/D2 mechanism); L3 policy intact + a handler Filter writing the caller's
+    stashed claim into ``record.trace_id``. Each turns this test RED.
     """
-    provider, exporter = _sdk_provider()
-    h = _Harness(provider, exporter)
-    line, _ = _log_line(
-        h, {"traceparent": _tp(), **INBOUND}, inject_trace_context=False
+    _, captured, _ = _log_run(
+        {"traceparent": _tp(), **INBOUND}, inject_trace_context=None
     )
-    raw = json.dumps(line)
     for forbidden in (T, "evil", "injected", "k=v"):
-        assert forbidden not in raw
+        assert forbidden not in captured
 
 
 def test_ac7b_with_trace_injection_the_line_carries_the_minted_root(
     sandbox: None,
 ) -> None:
-    """AC7b (forward protection for the log-trace-id unit). With
-    ``inject_trace_context=True`` the line's ``trace_id`` is the minted root.
+    """AC7b (forward protection for the log-trace-id unit). With trace injection
+    on, through the same product root handler, the line's ``trace_id`` is the
+    MINTED root.
 
     Neuters: N1 -> the line carries T (RED).
     """
-    provider, exporter = _sdk_provider()
-    h = _Harness(provider, exporter)
-    line, root = _log_line(
-        h, {"traceparent": _tp(), **INBOUND}, inject_trace_context=True
+    line, captured, root = _log_run(
+        {"traceparent": _tp(), **INBOUND}, inject_trace_context=True
     )
     assert line["trace_id"] == root != T
-    raw = json.dumps(line)
     for forbidden in ("evil", "injected", "k=v"):
-        assert forbidden not in raw
+        assert forbidden not in captured
+
+
+# ------------------------------------------------------------------ AC-D10 --
+def test_ac_d10_inbound_counter_counts_linked_and_malformed(
+    sandbox: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-D10. ``audittrace.trace_context.inbound_total{outcome}`` increments
+    once per request that carries a ``traceparent``: ``linked`` when usable,
+    ``malformed`` when not; never for absent headers or tracestate/baggage only;
+    the only label is ``outcome`` (no PII, no id).
+
+    Neuter: drop the increment(s) in ``ServerMintedTraceContext.extract`` -> RED.
+    """
+    reader = InMemoryMetricReader()
+    meter = MeterProvider(metric_readers=[reader]).get_meter("test")
+    monkeypatch.setattr(
+        telemetry,
+        "_inbound_total",
+        meter.create_counter("audittrace.trace_context.inbound_total"),
+    )
+    provider, exporter = _sdk_provider()
+    h = _Harness(provider, exporter)
+    for method, path, hdrs in (
+        ("GET", "/__m/ok", {}),  # absent -> nothing
+        ("GET", "/__m/ok", {"traceparent": _tp()}),  # linked
+        ("GET", "/__m/ok", {"traceparent": "garbage"}),  # malformed
+        ("GET", "/__m/ok", dict(INBOUND)),  # tracestate/baggage only -> nothing
+        ("GET", "/__m/ok", {"traceparent": f"00-{'0' * 32}-{P1}-01"}),  # malformed
+        ("GET", "/v1/models", {"traceparent": _tp(parent=P2)}),  # linked (401)
+    ):
+        h.run(method, path, hdrs)
+    data = reader.get_metrics_data()
+    points = [
+        p
+        for rm in data.resource_metrics
+        for sm in rm.scope_metrics
+        for m in sm.metrics
+        if m.name == "audittrace.trace_context.inbound_total"
+        for p in m.data.data_points
+    ]
+    by_outcome = {dict(p.attributes)["outcome"]: p.value for p in points}
+    assert by_outcome == {"linked": 2, "malformed": 2}
+    assert all(set(dict(p.attributes)) == {"outcome"} for p in points)
 
 
 # ------------------------------------------------------------------- AC-BG --
@@ -784,7 +869,9 @@ def test_ac_d9_tracing_disabled_inbound_header_yields_no_context(
 
 
 # ------------------------------------------------------------ wiring / unit --
-def test_create_app_wires_the_hook_and_the_policy(sandbox: None) -> None:
+def test_create_app_wires_the_hook_and_the_policy(
+    sandbox: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The REAL ``create_app()`` instrumentation (no re-instrumentation): a
     forged traceparent on the global provider is linked, not adopted.
 
@@ -792,18 +879,16 @@ def test_create_app_wires_the_hook_and_the_policy(sandbox: None) -> None:
     N4 (install call removed) -> RED.
     """
     propagate.set_global_textmap(_default_composite())
-    exporter = InMemorySpanExporter()
-    provider = trace.get_tracer_provider()
-    add = getattr(provider, "add_span_processor", None)
-    assert add is not None, "conftest installs an SDK provider for the session"
-    add(SimpleSpanProcessor(exporter))
-    try:
-        app = create_app()
-        res = TestClient(app, raise_server_exceptions=False).get(
-            "/v1/models", headers={"traceparent": _tp(), **INBOUND}
-        )
-    finally:
-        exporter.shutdown()
+    # Bind ``create_app()``'s own (un-re-instrumented) instrumentation to a LOCAL
+    # provider by swapping the API's global for the duration of the call: no
+    # processor is ever attached to the session provider (reviewer S3).
+    provider, exporter = _sdk_provider()
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", provider)
+    app = create_app()
+    monkeypatch.undo()
+    res = TestClient(app, raise_server_exceptions=False).get(
+        "/v1/models", headers={"traceparent": _tp(), **INBOUND}
+    )
     assert res.status_code == 401
     servers = [
         s for s in exporter.get_finished_spans() if str(s.kind).endswith("SERVER")
@@ -867,6 +952,60 @@ def test_policy_survives_init_telemetry_laptop_mode(sandbox: None) -> None:
         metrics_enabled=False,
     )
     assert propagate.get_global_textmap() is before
+
+
+_INIT_CHILD = r"""
+import json, os
+from opentelemetry import propagate
+from audittrace import telemetry
+from audittrace.server import create_app
+create_app()
+name = lambda: type(propagate.get_global_textmap()).__name__
+after_create = name()
+telemetry.init_telemetry(service_name="tp-child", otlp_endpoint="http://127.0.0.1:9",
+                         tracing_enabled=True, metrics_enabled=True)
+from opentelemetry import trace
+procs = [type(p).__name__ for p in trace.get_tracer_provider()._active_span_processor._span_processors]
+print("RESULT " + json.dumps({"after_create": after_create, "after_init": name(), "procs": procs,
+                              "langfuse": telemetry._langfuse_client is not None}), flush=True)
+os._exit(0)
+"""
+
+
+def test_policy_survives_production_init_telemetry_otlp_langfuse_branch() -> None:
+    """S1 (reviewer). The PRODUCTION ``init_telemetry`` branch (OTLP exporter +
+    Langfuse client enabled) is global and set-once, so it runs in a fresh
+    interpreter. The policy installed by ``create_app()`` must still be the
+    global textmap afterwards; the positive control is that the Langfuse and OTLP
+    processors really were attached (the branch ran).
+
+    Neuter: any ``set_global_textmap`` inside that branch -> RED.
+    """
+    env = {
+        **os.environ,
+        "AUDITTRACE_ENV": "test",
+        "AUDITTRACE_LANGFUSE_ENABLED": "true",
+        "AUDITTRACE_LANGFUSE_PUBLIC_KEY": "pk-lf-child",
+        "AUDITTRACE_LANGFUSE_SECRET_KEY": "sk-lf-child",
+        "AUDITTRACE_LANGFUSE_HOST": "http://127.0.0.1:9",
+        "OTEL_PROPAGATORS": "tracecontext,baggage",
+    }
+    proc = subprocess.run(  # noqa: S603 - fixed argv, our own interpreter
+        [sys.executable, "-c", _INIT_CHILD],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+        check=False,
+    )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
+    assert lines, proc.stdout[-500:] + proc.stderr[-1500:]
+    out = json.loads(lines[-1][len("RESULT ") :])
+    assert out["after_create"] == "ServerMintedTraceContext"
+    assert out["after_init"] == "ServerMintedTraceContext"
+    assert out["langfuse"] is True
+    assert "LangfuseSpanProcessor" in out["procs"]
+    assert "BatchSpanProcessor" in out["procs"]
 
 
 def test_propagator_unit_extract_inject_fields() -> None:

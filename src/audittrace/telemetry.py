@@ -35,7 +35,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from opentelemetry import context as otel_context
-from opentelemetry import propagate, trace
+from opentelemetry import metrics, propagate, trace
 from opentelemetry.context import Context
 from opentelemetry.propagators.textmap import (
     CarrierT,
@@ -72,6 +72,17 @@ logger = logging.getLogger(__name__)
 _INBOUND_SPAN_CONTEXT_KEY = "audittrace.inbound_span_context"
 INBOUND_LINK_ATTRIBUTES = {"audittrace.link": "inbound_traceparent"}
 
+# AC-D10 detection: how often callers present a trace context, and whether it
+# was usable. One increment per request that carries a ``traceparent`` header.
+# Labels: ``outcome`` (linked | malformed) ONLY - no PII, never an id.
+_inbound_total = metrics.get_meter("audittrace.trace_context").create_counter(
+    name="audittrace.trace_context.inbound_total",
+    description=(
+        "Inbound W3C traceparent headers seen by the server-minted policy. "
+        "Label: outcome (linked | malformed). No PII."
+    ),
+)
+
 
 class ServerMintedTraceContext(TextMapPropagator):
     """Global textmap that never adopts an inbound trace context.
@@ -98,6 +109,9 @@ class ServerMintedTraceContext(TextMapPropagator):
         span_context = trace.get_current_span(parsed).get_span_context()
         if span_context.is_valid:
             ctx = otel_context.set_value(_INBOUND_SPAN_CONTEXT_KEY, span_context, ctx)
+            _inbound_total.add(1, {"outcome": "linked"})
+        elif getter.get(carrier, "traceparent"):
+            _inbound_total.add(1, {"outcome": "malformed"})
         return ctx
 
     def inject(
@@ -633,6 +647,20 @@ def _init_langfuse_client(tracer_provider: TracerProvider | None = None) -> None
         logger.warning("Langfuse SDK init failed: %s", exc)
 
 
+def instrument_log_correlation() -> None:
+    """Correlate log records with active spans (called by ``init_telemetry``).
+
+    Its own function so tests drive exactly the product's call (TRACEPARENT-
+    TRUST AC7a) instead of a test-local ``LoggingInstrumentor`` invocation.
+    """
+    try:
+        from opentelemetry.instrumentation.logging import LoggingInstrumentor
+
+        LoggingInstrumentor().instrument(set_logging_format=False)
+    except Exception as e:  # pragma: no cover
+        logger.debug("LoggingInstrumentor not enabled: %s", e)
+
+
 def init_telemetry(
     service_name: str,
     otlp_endpoint: str = "",
@@ -717,13 +745,7 @@ def init_telemetry(
             description="Count of errors raised by @log_call-decorated operations",
         )
 
-    # Correlate log records with active spans
-    try:
-        from opentelemetry.instrumentation.logging import LoggingInstrumentor
-
-        LoggingInstrumentor().instrument(set_logging_format=False)
-    except Exception as e:  # pragma: no cover
-        logger.debug("LoggingInstrumentor not enabled: %s", e)
+    instrument_log_correlation()
 
     if tracing_enabled and tracer_provider is not None:
         # Langfuse SECOND — our scrubber is already index 0 (S-C2).
