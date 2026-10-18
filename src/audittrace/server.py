@@ -948,10 +948,18 @@ def create_app() -> FastAPI:
     # builds the stack on first request. Outbound instrumentors
     # (HTTPX/SQLAlchemy/Redis) live in the lifespan handler so they
     # bind to the concrete TracerProvider Langfuse installs there.
+    #
+    # TRACEPARENT-TRUST (C2): the trust policy is a security control, so it
+    # installs unconditionally and OUTSIDE the swallowing ``try`` below; an
+    # exception propagates and ``create_app()`` fails closed rather than
+    # leaving the default propagator adopting caller-chosen parents.
+    telemetry.install_trace_context_policy()
     try:
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
-        FastAPIInstrumentor.instrument_app(app)
+        FastAPIInstrumentor.instrument_app(
+            app, server_request_hook=telemetry.inbound_trace_context_hook
+        )
     except Exception as e:  # pragma: no cover
         logger.warning("FastAPI OTel instrumentation failed: %s", e)
 
