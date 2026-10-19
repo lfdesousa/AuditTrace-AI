@@ -951,6 +951,26 @@ async def _load_own_row(db: AsyncSession, es: EligibleSession) -> SessionRecord 
     ).scalar_one_or_none()
 
 
+def _driver_exception(exc: IntegrityError) -> BaseException | None:
+    """The real driver exception behind a SQLAlchemy ``DBAPIError``.
+
+    ``DBAPIError.driver_exception`` exists only from SQLAlchemy 2.1; the
+    product runs the 2.0 line (SQLALCHEMY-SPANS), so read it defensively:
+    ``driver_exception`` when present, else ``exc.orig``, and for the asyncpg
+    dialect's adapted exception (2.0: ``orig`` raised ``from`` the real
+    asyncpg error) the real error at ``orig.__cause__``. Degrades to
+    ``exc.orig`` itself for non-emulated DBAPIs (sqlite3). No
+    ``type: ignore``: ``getattr`` keeps mypy clean on both lines.
+    """
+    driver_exc: BaseException | None = getattr(exc, "driver_exception", None)
+    if driver_exc is not None:
+        return driver_exc
+    orig = exc.orig
+    if orig is not None and orig.__cause__ is not None:
+        return orig.__cause__
+    return orig
+
+
 def _is_sessions_pk_violation(exc: BaseException) -> bool:
     """S2 / A1-F3 — narrowly recognise the ``sessions`` table's own
     primary-key violation so every OTHER integrity error (a NOT NULL
@@ -964,22 +984,21 @@ def _is_sessions_pk_violation(exc: BaseException) -> bool:
     constraint name, only the message text, which names the table and
     column verbatim.
 
-    Reads ``exc.driver_exception`` (SQLAlchemy 2.1+, pinned by
-    ``pyproject.toml``'s ``sqlalchemy[asyncio]>=2.1.1,<3``), not
-    ``exc.orig`` directly: SQLAlchemy's asyncpg dialect wraps the real
-    ``asyncpg.exceptions.UniqueViolationError`` in an
-    ``EmulatedDBAPIException`` whose own ``sqlstate`` is present but
-    whose ``constraint_name`` is NOT — that attribute lives only on the
-    nested real driver exception. ``driver_exception`` is exactly
-    SQLAlchemy's documented unwrap for this (and degrades to ``exc.orig``
-    itself for non-emulated DBAPIs such as sqlite3) — measured against a
-    real Postgres PK violation during the AC4 build: the first draft of
-    this function, reading ``exc.orig`` directly, let the violation
-    escape instead of classifying it.
+    Unwraps the real driver exception through :func:`_driver_exception`
+    (SQLAlchemy 2.0 and 2.1 alike - the product is pinned to the 2.0 line,
+    ``sqlalchemy[asyncio]>=2.0.25,<2.1``, because the OTel SQLAlchemy
+    instrumentor does not declare 2.1 support), not ``exc.orig`` directly:
+    SQLAlchemy's asyncpg dialect wraps the real
+    ``asyncpg.exceptions.UniqueViolationError`` in an adapted exception
+    whose own ``sqlstate`` is present but whose ``constraint_name`` is NOT
+    - that attribute lives only on the nested real driver exception.
+    Measured against a real Postgres PK violation during the AC4 build: the
+    first draft of this function, reading ``exc.orig`` directly, let the
+    violation escape instead of classifying it.
     """
     if not isinstance(exc, IntegrityError):
         return False
-    driver_exc = exc.driver_exception
+    driver_exc = _driver_exception(exc)
     sqlstate = getattr(driver_exc, "sqlstate", None)
     if sqlstate is not None:
         return sqlstate == "23505" and getattr(driver_exc, "constraint_name", None) == (

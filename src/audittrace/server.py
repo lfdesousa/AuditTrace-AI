@@ -402,35 +402,49 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     # that Langfuse just installed as global — not the earlier
     # ProxyTracerProvider. Spans then fan out to both Tempo (via our
     # OTLP processor attached in init_telemetry) and Langfuse.
-    # SQLAlchemy is instrumented per-engine in db/postgres.py so query
-    # spans (SELECT/INSERT) are emitted. Global SQLAlchemyInstrumentor()
-    # was tried here and produced connect-only spans — engine-scoped is
-    # the supported hook for before/after_cursor_execute events.
+    # SQLAlchemy is instrumented per-engine in db/postgres.py (every engine
+    # via the chokepoint registry) so query spans (SELECT/INSERT) are
+    # emitted; a global instrument() here is measured connect-only.
+    # Every attach below goes through telemetry.attach_instrumentor
+    # (SQLALCHEMY-SPANS): a declined instrumentor is an ERROR + metric and,
+    # under instrumentation_strict (default), stops startup - it is no
+    # longer swallowed. ``disabled`` (tracing_enabled false) never raises.
     if settings.tracing_enabled:  # pragma: no cover - smoke-tested live, not in pytest
-        try:
-            from opentelemetry import trace
-            from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-            from opentelemetry.instrumentation.redis import RedisInstrumentor
-            from opentelemetry.instrumentation.urllib3 import URLLib3Instrumentor
+        from opentelemetry import trace
+        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+        from opentelemetry.instrumentation.redis import RedisInstrumentor
+        from opentelemetry.instrumentation.urllib3 import URLLib3Instrumentor
 
-            tp = trace.get_tracer_provider()
-            peer_service_map = _build_httpx_peer_service_map(settings)
-            HTTPXClientInstrumentor().instrument(
-                tracer_provider=tp,
-                request_hook=make_httpx_peer_service_hook(peer_service_map),
-                async_request_hook=make_httpx_async_peer_service_hook(peer_service_map),
-            )
-            URLLib3Instrumentor().instrument(
-                tracer_provider=tp,
-                request_hook=urllib3_set_server_address,
-            )
-            RedisInstrumentor().instrument(tracer_provider=tp)
-            logger.info(
-                "OTel outbound instrumentation: HTTPX (peer.service map=%s) + urllib3 + Redis",
-                peer_service_map,
-            )
-        except Exception as e:
-            logger.warning("Outbound OTel instrumentation failed: %s", e)
+        tp = trace.get_tracer_provider()
+        peer_service_map = _build_httpx_peer_service_map(settings)
+        telemetry.attach_instrumentor(
+            "HTTPXClientInstrumentor",
+            HTTPXClientInstrumentor(),
+            enabled=settings.tracing_enabled,
+            strict=settings.instrumentation_strict,
+            tracer_provider=tp,
+            request_hook=make_httpx_peer_service_hook(peer_service_map),
+            async_request_hook=make_httpx_async_peer_service_hook(peer_service_map),
+        )
+        telemetry.attach_instrumentor(
+            "URLLib3Instrumentor",
+            URLLib3Instrumentor(),
+            enabled=settings.tracing_enabled,
+            strict=settings.instrumentation_strict,
+            tracer_provider=tp,
+            request_hook=urllib3_set_server_address,
+        )
+        telemetry.attach_instrumentor(
+            "RedisInstrumentor",
+            RedisInstrumentor(),
+            enabled=settings.tracing_enabled,
+            strict=settings.instrumentation_strict,
+            tracer_provider=tp,
+        )
+        logger.info(
+            "OTel outbound instrumentation: HTTPX (peer.service map=%s) + urllib3 + Redis",
+            peer_service_map,
+        )
 
     # Register DI container with all services (ADR-020)
     register_default_dependencies(settings)
@@ -954,14 +968,17 @@ def create_app() -> FastAPI:
     # exception propagates and ``create_app()`` fails closed rather than
     # leaving the default propagator adopting caller-chosen parents.
     telemetry.install_trace_context_policy()
-    try:
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
-        FastAPIInstrumentor.instrument_app(
-            app, server_request_hook=telemetry.inbound_trace_context_hook
-        )
-    except Exception as e:  # pragma: no cover
-        logger.warning("FastAPI OTel instrumentation failed: %s", e)
+    # Through the chokepoint (SQLALCHEMY-SPANS C5): the dependency range is
+    # checked, the outcome is logged + counted, and a refusal is fatal under
+    # instrumentation_strict. No swallowing ``try`` any more.
+    telemetry.attach_instrumentor(
+        "FastAPIInstrumentor",
+        FastAPIInstrumentor(),
+        app=app,
+        server_request_hook=telemetry.inbound_trace_context_hook,
+    )
 
     # Custom OpenAPI generator: emit OR-semantics security scopes for
     # routes whose required scope is dynamic (per-layer). FastAPI's

@@ -14,6 +14,7 @@ import tempfile
 from abc import ABC, abstractmethod
 from typing import Any
 
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -23,6 +24,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool, StaticPool
 
 from audittrace.db.models import Base
+from audittrace.instrumentation import attach_instrumentor
 from audittrace.logging_config import log_call
 
 logger = logging.getLogger(__name__)
@@ -72,17 +74,23 @@ class URLPostgresFactory(PostgresFactory):
             else:
                 kwargs["connect_args"] = {"check_same_thread": False}
                 kwargs["poolclass"] = StaticPool
-            self._engine = create_async_engine(self._url, **kwargs)
-            # Statement-level OTel spans. The async engine wraps a sync
-            # Engine at .sync_engine — that's what the instrumentor hooks.
-            try:
-                from opentelemetry.instrumentation.sqlalchemy import (
-                    SQLAlchemyInstrumentor,
-                )
-
-                SQLAlchemyInstrumentor().instrument(engine=self._engine.sync_engine)
-            except Exception as exc:  # pragma: no cover - optional dep
-                logger.warning("SQLAlchemy engine instrumentation failed: %s", exc)
+            engine = create_async_engine(self._url, **kwargs)
+            # Statement-level OTel spans, for EVERY engine in the process
+            # (SQLALCHEMY-SPANS C4). The async engine wraps a sync Engine at
+            # .sync_engine - that is what the instrumentor hooks. The attach
+            # goes through the chokepoint, which registers the engine and
+            # re-instruments the whole registry (the instrumentor is a
+            # singleton that refuses a second plain instrument()), and which
+            # is loud (ERROR + metric, fatal under strict) when it declines.
+            attach_instrumentor(
+                "SQLAlchemyInstrumentor",
+                SQLAlchemyInstrumentor(),
+                engine=engine.sync_engine,
+            )
+            # Assigned only AFTER a successful attach: under strict a raise
+            # must not leave a cached, uninstrumented engine for the next
+            # get_engine() call to hand out silently.
+            self._engine = engine
         return self._engine
 
     @log_call(logger=logger)
