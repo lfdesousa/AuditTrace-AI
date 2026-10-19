@@ -149,7 +149,7 @@ services:
   # to resolve the cluster's front door directly, so the isolation is
   # structural, not just a missing route in librechat.yaml.
   librechat:
-    image: ghcr.io/danny-avila/librechat:v0.7.9@sha256:7d7c54a1daa1feba3185f14a4e16672d3aed11c3b523887c88c10560c0f3a776
+    image: ghcr.io/danny-avila/librechat:v0.8.7@sha256:c5db3331b845e1f289f8d04c0c77936c4bbe372f76730a804abc1c37e44d23a9
     container_name: audittrace-librechat
     profiles: ["console"]
     depends_on:
