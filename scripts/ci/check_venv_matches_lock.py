@@ -16,9 +16,14 @@ Checks, all mandatory, no bypass flag and no environment variable:
 3. the project is the editable install at the ``pyproject.toml`` version;
 4. the VCS package's ``direct_url.json`` ``commit_id`` equals the SHA pinned in
    ``pyproject.toml``;
-5. the interpreter's major.minor equals the lock header's ``--python-version``.
+5. the interpreter's major.minor equals the lock header's ``--python-version``;
+6. no distribution name resolves to MORE THAN ONE location on ``sys.path``
+   (review B2: a stale, gitignored ``src/audittrace_ai.egg-info`` reachable
+   through the editable ``.pth`` shadows the venv's dist-info). The refusal
+   NAMES every extra path and prints the exact ``rm -rf`` command.
 
-Recovery path (also in the error text): ``rm -rf .venv && make venv``.
+Recovery path (also in the error text): ``rm -rf .venv && make venv``
+(``make venv`` also removes ``src/*.egg-info``, scoped to that glob).
 
 Falsifiable by tests/test_check_venv_matches_lock.py: each check has a test
 that goes RED when its branch is removed.
@@ -80,13 +85,35 @@ def marker_applies(marker: str | None) -> bool:
         return True
 
 
+def _dist_path(dist: metadata.Distribution) -> str:
+    """Where this distribution's metadata lives (best effort, for messages)."""
+    path = getattr(dist, "_path", None)
+    return str(path if path is not None else dist.locate_file(""))
+
+
 def installed_distributions() -> dict[str, metadata.Distribution]:
+    """canonical name -> the distribution the RUNTIME resolves.
+
+    ``importlib.metadata.version()`` returns the FIRST match on ``sys.path``,
+    so the first one is kept (it used to keep the last, which let a stale
+    egg-info beyond site-packages impersonate the install — review B2).
+    """
     out: dict[str, metadata.Distribution] = {}
     for dist in metadata.distributions():
         name = dist.metadata["Name"]
         if name:
-            out[canonicalize_name(name)] = dist
+            out.setdefault(canonicalize_name(name), dist)
     return out
+
+
+def duplicate_locations() -> dict[str, list[str]]:
+    """canonical name -> metadata paths, only for names found in 2+ places."""
+    seen: dict[str, list[str]] = {}
+    for dist in metadata.distributions():
+        name = dist.metadata["Name"]
+        if name:
+            seen.setdefault(canonicalize_name(name), []).append(_dist_path(dist))
+    return {n: paths for n, paths in seen.items() if len(set(paths)) > 1}
 
 
 def vcs_commit(dist: metadata.Distribution) -> str | None:
@@ -116,10 +143,19 @@ def check(
     pyproject_text: str,
     installed: Mapping[str, metadata.Distribution],
     python_version: tuple[int, int],
+    duplicates: Mapping[str, list[str]] | None = None,
 ) -> list[str]:
     """Return the list of violations (empty == the environment is the lock)."""
     pins, header_pyver = parse_lock(lock_text)
     problems: list[str] = []
+
+    for name, paths in sorted((duplicates or {}).items()):
+        used, shadows = paths[0], sorted(set(paths[1:]) - {paths[0]})
+        problems.append(
+            f"{name} resolves to {len(set(paths))} locations: {used} (used by the "
+            f"runtime) and the shadowing/stale {', '.join(shadows)} — remove it: "
+            f"rm -rf {' '.join(shadows)}"
+        )
 
     if header_pyver is None:
         problems.append("lock header has no --python-version (not a uv-compiled lock?)")
@@ -189,6 +225,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         pyproject_text,
         installed_distributions(),
         (sys.version_info.major, sys.version_info.minor),
+        duplicate_locations(),
     )
     if problems:
         print(

@@ -13,7 +13,8 @@
 # Steps, in this order, each with NO fallback (spec C1):
 #   1. pip itself from its HASHED line in the lock — never `--upgrade pip`.
 #   2. `--require-hashes --only-binary=:all: -r <lock>`.
-#   3. `--no-deps --no-build-isolation -e .`            (dev only)
+#   3. `--no-deps --no-build-isolation -e .`            (dev only; first removes
+#      stale src/*.egg-info, which would shadow the venv's dist-info — B2)
 #   4. the VCS package at the commit SHA read from pyproject.toml
 #      (`--no-deps --no-build-isolation`; git has no hashes — a commit SHA is
 #      content-addressed, spec §4.4)                      (dev only)
@@ -69,6 +70,11 @@ fi
 $PIP install --require-hashes --only-binary=:all: -r "$LOCK"
 
 if [ "$MODE" = "dev" ]; then
+  # Review B2: a stale, gitignored src/<pkg>.egg-info (left by an older
+  # non-PEP-660 `pip install -e`) is reachable through the editable .pth and
+  # shadows the venv's dist-info, so G5 would refuse the fresh venv. Remove
+  # ONLY src/*.egg-info (maxdepth 1, name-matched) before the editable install.
+  find src -maxdepth 1 -name '*.egg-info' -prune -exec rm -rf {} + 2>/dev/null || true
   # shellcheck disable=SC2086
   $PIP install --no-deps --no-build-isolation -e .
   SHA="$(sed -n 's#.*audittrace-object-storage\.git@\([0-9a-f]\{40\}\)".*#\1#p' pyproject.toml)"

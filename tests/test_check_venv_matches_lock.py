@@ -73,6 +73,7 @@ def run(
     lock: str = LOCK,
     pyproject_text: str = PYPROJECT_TEXT,
     py: tuple[int, int] = (3, 12),
+    duplicates: dict[str, list[str]] | None = None,
 ) -> list[str]:
     import tomllib
 
@@ -82,6 +83,7 @@ def run(
         pyproject_text,
         good_env() if env is None else env,
         py,
+        duplicates,
     )
 
 
@@ -268,3 +270,118 @@ def test_there_is_no_flag_or_env_bypass(
     assert {"lock", "--pyproject"} <= set(seen) <= {"lock", "--pyproject", "-h"}
     source = (ROOT / "scripts/ci/check_venv_matches_lock.py").read_text()
     assert "os.environ" not in source and "getenv" not in source
+
+
+# ───────────── B2: a stale egg-info shadowing the venv dist-info ─────────────
+
+PROBE = (
+    "import json, sys; sys.path.insert(0, %r);"
+    "from scripts.ci import check_venv_matches_lock as c;"
+    "print(json.dumps({'dups': c.duplicate_locations(),"
+    "'ver': c.installed_distributions()['stalepkg'].version}))"
+)
+
+
+def _plant(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """site/ holds the 'venv' dist-info (1.0); src/ holds a stale egg-info
+    (0.9), reachable through a PYTHONPATH entry exactly like the editable .pth."""
+    site, src = tmp_path / "site", tmp_path / "src"
+    (site / "stalepkg-1.0.dist-info").mkdir(parents=True)
+    (site / "stalepkg-1.0.dist-info" / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: stalepkg\nVersion: 1.0\n"
+    )
+    (src / "stalepkg.egg-info").mkdir(parents=True)
+    (src / "stalepkg.egg-info" / "PKG-INFO").write_text(
+        "Metadata-Version: 2.1\nName: stalepkg\nVersion: 0.9\n"
+    )
+    return site, src, src / "stalepkg.egg-info"
+
+
+def _probe(tmp_path: Path, *paths: Path) -> dict[str, Any]:
+    import subprocess
+    import sys
+
+    from tests._hermetic_env import hermetic_env
+
+    env = hermetic_env(
+        {
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": ":".join(str(p) for p in paths),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", PROBE % str(ROOT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return json.loads(out)  # type: ignore[no-any-return]
+
+
+def test_a_stale_egg_info_is_detected_named_and_the_runtime_dist_wins(
+    tmp_path: Path,
+) -> None:
+    """(a) the refusal NAMES the shadowing path and the exact rm -rf command;
+    the dist kept is the FIRST on sys.path (what importlib.metadata.version
+    resolves), not the last (the old behaviour let 0.9 impersonate 1.0)."""
+    site, src, egg = _plant(tmp_path)
+    seen = _probe(tmp_path, site, src)
+    assert seen["ver"] == "1.0"
+    assert list(seen["dups"]) == ["stalepkg"]
+    problems = run(
+        env=good_env(),
+        duplicates=seen["dups"],
+    )
+    named = [p for p in problems if "stalepkg resolves to 2 locations" in p]
+    assert len(named) == 1
+    assert str(egg) in named[0] and f"rm -rf {egg}" in named[0]
+
+
+def test_no_duplicate_means_no_duplicate_problem(tmp_path: Path) -> None:
+    site, _, _ = _plant(tmp_path)
+    seen = _probe(tmp_path, site)
+    assert seen["dups"] == {} and seen["ver"] == "1.0"
+    assert not any("resolves to" in p for p in run(duplicates=seen["dups"]))
+
+
+def test_install_locked_clears_only_the_stale_egg_info_and_the_recovery_passes(
+    tmp_path: Path,
+) -> None:
+    """(b) `make venv` -> install-locked.sh (dev) removes src/*.egg-info and
+    NOTHING else; (c) the same probe, re-run after, finds no duplicate."""
+    import shutil
+    import stat
+    import subprocess
+
+    from tests._hermetic_env import hermetic_env
+
+    site, src, egg = _plant(tmp_path)
+    (src / "keep_me").mkdir()
+    (src / "keep_me" / "x.py").write_text("")
+    (src / "pkg.egg-info-not").write_text("")  # name must END in .egg-info
+    assert len(_probe(tmp_path, site, src)["dups"]) == 1
+
+    root = tmp_path / "repo"
+    (root / "scripts").mkdir(parents=True)
+    shutil.copy(
+        ROOT / "scripts" / "install-locked.sh", root / "scripts" / "install-locked.sh"
+    )
+    shutil.copy(ROOT / "requirements-dev.txt", root / "requirements-dev.txt")
+    shutil.copy(ROOT / "pyproject.toml", root / "pyproject.toml")
+    shutil.copytree(src, root / "src")
+    fakepip = tmp_path / "fakepip"
+    fakepip.write_text("#!/bin/sh\nexit 0\n")
+    fakepip.chmod(fakepip.stat().st_mode | stat.S_IXUSR)
+    subprocess.run(
+        ["bash", str(root / "scripts" / "install-locked.sh"), str(fakepip)],
+        cwd=root,
+        env=hermetic_env({"PATH": "/usr/bin:/bin"}),
+        check=True,
+        capture_output=True,
+    )
+    assert not (root / "src" / "stalepkg.egg-info").exists()
+    assert (root / "src" / "keep_me" / "x.py").exists()
+    assert (root / "src" / "pkg.egg-info-not").exists()
+    assert _probe(tmp_path, site, root / "src")["dups"] == {}

@@ -54,13 +54,19 @@ LOCK_FILES = {
 }
 
 PIP_VERB = re.compile(
-    r"""(?:^|[\s"'(@])
-        (?:pip3?|python3?(?:\.\d+)?\s+-m\s+pip|[\w./-]*/pip3?|\$\{?PIP\}?|"\$\{?PIP\}?")
+    r"""(?:^|[\s"'(@=])
+        (?:pip3?
+          |-m\s+pip3?                  # python -m pip / python3.12 -m pip / ${PY} -m pip
+          |[\w./-]*/pip3?              # .venv/bin/pip, /usr/bin/pip3
+          |"?\$\{?\w*PIP\w*\}?"?      # $PIP, "${PIP_BIN}", $UV_PIP ...
+          |"?\$\(\w+\)"?/bin/pip3?   # $(GATE_VENV)/bin/pip (make)
+        )
         \s+install\b""",
     re.X,
 )
 FORBIDDEN_VERB = re.compile(
-    r"(?:^|[\s\"'(@])(?:uvx|pipx|uv\s+pip\s+(?:install|sync)|uv\s+sync|uv\s+tool\s+install)\b"
+    r"(?:^|[\s\"'(@])(?:uvx|pipx|uv\s+pip\s+(?:install|sync)|uv\s+sync"
+    r"|uv\s+tool\s+(?:install|run)|uv\s+add|uv\s+run\b[^\n]*--with)\b"
 )
 VCS_OCCURRENCE = re.compile(r"audittrace-object-storage\.git@([^\s\"')]+)")
 VCS_SPEC_PREFIX = "audittrace-object-storage @ git+https://github.com/lfdesousa/audittrace-object-storage.git@"
@@ -107,50 +113,73 @@ def statements(text: str) -> list[str]:
     return out
 
 
+_REQ_OPTS = ("-r", "--requirement", "-c", "--constraint")
+_EDIT_OPTS = ("-e", "--editable")
+
+
+def normalise_tokens(tokens: list[str]) -> list[str]:
+    """Split ``--opt=value`` and attached short forms (``-rFILE``, ``-cFILE``,
+    ``-eURL``) into separate tokens BEFORE classifying, so no spelling hides
+    an option from the allowlist (review B1: ``--requirement=FILE`` and
+    ``-rFILE`` next to ``.`` used to pass)."""
+    out: list[str] = []
+    for tok in tokens:
+        if tok.startswith("--") and "=" in tok:
+            opt, _, value = tok.partition("=")
+            out += [opt, value]
+        elif re.fullmatch(r"-[rce].+", tok):
+            out += [tok[:2], tok[2:]]
+        else:
+            out.append(tok)
+    return out
+
+
 def classify(statement: str) -> str | None:
     """None if allowed (or not a pip statement); else the reason it is not."""
     if FORBIDDEN_VERB.search(statement):
         return (
-            "forbidden installer (uvx / pipx / uv pip install|sync / uv tool install)"
+            "forbidden installer (uvx / pipx / uv pip install|sync / "
+            "uv tool install|run / uv add / uv run --with)"
         )
     m = PIP_VERB.search(statement)
     if not m:
         return None
     args = statement[m.end() :]
     try:
-        tokens = shlex.split(args, comments=False, posix=True)
+        tokens = normalise_tokens(shlex.split(args, comments=False, posix=True))
     except ValueError:
         return "unparseable pip install statement (fail closed)"
     if "--upgrade" in tokens or "-U" in tokens:
         return "pip install --upgrade (unpinned)"
     if "--require-hashes" in tokens:
-        if "--only-binary=:all:" not in tokens:
+        only_binary = any(
+            a == "--only-binary" and b == ":all:" for a, b in zip(tokens, tokens[1:])
+        )
+        if not only_binary:
             return "hashed install without --only-binary=:all: (C1)"
-        if "-r" not in tokens or "-e" in tokens:
+        if not any(t in ("-r", "--requirement") for t in tokens) or any(
+            t in _EDIT_OPTS for t in tokens
+        ):
             return "hashed install must be `-r <lock>` and nothing editable"
         return None
     if "--no-deps" in tokens:
         if "--no-build-isolation" not in tokens:
             return "--no-deps source build without --no-build-isolation (C1)"
+        if any(t in _REQ_OPTS for t in tokens):
+            return "--no-deps source build must not take -r/-c requirement files (C4)"
         positional: list[str] = []
-        skip_next = False
         for tok in tokens:
-            if skip_next:
-                skip_next = False
-                continue
-            if tok in ("-e", "-r", "-c"):
-                if tok == "-e":
-                    continue  # the editable target is the next positional; keep it
-                skip_next = True
-                continue
-            if tok.startswith("-"):
-                continue
+            if tok in _EDIT_OPTS or tok.startswith("-"):
+                continue  # an editable target is the next token: kept as positional
             positional.append(tok)
         if positional and all(
             p == "." or p.startswith(VCS_SPEC_PREFIX) for p in positional
         ):
             return None
-        return f"--no-deps is only allowed for `.` / `-e .` / the VCS requirement, got {positional}"
+        return (
+            "--no-deps is only allowed for `.` / `-e .` / the VCS requirement, "
+            f"got {positional}"
+        )
     return "unhashed pip install (needs --require-hashes ... -r <lock>, or an exempt --no-deps source build)"
 
 
@@ -313,6 +342,8 @@ def test_the_classifier_rejects_each_escape_hatch(stmt: str, why: str) -> None:
         "pip install --require-hashes --only-binary=:all: -r requirements.txt",
         'pip install --user --no-cache-dir --require-hashes --only-binary=:all: -r "$block"',
         "pip install --no-deps --no-build-isolation -e .",
+        "pip install --no-deps --no-build-isolation --editable=.",
+        "pip install --require-hashes --only-binary=:all: --requirement=requirements.txt",
         "pip install --user --no-deps --no-build-isolation .",
         f'$PIP install --no-deps --no-build-isolation "{VCS_SPEC_PREFIX}${{SHA}}"',
     ],

@@ -74,7 +74,8 @@ def _semgrep_bin() -> str | None:
     gate venv built from the hashed ``requirements-gate.txt`` (``make
     gate-venv``; ``$GATE_VENV``, default ``.gate-venv``). Prefer exactly that
     one so this test runs the SAME locked semgrep; then the interpreter's own
-    venv, then PATH (CI puts the gate venv on PATH).
+    venv, then PATH. The gate venv is deliberately NOT on PATH in CI (GITHUB_PATH
+    prepends, which would shadow the runner python G5 checks).
     """
     gate = REPO_ROOT / os.environ.get("GATE_VENV", ".gate-venv") / "bin" / "semgrep"
     if gate.exists():

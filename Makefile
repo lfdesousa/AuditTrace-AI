@@ -97,7 +97,7 @@ typecheck: ## Run type checking (resolves mypy as .venv/bin/mypy, else mypy on P
 	@MYPY="$$( [ -x .venv/bin/mypy ] && echo .venv/bin/mypy || command -v mypy || true )"; \
 	if [ -z "$$MYPY" ]; then \
 	  echo "❌ mypy not found (looked for .venv/bin/mypy and mypy on PATH)."; \
-	  echo "   Install the dev deps: pip install -e '.[dev]'"; \
+	  echo "   Install the dev deps from the hashed lock: make venv"; \
 	  exit 1; \
 	fi; \
 	echo "🔎 Running type checker via $$MYPY ..."; \
