@@ -49,6 +49,7 @@ from opentelemetry.trace import SpanContext
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 from audittrace.instrumentation import attach_instrumentor as attach_instrumentor
+from audittrace.instrumentation import flush_pending_outcomes
 
 if TYPE_CHECKING:
     from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
@@ -741,6 +742,9 @@ def init_telemetry(
                 logger.warning("Failed to configure OTLP metric exporter: %s", e)
         meter_provider = MeterProvider(resource=resource, metric_readers=readers)
         metrics.set_meter_provider(meter_provider)
+        # F1: attach outcomes recorded at import (create_app) predate this
+        # provider; replay them now so every family reaches the product meter.
+        flush_pending_outcomes()
         meter = metrics.get_meter(service_name)
         _duration_histogram = meter.create_histogram(
             name="sovereign.operation.duration",

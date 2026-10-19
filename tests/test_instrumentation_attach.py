@@ -93,6 +93,7 @@ def metric_reader(monkeypatch: pytest.MonkeyPatch) -> InMemoryMetricReader:
         "audittrace.instrumentation.attached_total"
     )
     monkeypatch.setattr(instrumentation, "_attach_total", counter)
+    monkeypatch.setitem(instrumentation._state, "meter_ready", True)
     return reader
 
 
@@ -389,3 +390,28 @@ def test_scanner_flags_a_bypass(tmp_path: pathlib.Path) -> None:
         "def boot():\n    SQLAlchemyInstrumentor().instrument(engine=e)\n"
     )
     assert attach_call_sites(tmp_path) == [("bypass.py", "boot", 2)]
+
+
+# ------------------------------------------- F1: outcomes before a provider ---
+def test_outcomes_before_the_meter_provider_are_held_then_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The log line is immediate; the metric waits for the provider (F1)."""
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    counter = provider.get_meter("test").create_counter("c")
+    monkeypatch.setattr(instrumentation, "_attach_total", counter)
+    monkeypatch.setitem(instrumentation._state, "meter_ready", False)
+    attach_instrumentor("Early", _fake_instrumentor(), strict=True, enabled=True)
+    attach_instrumentor("EarlyOff", _fake_instrumentor(), strict=True, enabled=False)
+    assert _points(reader) == {}
+    instrumentation.flush_pending_outcomes()
+    assert _points(reader) == {("Early", "attached"): 1, ("EarlyOff", "disabled"): 1}
+    attach_instrumentor("Late", _fake_instrumentor(), strict=True, enabled=True)
+    assert _points(reader)[("Late", "attached")] == 1
+    instrumentation.flush_pending_outcomes()  # idempotent: nothing replays twice
+    assert _points(reader) == {
+        ("Early", "attached"): 1,
+        ("EarlyOff", "disabled"): 1,
+        ("Late", "attached"): 1,
+    }

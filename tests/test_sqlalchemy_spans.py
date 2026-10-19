@@ -124,6 +124,9 @@ def _assert_postgres_statement_span(
         f"no postgresql statement span for {statement!r}; got "
         f"{[dict(s.attributes or {}) for s in spans]}"
     )
+    # A1: exactly ONE span per statement per engine (a duplicate-listener
+    # regression would double-count every query).
+    assert len(hits) == 1, f"{len(hits)} spans for {statement!r}, expected exactly 1"
     attrs = dict(hits[0].attributes or {})
     assert REQUIRED_KEYS <= set(attrs), sorted(REQUIRED_KEYS - set(attrs))
     assert attrs["db.system"] == "postgresql"
@@ -203,7 +206,7 @@ async def test_sqlite_engine_is_instrumented_too(
         for s in _statement_spans(exporter, "sqlite")
         if "sqlite_probe" in str(s.attributes["db.statement"])
     ]
-    assert hits and hits[0].attributes["db.system"] == "sqlite"
+    assert len(hits) == 1 and hits[0].attributes["db.system"] == "sqlite"
     await _dispose(factory.get_engine())
 
 

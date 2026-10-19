@@ -39,6 +39,7 @@ import enum
 import logging
 import threading
 import weakref
+from collections import deque
 from typing import Any
 
 from opentelemetry import metrics
@@ -59,6 +60,17 @@ _attach_total = metrics.get_meter("audittrace.instrumentation").create_counter(
         "disabled). No PII."
     ),
 )
+
+
+# F1 (review 2026-10-19): ``create_app()`` runs at import time, BEFORE
+# ``init_telemetry`` installs the real MeterProvider, and an OTel API proxy
+# instrument drops every measurement taken before a provider is set. Outcomes
+# recorded in that window are therefore held here and replayed by
+# :func:`flush_pending_outcomes`, which ``init_telemetry`` calls right after
+# ``set_meter_provider``. The LOG line stays immediate. Bounded, so a process
+# that never installs a provider (metrics disabled) cannot grow it.
+_PENDING: deque[tuple[str, str]] = deque(maxlen=256)
+_state = {"meter_ready": False}
 
 
 class AttachResult(enum.StrEnum):
@@ -107,7 +119,28 @@ def _report(name: str, result: AttachResult, conflict: str | None) -> None:
         detail,
         extra={"instrumentor": name, "result": result.value, "conflict": detail},
     )
-    _attach_total.add(1, {"instrumentor": name, "result": result.value})
+    _count(name, result.value)
+
+
+def _count(name: str, result: str) -> None:
+    with _LOCK:
+        if _state["meter_ready"]:
+            _attach_total.add(1, {"instrumentor": name, "result": result})
+        else:
+            _PENDING.append((name, result))
+
+
+def flush_pending_outcomes() -> None:
+    """Replay outcomes recorded before the MeterProvider existed.
+
+    Called by ``init_telemetry`` immediately after ``set_meter_provider``;
+    from then on outcomes are counted directly.
+    """
+    with _LOCK:
+        _state["meter_ready"] = True
+        while _PENDING:
+            name, result = _PENDING.popleft()
+            _attach_total.add(1, {"instrumentor": name, "result": result})
 
 
 def _policy(strict: bool | None, enabled: bool | None) -> tuple[bool, bool]:
@@ -193,3 +226,4 @@ def _reset_for_tests() -> None:
     with _LOCK:
         _OWNED.clear()
         _SA_ENGINES.clear()
+        _PENDING.clear()
