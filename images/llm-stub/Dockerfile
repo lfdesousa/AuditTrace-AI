@@ -5,8 +5,12 @@
 # starts in <2 s instead of paying a ~10 s pip-install every restart.
 FROM python:3.12-slim
 
-# Versions pinned to match the retired kind fixture for parity.
-RUN pip install --no-cache-dir 'fastapi==0.115.0' 'uvicorn[standard]==0.32.0'
+# Versions pinned to match the retired kind fixture for parity (see
+# requirements.in). DEP-LOCK-AT (ADR-065): installed from the HASHED lock beside
+# this Dockerfile — transitives included, wheels only. The build context is
+# images/llm-stub/ (server.py is COPYed from it), so requirements.txt is too.
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r /app/requirements.txt
 
 WORKDIR /app
 COPY server.py /app/server.py

@@ -60,3 +60,6 @@ secrets/*
 *.bak
 *.tmp
 node_modules/
+
+# DEP-LOCK-AT: isolated gate venv (semgrep) is build-context noise
+.gate-venv/

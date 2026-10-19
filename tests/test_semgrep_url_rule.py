@@ -17,6 +17,7 @@ so the test needs no network and returns the same result every run.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -69,10 +70,15 @@ def driver_check(url):
 def _semgrep_bin() -> str | None:
     """Locate the semgrep binary.
 
-    Prefer the interpreter's own venv (``sys.executable``'s directory) so the
-    test uses the SAME pinned semgrep that ``make security-lint`` uses, then
-    fall back to PATH.
+    DEP-LOCK-AT C7: ``make security-lint`` uses the semgrep in the ISOLATED
+    gate venv built from the hashed ``requirements-gate.txt`` (``make
+    gate-venv``; ``$GATE_VENV``, default ``.gate-venv``). Prefer exactly that
+    one so this test runs the SAME locked semgrep; then the interpreter's own
+    venv, then PATH (CI puts the gate venv on PATH).
     """
+    gate = REPO_ROOT / os.environ.get("GATE_VENV", ".gate-venv") / "bin" / "semgrep"
+    if gate.exists():
+        return str(gate)
     candidate = Path(sys.executable).parent / "semgrep"
     if candidate.exists():
         return str(candidate)

@@ -1,0 +1,6 @@
+# DEP-LOCK-AT C7 — the CI-Agent gate tooling (semgrep). Its own hashed lock,
+# installed into an ISOLATED venv (`make gate-venv`), never into the app/test
+# venv (semgrep pins opentelemetry-instrumentation-requests~=0.58b0 and would
+# downgrade the app's otel line). Must equal pyproject [gate] (G3 asserts it).
+semgrep==1.171.0
+pip==26.2.1
