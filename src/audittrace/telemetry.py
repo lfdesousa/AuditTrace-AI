@@ -48,6 +48,9 @@ from opentelemetry.propagators.textmap import (
 from opentelemetry.trace import SpanContext
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
+from audittrace.instrumentation import attach_instrumentor as attach_instrumentor
+from audittrace.instrumentation import flush_pending_outcomes
+
 if TYPE_CHECKING:
     from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
     from opentelemetry.sdk.trace.export import SpanExportResult
@@ -647,18 +650,23 @@ def _init_langfuse_client(tracer_provider: TracerProvider | None = None) -> None
         logger.warning("Langfuse SDK init failed: %s", exc)
 
 
-def instrument_log_correlation() -> None:
+def instrument_log_correlation(enabled: bool | None = None) -> None:
     """Correlate log records with active spans (called by ``init_telemetry``).
 
     Its own function so tests drive exactly the product's call (TRACEPARENT-
     TRUST AC7a) instead of a test-local ``LoggingInstrumentor`` invocation.
+    The attach goes through the SQLALCHEMY-SPANS chokepoint, so a declined
+    instrumentor is an ERROR + metric (and fatal under strict), not a
+    swallowed debug line.
     """
-    try:
-        from opentelemetry.instrumentation.logging import LoggingInstrumentor
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
 
-        LoggingInstrumentor().instrument(set_logging_format=False)
-    except Exception as e:  # pragma: no cover
-        logger.debug("LoggingInstrumentor not enabled: %s", e)
+    attach_instrumentor(
+        "LoggingInstrumentor",
+        LoggingInstrumentor(),
+        enabled=enabled,
+        set_logging_format=False,
+    )
 
 
 def init_telemetry(
@@ -734,6 +742,9 @@ def init_telemetry(
                 logger.warning("Failed to configure OTLP metric exporter: %s", e)
         meter_provider = MeterProvider(resource=resource, metric_readers=readers)
         metrics.set_meter_provider(meter_provider)
+        # F1: attach outcomes recorded at import (create_app) predate this
+        # provider; replay them now so every family reaches the product meter.
+        flush_pending_outcomes()
         meter = metrics.get_meter(service_name)
         _duration_histogram = meter.create_histogram(
             name="sovereign.operation.duration",
@@ -745,7 +756,7 @@ def init_telemetry(
             description="Count of errors raised by @log_call-decorated operations",
         )
 
-    instrument_log_correlation()
+    instrument_log_correlation(enabled=tracing_enabled)
 
     if tracing_enabled and tracer_provider is not None:
         # Langfuse SECOND — our scrubber is already index 0 (S-C2).

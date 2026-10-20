@@ -576,6 +576,10 @@ class Settings(BaseSettings):
     otel_service_name: str = "audittrace-server"
     metrics_enabled: bool = True
     tracing_enabled: bool = True
+    # SQLALCHEMY-SPANS (Q2, default true): a declined / errored / refused OTel
+    # instrumentor aborts startup instead of silently leaving a dead witness.
+    # Never fires when ``tracing_enabled`` is false (result ``disabled``).
+    instrumentation_strict: bool = True
 
     # #459 WU-459-1: decision-model client (llama.cpp ``/completion``).
     # Everything is default-off: ``decision_url == ""`` means no network call
