@@ -22,7 +22,8 @@ venv: ## Create the virtual environment and install EXACTLY the hashed dev lock 
 	@python3 -m venv .venv
 	@echo "🔒 Installing the hashed lock (scripts/install-locked.sh)..."
 	@bash scripts/install-locked.sh .venv/bin/pip
-	@echo "✅ Virtual environment created from requirements-dev.txt"
+	@$(MAKE) gate-venv
+	@echo "✅ Virtual environment created from requirements-dev.txt (+ the isolated gate venv, S5)"
 	@echo ""
 	@echo "Activate with: source .venv/bin/activate"
 

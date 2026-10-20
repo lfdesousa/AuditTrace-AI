@@ -18,9 +18,7 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -67,30 +65,27 @@ def driver_check(url):
 """
 
 
-def _semgrep_bin() -> str | None:
-    """Locate the semgrep binary.
+def _semgrep_bin() -> str:
+    """The semgrep binary of the ISOLATED gate venv, or FAIL (review r2 S5).
 
-    DEP-LOCK-AT C7: ``make security-lint`` uses the semgrep in the ISOLATED
-    gate venv built from the hashed ``requirements-gate.txt`` (``make
-    gate-venv``; ``$GATE_VENV``, default ``.gate-venv``). Prefer exactly that
-    one so this test runs the SAME locked semgrep; then the interpreter's own
-    venv, then PATH. The gate venv is deliberately NOT on PATH in CI (GITHUB_PATH
-    prepends, which would shadow the runner python G5 checks).
+    DEP-LOCK-AT C7: ``make security-lint`` uses the semgrep built from the hashed
+    ``requirements-gate.txt`` (``make gate-venv``; ``$GATE_VENV``, default
+    ``.gate-venv``); ``make venv`` builds it, so the documented recovery
+    ``rm -rf .venv && make venv && make test`` is complete. There is NO PATH or
+    interpreter-venv fallback (an unhashed pipx semgrep would run against the spirit
+    of C7) and NO skip (zero-skip policy): a missing gate venv is a failure that
+    names the one command that fixes it. The gate venv is deliberately NOT on PATH
+    in CI (GITHUB_PATH prepends, which would shadow the runner python G5 checks).
     """
     gate = REPO_ROOT / os.environ.get("GATE_VENV", ".gate-venv") / "bin" / "semgrep"
-    if gate.exists():
-        return str(gate)
-    candidate = Path(sys.executable).parent / "semgrep"
-    if candidate.exists():
-        return str(candidate)
-    return shutil.which("semgrep")
+    if not gate.exists():
+        pytest.fail(f"{gate} is missing: run `make gate-venv` (DEP-LOCK-AT C7, S5)")
+    return str(gate)
 
 
 def _run_semgrep(target: Path) -> list[str]:
     """Run the vendored rule offline against ``target``; return fired rule ids."""
     semgrep = _semgrep_bin()
-    if semgrep is None:  # pragma: no cover - environment guard
-        pytest.skip("semgrep binary not installed (expected in the dev venv)")
 
     proc = subprocess.run(
         [
@@ -165,8 +160,6 @@ def test_clean_tree_has_no_findings() -> None:
     block the tree it lands on.
     """
     semgrep = _semgrep_bin()
-    if semgrep is None:  # pragma: no cover - environment guard
-        pytest.skip("semgrep binary not installed (expected in the dev venv)")
 
     proc = subprocess.run(
         [
@@ -190,3 +183,26 @@ def test_clean_tree_has_no_findings() -> None:
         "security-lint gate is not clean on the current tree:\n"
         f"{proc.stdout}\n{proc.stderr}"
     )
+
+
+def test_s5_a_missing_gate_venv_is_a_failure_not_a_skip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review r2 S5: the semgrep tests used to SKIP when no semgrep was found,
+    so `rm -rf .venv && make venv && make test` hit the zero-skip gate. They now
+    FAIL, naming the fix, and never fall back to a PATH semgrep."""
+    monkeypatch.setenv("GATE_VENV", str(tmp_path / "no-such-gate-venv"))
+    # BaseException: a pytest.skip() outcome is not an Exception, so a skip is caught.
+    with pytest.raises(BaseException) as excinfo:
+        _semgrep_bin()
+    assert excinfo.type is pytest.fail.Exception
+    assert "make gate-venv" in str(excinfo.value)
+
+
+def test_s5_make_venv_builds_the_gate_venv() -> None:
+    """The documented recovery (`make venv`, which `make install` runs) must
+    leave a machine on which `make test` passes: it builds `.gate-venv` too."""
+    from tests.test_ci_make_targets_resolve_tools import parse_makefile
+
+    deps, recipe = parse_makefile((REPO_ROOT / "Makefile").read_text())["venv"]
+    assert "gate-venv" in " ".join(deps) + str(recipe)

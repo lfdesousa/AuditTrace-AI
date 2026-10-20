@@ -31,14 +31,21 @@ pyproject.
 
 from __future__ import annotations
 
+import functools
 import re
-import shlex
 import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
+from tests._g4_install_scan import (
+    VCS_SPEC_PREFIX,
+    classify,
+    install_violations,
+    is_pip_install,
+    statements,
+)
 from tests._hermetic_env import hermetic_env
 from tests.test_ci_make_targets_resolve_tools import parse_makefile
 
@@ -53,25 +60,10 @@ LOCK_FILES = {
     "images/llm-stub/requirements.txt",
 }
 
-PIP_VERB = re.compile(
-    r"""(?:^|[\s"'(@=])
-        (?:pip3?
-          |-m\s+pip3?                  # python -m pip / python3.12 -m pip / ${PY} -m pip
-          |[\w./-]*/pip3?              # .venv/bin/pip, /usr/bin/pip3
-          |"?\$\{?\w*PIP\w*\}?"?      # $PIP, "${PIP_BIN}", $UV_PIP ...
-          |"?\$\(\w+\)"?/bin/pip3?   # $(GATE_VENV)/bin/pip (make)
-        )
-        \s+install\b""",
-    re.X,
-)
-FORBIDDEN_VERB = re.compile(
-    r"(?:^|[\s\"'(@])(?:uvx|pipx|uv\s+pip\s+(?:install|sync)|uv\s+sync"
-    r"|uv\s+tool\s+(?:install|run)|uv\s+add|uv\s+run\b[^\n]*--with)\b"
-)
 VCS_OCCURRENCE = re.compile(r"audittrace-object-storage\.git@([^\s\"')]+)")
-VCS_SPEC_PREFIX = "audittrace-object-storage @ git+https://github.com/lfdesousa/audittrace-object-storage.git@"
 
 
+@functools.cache
 def tracked_text_files(root: Path = ROOT) -> dict[str, str]:
     proc = subprocess.run(
         ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
@@ -94,103 +86,6 @@ def tracked_text_files(root: Path = ROOT) -> dict[str, str]:
         except UnicodeDecodeError:
             continue  # binary
     return out
-
-
-def statements(text: str) -> list[str]:
-    """Logical segments: continuations joined, comments/echo dropped, split on && || ; |."""
-    joined = re.sub(r"\\\s*\n\s*", " ", text)
-    out: list[str] = []
-    for line in joined.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        # `RUN`, make `@`, yaml `run:`/`- ` prefixes are noise for verb matching
-        for seg in re.split(r"&&|\|\||;|\|", line):
-            body = seg.strip().lstrip("@-").strip()
-            if body.startswith(("echo ", "printf ", "#")):
-                continue
-            out.append(body)
-    return out
-
-
-_REQ_OPTS = ("-r", "--requirement", "-c", "--constraint")
-_EDIT_OPTS = ("-e", "--editable")
-
-
-def normalise_tokens(tokens: list[str]) -> list[str]:
-    """Split ``--opt=value`` and attached short forms (``-rFILE``, ``-cFILE``,
-    ``-eURL``) into separate tokens BEFORE classifying, so no spelling hides
-    an option from the allowlist (review B1: ``--requirement=FILE`` and
-    ``-rFILE`` next to ``.`` used to pass)."""
-    out: list[str] = []
-    for tok in tokens:
-        if tok.startswith("--") and "=" in tok:
-            opt, _, value = tok.partition("=")
-            out += [opt, value]
-        elif re.fullmatch(r"-[rce].+", tok):
-            out += [tok[:2], tok[2:]]
-        else:
-            out.append(tok)
-    return out
-
-
-def classify(statement: str) -> str | None:
-    """None if allowed (or not a pip statement); else the reason it is not."""
-    if FORBIDDEN_VERB.search(statement):
-        return (
-            "forbidden installer (uvx / pipx / uv pip install|sync / "
-            "uv tool install|run / uv add / uv run --with)"
-        )
-    m = PIP_VERB.search(statement)
-    if not m:
-        return None
-    args = statement[m.end() :]
-    try:
-        tokens = normalise_tokens(shlex.split(args, comments=False, posix=True))
-    except ValueError:
-        return "unparseable pip install statement (fail closed)"
-    if "--upgrade" in tokens or "-U" in tokens:
-        return "pip install --upgrade (unpinned)"
-    if "--require-hashes" in tokens:
-        only_binary = any(
-            a == "--only-binary" and b == ":all:" for a, b in zip(tokens, tokens[1:])
-        )
-        if not only_binary:
-            return "hashed install without --only-binary=:all: (C1)"
-        if not any(t in ("-r", "--requirement") for t in tokens) or any(
-            t in _EDIT_OPTS for t in tokens
-        ):
-            return "hashed install must be `-r <lock>` and nothing editable"
-        return None
-    if "--no-deps" in tokens:
-        if "--no-build-isolation" not in tokens:
-            return "--no-deps source build without --no-build-isolation (C1)"
-        if any(t in _REQ_OPTS for t in tokens):
-            return "--no-deps source build must not take -r/-c requirement files (C4)"
-        positional: list[str] = []
-        for tok in tokens:
-            if tok in _EDIT_OPTS or tok.startswith("-"):
-                continue  # an editable target is the next token: kept as positional
-            positional.append(tok)
-        if positional and all(
-            p == "." or p.startswith(VCS_SPEC_PREFIX) for p in positional
-        ):
-            return None
-        return (
-            "--no-deps is only allowed for `.` / `-e .` / the VCS requirement, "
-            f"got {positional}"
-        )
-    return "unhashed pip install (needs --require-hashes ... -r <lock>, or an exempt --no-deps source build)"
-
-
-def install_violations(files: dict[str, str]) -> list[str]:
-    bad: list[str] = []
-    for rel, text in sorted(files.items()):
-        for stmt in statements(text):
-            reason = classify(stmt)
-            if reason:
-                bad.append(f"{rel}: {reason}: {stmt[:140]}")
-    return bad
 
 
 def vcs_violations(files: dict[str, str], pyproject_text: str) -> list[str]:
@@ -265,7 +160,7 @@ def test_the_scan_actually_sees_the_install_paths() -> None:
         "images/llm-stub/Dockerfile": "-r /app/requirements.txt",
     }
     for rel, needle in must.items():
-        stmts = [s for s in statements(files[rel]) if PIP_VERB.search(s)]
+        stmts = [s for s in statements(files[rel]) if is_pip_install(s)]
         assert any(needle in s and "--require-hashes" in s for s in stmts), rel
     for rel in (".github/workflows/ci.yml", ".github/workflows/test-count-badge.yml"):
         assert "bash scripts/install-locked.sh pip" in files[rel], rel
@@ -281,7 +176,7 @@ def test_the_chokepoint_uses_no_build_isolation_for_every_source_build() -> None
     stmts = [
         s
         for s in statements(tracked_text_files()["scripts/install-locked.sh"])
-        if PIP_VERB.search(s) and "--no-deps" in s
+        if is_pip_install(s) and "--no-deps" in s
     ]
     assert len(stmts) == 2  # `-e .` and the VCS requirement
     assert all("--no-build-isolation" in s for s in stmts)
@@ -309,31 +204,223 @@ def test_the_ruff_hook_target_does_not_pull_in_semgrep() -> None:
 # ───────────────────────── neuters N5 / N5b / N6 / N7 / N7b ─────────────────────────
 
 
-@pytest.mark.parametrize(
-    ("stmt", "why"),
-    [
-        ('pip install -e ".[dev]"', "N5 range resolution"),
-        ("pip install --no-deps foo==1", "N5b --no-deps is not a blanket pass"),
-        ("python -m pip install --upgrade pip", "upgrade pip"),
-        (
-            "pip install --require-hashes -r requirements.txt",
-            "hashed but not wheels-only",
-        ),
-        ("pip install -r requirements.txt", "unhashed lock"),
-        ("pip install --no-deps .", "source build with build isolation"),
-        ('"$PIP" install requests', "variable pip, unhashed"),
-        ("uv pip install foo", "uv installer"),
-        ("pipx install semgrep==1.171.0", "pipx"),
-        ("uvx ruff", "uvx"),
-        (".venv/bin/pip3 install foo", "path pip3"),
-        (
-            "pip install --require-hashes --only-binary=:all: -e .",
-            "hashed but editable",
-        ),
-    ],
-)
+U = "requirements-unpinned.txt"
+OK = "--no-deps --no-build-isolation"
+EVIL = "git+https://evil.example/x.git"
+
+# One rejecting case for EVERY spelling in the r1 verdict and in the r2
+# reviewer probe (b1_probe.out / b1_pip_semantics-pip2621.out), plus the
+# original neuters. A case that stops being refused turns this RED.
+REJECTED = [
+    # original neuters
+    ('pip install -e ".[dev]"', "N5 range resolution"),
+    ("pip install --no-deps foo==1", "N5b --no-deps is not a blanket pass"),
+    ("python -m pip install --upgrade pip", "upgrade pip"),
+    ("pip install --require-hashes -r requirements.txt", "hashed, not wheels-only"),
+    ("pip install -r requirements.txt", "unhashed lock"),
+    ("pip install --no-deps .", "source build with build isolation"),
+    ('"$PIP" install requests', "variable pip, unhashed"),
+    (".venv/bin/pip3 install foo", "path pip3"),
+    (
+        "pip install --require-hashes --only-binary=:all: -e .",
+        "hashed but editable",
+    ),
+    # r1 (B1)
+    (f"pip install {OK} --requirement={U} .", "r1 --requirement=FILE"),
+    (f"pip install {OK} -r{U} .", "r1 attached -rFILE"),
+    (f"pip install {OK} --editable={EVIL} .", "r1 --editable=URL"),
+    ('"${PIP_BIN}" install fastapi', "r1 braced variable pip"),
+    ("uv run --with fastapi python x.py", "r1 uv run --with"),
+    # r2 brief list
+    (f"pip install {OK} --requirement {U} .", "--requirement FILE"),
+    (f"pip install {OK} -r={U} .", "-r=FILE"),
+    (f"pip install {OK} '--requirement={U}' .", "quoted --requirement="),
+    ("python -m pip install fastapi", "python -m pip"),
+    ("pip3 install fastapi", "pip3"),
+    ("uv pip install fastapi", "uv pip install"),
+    ("pipx install semgrep", "pipx"),
+    (f"pip install {OK} --constraint={U} .", "--constraint="),
+    # r2 reviewer-new (N1..N38)
+    (f"pip install {OK} -qr {U} .", "N1 clustered -qr FILE"),
+    (f"pip install {OK} -qr{U} .", "N2 clustered -qrFILE"),
+    (f"pip install {OK} -ve {EVIL} .", "N3 clustered -ve URL"),
+    ("python3 -mpip install fastapi", "N4 -mpip"),
+    ("pip3.12 install fastapi", "N5 pip3.12"),
+    (".venv/bin/pip3.12 install fastapi", "N6 path pip3.12"),
+    ("pip --no-cache-dir install fastapi", "N7 global option before verb"),
+    ("pip -q install fastapi", "N8 short global option before verb"),
+    ("python -m pip -q install fastapi", "N9 -m pip with global option"),
+    ("$(PIP) install fastapi", "N10 make $(PIP)"),
+    ("$VENV/bin/pip install fastapi", "N11 $VENV/bin/pip"),
+    ("${VENV}/bin/pip install fastapi", "N12 ${VENV}/bin/pip"),
+    ("X=`pip install fastapi`", "N13 backticks"),
+    ('echo "$(pip install fastapi)"', "N14 command substitution"),
+    ('subprocess.run(["pip", "install", "fastapi"], check=True)', "N15 py list"),
+    (
+        'subprocess.run([sys.executable, "-m", "pip", "install", "fastapi"])',
+        "N16 py list -m pip",
+    ),
+    ('RUN ["pip", "install", "fastapi"]', "N17 Dockerfile exec form"),
+    ('RUN ["python", "-m", "pip", "install", "fastapi"]', "N38 exec form -m pip"),
+    ("uv --quiet pip install fastapi", "N18 uv global option, pip install"),
+    ("uv --offline run --with fastapi x.py", "N19 uv global option, run --with"),
+    ("uv -q tool install ruff", "N20 uv global option, tool install"),
+    (f"PIP_REQUIREMENT={U} pip install {OK} .", "N21 PIP_REQUIREMENT"),
+    (f"PIP_EDITABLE={EVIL} pip install {OK} .", "N22 PIP_EDITABLE"),
+    (f"PIP_CONSTRAINT={U} pip install {OK} .", "PIP_CONSTRAINT"),
+    (
+        "PIP_CONFIG_FILE=/tmp/pip.conf pip install --require-hashes -r x",
+        "PIP_CONFIG_FILE",
+    ),
+    (f"pip install {OK} --index-url=https://evil.example/simple .", "N23 index-url"),
+    (f"pip install {OK} --find-links=./w .", "N24 find-links"),
+    (
+        "pip install --require-hashes --only-binary=:all: -r requirements.txt fastapi",
+        "N25 hashed plus an extra positional",
+    ),
+    ("sudo pip install fastapi", "N29 sudo"),
+    ("uv\tpip\tinstall fastapi", "N30 tabs"),
+    ("pip install --no-index --find-links w fastapi", "N31 offline find-links"),
+    ("python -m uv pip install fastapi", "N32 python -m uv"),
+    ("uv tool run --from x y", "N33 uv tool run"),
+    (
+        "pip install --require-hashes --only-binary=:all: -r requirements.txt -qe git+https://x",
+        "N34 hashed plus clustered -qe",
+    ),
+    ("uvx ruff", "uvx"),
+    ("pip install 'unterminated", "unparseable (fail closed)"),
+    (
+        "pip install --global-opt=x --require-hashes --only-binary=:all: -r l",
+        "unlisted option",
+    ),
+    (
+        "pip --log /tmp/l install --require-hashes --only-binary=:all: -r l",
+        "global option value",
+    ),
+    (
+        "pip install --require-hashes --only-binary=:all: -r l --pre",
+        "unlisted flag --pre",
+    ),
+    (
+        "pip install --require-hashes --only-binary=:all: -r l --no-index",
+        "unlisted flag --no-index",
+    ),
+    (
+        "pip install --require-hashes --only-binary=:all: -r l --force-reinstall",
+        "unlisted flag",
+    ),
+    (f"pip install {OK} --pre .", "unlisted flag on a source build"),
+    (
+        f"pip install {OK} --break-system-packages .",
+        "unlisted flag on a source build 2",
+    ),
+    ("pip install --upgrade --require-hashes --only-binary=:all: -r l", "--upgrade"),
+    ("pip install -U --require-hashes --only-binary=:all: -r l", "-U"),
+    ("pip install --require-hashes --only-binary=:all: -r", "-r without a value"),
+    ("uv add fastapi", "uv add"),
+    ("uv sync", "uv sync"),
+]
+
+
+@pytest.mark.parametrize(("stmt", "why"), REJECTED, ids=[w for _, w in REJECTED])
 def test_the_classifier_rejects_each_escape_hatch(stmt: str, why: str) -> None:
     assert classify(stmt), why
+
+
+# The statements the classifier is given in the real scan path come out of
+# `statements()`/`scan_units()`: forms that only exist at FILE level.
+FILE_LEVEL_REJECTED = [
+    (
+        "x.yml",
+        "jobs:\n  t:\n    steps:\n      - run: >\n          pip install --no-deps --no-build-isolation .\n          fastapi\n",
+        "N35 YAML folded scalar folds two lines into one command",
+    ),
+    (
+        "x.yml",
+        "jobs:\n  t:\n    steps:\n      - run: |\n          pip -q install fastapi\n",
+        "YAML literal block",
+    ),
+    (
+        "x.yml",
+        "env:\n  PIP_REQUIREMENT: requirements-extra.txt\n",
+        "PIP_REQUIREMENT as a YAML env key",
+    ),
+    ("Dockerfile", "RUN <<EOT\npip install fastapi\nEOT\n", "N36 heredoc"),
+    (
+        "scripts/x.sh",
+        "pip install --no-deps --no-build-isolation . \\\r\n  fastapi\n",
+        "N37 CRLF continuation hides a second package",
+    ),
+    (
+        "Dockerfile",
+        'RUN ["python", "-m", "pip", "install", "fastapi"]\n',
+        "N38 exec form",
+    ),
+    (
+        "scripts/x.py",
+        'import subprocess\nsubprocess.run(["pip", "install", "fastapi"])\n',
+        "N15 py list",
+    ),
+    (
+        "scripts/x.py",
+        'import subprocess, sys\nsubprocess.run([sys.executable, "-m", "pip",\n    "install", "fastapi"])\n',
+        "N16 py list spanning lines",
+    ),
+    (
+        "scripts/x.py",
+        'import os\nos.system("pip -q install fastapi")\n',
+        "py string command",
+    ),
+    ("scripts/x.sh", "X=`pip install fastapi`\n", "N13 backticks"),
+    (
+        "scripts/x.sh",
+        'echo "$(pip install fastapi)"\n',
+        "N14 echo that executes a substitution",
+    ),
+    ("Makefile", "install:\n\t@$(PIP) install fastapi\n", "N10 Makefile $(PIP)"),
+    (
+        "Makefile",
+        "install:\n\t$(PYTHON) -m pip -q install fastapi\n",
+        "Makefile -m pip with option",
+    ),
+    (
+        "scripts/x.sh",
+        "PIP_REQUIREMENT=requirements-extra.txt pip install --no-deps --no-build-isolation .\n",
+        "N21 env prefix",
+    ),
+    (
+        "scripts/x.sh",
+        "export PIP_CONFIG_FILE=/tmp/pip.conf\n",
+        "PIP_CONFIG_FILE export",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("rel", "text", "why"),
+    FILE_LEVEL_REJECTED,
+    ids=[w for *_, w in FILE_LEVEL_REJECTED],
+)
+def test_the_file_scan_rejects_each_file_level_escape_hatch(
+    rel: str, text: str, why: str
+) -> None:
+    assert install_violations({rel: text}), why
+
+
+def test_a_python_markdown_hint_is_prose_not_a_command() -> None:
+    """The backtick-span removal is scoped to `.py` literals (Python has no
+    backtick substitution): the same text in a shell file is a command."""
+    hint = 'msg = "Reinstall with `pip install pyhanko`."\n'
+    assert install_violations({"src/x.py": hint}) == []
+    assert install_violations(
+        {"scripts/x.sh": "echo Reinstall with `pip install pyhanko`\n"}
+    )
+
+
+def test_a_python_file_that_does_not_parse_is_scanned_by_line() -> None:
+    assert install_violations(
+        {"scripts/broken.py": "def f(:\n    pip install fastapi\n"}
+    )
 
 
 @pytest.mark.parametrize(
@@ -346,10 +433,42 @@ def test_the_classifier_rejects_each_escape_hatch(stmt: str, why: str) -> None:
         "pip install --require-hashes --only-binary=:all: --requirement=requirements.txt",
         "pip install --user --no-deps --no-build-isolation .",
         f'$PIP install --no-deps --no-build-isolation "{VCS_SPEC_PREFIX}${{SHA}}"',
+        # the repo's own real shapes
+        'RUN pip install --user --no-cache-dir --no-deps --no-build-isolation "'
+        + VCS_SPEC_PREFIX
+        + '${SHA}"',
+        '$PIP install --require-hashes --only-binary=:all: -r "$work/uv.txt"',
+        "$UV pip compile requirements.in --generate-hashes",
+        "python -m pip install --require-hashes --only-binary=:all: -r requirements.txt",
+        "pip --disable-pip-version-check install --require-hashes --only-binary=:all: -qr l",
+        "pip3.12 install --require-hashes --only-binary=:all: -r requirements.txt",
+        "uv --version",
+        "pip freeze",
+        "pip download -r requirements.txt",
+        "bash scripts/install-locked.sh pip uv-only",
     ],
 )
 def test_the_classifier_accepts_the_sanctioned_forms(stmt: str) -> None:
-    assert classify(stmt) is None
+    assert classify(stmt) is None, stmt
+
+
+def test_b1r_a_requirements_file_that_spells_an_allowed_target_is_refused() -> None:
+    """B1r is LOAD-BEARING (r2: 36/84 spellings differ without it). Under
+    `--no-deps` the value of `-r` is a requirements FILE pip reads and installs
+    unhashed; `.` and the VCS requirement are allowed *positional* targets, so
+    only the explicit `-r` refusal stops a FILE path spelled like one of them."""
+    spelled_vcs = f"{VCS_SPEC_PREFIX}cc21c553" + "0" * 32
+    for stmt in (
+        f"pip install {OK} -r .",
+        f"pip install {OK} --requirement .",
+        f"pip install {OK} --requirement=.",
+        f'pip install {OK} -r "{spelled_vcs}" .',
+        f'pip install {OK} -r "{spelled_vcs}"',
+        f'pip install {OK} --requirement="{spelled_vcs}"',
+        f"pip install {OK} -qr .",
+    ):
+        reason = classify(stmt)
+        assert reason and "-r" in reason, stmt
 
 
 def test_statements_drops_comments_and_echo_but_splits_chained_installs() -> None:
@@ -396,6 +515,37 @@ def test_n5b_the_positional_allowlist_catches_a_correctly_flagged_stray_package(
     assert any(
         "only allowed for" in v and "foo==1" in v for v in install_violations(files)
     )
+
+
+@pytest.mark.parametrize(
+    ("rel", "line"),
+    [
+        (".github/workflows/ci.yml", "          pip --no-cache-dir install fastapi"),
+        ("Makefile", "\t$(PIP) install fastapi"),
+        ("Dockerfile", 'RUN ["pip", "install", "fastapi"]'),
+        ("scripts/setup.sh", "pip3.12 install fastapi"),
+        ("scripts/setup.sh", "$VENV/bin/pip install fastapi"),
+        ("Makefile", "\t$(PYTHON) -m pip -q install fastapi"),
+        (
+            "scripts/setup.sh",
+            "pip install --no-deps --no-build-isolation -qrrequirements-extra.txt .",
+        ),
+        (
+            "scripts/setup.sh",
+            "PIP_REQUIREMENT=requirements-extra.txt pip install "
+            "--no-deps --no-build-isolation .",
+        ),
+        (".github/workflows/ci.yml", "          python -mpip install fastapi"),
+    ],
+)
+def test_r2_m4_every_spelling_appended_to_a_real_tracked_file_is_red(
+    rel: str, line: str
+) -> None:
+    """The r2 reviewer's real-file neuters M4a-i: each spelling appended to the
+    REAL tracked file went undetected. The same append now turns the real scan RED
+    (and the unmodified tree stays GREEN, test above)."""
+    files = _with(tracked_text_files(), rel, line)
+    assert any(v.startswith(f"{rel}:") for v in install_violations(files)), line
 
 
 def test_n6_additional_dependencies_in_precommit_is_red() -> None:

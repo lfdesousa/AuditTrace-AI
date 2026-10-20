@@ -238,6 +238,54 @@ def test_main_fails_closed_and_prints_the_recovery_path(
     assert "fastapi" in err and "rm -rf .venv && make venv" in err
 
 
+class _MetaDist:
+    """A distribution as ``metadata.distributions()`` yields it: a Name and a path."""
+
+    def __init__(self, name: str, path: str) -> None:
+        self.metadata = {"Name": name}
+        self._path = path
+
+
+def test_main_refuses_a_distribution_found_in_two_places_through_the_real_call_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review r2 B2-r2v / M3: ``main()`` must feed ``duplicate_locations()``
+    (the real function, reading ``metadata.distributions()``) into ``check``.
+    The unit tests call ``check(..., duplicates=...)`` directly; with ``main()``
+    passing ``{}`` instead, a stale egg-info next to the venv dist-info passed
+    silently. Everything else about the environment is the lock here, so the
+    duplicate is the ONLY reason for the refusal."""
+    lockfile, pyproject = _write(tmp_path)
+    monkeypatch.setattr(cvl, "installed_distributions", good_env)
+    monkeypatch.setattr(
+        cvl.metadata,
+        "distributions",
+        lambda: [
+            _MetaDist(
+                "audittrace_ai", "/venv/lib/site-packages/audittrace_ai-1.dist-info"
+            ),
+            _MetaDist("audittrace-ai", "/repo/src/audittrace_ai.egg-info"),
+        ],
+    )
+    rc = cvl.main([str(lockfile), "--pyproject", str(pyproject)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "audittrace-ai" in err and "egg-info" in err
+
+
+def test_main_accepts_distributions_that_are_each_found_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lockfile, pyproject = _write(tmp_path)
+    monkeypatch.setattr(cvl, "installed_distributions", good_env)
+    monkeypatch.setattr(
+        cvl.metadata,
+        "distributions",
+        lambda: [_MetaDist("fastapi", "/a"), _MetaDist("pip", "/b")],
+    )
+    assert cvl.main([str(lockfile), "--pyproject", str(pyproject)]) == 0
+
+
 def test_main_truncates_a_long_problem_list(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
