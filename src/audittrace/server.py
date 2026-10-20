@@ -409,42 +409,48 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     # (SQLALCHEMY-SPANS): a declined instrumentor is an ERROR + metric and,
     # under instrumentation_strict (default), stops startup - it is no
     # longer swallowed. ``disabled`` (tracing_enabled false) never raises.
-    if settings.tracing_enabled:  # pragma: no cover - smoke-tested live, not in pytest
-        from opentelemetry import trace
-        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-        from opentelemetry.instrumentation.redis import RedisInstrumentor
-        from opentelemetry.instrumentation.urllib3 import URLLib3Instrumentor
+    # No caller-side tracing gate (SQLALCHEMY-SPANS-FU1 A4): the chokepoint owns
+    # the ``disabled`` outcome, so with tracing off all three still report it
+    # (log + metric) and none instruments. The imports and the peer-service map
+    # below are side-effect free.
+    from opentelemetry import trace
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+    from opentelemetry.instrumentation.redis import RedisInstrumentor
+    from opentelemetry.instrumentation.urllib3 import URLLib3Instrumentor
 
-        tp = trace.get_tracer_provider()
-        peer_service_map = _build_httpx_peer_service_map(settings)
-        telemetry.attach_instrumentor(
-            "HTTPXClientInstrumentor",
-            HTTPXClientInstrumentor(),
-            enabled=settings.tracing_enabled,
-            strict=settings.instrumentation_strict,
-            tracer_provider=tp,
-            request_hook=make_httpx_peer_service_hook(peer_service_map),
-            async_request_hook=make_httpx_async_peer_service_hook(peer_service_map),
-        )
-        telemetry.attach_instrumentor(
-            "URLLib3Instrumentor",
-            URLLib3Instrumentor(),
-            enabled=settings.tracing_enabled,
-            strict=settings.instrumentation_strict,
-            tracer_provider=tp,
-            request_hook=urllib3_set_server_address,
-        )
-        telemetry.attach_instrumentor(
-            "RedisInstrumentor",
-            RedisInstrumentor(),
-            enabled=settings.tracing_enabled,
-            strict=settings.instrumentation_strict,
-            tracer_provider=tp,
-        )
-        logger.info(
-            "OTel outbound instrumentation: HTTPX (peer.service map=%s) + urllib3 + Redis",
-            peer_service_map,
-        )
+    tp = trace.get_tracer_provider()
+    peer_service_map = _build_httpx_peer_service_map(settings)
+    httpx_result = telemetry.attach_instrumentor(
+        "HTTPXClientInstrumentor",
+        HTTPXClientInstrumentor(),
+        enabled=settings.tracing_enabled,
+        strict=settings.instrumentation_strict,
+        tracer_provider=tp,
+        request_hook=make_httpx_peer_service_hook(peer_service_map),
+        async_request_hook=make_httpx_async_peer_service_hook(peer_service_map),
+    )
+    urllib3_result = telemetry.attach_instrumentor(
+        "URLLib3Instrumentor",
+        URLLib3Instrumentor(),
+        enabled=settings.tracing_enabled,
+        strict=settings.instrumentation_strict,
+        tracer_provider=tp,
+        request_hook=urllib3_set_server_address,
+    )
+    redis_result = telemetry.attach_instrumentor(
+        "RedisInstrumentor",
+        RedisInstrumentor(),
+        enabled=settings.tracing_enabled,
+        strict=settings.instrumentation_strict,
+        tracer_provider=tp,
+    )
+    logger.info(
+        "OTel outbound instrumentation: httpx=%s urllib3=%s redis=%s (peer.service map=%s)",
+        httpx_result.value,
+        urllib3_result.value,
+        redis_result.value,
+        peer_service_map,
+    )
 
     # Register DI container with all services (ADR-020)
     register_default_dependencies(settings)
@@ -727,7 +733,19 @@ OPENAPI_TAGS: list[dict[str, str]] = [
 
 
 def create_app() -> FastAPI:
-    """Create and configure FastAPI application."""
+    """Create and configure FastAPI application.
+
+    Import-time side effect (SQLALCHEMY-SPANS-FU1 A5): ``app = create_app()``
+    runs at import, before any lifespan, so this configures the root logger
+    (stdout handler, configured level) first - 12-factor "configure logging
+    once at startup" (PYTHON-ENGINEERING section 7). Without it the attach
+    outcome logged below, at INFO, is dropped under uvicorn (root at WARNING,
+    no handler). ``setup_logging`` is idempotent; the lifespan call stays.
+    """
+    _settings = get_settings()
+    setup_logging(
+        level=_settings.log_level, structured=(_settings.log_format == "json")
+    )
     app = FastAPI(
         title="AuditTrace-AI",
         description=(

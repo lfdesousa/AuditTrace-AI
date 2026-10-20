@@ -19,13 +19,19 @@ N9  drop the ERROR log                                       -> log test RED
 N10 route ``db/postgres.py``'s attach around the chokepoint  -> G3b RED
 N11 drop the ``disabled`` branch                             -> disabled test RED
 N12 drop the INFO success log                                -> attached-log test RED
+N13 re-wrap the lifespan attaches in ``if settings.tracing_enabled:``
+                                                             -> G3c RED (and G5/G6)
+N1  restore ``exc.conflict._format_message(name)``           -> stub-conflict test RED
+C3  re-add ``pragma: no cover`` between init_telemetry and DI -> pragma test RED
 """
 
 from __future__ import annotations
 
 import ast
+import io
 import logging
 import pathlib
+import tokenize
 from collections.abc import Collection, Iterator
 from typing import Any
 
@@ -245,6 +251,82 @@ def test_non_strict_never_raises_on_a_declined_instrumentor(
     )
 
 
+class _StubConflict:
+    """A conflict object WITHOUT the private ``_format_message`` (what some
+    ``opentelemetry-instrumentation`` releases carry): public ``__str__`` only."""
+
+    def __str__(self) -> str:
+        return "stub conflict: requires foo<1"
+
+
+class _HostileConflict:
+    def __str__(self) -> str:
+        raise RuntimeError("no text for you")
+
+
+def _conflicting_instrumentor(conflict: object) -> BaseInstrumentor:
+    class _Declines(BaseInstrumentor):
+        _instance = None
+        _is_instrumented_by_opentelemetry = False
+
+        def instrumentation_dependencies(self) -> Collection[str]:
+            return ()
+
+        def instrument(self, **kwargs: Any) -> None:  # type: ignore[override]
+            raise instrumentation.DependencyConflictError(conflict)
+
+        def _instrument(self, **kwargs: Any) -> None:
+            return None
+
+        def _uninstrument(self, **kwargs: Any) -> None:
+            return None
+
+    return _Declines()
+
+
+@pytest.mark.parametrize(
+    ("conflict", "expected"),
+    [
+        (_StubConflict(), "stub conflict: requires foo<1"),
+        (_HostileConflict(), "DependencyConflictError"),
+    ],
+    ids=["public_str_only", "hostile_str_never_raises"],
+)
+def test_declined_path_uses_public_api_only_through_the_real_chokepoint(
+    metric_reader: InMemoryMetricReader,
+    caplog: pytest.LogCaptureFixture,
+    conflict: object,
+    expected: str,
+) -> None:
+    """N1 - the declined path must not call the private ``_format_message``:
+    a conflict lacking it used to raise ``AttributeError`` out of the
+    chokepoint even under non-strict. Real ``attach_instrumentor``; asserts
+    the result, the ERROR line and the metric point."""
+    with caplog.at_level(logging.INFO, logger="audittrace.instrumentation"):
+        result = attach_instrumentor(
+            "Stubbed",
+            _conflicting_instrumentor(conflict),
+            strict=False,
+            enabled=True,
+        )
+    assert result is AttachResult.DECLINED
+    (rec,) = _attach_records(caplog)
+    assert rec.levelno == logging.ERROR
+    assert "instrumentor=Stubbed result=declined" in rec.getMessage()
+    assert expected in rec.getMessage()
+    assert _points(metric_reader) == {("Stubbed", "declined"): 1}
+
+
+def test_declined_with_real_dependency_conflict_names_the_requirement(
+    metric_reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = _fake_instrumentor(deps=("definitely-not-installed-xyz >= 1",))
+    with caplog.at_level(logging.INFO, logger="audittrace.instrumentation"):
+        attach_instrumentor("Fake", fake, strict=False, enabled=True)
+    (rec,) = _attach_records(caplog)
+    assert "definitely-not-installed-xyz" in rec.getMessage()
+
+
 # ------------------------------------------------------------- FastAPI app ----
 def test_fastapi_app_path_attached_refused_and_declined(
     metric_reader: InMemoryMetricReader, monkeypatch: pytest.MonkeyPatch
@@ -382,6 +464,86 @@ def test_the_six_product_families_all_attach_through_the_chokepoint() -> None:
         "SQLAlchemyInstrumentor",
         "URLLib3Instrumentor",
     }
+
+
+def _attach_instrumentor_sites(
+    root: pathlib.Path,
+) -> list[tuple[str, int, list[str]]]:
+    """(path, line, [source of every enclosing ``If`` test]) of each
+    ``attach_instrumentor(...)`` CALL (not ``.instrument*``) under ``root``.
+
+    Same call predicate as ``test_the_six_product_families_...`` (C1 of the
+    WU-FU1 gate: ``attach_call_sites`` only sees ``.instrument*`` calls, which
+    live inside the chokepoint, so it could never see a caller-side gate).
+    """
+    sites: list[tuple[str, int, list[str]]] = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+
+        def visit(node: ast.AST, tests: tuple[str, ...], rel: str = "") -> None:
+            for child in ast.iter_child_nodes(node):
+                inner = tests
+                if isinstance(child, ast.If):
+                    inner = (*tests, ast.unparse(child.test))
+                if isinstance(child, ast.Call) and (
+                    getattr(child.func, "attr", None) == "attach_instrumentor"
+                    or getattr(child.func, "id", None) == "attach_instrumentor"
+                ):
+                    sites.append(
+                        (str(path.relative_to(root)), child.lineno, list(tests))
+                    )
+                visit(child, inner)
+
+        visit(tree, ())
+    return sites
+
+
+def test_no_attach_site_is_gated_on_tracing_enabled() -> None:
+    """G3c - structural early warning (N13): the chokepoint owns ``disabled``,
+    so no caller may wrap an attach in ``if ...tracing_enabled``. Enumerative by
+    nature; G5/G6 are the behavioural pin."""
+    sites = _attach_instrumentor_sites(SRC / "audittrace")
+    assert len(sites) == 6, sites  # one per family; also guards vacuity
+    gated = [s for s in sites if any("tracing_enabled" in t for t in s[2])]
+    assert not gated, f"attach gated on tracing_enabled: {gated}"
+
+
+def test_g3c_scanner_flags_a_gated_attach(tmp_path: pathlib.Path) -> None:
+    (tmp_path / "gated.py").write_text(
+        "def boot(settings):\n"
+        "    if settings.tracing_enabled:\n"
+        "        telemetry.attach_instrumentor('X', X())\n"
+        "    attach_instrumentor('Y', Y())\n"
+    )
+    assert _attach_instrumentor_sites(tmp_path) == [
+        ("gated.py", 3, ["settings.tracing_enabled"]),
+        ("gated.py", 4, []),
+    ]
+
+
+def test_lifespan_attach_block_carries_no_pragma_no_cover() -> None:
+    """C3 / AC-A2 - the block between ``init_telemetry(`` and
+    ``register_default_dependencies(`` must execute under pytest, so it may not
+    be excused from coverage. Comments are read with ``tokenize`` (a docstring
+    mention elsewhere in the file does not count)."""
+    src = (SRC / "audittrace" / "server.py").read_text()
+    fn = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "lifespan"
+    )
+    lines = src.splitlines()
+    body = range(fn.lineno, (fn.end_lineno or fn.lineno) + 1)
+    start = next(i for i in body if "telemetry.init_telemetry(" in lines[i - 1])
+    end = next(i for i in body if "register_default_dependencies(" in lines[i - 1])
+    assert start < end
+    comments = [
+        t.string
+        for t in tokenize.generate_tokens(io.StringIO(src).readline)
+        if t.type == tokenize.COMMENT and start < t.start[0] < end
+    ]
+    assert comments, "no comments in the span: the scan is vacuous"
+    assert not [c for c in comments if "pragma: no cover" in c], comments
 
 
 def test_scanner_flags_a_bypass(tmp_path: pathlib.Path) -> None:
