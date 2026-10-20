@@ -5,7 +5,7 @@ meta {
 }
 
 post {
-  url: {{baseUrl}}/memory/index?collections=ai_research_papers&file=episodic/main_signed.pdf
+  url: {{baseUrl}}/memory/index?collections={{indexPdfCollection}}&file={{indexPdfKey}}
   body: none
   auth: bearer
 }
@@ -15,8 +15,8 @@ auth:bearer {
 }
 
 query {
-  collections: ai_research_papers
-  file: episodic/main_signed.pdf
+  collections: {{indexPdfCollection}}
+  file: {{indexPdfKey}}
 }
 
 tests {
@@ -26,7 +26,7 @@ tests {
   test("returns single-file outcome", function() {
     const body = res.getBody();
     expect(body.collections).to.be.an("object");
-    expect(body.collections.ai_research_papers).to.be.a("number");
+    expect(body.collections[bru.getEnvVar("indexPdfCollection")]).to.be.a("number");
   });
 }
 
@@ -44,7 +44,10 @@ docs {
   Sending ``?file=...`` without ``?collections=...`` returns
   ``HTTP 400 — "?file= requires exactly one collection in
   ?collections= (single-file mode is per-collection)."`` The
-  ai_research_papers example above shows the PDF→PDF-corpus path;
+  defaults (env vars ``indexPdfCollection=ai_research_papers``,
+  ``indexPdfKey=episodic/main_signed.pdf``) show the PDF→PDF-corpus
+  path. Override both with ``--env-var`` for any other object, e.g.
+  ``indexPdfKey=episodic/papers/<scan_id>/<file>.pdf``;
   the sibling file ``index-single-file-md-to-decisions.bru`` shows
   the EOD-memo→decisions path that motivated the v1.0.22 scope-grant
   PRs (#87 / #88).

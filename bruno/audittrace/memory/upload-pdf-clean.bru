@@ -19,7 +19,7 @@ query {
 }
 
 body:multipart-form {
-  file: @file(/tmp/clean.pdf)
+  file: @file({{uploadPdfFile}})
 }
 
 vars:post-response {
@@ -75,7 +75,16 @@ docs {
     4. Return HTTP 202 + {scan_id, status, poll_url, object_uri,
        object_sha256, size_bytes}
 
-  Prepare a fixture ``/tmp/clean.pdf`` containing a real PDF
+  The file comes from the env var ``uploadPdfFile`` (default
+  ``/tmp/clean.pdf`` in ``environments/*.bru``). Upload any real PDF,
+  e.g. a knowledge-base paper, without copying this request:
+
+    bru run memory/upload-pdf-clean.bru --env cluster \
+      --env-var uploadPdfFile=/abs/path/paper.pdf
+    bru run memory/upload-status-clean.bru --env cluster \
+      --env-var cleanScanId=<scan_id from the upload>
+
+  For the fixture run, prepare ``/tmp/clean.pdf`` containing a real PDF
   (start with ``%PDF-1.4`` or later). A minimal valid PDF works
   (~400 bytes is enough — content_control scans the bytes, not
   the document semantics).
