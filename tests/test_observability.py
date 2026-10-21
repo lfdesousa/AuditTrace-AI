@@ -1224,3 +1224,22 @@ def test_g6_canary_registered_value_leg_is_scanned(_canary_registered_value_leg)
     from audittrace.identity import register_request_secret
 
     register_request_secret("s3cr3t-canary-" + "A" * 20)
+
+
+# ----------------------------------------- A5 (SPANS-FU1): idempotent setup ----
+def test_setup_logging_twice_leaves_exactly_one_root_handler() -> None:
+    """``create_app()`` (import time) and ``lifespan`` both call
+    ``setup_logging``; the second call must replace, never add (C2)."""
+    import logging
+
+    from audittrace.logging_config import setup_logging
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = list(root.handlers), root.level
+    try:
+        setup_logging(level="INFO", structured=True)
+        setup_logging(level="INFO", structured=True)
+        assert len(root.handlers) == 1
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)

@@ -207,7 +207,7 @@ def attach_instrumentor(
                 _OWNED.add(name)
         except DependencyConflictError as exc:
             result = AttachResult.DECLINED
-            conflict = exc.conflict._format_message(name)
+            conflict = _conflict_text(exc)
         except Exception as exc:
             result = AttachResult.ERROR
             conflict = f"{type(exc).__name__}: {exc}"
@@ -219,6 +219,22 @@ def attach_instrumentor(
             "set AUDITTRACE_INSTRUMENTATION_STRICT=false only to run without it"
         )
     return result
+
+
+def _conflict_text(exc: DependencyConflictError) -> str:
+    """Describe a declined instrumentor from PUBLIC API only (N1).
+
+    ``DependencyConflict`` has a public ``__str__`` on every supported
+    ``opentelemetry-instrumentation`` release; the private
+    ``_format_message`` it delegates to is not on all of them, and an
+    ``AttributeError`` from the declined path would escape the chokepoint
+    even under non-strict. This never raises: falls back to the exception text.
+    """
+    conflict = getattr(exc, "conflict", None)
+    try:
+        return str(conflict if conflict is not None else exc)
+    except Exception:  # a hostile __str__ must not break the fail-loud path
+        return type(exc).__name__
 
 
 def _reset_for_tests() -> None:
