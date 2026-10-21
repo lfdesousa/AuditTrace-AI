@@ -47,7 +47,7 @@ dependencies = [
     "langfuse==4.18.0",
     "openai==3.35.1",
     "alembic==1.20.0",
-    "sqlalchemy[asyncio]==2.0.55",
+    "sqlalchemy[asyncio]==2.1.5",
     # asyncpg = production async Postgres driver. psycopg2-binary kept for
     # Alembic + the sync RLS oracle test (out-of-band of the request loop).
     # aiosqlite = async SQLite for the in-memory test engine.
@@ -92,8 +92,8 @@ dependencies = [
     # its sync/async wrapper surface change between minors (0.36 added the
     # `validation_time` argument that silently broke the Swiss TSL builder).
     # Bump deliberately, with the AC6/AC9 guard tests, never by drift.
-    "pyhanko[etsi,async-http]==0.37.0",
-    "pyhanko-certvalidator==0.32.1",
+    "pyhanko[etsi,async-http]==0.38.0",
+    "pyhanko-certvalidator==0.33.0",
     # pytesseract: tier-B item #1 — OCR for scanned pages. Python
     # binding only; the actual `tesseract` binary + language packs
     # (eng+deu+fra+ita) are installed via apt in the Dockerfile.
@@ -186,7 +186,7 @@ dev = [
 # + same engine → same findings, no wall-clock, no network. See
 # ci/semgrep/rules.yml and the `security-lint` Makefile target.
 gate = [
-    "semgrep==1.171.0",
+    "semgrep==1.181.0",
 ]
 
 [project.urls]
