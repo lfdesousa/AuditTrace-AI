@@ -12,7 +12,7 @@ Checks, all mandatory, no bypass flag and no environment variable:
 1. every lock pin whose environment marker applies here is installed at
    exactly that version;
 2. everything installed that the lock does not name is in ``ALLOWED_EXTRAS``
-   (the editable project and the VCS package, which pip cannot hash);
+   (the editable project and the VCS package, which cannot be hashed);
 3. the project is the editable install at the ``pyproject.toml`` version;
 4. the VCS package's ``direct_url.json`` ``commit_id`` equals the SHA pinned in
    ``pyproject.toml``;
@@ -158,7 +158,7 @@ def check(
         )
 
     if header_pyver is None:
-        problems.append("lock header has no --python-version (not a uv-compiled lock?)")
+        problems.append("lock header has no --python-version (not a compiler-generated lock?)")
     elif header_pyver != f"{python_version[0]}.{python_version[1]}":
         problems.append(
             f"interpreter is {python_version[0]}.{python_version[1]} but the lock "

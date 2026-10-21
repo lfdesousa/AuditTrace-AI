@@ -17,13 +17,13 @@ help: ## Show this help message
 	@echo 'Available targets:'
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-venv: ## Create the virtual environment and install EXACTLY the hashed dev lock (requirements-dev.txt, --require-hashes, wheels only; DEP-LOCK-AT). To rebuild a drifted venv: rm -rf .venv && make venv
+venv: ## Create the virtual environment and install EXACTLY the hashed dev lock (--require-hashes, wheels only; DEP-LOCK-AT). To rebuild a drifted venv: rm -rf .venv && make venv
 	@echo "🐍 Creating virtual environment..."
 	@python3 -m venv .venv
 	@echo "🔒 Installing the hashed lock (scripts/install-locked.sh)..."
 	@bash scripts/install-locked.sh .venv/bin/pip
 	@$(MAKE) gate-venv
-	@echo "✅ Virtual environment created from requirements-dev.txt (+ the isolated gate venv, S5)"
+	@echo "✅ Virtual environment created from the hashed dev lock (+ the isolated gate venv, S5)"
 	@echo ""
 	@echo "Activate with: source .venv/bin/activate"
 
@@ -35,15 +35,15 @@ install: venv ## Install all dependencies (including dev) from the hashed lock, 
 
 GATE_VENV ?= .gate-venv
 
-gate-venv: ## Create the ISOLATED gate venv (semgrep) from the hashed requirements-gate.txt (DEP-LOCK-AT C7). Never installed into the app/test venv.
+gate-venv: ## Create the ISOLATED gate venv (semgrep) from the hashed gate lock (DEP-LOCK-AT C7). Never installed into the app/test venv.
 	@python3 -m venv $(GATE_VENV)
 	@bash scripts/install-locked.sh $(GATE_VENV)/bin/pip gate
 	@echo "✅ gate venv ready: $(GATE_VENV)/bin/semgrep"
 
-lock: ## Recompile ALL hashed locks from their inputs (uv, --universal; DEP-LOCK-AT). Run after editing pyproject.toml / *.in, then commit the result.
+lock: ## Recompile ALL hashed locks from their inputs (the pinned lock compiler, --universal; DEP-LOCK-AT). Run after editing pyproject.toml / *.in, then commit the result.
 	@bash scripts/lock.sh compile
 
-lock-check: ## G1 (required CI check): every committed lock is the fixed point of its inputs under its own pinned versions, every hash re-derived from the index (comment-stripped diff). Resolves uv as .venv/bin/uv, else PATH, fails closed.
+lock-check: ## G1 (required CI check): every committed lock is the fixed point of its inputs under its own pinned versions, every hash re-derived from the index (comment-stripped diff). Resolves the compiler from the venv, else PATH, fails closed.
 	@bash scripts/lock.sh check
 
 lock-freshness: ## G2 (informational, never required): what would `--upgrade` change in each lock?
@@ -65,14 +65,14 @@ lint-ruff: ## ruff check + format check ONLY (no semgrep; check-only, never rewr
 	@.venv/bin/ruff format --check src/ bff/ tests/
 	@echo "✅ Formatting passed"
 
-security-lint: ## Run the OFFLINE, deterministic semgrep security-lint gate (#382, ADR-059 WS1). GATEKEEPER tooling from the HASHED gate lock: `make gate-venv` first (isolated $(GATE_VENV), requirements-gate.txt, --require-hashes; DEP-LOCK-AT C7). Vendored rules only — no network, no `--config auto`. Fails closed if the gate venv is absent — a semgrep from anywhere else is unhashed and NOT accepted.
+security-lint: ## Run the OFFLINE, deterministic semgrep security-lint gate (#382, ADR-059 WS1). GATEKEEPER tooling from the HASHED gate lock: `make gate-venv` first (isolated $(GATE_VENV), the gate lock, --require-hashes; DEP-LOCK-AT C7). Vendored rules only — no network, no `--config auto`. Fails closed if the gate venv is absent — a semgrep from anywhere else is unhashed and NOT accepted.
 	@SEMGREP="$$( [ -x $(GATE_VENV)/bin/semgrep ] && echo $(GATE_VENV)/bin/semgrep || true )"; \
 	if [ -z "$$SEMGREP" ]; then \
 	  echo "❌ semgrep not found at $(GATE_VENV)/bin/semgrep. It is the CI-Agent gate"; \
-	  echo "   (gatekeeper) tooling, installed from the HASHED requirements-gate.txt into"; \
+	  echo "   (gatekeeper) tooling, installed from the HASHED gate lock into"; \
 	  echo "   its own isolated venv (so it can't downgrade the app's otel line):"; \
 	  echo "       make gate-venv"; \
-	  echo "   Do NOT pipx/pip-install an unhashed semgrep, and do NOT put it in the app venv."; \
+	  echo "   Do NOT install an unhashed semgrep, and do NOT put it in the app venv."; \
 	  exit 1; \
 	fi; \
 	echo "🛡️  Running semgrep security-lint (offline, vendored rules) via $$SEMGREP ..."; \
