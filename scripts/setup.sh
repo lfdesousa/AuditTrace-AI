@@ -27,19 +27,14 @@ else
     echo "   ✅ Virtual environment already exists"
 fi
 
-# Activate virtual environment
+# Install dependencies from the HASHED lock (DEP-LOCK-AT, ADR-065): pip from
+# its hashed line, then --require-hashes --only-binary=:all: -r
+# requirements-dev.txt, then the project (-e .) and the VCS package, all
+# --no-deps --no-build-isolation. No `pip install --upgrade pip`, no range
+# resolution. To rebuild a drifted venv: rm -rf .venv && make venv
 echo ""
-echo "🔄 Activating virtual environment..."
-source .venv/bin/activate
-
-# Upgrade pip
-echo "📦 Upgrading pip..."
-.venv/bin/pip install --upgrade pip -q
-
-# Install dependencies
-echo ""
-echo "📦 Installing project dependencies..."
-pip install -e ".[dev]" -q
+echo "📦 Installing project dependencies from the hashed lock..."
+bash scripts/install-locked.sh .venv/bin/pip
 
 # Install pre-commit hooks
 echo ""

@@ -27,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_SCRIPT = REPO_ROOT / "scripts" / "ci" / "run-tests.sh"
 REAL_SKIP_CHECK = REPO_ROOT / "scripts" / "check-no-skipped-tests.py"
 REAL_COVERAGE_CHECK = REPO_ROOT / "scripts" / "check-per-file-coverage.py"
+REAL_VENV_LOCK_CHECK = REPO_ROOT / "scripts" / "ci" / "check_venv_matches_lock.py"
 HELM_RULE_CASES = json.loads(
     (REPO_ROOT / "tests" / "data" / "helm_rule_cases.json").read_text()
 )["cases"]
@@ -41,6 +42,16 @@ def _scratch_script_root(tmp_path: Path) -> Path:
     shutil.copy(REAL_SCRIPT, root / "scripts" / "ci" / "run-tests.sh")
     shutil.copy(REAL_SKIP_CHECK, root / "scripts" / "check-no-skipped-tests.py")
     shutil.copy(REAL_COVERAGE_CHECK, root / "scripts" / "check-per-file-coverage.py")
+    # DEP-LOCK-AT G5 (spec gate C2): run-tests.sh now refuses an interpreter
+    # that is not the hashed lock BEFORE pytest. The scratch root therefore
+    # carries the REAL checker, the REAL lock and the REAL pyproject — never a
+    # bypass flag or env var. That is legitimate: the suite's own interpreter IS
+    # the locked one (and if it is not, G5 refuses the whole suite first).
+    shutil.copy(
+        REAL_VENV_LOCK_CHECK, root / "scripts" / "ci" / "check_venv_matches_lock.py"
+    )
+    shutil.copy(REPO_ROOT / "requirements-dev.txt", root / "requirements-dev.txt")
+    shutil.copy(REPO_ROOT / "pyproject.toml", root / "pyproject.toml")
     return root
 
 
@@ -510,6 +521,7 @@ def test_a2_9_pytest_argument_set_matches_golden(tmp_path: Path):
         "--cov=scripts/curator",
         "--cov=scripts/network",
         "--cov=scripts/neuter",
+        "--cov=scripts/ci",
         "--cov=scripts.replay_dead_lettered_index",
         "--cov=scripts.backfill_pdf_signature_status",
         "--cov=scripts.integration_gate",
@@ -520,3 +532,30 @@ def test_a2_9_pytest_argument_set_matches_golden(tmp_path: Path):
         "--junit-xml=junit.xml",
     ]
     assert recorded == golden
+
+
+def test_a_scratch_run_with_an_altered_lock_copy_is_refused_before_pytest(
+    tmp_path: Path,
+):
+    """C2 / N8: the lock copy names fastapi at a version this interpreter does
+    not have -> run-tests.sh exits non-zero BEFORE pytest runs, with the
+    recovery path in the error. The fake pytest would have exited 0, so the
+    refusal can only come from the G5 preamble."""
+    root = _scratch_script_root(tmp_path)
+    lock = root / "requirements-dev.txt"
+    lock.write_text(
+        lock.read_text().replace("\nfastapi==0.146.0 ", "\nfastapi==0.141.1 ", 1)
+    )
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    ran = tmp_path / "pytest.ran"
+    _fake_pytest(bin_dir, body=f'touch "{ran}"')
+    _fake_python_passthrough(bin_dir)
+    _fake_real_helm(bin_dir)
+
+    result = _run_script(root, bin_dir)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "check-venv-matches-lock" in result.stderr
+    assert "rm -rf .venv && make venv" in result.stderr
+    assert not ran.exists(), "pytest ran although the venv does not match the lock"

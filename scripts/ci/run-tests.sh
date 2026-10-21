@@ -63,13 +63,20 @@ resolve_tool() {
   elif command -v "$name" >/dev/null 2>&1; then
     command -v "$name"
   else
-    echo "❌ $name not found (.venv/bin/$name or PATH) — install dev deps first (pip install -e '.[dev]')" >&2
+    echo "❌ $name not found (.venv/bin/$name or PATH) — install dev deps first (make venv)" >&2
     exit 1
   fi
 }
 
 PYTEST="$(resolve_tool pytest)"
 PYTHON="$(resolve_tool python)"
+
+# ---- G5 (DEP-LOCK-AT C2): the interpreter running the suite MUST be the
+# hashed lock, exactly — fail closed, no flag, no env bypass. A venv that
+# drifted from requirements-dev.txt (the 2026-10-18 otel 1.44.0 / fastapi
+# 0.140.7 venvs) is refused BEFORE a single test runs. Recovery:
+# `rm -rf .venv && make venv`. ----
+"$PYTHON" scripts/ci/check_venv_matches_lock.py requirements-dev.txt
 
 # ---- R4/A3-8: resolve the REAL helm BEFORE the PATH change — the shim
 # execs this absolute path on an allowed call. Fail at start if missing;
@@ -187,6 +194,7 @@ else
     --cov=scripts/curator \
     --cov=scripts/network \
     --cov=scripts/neuter \
+    --cov=scripts/ci \
     --cov=scripts.replay_dead_lettered_index \
     --cov=scripts.backfill_pdf_signature_status \
     --cov=scripts.integration_gate \

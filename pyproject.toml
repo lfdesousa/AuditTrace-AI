@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+# Exact pins (DEP-LOCK-AT C1): installs run --no-build-isolation against the
+# hashed copies in the locks, so these are documentation + the isolated-build
+# fallback; tests/test_dep_lock_sync.py asserts they equal requirements-build.in.
+requires = ["setuptools==84.0.0", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -25,46 +28,51 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "fastapi>=0.109.0,<1",
-    "uvicorn[standard]>=0.27.0",
-    "pydantic>=2.5.0",
-    "pydantic-settings>=2.1.0",
+    "fastapi==0.146.0",
+    "uvicorn[standard]==0.54.0",
+    "pydantic==2.14.1",
+    "pydantic-settings==2.16.0",
     # langchain and langchain-community dropped in ADR-025 — the repo only
     # used them passively via `from langchain_core.documents import Document`.
     # langchain-core is retained explicitly so the dataclass import keeps
     # working without pulling the full Langchain + langchain-community tree.
-    "langchain-core>=0.1.0",
+    "langchain-core==1.6.12",
     # chromadb 1.x — provides AsyncHttpClient (memory-server uses the async
     # Chroma client so vector I/O never blocks the event loop). The .venv is
     # already on 1.5.7 and the suite is green on it.
-    "chromadb>=1.5,<2",
-    "python-jose[cryptography]>=3.3.0",
-    "python-multipart>=0.0.6",
-    "httpx>=0.25.0",
-    "langfuse>=4.0.0,<5.0.0",
-    "openai>=1.12.0",
-    "alembic>=1.13.0",
-    "sqlalchemy[asyncio]>=2.0.25,<2.1",
+    "chromadb==1.5.9",
+    "python-jose[cryptography]==3.5.0",
+    "python-multipart==0.0.32",
+    "httpx==0.28.1",
+    "langfuse==4.18.0",
+    "openai==3.35.1",
+    "alembic==1.20.0",
+    "sqlalchemy[asyncio]==2.0.55",
     # asyncpg = production async Postgres driver. psycopg2-binary kept for
     # Alembic + the sync RLS oracle test (out-of-band of the request loop).
     # aiosqlite = async SQLite for the in-memory test engine.
-    "asyncpg>=0.29.0",
-    "psycopg2-binary>=2.9.9",
-    "aiosqlite>=0.19.0",
-    "redis>=5.0.0",
+    "asyncpg==0.32.0",
+    "psycopg2-binary==2.9.13",
+    "aiosqlite==0.22.1",
+    "redis==8.1.0",
     # ADR-057 — RabbitMQ AMQP client for the scan-control broker
     # (PR-B3 ScanRequestPublisher + PR-B4 verdict/audit consumers).
     # ADR-046 chat persistence stays on redis-py via Redis Streams.
-    "aio-pika>=9.4.0",
+    "aio-pika==10.1.1",
     # ADR-006 — shared object-storage abstraction. v0.1.0 ships
     # S3ObjectStorageProvider ABC + MinIO + AWS S3 backends (IRSA-native
     # via botocore's default credential chain). `minio` stays as a direct
     # dep because the shared package re-uses it for the MinIO backend AND
     # for graceful migration of the existing call sites — drop it in a
     # follow-up once the grep audit confirms zero direct references.
-    "audittrace-object-storage @ git+https://github.com/lfdesousa/audittrace-object-storage.git@v0.1.1",
-    "minio>=7.2.0",
-    "pymupdf>=1.24.0",
+    # DEP-LOCK-AT §4.4: pinned to the full commit SHA of tag v0.1.1 (pip cannot
+    # hash VCS requirements; a SHA is content-addressed). It is the ONLY copy of
+    # this SHA: install-locked.sh and the Dockerfile READ it from this line, and
+    # tests/test_dep_lock_install_paths.py forbids a second one. Omitted from the
+    # locks (--no-emit-package) and installed --no-deps --no-build-isolation.
+    "audittrace-object-storage @ git+https://github.com/lfdesousa/audittrace-object-storage.git@cc21c5530e1a471d48b697f3ff8f3df1cd5c0185",
+    "minio==7.2.20",
+    "pymupdf==1.28.2",
     # pyhanko: PAdES / PDF signature validation (gap-inventory item #12).
     # Detect-and-record only in v1 — never reject. Adds ~10 MB
     # to image size (cryptography, asn1crypto, pyhanko-certvalidator
@@ -84,8 +92,8 @@ dependencies = [
     # its sync/async wrapper surface change between minors (0.36 added the
     # `validation_time` argument that silently broke the Swiss TSL builder).
     # Bump deliberately, with the AC6/AC9 guard tests, never by drift.
-    "pyhanko[etsi,async-http]>=0.37,<0.38",
-    "pyhanko-certvalidator>=0.32,<0.33",
+    "pyhanko[etsi,async-http]==0.37.0",
+    "pyhanko-certvalidator==0.32.1",
     # pytesseract: tier-B item #1 — OCR for scanned pages. Python
     # binding only; the actual `tesseract` binary + language packs
     # (eng+deu+fra+ita) are installed via apt in the Dockerfile.
@@ -93,7 +101,7 @@ dependencies = [
     # `_ocr_render_page` emits a `no_text_layer` warning rather than
     # crashing — keeps unit tests green on hosts that don't have
     # tesseract installed locally.
-    "pytesseract>=0.3.10",
+    "pytesseract==0.3.13",
     # ADR-063 Phase 1 — official MCP Python SDK. Only ``mcp.types`` is
     # used (the Pydantic message shapes for the JSON-RPC 2.0 envelope);
     # the SDK's own server/session-management transport is intentionally
@@ -102,7 +110,7 @@ dependencies = [
     # ContextVar binding (routes/mcp.py). Upper-bounded to the current
     # major so a future SDK 2.x doesn't silently change message shapes
     # under us.
-    "mcp>=1.9.0,<2.0.0",
+    "mcp==1.30.0",
     # SEC-JWT-IN-LANGFUSE-SPAN S-C1 — bounded to the tested minor (not
     # just a floor). ``ScrubbingSpanProcessor`` (telemetry.py) rewrites
     # PRIVATE ReadableSpan/BoundedAttributes fields; a later SDK minor
@@ -114,35 +122,40 @@ dependencies = [
     # release). Bump deliberately, together with requirements.txt, after
     # re-running the startup self-test (telemetry._run_startup_scrub_self_test)
     # against the new minor.
-    "opentelemetry-api>=1.45.0,<1.46.0",
-    "opentelemetry-sdk>=1.45.0,<1.46.0",
-    "opentelemetry-exporter-otlp>=1.27.0",
-    "opentelemetry-instrumentation-fastapi>=0.48b0",
-    "opentelemetry-instrumentation-logging>=0.48b0",
-    "opentelemetry-instrumentation-httpx>=0.48b0",
-    "opentelemetry-instrumentation-urllib3>=0.48b0",
-    "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
-    "opentelemetry-instrumentation-redis>=0.48b0",
+    "opentelemetry-api==1.45.1",
+    "opentelemetry-sdk==1.45.1",
+    "opentelemetry-exporter-otlp==1.45.1",
+    "opentelemetry-instrumentation-fastapi==0.66b1",
+    "opentelemetry-instrumentation-logging==0.66b1",
+    "opentelemetry-instrumentation-httpx==0.66b1",
+    "opentelemetry-instrumentation-urllib3==0.66b1",
+    "opentelemetry-instrumentation-sqlalchemy==0.66b1",
+    "opentelemetry-instrumentation-redis==0.66b1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.4.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-cov>=4.1.0",
-    "pytest-mock>=3.12.0",
-    "fakeredis>=2.30.0",
-    "httpx>=0.25.0",
-    "ruff>=0.15.0",
-    "mypy>=1.8.0",
-    "black>=24.1.0",
-    "pre-commit>=3.6.0",
-    "types-redis>=4.6.0.20241004",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-cov==7.1.0",
+    "pytest-mock==3.17.0",
+    "fakeredis==2.40.0",
+    "httpx==0.28.1",
+    "ruff==0.17.1",
+    "mypy==2.4.0",
+    "black==26.10.1",
+    "pre-commit==4.7.0",
+    "types-redis==4.6.0.20241004",
     # PyYAML — used by tests/test_version_drift.py to parse
     # charts/audittrace/Chart.yaml. Already a transitive dep via
     # pyhanko/etsi but declared explicitly so the dev environment
-    # is self-contained (per make sync-requirements).
-    "pyyaml>=6.0",
+    # is self-contained (locked by `make lock`).
+    "pyyaml==6.0.3",
+    # DEP-LOCK-AT Q1/Q5 + C1: the lock compiler and the installer are pinned
+    # IN the dev lock (hashed) so every checkout and CI job compiles and
+    # installs with the same uv/pip. Never `pip install --upgrade pip`.
+    "uv==0.13.1",
+    "pip==26.2.1",
 ]
 
 # CI-Agent gate tooling — GATEKEEPER, NOT a runtime/test dependency; NEVER
@@ -150,10 +163,10 @@ dev = [
 # the offline semgrep security-lint gate (#382, ADR-059 WS1 — the first
 # component of the local deterministic CI-Agent). It is DELIBERATELY kept out
 # of both `dependencies` and the `dev` extra so that:
-#   * `make sync-requirements` (which renders only runtime + dev) never puts
-#     semgrep into requirements.txt, and
-#   * the Docker image build (`pip install -r requirements.txt`) never pulls
-#     semgrep.
+#   * the runtime/dev locks (requirements.txt, requirements-dev.txt) never
+#     contain semgrep, and
+#   * the Docker image build (`pip install --require-hashes -r
+#     requirements.txt`) never pulls semgrep.
 # CRITICAL — install semgrep ISOLATED, via pipx, never `pip install -e .[gate]`
 # into the app/.venv:  semgrep hard-pins
 # `opentelemetry-instrumentation-requests~=0.58b0`, which DOWNGRADES the whole
@@ -165,8 +178,9 @@ dev = [
 # downgrade "consistent" because the pin IS satisfied — the break is runtime,
 # not metadata. The shipped image never sees it (installs from
 # requirements.txt, no semgrep, keeps 0.65b0). So this group exists only as
-# the PINNED SOURCE OF TRUTH for the version; the actual install is:
-#     pipx install 'semgrep==1.171.0'   # its own venv, exposed on PATH
+# the PINNED SOURCE OF TRUTH for the version; the actual install is the
+# HASHED gate lock (DEP-LOCK-AT C7) into an ISOLATED venv:
+#     make gate-venv    # requirements-gate.txt, --require-hashes, own venv
 # Keep the CI (`.github/workflows/ci.yml`) + Makefile pins in lockstep with
 # the version here. semgrep is PINNED for determinism: same code + same rules
 # + same engine → same findings, no wall-clock, no network. See
@@ -245,6 +259,11 @@ source = [
     # public SDLC tooling under the same ≥90% per-file gate as everything
     # else, measured alongside `--cov=scripts/neuter` in `make test`/`test-cov`.
     "scripts/neuter",
+    # `scripts/ci` (DEP-LOCK-AT G5: check_venv_matches_lock.py) joins the same
+    # way: the fail-closed venv==lock checker is decision logic and gets the
+    # same >=90% per-file floor; measured via `--cov=scripts/ci` in
+    # scripts/ci/run-tests.sh.
+    "scripts/ci",
     "bff",
 ]
 branch = true

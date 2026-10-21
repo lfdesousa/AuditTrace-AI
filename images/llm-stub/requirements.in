@@ -1,0 +1,5 @@
+# OpenAI-compatible LLM stub (a fixture): keeps its own old fastapi on purpose,
+# so it is NOT constrained by the server lock. Versions pinned to match the
+# retired kind fixture for parity. Hashed lock: requirements.txt beside this file.
+fastapi==0.115.0
+uvicorn[standard]==0.32.0

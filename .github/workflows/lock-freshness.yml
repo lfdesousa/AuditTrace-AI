@@ -1,0 +1,47 @@
+name: lock-freshness
+
+# G2 (DEP-LOCK-AT, ADR-065) — INFORMATIONAL ONLY. Weekly (and on demand) it
+# recompiles every hashed lock with --upgrade into a temp copy and prints which
+# pins would move, as a job summary. It gates NOTHING: continue-on-error is set
+# and this check must NEVER be added to branch protection (operator ruling Q4:
+# lock-check is required, lock-freshness is not). Transitive pins move only by
+# a deliberate `make lock-upgrade` unit, never at build time.
+#
+# Deliberately NOT triggered on pull_request / push: it would also run on every
+# PR and push and turn an advisory signal into noise. The weekly cron + manual
+# dispatch are the whole trigger set.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  freshness:
+    name: Report available lock upgrades (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Provision uv from the hashed lock
+        run: bash scripts/install-locked.sh pip uv-only
+
+      - name: Diff the locks against what --upgrade would resolve
+        run: |
+          set -euo pipefail
+          make lock-freshness | tee freshness.txt
+          {
+            echo "## Lock freshness (informational)"
+            echo '```diff'
+            cat freshness.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
