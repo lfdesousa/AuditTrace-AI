@@ -59,8 +59,13 @@ UV_RX = r"(?<![A-Za-z0-9])uvx?(?![A-Za-z0-9])"  # uv, uvx, UV_*, .venv/bin/uv; n
 # `hatch` is deliberately absent: "escape hatch" appears in ten files.
 ADVISORY_RX = (
     r"\b(?:pipenv|poetry|conda|easy_install|nox|tox)\b|setup\.py\s+install"
-    r"|-m\s*build\b|pyproject-build|--upgrade-deps"
+    r"|pyproject-build|--upgrade-deps"
     r"|\b(?:pdm|rye|pixi|micromamba|mamba)\b"
+    # r4 (B1-r4a): the build front-end in list/exec spelling (`"-m", "build"`), and the
+    # installs our own locked tools perform without a pip/uv token (mypy, virtualenv).
+    r"""|-m["',\s]*build\b"""
+    r"|--install-types"
+    r"|\bvirtualenv\b[^\n]*--(?:download|upgrade-embed-wheels)"
 )
 LOCK_RX = r"requirements[\w.\-]*\.(?:txt|in)"  # a lock name is a token: COPY extras.txt requirements.txt is RED
 TOKEN_RX = re.compile(

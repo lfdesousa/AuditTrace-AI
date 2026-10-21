@@ -222,6 +222,52 @@ RED_CASES: dict[str, tuple[Any, ...]] = {
     "C1-D4-Dockerfile-python-m-build": ("append", "Dockerfile", "RUN python -m build"),
     "C1-pyproject-build": ("append", "scripts/setup.sh", "pyproject-build ."),
     "C1-pdm-install": ("append", "scripts/setup.sh", "pdm install"),
+    # r4 B1-r4a: installs our own locked tools perform without a pip/uv token, and the list/exec
+    # spellings of `-m build` (`", "` sits between the tokens). Erratum to ADDENDUM-2 C1.
+    "r4a-Makefile-mypy-install-types": (
+        "append",
+        "Makefile",
+        "\t@.venv/bin/mypy --install-types --non-interactive src/",
+    ),
+    "r4a-ci-step-mypy-install-types": (
+        "append",
+        ".github/workflows/ci.yml",
+        "      - run: mypy --install-types --non-interactive src/",
+    ),
+    "r4a-Makefile-virtualenv-download": (
+        "append",
+        "Makefile",
+        "\t@virtualenv --download .venv2",
+    ),
+    "r4a-Makefile-virtualenv-upgrade-embed-wheels": (
+        "append",
+        "Makefile",
+        "\t@virtualenv --upgrade-embed-wheels",
+    ),
+    "r4a-py-list-python-m-build": (
+        "append",
+        "scripts/ci/check_venv_matches_lock.py",
+        'import subprocess, sys; subprocess.run([sys.executable, "-m", "build", "--wheel"])',
+    ),
+    "r4a-Dockerfile-exec-form-python-m-build": (
+        "append",
+        "Dockerfile",
+        'RUN ["python", "-m", "build", "."]',
+    ),
+    # r4 B1-r4b / O3: an install call and a trailing comment on ONE line of a .py. Only the COMMENT
+    # span is exempt; widening the exemption to the whole line would let this through.
+    "r4b-O3-py-install-call-with-trailing-comment": (
+        "append",
+        "scripts/ci/check_venv_matches_lock.py",
+        'import subprocess; subprocess.run(["pip", "install", "fastapi"])  # needed for the demo',
+    ),
+    # r4 B1-r4b / O2: an escaped YAML scalar (no token on any physical line) shadowed by an IDENTICAL
+    # comment line. Only the comment-shadow filter decides this one (G20 is caught by the joiner).
+    "r4b-O2-yaml-escaped-scalar-shadowed-by-identical-comment": (
+        "append",
+        ".github/workflows/ci.yml",
+        '  go2:\n    runs-on: x\n    steps:\n      # pip install fastapi\n      - run: "\\x70ip install fastapi"',
+    ),
     "C1-mamba": ("append", "scripts/setup.sh", "micromamba install -y numpy"),
 }
 
@@ -384,3 +430,58 @@ def test_the_installer_name_list_is_an_enumeration_hatch_is_not_in_it() -> None:
     """C1: `hatch` is deliberately NOT a token ("escape hatch" appears in ten files)."""
     files = {"a.sh": b"hatch build\nthis is an escape hatch\n"}
     assert violations(files, sanctioned=frozenset(), pinned={}, archives={}) == []
+
+
+# ------------------------------------------------------------------ S1: one synthetic tree per guard
+# No real tree and NO assert_baseline_clean(): a neutered guard must fail on THIS assertion, not
+# through the allow-list hygiene of the real tree (r4 S1; NC3, NC6, NC13, NC15b and the r4a forms).
+def synthetic(rel: str, text: str) -> list[str]:
+    return violations(
+        {rel: text.encode()},
+        sanctioned=frozenset(),
+        pinned={},
+        binaries=frozenset(),
+        archives={},
+    )
+
+
+@pytest.mark.parametrize(
+    ("guard", "rel", "text"),
+    [
+        ("NC3-uv-token", "scripts/x.sh", "uv run pytest\n"),
+        ("NC6-continuation-join", "scripts/x.sh", "p\\\nip install fastapi\n"),
+        (
+            "NC13-lock-name-token",
+            "scripts/x.sh",
+            "cp extras.txt requirements-dev.txt\n",
+        ),
+        ("NC15-pyproject-build", "scripts/x.sh", "pyproject-build .\n"),
+        ("NC15-upgrade-deps", "scripts/x.sh", "python3 -m venv --upgrade-deps v\n"),
+        ("NC15b-pdm", "scripts/x.sh", "pdm install\n"),
+        ("NC16a-m-build-shell", "scripts/x.sh", "python -m build\n"),
+        (
+            "NC16a-m-build-list",
+            "scripts/x.py",
+            'run([sys.executable, "-m", "build"])\n',
+        ),
+        ("NC16a-m-build-exec", "Dockerfile", 'RUN ["python", "-m", "build", "."]\n'),
+        ("NC16b-mypy-install-types", "scripts/x.sh", "mypy --install-types src/\n"),
+        ("NC16c-virtualenv-download", "scripts/x.sh", "virtualenv --download v\n"),
+        (
+            "NC16c-virtualenv-upgrade-embed",
+            "scripts/x.sh",
+            "virtualenv --upgrade-embed-wheels\n",
+        ),
+    ],
+    ids=lambda v: v if isinstance(v, str) and v.startswith("NC") else None,
+)
+def test_each_token_guard_is_red_on_its_own_synthetic_tree(
+    guard: str, rel: str, text: str
+) -> None:
+    assert synthetic(rel, text), guard
+
+
+def test_synthetic_controls_stay_green() -> None:
+    """The synthetic tree is not trivially RED: prose-free, token-free lines pass."""
+    assert synthetic("scripts/x.sh", "echo hello\nmake test\n") == []
+    assert synthetic("scripts/x.sh", "# virtualenv --download v\n") == []
