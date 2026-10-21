@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # B7 step 1 — Login to ghcr.io BEFORE compose pulls images.
       # Without this the rabbitmq pull fails with HTTP 401 unauth.
