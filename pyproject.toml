@@ -110,7 +110,7 @@ dependencies = [
     # ContextVar binding (routes/mcp.py). Upper-bounded to the current
     # major so a future SDK 2.x doesn't silently change message shapes
     # under us.
-    "mcp==1.30.0",
+    "mcp==2.3.0",
     # SEC-JWT-IN-LANGFUSE-SPAN S-C1 — bounded to the tested minor (not
     # just a floor). ``ScrubbingSpanProcessor`` (telemetry.py) rewrites
     # PRIVATE ReadableSpan/BoundedAttributes fields; a later SDK minor
