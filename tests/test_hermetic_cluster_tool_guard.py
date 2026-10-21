@@ -558,6 +558,13 @@ class TestEnvEqualityCheck:
             REPO_ROOT / "scripts" / "check-no-skipped-tests.py",
             root / "scripts" / "check-no-skipped-tests.py",
         )
+        # DEP-LOCK-AT G5: run-tests.sh runs the venv-vs-lock checker first.
+        for rel in (
+            "scripts/ci/check_venv_matches_lock.py",
+            "requirements-dev.txt",
+            "pyproject.toml",
+        ):
+            shutil.copy(REPO_ROOT / rel, root / rel)
         bin_dir = tmp_path / "fakebin"
         bin_dir.mkdir()
         env_dump = tmp_path / "env.json"

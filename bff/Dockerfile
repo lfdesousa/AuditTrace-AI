@@ -18,8 +18,11 @@ RUN groupadd --gid 1000 bff && \
 # System-wide install (root, build time) — simpler than the main image's
 # builder/runtime split since this image has no compiled-from-source
 # dependency (no git-fetched shared package, no PDF/OCR toolchain).
+#
+# DEP-LOCK-AT (ADR-065): bff/requirements.txt is a HASHED lock compiled from
+# bff/requirements.in (constrained by the server lock), installed wheels-only.
 COPY bff/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt
 
 COPY bff/ ./bff/
 

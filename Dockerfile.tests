@@ -27,11 +27,14 @@ ARG TESTS_BASE_IMAGE=audittrace-ai:latest
 FROM ${TESTS_BASE_IMAGE}
 
 USER root
-RUN pip install --no-cache-dir \
-    "pytest>=7.4.0" \
-    "pytest-asyncio>=0.23.0" \
-    "pytest-mock>=3.12.0" \
-    "psycopg2-binary"
+# DEP-LOCK-AT (ADR-065): the tests image installs the HASHED dev lock instead
+# of an inline range list (the old `pytest>=...` / unpinned `psycopg2-binary`).
+# It duplicates the runtime packages that already sit in sovereign's
+# ~/.local — acceptable (spec gate A3): the system site-packages copy is the
+# hashed, exact one the tests run against.
+COPY requirements-dev.txt /tmp/requirements-dev.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r /tmp/requirements-dev.txt && \
+    rm /tmp/requirements-dev.txt
 
 COPY tests/ /app/tests/
 COPY pyproject.toml /app/

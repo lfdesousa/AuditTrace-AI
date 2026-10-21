@@ -611,7 +611,7 @@ def _resolve_version() -> str:
 
     Tries ``audittrace-ai`` (the pyproject ``project.name``); falls back
     to a constant when running from a source tree without
-    ``pip install -e``. The constant tracks the latest release tag.
+    an editable install. The constant tracks the latest release tag.
     """
     try:
         from importlib.metadata import PackageNotFoundError, version

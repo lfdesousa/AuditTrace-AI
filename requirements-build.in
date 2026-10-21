@@ -1,0 +1,8 @@
+# DEP-LOCK-AT C1 — build-time dependencies, pinned exactly and hashed into
+# the runtime AND dev locks. Every source build (`-e .`, `.`, the VCS step) runs
+# with --no-build-isolation against these, so pip never fetches an unhashed
+# setuptools/wheel from PyPI. Must equal [build-system].requires in
+# pyproject.toml (tests/test_dep_lock_sync.py asserts it). Bumped only by
+# `make lock-upgrade`, together with pyproject.toml.
+setuptools==84.0.0
+wheel==0.48.0

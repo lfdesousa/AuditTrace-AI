@@ -16,8 +16,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
 # opentelemetry-instrumentation-fastapi + opentelemetry-instrumentation-logging,
 # which made FastAPI request spans invisible in Langfuse and triggered the
 # "No module named 'opentelemetry.instrumentation'" warning at startup.
+#
+# DEP-LOCK-AT (ADR-065): requirements.txt is a HASHED lock (uv, --universal).
+# Install it with --require-hashes --only-binary=:all: so the image can only
+# contain the exact, hash-verified wheels in the lock. setuptools/wheel are
+# in the lock too (B1), so every source build below runs --no-build-isolation
+# and never fetches an unhashed build backend from PyPI.
 COPY requirements.txt .
-RUN pip install --user --no-cache-dir -r requirements.txt
+RUN pip install --user --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt
 
 # Install the audittrace-ai package itself (no deps — already installed
 # above). Without this, the runtime image had no package metadata for
@@ -31,7 +37,17 @@ RUN pip install --user --no-cache-dir -r requirements.txt
 COPY pyproject.toml ./
 COPY src/ ./src/
 COPY README.md ./
-RUN pip install --user --no-cache-dir --no-deps .
+# The audittrace-object-storage VCS package cannot be hashed (pip refuses
+# git requirements in hash mode); it is installed at the 40-hex commit SHA READ
+# FROM pyproject.toml (one source of truth — tests/test_dep_lock_install_paths.py
+# asserts no second SHA exists anywhere), --no-deps --no-build-isolation. A
+# commit SHA is content-addressed. Folds into the hashed lock once a wheel asset
+# is published (operator ruling Q2 / WU-0).
+RUN SHA="$(sed -n 's#.*audittrace-object-storage\.git@\([0-9a-f]\{40\}\)".*#\1#p' pyproject.toml)" && \
+    test -n "$SHA" && \
+    pip install --user --no-cache-dir --no-deps --no-build-isolation \
+      "audittrace-object-storage @ git+https://github.com/lfdesousa/audittrace-object-storage.git@${SHA}"
+RUN pip install --user --no-cache-dir --no-deps --no-build-isolation .
 
 # Stage 2: Runtime image
 FROM python:3.12-slim AS runtime

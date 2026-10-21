@@ -812,14 +812,27 @@ class TestAc10TaxonomyEnumerations:
 class TestDependencyPinsAndCi:
     """Neuter: widen a pin / delete the CI step -> RED."""
 
-    def test_pyhanko_pins_are_bounded_in_pyproject_and_requirements(self) -> None:
+    def test_pyhanko_pins_are_exact_in_pyproject_and_hashed_in_the_locks(self) -> None:
+        """The guard's intent (#366: pyhanko's private ETSI helpers change
+        between minors, so a drifting range is how the Swiss TSL builder broke)
+        is preserved by DEP-LOCK-AT as ``==`` in pyproject PLUS a hashed block
+        in both locks (tests/test_dep_lock_sync.py is the general G3 form)."""
+        import re
         from pathlib import Path
 
         root = Path(__file__).resolve().parent.parent
-        for name in ("pyproject.toml", "requirements.txt"):
-            text = (root / name).read_text()
-            assert "pyhanko[etsi,async-http]>=0.37,<0.38" in text, name
-            assert "pyhanko-certvalidator>=0.32,<0.33" in text, name
+        pyproject = (root / "pyproject.toml").read_text()
+        assert re.search(r'"pyhanko\[etsi,async-http\]==0\.37\.\d+"', pyproject)
+        assert re.search(r'"pyhanko-certvalidator==0\.32\.\d+"', pyproject)
+        for name in ("requirements.txt", "requirements-dev.txt"):
+            lock = (root / name).read_text()
+            for pkg, minor in (("pyhanko", "0.37"), ("pyhanko-certvalidator", "0.32")):
+                block = re.search(
+                    rf"^{re.escape(pkg)}==({re.escape(minor)}\.\d+) \\\n((?:    --hash=\S+.*\n?)+)",
+                    lock,
+                    re.M,
+                )
+                assert block, f"{pkg} {minor}.x hashed block missing from {name}"
 
     def test_resolved_versions_are_inside_the_bounds(self) -> None:
         from importlib.metadata import version

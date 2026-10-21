@@ -1,6 +1,13 @@
 version: 2
 updates:
-  # Python dependencies (pyproject.toml + requirements.txt at root)
+  # Python dependencies (pyproject.toml + the hashed locks at root).
+  # DEP-LOCK-AT (ADR-065): direct pins are `==`, so a Dependabot PR bumps
+  # pyproject.toml; the hashed locks are then recompiled with `make lock` and
+  # `lock-check` (a REQUIRED check) fails closed on a PR that did not (operator
+  # ruling Q3/Q4 — verify Dependabot's handling on its first post-merge PR).
+  # Dependabot covers `/` ONLY: bff/requirements.in, images/llm-stub/
+  # requirements.in, requirements-build.in and requirements-gate.in move only
+  # through the deliberate `make lock-upgrade` unit (spec gate C8).
   - package-ecosystem: "pip"
     directory: "/"
     schedule:

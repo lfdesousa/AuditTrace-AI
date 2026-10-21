@@ -78,23 +78,26 @@ CI_TEST_JOB_GOLDEN: dict = {
             "uses": "actions/cache@v5",
             "with": {
                 "path": "~/.cache/pip",
-                "key": "${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}",
+                "key": (
+                    "${{ runner.os }}-pip-"
+                    "${{ hashFiles('requirements-dev.txt', 'requirements-gate.txt') }}"
+                ),
                 "restore-keys": "${{ runner.os }}-pip-\n",
             },
         },
         {
-            "name": "Install dependencies",
-            "run": 'python -m pip install --upgrade pip\npip install -e ".[dev]"\n',
+            "name": (
+                "Install dependencies (hashed lock — "
+                "scripts/install-locked.sh; DEP-LOCK-AT)"
+            ),
+            "run": "bash scripts/install-locked.sh pip",
         },
         {
             "name": (
                 "Install CI-Agent gate tooling (semgrep — ISOLATED gatekeeper, "
                 "never in the app/test venv)"
             ),
-            "run": (
-                'pipx install "semgrep==1.171.0"\n'
-                'echo "$HOME/.local/bin" >> "$GITHUB_PATH"\n'
-            ),
+            "run": "make gate-venv",
         },
         {"name": "Lint", "run": "ruff check src/ tests/"},
         {"name": "Format check", "run": "ruff format --check src/ tests/"},

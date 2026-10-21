@@ -14,7 +14,7 @@
 #
 # (verified empirically 2026-08-03 while building #397, against
 # pre-commit 4.6.1). Repointing hooksPath would therefore CLOBBER the
-# ruff/mypy/semgrep/commit-evidence/requirements-sync hooks `make
+# ruff/mypy/semgrep/commit-evidence hooks `make
 # install` sets up — exactly what the spec forbids. Installing directly
 # into the default hooks directory (`git rev-parse --git-path hooks`,
 # which resolves correctly for worktrees too), in the ONE hook slot

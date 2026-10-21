@@ -1,6 +1,6 @@
 .PHONY: help venv install install-hooks lint security-lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
-       deploy-preflight verify-deploy sync-requirements check-requirements-sync check-pr-body \
+       deploy-preflight verify-deploy lock lock-check lock-freshness lock-upgrade gate-venv lint-ruff check-pr-body \
        token-guard sync-dashboards check-dashboard-drift check-retention-drift integration \
        release-bump-files release release-cut
 
@@ -17,27 +17,47 @@ help: ## Show this help message
 	@echo 'Available targets:'
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-venv: ## Create virtual environment
+venv: ## Create the virtual environment and install EXACTLY the hashed dev lock (--require-hashes, wheels only; DEP-LOCK-AT). To rebuild a drifted venv: rm -rf .venv && make venv
 	@echo "🐍 Creating virtual environment..."
 	@python3 -m venv .venv
-	@echo "✅ Virtual environment created"
+	@echo "🔒 Installing the hashed lock (scripts/install-locked.sh)..."
+	@bash scripts/install-locked.sh .venv/bin/pip
+	@$(MAKE) gate-venv
+	@echo "✅ Virtual environment created from the hashed dev lock (+ the isolated gate venv, S5)"
 	@echo ""
 	@echo "Activate with: source .venv/bin/activate"
 
-install: venv ## Install all dependencies (including dev)
-	@echo "📦 Installing dependencies..."
-	@.venv/bin/pip install --upgrade pip
-	@.venv/bin/pip install -e ".[dev]"
-	@echo "✅ Dependencies installed"
+install: venv ## Install all dependencies (including dev) from the hashed lock, then the git hooks
 	@.venv/bin/pre-commit install
 	@$(MAKE) install-hooks
 	@echo ""
 	@echo "Run tests: make test"
 
+GATE_VENV ?= .gate-venv
+
+gate-venv: ## Create the ISOLATED gate venv (semgrep) from the hashed gate lock (DEP-LOCK-AT C7). Never installed into the app/test venv.
+	@python3 -m venv $(GATE_VENV)
+	@bash scripts/install-locked.sh $(GATE_VENV)/bin/pip gate
+	@echo "✅ gate venv ready: $(GATE_VENV)/bin/semgrep"
+
+lock: ## Recompile ALL hashed locks from their inputs (the pinned lock compiler, --universal; DEP-LOCK-AT). Run after editing pyproject.toml / *.in, then commit the result.
+	@bash scripts/lock.sh compile
+
+lock-check: ## G1 (required CI check): every committed lock is the fixed point of its inputs under its own pinned versions, every hash re-derived from the index (comment-stripped diff). Resolves the compiler from the venv, else PATH, fails closed.
+	@bash scripts/lock.sh check
+
+lock-freshness: ## G2 (informational, never required): what would `--upgrade` change in each lock?
+	@bash scripts/lock.sh freshness
+
+lock-upgrade: ## Deliberate upgrade of the locks. Usage: make lock-upgrade [PKG=name]. Then run the full gates and name the pin diff in the PR body.
+	@bash scripts/lock.sh upgrade $(PKG)
+
 install-hooks: ## Install the tracked pre-push hook (.githooks/pre-push -> git hooks dir). Idempotent, composes with gitleaks; does NOT touch core.hooksPath (pre-commit refuses `install` when it's set — see scripts/install-git-hooks.sh). #397.
 	@bash scripts/install-git-hooks.sh
 
-lint: security-lint ## Run linting and formatting (includes the offline security-lint gate)
+lint: security-lint lint-ruff ## Run linting and formatting (includes the offline security-lint gate)
+
+lint-ruff: ## ruff check + format check ONLY (no semgrep; check-only, never rewrites files). The pre-commit `ruff` hook calls this, so hook and `make lint` run the SAME venv ruff from the lock.
 	@echo "🔍 Running linter..."
 	@.venv/bin/ruff check src/ bff/ tests/
 	@echo "✅ Linting passed"
@@ -45,16 +65,14 @@ lint: security-lint ## Run linting and formatting (includes the offline security
 	@.venv/bin/ruff format --check src/ bff/ tests/
 	@echo "✅ Formatting passed"
 
-security-lint: ## Run the OFFLINE, deterministic semgrep security-lint gate (#382, ADR-059 WS1). GATEKEEPER tooling — install first with `pip install -e '.[gate]'` (kept OUT of the image on purpose). Vendored rules only — no network, no `--config auto`. Composable: slots into the unified local CI-Agent gate.
-	@SEMGREP="$$( [ -x .venv/bin/semgrep ] && echo .venv/bin/semgrep || command -v semgrep || true )"; \
+security-lint: ## Run the OFFLINE, deterministic semgrep security-lint gate (#382, ADR-059 WS1). GATEKEEPER tooling from the HASHED gate lock: `make gate-venv` first (isolated $(GATE_VENV), the gate lock, --require-hashes; DEP-LOCK-AT C7). Vendored rules only — no network, no `--config auto`. Fails closed if the gate venv is absent — a semgrep from anywhere else is unhashed and NOT accepted.
+	@SEMGREP="$$( [ -x $(GATE_VENV)/bin/semgrep ] && echo $(GATE_VENV)/bin/semgrep || true )"; \
 	if [ -z "$$SEMGREP" ]; then \
-	  echo "❌ semgrep not found. It is the CI-Agent gate (gatekeeper) tooling —"; \
-	  echo "   deliberately NOT a runtime/image/test dependency. Install it ISOLATED"; \
-	  echo "   (pipx gives it its own venv so it can't downgrade the app's otel):"; \
-	  echo "       pipx install 'semgrep==1.171.0'   # pin == pyproject [gate]"; \
-	  echo "   Do NOT 'pip install -e .[gate]' into the app/.venv — semgrep pins"; \
-	  echo "   opentelemetry-instrumentation-requests~=0.58b0 and drags the app's"; \
-	  echo "   otel line down from 0.65b0, breaking FastAPI route detection."; \
+	  echo "❌ semgrep not found at $(GATE_VENV)/bin/semgrep. It is the CI-Agent gate"; \
+	  echo "   (gatekeeper) tooling, installed from the HASHED gate lock into"; \
+	  echo "   its own isolated venv (so it can't downgrade the app's otel line):"; \
+	  echo "       make gate-venv"; \
+	  echo "   Do NOT install an unhashed semgrep, and do NOT put it in the app venv."; \
 	  exit 1; \
 	fi; \
 	echo "🛡️  Running semgrep security-lint (offline, vendored rules) via $$SEMGREP ..."; \
@@ -80,7 +98,7 @@ typecheck: ## Run type checking (resolves mypy as .venv/bin/mypy, else mypy on P
 	@MYPY="$$( [ -x .venv/bin/mypy ] && echo .venv/bin/mypy || command -v mypy || true )"; \
 	if [ -z "$$MYPY" ]; then \
 	  echo "❌ mypy not found (looked for .venv/bin/mypy and mypy on PATH)."; \
-	  echo "   Install the dev deps: pip install -e '.[dev]'"; \
+	  echo "   Install the dev deps from the hashed lock: make venv"; \
 	  exit 1; \
 	fi; \
 	echo "🔎 Running type checker via $$MYPY ..."; \
@@ -326,12 +344,6 @@ verify-deploy: ## Post-deploy gate: pods Ready, helm status deployed, /health, /
 k8s-bootstrap-secrets: ## Post-helm bootstrap: Vault provisioning + Keycloak memory scopes (idempotent; run after every helm install/upgrade that touches operator-bound infra). Requires VAULT_TOKEN exported. SECRETS_DIR defaults to ~/work/audittrace-private/secrets/ — override to point elsewhere.
 	@SECRETS_DIR=$${SECRETS_DIR:-$$HOME/work/audittrace-private/secrets} scripts/setup-vault.sh
 	@scripts/setup-memory-scopes.sh
-
-sync-requirements: ## Regenerate requirements.txt from pyproject.toml (single source of truth). Run after touching dependencies; the requirements-sync hook + CI job block drifted state.
-	@python3 scripts/sync-requirements.py
-
-check-requirements-sync: ## Fail if requirements.txt has drifted from pyproject.toml (mirrors the pre-commit hook + CI job).
-	@python3 scripts/sync-requirements.py --check
 
 check-pr-body: ## Validate a PR-body file against the ADR-049 evidence gate (local mirror of CI). Usage: make check-pr-body BODY=scratchpad/PR-BODY-x.md
 	@if [ -z "$(BODY)" ]; then \
