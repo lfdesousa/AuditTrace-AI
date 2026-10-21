@@ -154,7 +154,7 @@ dev = [
     # DEP-LOCK-AT Q1/Q5 + C1: the lock compiler and the installer are pinned
     # IN the dev lock (hashed) so every checkout and CI job compiles and
     # installs with the same uv/pip. Never `pip install --upgrade pip`.
-    "uv==0.13.1",
+    "uv==0.13.4",
     "pip==26.2.1",
 ]
 
