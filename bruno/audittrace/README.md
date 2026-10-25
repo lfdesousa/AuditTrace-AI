@@ -54,7 +54,7 @@ minimal.
 |---|---|
 | `GET /health` | health/health.bru |
 | `GET /metrics` | health/metrics.bru |
-| `POST /v1/chat/completions` | chat/02-chat-completions.bru |
+| `POST /v1/chat/completions` | chat/02-chat-completions.bru, chat/03-chat-completions-param.bru, chat/04-chat-untrusted-traceparent.bru |
 | `GET /v1/models` | chat/01-list-models.bru |
 | `POST /context` | context/01-context.bru ← **NEW 2026-05-09** |
 | `GET /interactions` | audit/01-list-interactions.bru |
@@ -68,6 +68,45 @@ minimal.
 | `GET /system/trust-store` | system/01-trust-store-get.bru ← **NEW 2026-05-09** |
 | `POST /system/trust-store/refresh` | system/02-trust-store-refresh.bru ← **NEW 2026-05-09** |
 | `POST /mcp` (JSON-RPC) | mcp/01-tools-list.bru, mcp/02-tools-call-read.bru, mcp/03-tools-call-write.bru, mcp/04-tools-call-broker-template.bru, mcp/05-no-auth-401.bru ← **NEW 2026-08-24 (ADR-063 Phase 2 Track C, folds read+write+broker+negative)** |
+
+## Chat recall + TRACEPARENT-TRUST chain (BRUNO-CHAT-PARAM)
+
+Closes the v1.30.0 candidate verify gaps F2 (no parameterisable chat
+request that can drive a recall turn), F3 (corroboration tests passing
+vacuously as separate runs) and F5 (no shipped request sends a
+`traceparent`).
+
+| Request | Proves |
+|---|---|
+| `chat/03-chat-completions-param.bru` | `POST /v1/chat/completions` with the prompt from env `chatPrompt` (default asks for the ratified memory-mode decision, which triggers a recall in `memory_mode=tools`), optional `X-Session-Id` from `chatSessionId`, `stream:false`. 200 + OpenAI shape (id/object/created/model/choices/usage), additive-only key check, and with `expectSourcesTrailer=true` the LC-6 trailer `\n\n**Sources consultées**\n- <source_ref>...` at the END of `choices[0].message.content` (label: `routes/_sources_trailer.py:47`; appended by `routes/chat.py:1890-1896` when `AUDITTRACE_RESPONSE_SOURCES=trailer`). |
+| `chat/04-chat-untrusted-traceparent.bru` | Same call with a valid W3C `traceparent` (env `inboundTraceparent`, default carries the obviously synthetic trace id `0123456789abcdef0123456789abcdef`) and a unique `X-Session-Id`. |
+| `chat/05-audit-session-server-trace.bru` | Finds the 04 interaction by session: exactly one row, 32-hex non-zero `trace_id` that is NOT the inbound id. Stashes the server trace id + interaction id. |
+| `chat/06-tempo-inbound-link-on-server-trace.bru` | Proves the header ARRIVED: reads the server trace from Tempo (`tempoUrl`, cluster default `http://localhost:3200`; bounded poll, 12 x 5 s, for ingest delay) and asserts `audittrace.inbound.trace_id` == the inbound id and a span link to it exists. Without this the chain could not tell "not adopted" from "never received" (header dropped by 04 or stripped by the gateway). Only the inbound attributes/links are extracted; the response body is replaced so the Langfuse key literal in span attributes never reaches a capture. |
+| `chat/07-audit-inbound-trace-zero-rows.bru` | `GET /interactions?trace_id=<inbound>` returns **0 rows**: the server never adopted the caller's trace context (`telemetry.py:90` `ServerMintedTraceContext`, `:145` `inbound_trace_context_hook`). Fails if the server adopted it. |
+| `chat/08-audit-server-trace-one-row.bru` | Positive control: the same filter with the server id returns exactly the 04 interaction, so the 0 in 07 is not a broken filter. |
+| `chat/09-audit-tool-calls-of-traceparent-turn.bru` | The `tool_calls` audit rows (ids, tools, scopes) of that interaction; with `expectSourcesTrailer=true` at least one recall tool (`recall_*` / `read_decision`) is required. |
+
+**These must run in ONE `bru run`.** 05-09 read runtime vars (`bru.setVar`)
+set by 04/05 and each carries a precondition test that FAILS (it does not pass vacuously)
+when the earlier requests did not run in the same invocation. Run
+sequence is the `seq` order:
+
+```bash
+cd bruno/audittrace
+bru run chat --env cluster --env-var expectSourcesTrailer=true \
+  --output /tmp/chat-param-run.json     # folder form: 01..09
+# or only the new chain (explicit paths, one invocation):
+bru run chat/03-chat-completions-param.bru chat/04-chat-untrusted-traceparent.bru \
+  chat/05-audit-session-server-trace.bru chat/06-tempo-inbound-link-on-server-trace.bru \
+  chat/07-audit-inbound-trace-zero-rows.bru chat/08-audit-server-trace-one-row.bru \
+  chat/09-audit-tool-calls-of-traceparent-turn.bru \
+  --env cluster --env-var expectSourcesTrailer=true --output /tmp/chat-param-run.json
+```
+
+Knobs: `chatPrompt`, `chatSessionId` (empty = generated), `expectSourcesTrailer`
+(`true` only against a deploy with `AUDITTRACE_RESPONSE_SOURCES=trailer`),
+`inboundTraceparent`, `tempoUrl`. A recall turn on the local model can take minutes.
+`--output` JSON masks the bearer token; secret-scan it before sharing.
 
 ## Live-validation — 2026-05-09
 

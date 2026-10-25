@@ -1,0 +1,79 @@
+meta {
+  name: POST /v1/chat/completions with an inbound traceparent (TRACEPARENT-TRUST)
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": "{{chatPrompt}}" }
+    ],
+    "stream": false,
+    "max_tokens": 2048
+  }
+}
+
+script:pre-request {
+  const prompt = bru.getEnvVar("chatPrompt");
+  req.setBody({
+    model: "audittrace-default",
+    messages: [{ role: "user", content: prompt }],
+    stream: false,
+    max_tokens: 2048
+  });
+  // Fixed, documented, syntactically valid W3C traceparent (synthetic id).
+  const tp = bru.getEnvVar("inboundTraceparent");
+  req.setHeader("traceparent", tp);
+  // Unique session so 05 finds exactly this interaction.
+  const sid = "bru-traceparent-trust-" + Date.now();
+  req.setHeader("X-Session-Id", sid);
+  bru.setVar("inboundTraceId", tp.split("-")[1]);
+  bru.setVar("inboundSessionId", sid);
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("OpenAI shape preserved", function() {
+    const b = res.getBody();
+    expect(b.object).to.equal("chat.completion");
+    expect(b.choices[0].message.role).to.equal("assistant");
+    expect(b.choices[0].message.content).to.be.a("string");
+  });
+  test("the inbound traceparent is syntactically valid W3C and synthetic (precondition)", function() {
+    // If this were malformed the server would drop it for a different
+    // reason and the trust proof below would prove less.
+    const tp = bru.getEnvVar("inboundTraceparent");
+    expect(tp).to.match(/^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/);
+    expect(tp.split("-")[1]).to.not.equal("0".repeat(32));
+  });
+}
+
+docs {
+  TRACEPARENT-TRUST step 1 (closes v1.30.0 candidate verify F5). Sends a
+  valid `traceparent` carrying a synthetic trace id (`inboundTraceparent`,
+  default `00-0123456789abcdef0123456789abcdef-0123456789abcdef-01`).
+
+  Server contract (telemetry.py `ServerMintedTraceContext.extract`,
+  line 104, and `inbound_trace_context_hook`, line 145): the caller's
+  context is never adopted as parent; it is recorded only as a span link
+  plus the `audittrace.inbound.*` attributes. The interaction must
+  therefore be persisted under a SERVER-minted trace id.
+
+  Must be followed, in the SAME `bru run`, by 05 -> 09 (06 proves the header ARRIVED, 07 that it was not adopted) which
+  assert that. Run them together (see README); run alone this proves
+  nothing. Stashes runtime vars `inboundTraceId`, `inboundSessionId`.
+}

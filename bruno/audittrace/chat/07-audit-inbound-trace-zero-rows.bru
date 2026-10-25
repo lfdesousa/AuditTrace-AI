@@ -1,0 +1,34 @@
+meta {
+  name: GET /interactions?trace_id=<INBOUND> — must return 0 rows
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/interactions?trace_id={{inboundTraceId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("precondition: queried id is the inbound id and a server id exists (not vacuous)", function() {
+    expect(bru.getVar("inboundTraceId")).to.equal(
+      bru.getEnvVar("inboundTraceparent").split("-")[1]);
+    expect(bru.getVar("serverTraceId"), "05 stashed serverTraceId").to.match(/^[0-9a-f]{32}$/);
+  });
+  test("returns 200 with ZERO rows under the inbound trace id (server did not adopt it)", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().interactions).to.have.lengthOf(0);
+  });
+}
+
+docs {
+  TRACEPARENT-TRUST step 4 (the proof): the audit trail has NO row keyed
+  by the caller-supplied trace id. 07 is the positive control showing the
+  same filter does find a row when given the real (server) id, so a
+  0-row result here is not a broken filter.
+}

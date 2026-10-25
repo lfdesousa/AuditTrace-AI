@@ -1,0 +1,54 @@
+meta {
+  name: GET /interactions/{id}/tool-calls — the recall rows of the 04 turn
+  type: http
+  seq: 9
+}
+
+get {
+  url: {{baseUrl}}/interactions/{{serverInteractionId}}/tool-calls
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    const calls = res.getBody().tool_calls;
+    console.log("tool_calls:", calls.map(c => c.id + " " + c.tool_name).join(" | "));
+  }
+}
+
+tests {
+  test("precondition: interaction id stashed by 05", function() {
+    expect(bru.getVar("serverInteractionId")).to.match(/^[0-9]+$/);
+  });
+  test("returns 200; total equals array length; rows belong to the interaction", function() {
+    expect(res.getStatus()).to.equal(200);
+    const b = res.getBody();
+    expect(b.interaction_id).to.equal(Number(bru.getVar("serverInteractionId")));
+    expect(b.total).to.equal(b.tool_calls.length);
+    b.tool_calls.forEach(c => {
+      expect(c.id).to.be.a("string");
+      expect(c.tool_name).to.be.a("string");
+      expect(c.granted_scope).to.be.a("string");
+    });
+  });
+  test("recall turn: at least one recall tool (recall_* / read_decision) when expectSourcesTrailer=true", function() {
+    // The default chatPrompt is designed to trigger a recall; a deploy
+    // expecting the LC-6 trailer must also show tool_calls rows (the
+    // trailer is rendered from them).
+    if (bru.getEnvVar("expectSourcesTrailer") !== "true") {
+      return;
+    }
+    const names = res.getBody().tool_calls.map(c => c.tool_name);
+    expect(names.some(n => n.startsWith("recall_") || n === "read_decision")).to.equal(true);
+  });
+}
+
+docs {
+  Closes the chain: the tool_calls audit rows (ids, names, scopes) of the
+  interaction 04 produced. Requires the 04 -> 07 chain in the same run.
+}
