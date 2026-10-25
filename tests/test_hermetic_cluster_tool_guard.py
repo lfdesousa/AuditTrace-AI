@@ -561,10 +561,14 @@ class TestEnvEqualityCheck:
         # DEP-LOCK-AT G5: run-tests.sh runs the venv-vs-lock checker first.
         for rel in (
             "scripts/ci/check_venv_matches_lock.py",
+            "scripts/ci/check_freeze_matches_lock.py",
             "requirements-dev.txt",
+            "requirements-gate.txt",
             "pyproject.toml",
         ):
             shutil.copy(REPO_ROOT / rel, root / rel)
+        # WU-2: G5 also checks the gate venv (the real one, `make gate-venv`).
+        (root / ".gate-venv").symlink_to(REPO_ROOT / ".gate-venv")
         bin_dir = tmp_path / "fakebin"
         bin_dir.mkdir()
         env_dump = tmp_path / "env.json"

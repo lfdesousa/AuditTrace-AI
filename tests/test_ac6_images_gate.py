@@ -19,6 +19,8 @@ from pathlib import Path
 
 import yaml
 
+from tests._hermetic_env import override_sentinel
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SHA = "c" * 40
 LOCK = "alpha==1.0 \\\n    --hash=sha256:" + "0" * 64 + "\n"
@@ -86,20 +88,35 @@ def _fake_docker(
     tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
 
 
+def _spawn(
+    argv: list[str], cwd: Path, env: dict[str, str], timeout: int = 120
+) -> subprocess.CompletedProcess[str]:
+    """Run the REAL script from a scratch env, with the ambient hermetic sentinel
+    made to match this spawn's own PATH (the technique the other scratch-root
+    tests use; run-tests.sh sets the sentinel for the whole suite)."""
+    shim_dir = env["PATH"].split(os.pathsep)[0]
+    with override_sentinel(shim_dir=shim_dir, kubeconfig=None, required=False):
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+
 def _run(root: Path, bin_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {
         "PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin",
         "HOME": os.environ.get("HOME", "/tmp"),
         "AC6_PYTHON": sys.executable,
     }
-    return subprocess.run(
+    return _spawn(
         ["bash", str(root / "scripts" / "ci" / "check-images-match-locks.sh"), *args],
-        cwd=root,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
+        root,
+        env,
     )
 
 
@@ -194,14 +211,10 @@ def test_a_missing_docker_fails_closed(tmp_path: Path) -> None:
     bare.mkdir()
     (bare / "dirname").symlink_to(shutil.which("dirname") or "/usr/bin/dirname")
     env = {"PATH": str(bare), "AC6_PYTHON": sys.executable}
-    result = subprocess.run(
+    result = _spawn(
         ["/bin/bash", str(root / "scripts" / "ci" / "check-images-match-locks.sh")],
-        cwd=root,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
+        root,
+        env,
     )
     assert result.returncode != 0 and "docker not found" in result.stderr
 
@@ -216,14 +229,10 @@ def test_the_arm64_platform_knob_reaches_build_and_run(tmp_path: Path) -> None:
         "AC6_PYTHON": sys.executable,
         "AC6_PLATFORM": "linux/arm64",
     }
-    result = subprocess.run(
+    result = _spawn(
         ["bash", str(root / "scripts" / "ci" / "check-images-match-locks.sh")],
-        cwd=root,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
+        root,
+        env,
     )
     assert result.returncode == 0, result.stderr
     lines = log.read_text().splitlines()
