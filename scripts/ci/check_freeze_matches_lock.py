@@ -99,6 +99,7 @@ def check(
     freeze_text: str,
     *,
     allow_extra: Iterable[str] = (),
+    allow_extra_pinned: Iterable[str] = (),
     vcs_package: str | None = None,
     pyproject_text: str | None = None,
     marker_env: Mapping[str, str] | None = None,
@@ -108,6 +109,7 @@ def check(
     wanted = {n: v for n, (v, mk) in pins.items() if applies(mk, marker_env)}
     pinned, direct, bad = parse_freeze(freeze_text)
     extras = {canonicalize_name(n) for n in allow_extra}
+    pinned_extras = {canonicalize_name(n) for n in allow_extra_pinned}
     problems = [f"unparseable freeze line (fail closed): {line!r}" for line in bad]
 
     for name, version in sorted(wanted.items()):
@@ -123,7 +125,13 @@ def check(
         else:
             problems.append(f"{name}=={version} is in the lock but NOT installed")
 
-    for name in sorted((set(pinned) | set(direct)) - set(wanted) - extras):
+    for name in sorted(pinned_extras & set(direct)):
+        problems.append(
+            f"{name} @ {direct[name]} is a direct reference; only {name}==<version> is allowed"
+        )
+    for name in sorted(
+        (set(pinned) | set(direct)) - set(wanted) - extras - pinned_extras
+    ):
         shown = f"=={pinned[name]}" if name in pinned else f" @ {direct[name]}"
         problems.append(f"{name}{shown} is installed but NOT in the lock")
 
@@ -202,6 +210,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         help="distribution allowed outside the lock",
     )
     parser.add_argument(
+        "--allow-extra-pinned",
+        action="append",
+        default=[],
+        help="distribution allowed outside the lock ONLY as name==version",
+    )
+    parser.add_argument(
         "--vcs-package",
         help="distribution that must be a git+...@<pyproject SHA> reference",
     )
@@ -230,6 +244,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         lock_text,
         _freeze_text(args.freeze, args.python),
         allow_extra=args.allow_extra,
+        allow_extra_pinned=args.allow_extra_pinned,
         vcs_package=args.vcs_package,
         pyproject_text=pyproject_text,
         marker_env=marker_env,

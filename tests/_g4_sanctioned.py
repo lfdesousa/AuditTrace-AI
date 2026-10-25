@@ -76,7 +76,7 @@ SANCTIONED_STATEMENTS: frozenset[tuple[str, str]] = frozenset(
         ),
         (
             "scripts/ci/check-images-match-locks.sh",
-            "BASE_IMAGE_TOOLING=(--allow-extra pip)",
+            "BASE_IMAGE_TOOLING=(--allow-extra-pinned pip)",
         ),
         (
             "scripts/ci/check-images-match-locks.sh",

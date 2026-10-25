@@ -45,7 +45,7 @@ def free_port() -> int:
 
 #: Set by scripts/ci/run-tests.sh (BL-4). The label lets the wrapper find and
 #: remove this run's containers when SIGTERM skips this module's ``atexit``.
-RUN_ID_ENV = "AUDITTRACE_RUN_TESTS_ID"
+RUN_ID_ENV = "RUN_TESTS_ID"
 RUN_ID_LABEL = "audittrace.run-tests-id"
 
 

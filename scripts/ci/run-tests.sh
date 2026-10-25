@@ -220,9 +220,11 @@ export HERMETIC_REQUIRED=1
 # (1) pytest runs as a background job in ITS OWN process group (`set -m`) and the
 # wrapper `wait`s, so the trap runs at once; (2) the trap TERMs that whole group,
 # KILLs it after a grace period, then (3) removes every container labelled with
-# this run's id (tests/_pg_ephemeral.py labels them from AUDITTRACE_RUN_TESTS_ID).
+# this run's id (tests/_pg_ephemeral.py labels them from RUN_TESTS_ID, deliberately
+# NOT AUDITTRACE_-prefixed: tests/conftest.py wipes every AUDITTRACE_* variable at
+# import, so a prefixed name never reached the labelling code in a real run).
 RUN_ID="run-tests-$$-$(date +%s)"
-export AUDITTRACE_RUN_TESTS_ID="$RUN_ID"
+export RUN_TESTS_ID="$RUN_ID"
 CHILD_PID=""
 TERM_GRACE_POLLS=50   # x 0.2 s = 10 s between TERM and KILL
 

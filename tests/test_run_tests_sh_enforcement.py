@@ -822,7 +822,7 @@ def test_ephemeral_postgres_is_labelled_with_the_run_id_only_when_one_is_set():
     Neuter: return [] unconditionally -> the SIGTERM cleanup finds nothing."""
     from tests._pg_ephemeral import run_label_args
 
-    assert run_label_args({"AUDITTRACE_RUN_TESTS_ID": "run-tests-1-2"}) == [
+    assert run_label_args({"RUN_TESTS_ID": "run-tests-1-2"}) == [
         "--label",
         "audittrace.run-tests-id=run-tests-1-2",
     ]
@@ -872,3 +872,60 @@ def test_a_pytest_that_ignores_sigterm_is_killed_after_the_grace_period(tmp_path
     while _alive(hung_pid) and time.time() < deadline:
         time.sleep(0.1)
     assert not _alive(hung_pid), "a pytest that ignores SIGTERM was left running"
+
+
+def test_g5_runs_after_pytest_on_the_full_path_too(tmp_path: Path):
+    """B1: `make test` and CI use full mode, not --subset. The fake suite leaves the
+    lock violated; the full-mode post-pytest G5 must refuse BEFORE the zero-skip and
+    coverage checks (a passing coverage.xml is supplied so only G5 can fail the run).
+    Neuter: delete ONLY the full-mode `check_environments post` -> exit 0, RED."""
+    passing_xml = (
+        '<?xml version="1.0" ?>\n'
+        '<coverage line-rate="1.0" branch-rate="1.0"><packages/></coverage>'
+    )
+    root, bin_dir = _fakes(
+        tmp_path,
+        body="sed -i 's/^fastapi==0.146.0 /fastapi==0.141.1 /' requirements-dev.txt",
+        write_coverage_xml=passing_xml,
+    )
+    result = _run_script(root, bin_dir, subset=False)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "G5 (post-pytest)" in result.stdout
+    assert "fastapi" in result.stderr
+    assert "Enforcing zero-skip" not in result.stdout, "G5 must refuse first"
+
+
+def test_the_container_label_variable_survives_conftests_environment_wipe():
+    """B2: conftest deletes every AUDITTRACE_* variable at import. Import the REAL
+    conftest in a fresh interpreter with the variable set and read the label args
+    through the real helper. Neuter: rename the variable back to an AUDITTRACE_
+    name -> the label list is empty -> RED."""
+    from tests._pg_ephemeral import RUN_ID_ENV
+
+    code = (
+        "import tests.conftest\n"
+        "from tests._pg_ephemeral import run_label_args\n"
+        "print(run_label_args())\n"
+    )
+    env = {**os.environ, RUN_ID_ENV: "probe-123", "PYTHONDONTWRITEBYTECODE": "1"}
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "audittrace.run-tests-id=probe-123" in out
+
+
+def test_inside_a_real_wrapped_run_the_label_variable_reaches_the_suite():
+    """B2, observed from INSIDE the suite process: under scripts/ci/run-tests.sh
+    (which exports HERMETIC_REQUIRED=1) the run id must have survived conftest's
+    wipe and produce a label. Outside the wrapper there is nothing to observe."""
+    from tests._pg_ephemeral import run_label_args
+
+    if os.environ.get("HERMETIC_REQUIRED") == "1":
+        args = run_label_args()
+        assert args and args[1].startswith("audittrace.run-tests-id=run-tests-")

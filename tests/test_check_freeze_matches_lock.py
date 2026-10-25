@@ -314,3 +314,12 @@ def test_a_runner_python_without_packaging_falls_back_to_the_pips_vendored_copy(
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_a_pinned_only_extra_rejects_a_direct_reference() -> None:
+    """`pip` is allowed outside the lock only as `pip==<version>`; `pip @ url` is
+    not intended. Neuter: treat allow_extra_pinned like allow_extra -> RED."""
+    assert run(GOOD + "pip==25.0.1\n", allow_extra_pinned=["pip"]) == []
+    bad = run(GOOD + "pip @ https://x/pip.whl\n", allow_extra_pinned=["pip"])
+    assert any("pip @ https://x/pip.whl is a direct reference" in p for p in bad)
+    assert run(GOOD + "pip==25.0.1\n") != []  # not allowed at all without the flag

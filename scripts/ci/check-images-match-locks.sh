@@ -63,7 +63,7 @@ build() { # build <image> <dockerfile> <context>
 # image's own installer (python:3.12-slim ships it; the runtime locks do not
 # name it). Allowed by name, version not asserted here: it is recorded in the
 # build evidence and the unpinned base-image tag is a declared residual (BL-3).
-BASE_IMAGE_TOOLING=(--allow-extra pip)
+BASE_IMAGE_TOOLING=(--allow-extra-pinned pip)
 
 check() { # check <label> <image> <lock path> [extra check_freeze args...]
   local label="$1" image="$2" lock="$3"
