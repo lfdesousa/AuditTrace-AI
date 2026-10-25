@@ -1,0 +1,49 @@
+meta {
+  name: GET /interactions?session_id= — the interaction carries a server-minted trace id
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{baseUrl}}/interactions?session_id={{inboundSessionId}}&limit=5
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    const rows = res.getBody().interactions;
+    if (rows.length === 1) {
+      bru.setVar("serverTraceId", rows[0].trace_id);
+      bru.setVar("serverInteractionId", String(rows[0].id));
+      console.log("server trace_id:", rows[0].trace_id, "interaction id:", rows[0].id);
+    }
+  }
+}
+
+tests {
+  test("precondition: 04 ran in this run (inbound ids stashed, not vacuous)", function() {
+    expect(bru.getVar("inboundTraceId"), "inboundTraceId").to.match(/^[0-9a-f]{32}$/);
+    expect(bru.getVar("inboundSessionId"), "inboundSessionId").to.be.a("string").and.not.empty;
+  });
+  test("returns 200 and exactly one persisted interaction for the session", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().interactions).to.have.lengthOf(1);
+  });
+  test("persisted trace_id is a valid, non-zero, server-minted id (NOT the inbound one)", function() {
+    const t = res.getBody().interactions[0].trace_id;
+    expect(t).to.match(/^[0-9a-f]{32}$/);
+    expect(t).to.not.equal("0".repeat(32));
+    expect(t).to.not.equal(bru.getVar("inboundTraceId"));
+  });
+}
+
+docs {
+  TRACEPARENT-TRUST step 2: find the interaction written by 04 by its
+  unique `X-Session-Id` and assert its trace id differs from the inbound
+  one. Stashes `serverTraceId` / `serverInteractionId` for 06-08.
+}

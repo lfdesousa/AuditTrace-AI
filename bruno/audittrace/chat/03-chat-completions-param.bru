@@ -1,0 +1,108 @@
+meta {
+  name: POST /v1/chat/completions (parameterised prompt, drives a recall turn)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": "{{chatPrompt}}" }
+    ],
+    "stream": false,
+    "max_tokens": 2048
+  }
+}
+
+script:pre-request {
+  // The prompt comes from env var `chatPrompt` (default in
+  // environments/*.bru asks for the ratified memory-mode decision, which
+  // makes the model call the recall tools in memory_mode=tools). The body
+  // is rebuilt here so a prompt containing quotes cannot break the JSON.
+  const prompt = bru.getEnvVar("chatPrompt");
+  req.setBody({
+    model: "audittrace-default",
+    messages: [{ role: "user", content: prompt }],
+    stream: false,
+    max_tokens: 2048
+  });
+  // X-Session-Id: the caller's `chatSessionId`, else a generated one so
+  // the follow-up audit lookups can find THIS interaction deterministically
+  // (chat.py::_resolve_session_id honours the header).
+  const given = bru.getEnvVar("chatSessionId");
+  const sid = given ? given : "bru-chat-param-" + Date.now();
+  req.setHeader("X-Session-Id", sid);
+  bru.setVar("paramChatSessionId", sid);
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("OpenAI shape preserved (feedback_openai_schema_inviolate)", function() {
+    const b = res.getBody();
+    expect(b.id).to.be.a("string");
+    expect(b.object).to.equal("chat.completion");
+    expect(b.created).to.be.a("number");
+    expect(b.model).to.be.a("string");
+    expect(b.choices).to.be.an("array").with.lengthOf.at.least(1);
+    expect(b.choices[0].message.role).to.equal("assistant");
+    expect(b.choices[0].message.content).to.be.a("string");
+    expect(b.choices[0].finish_reason).to.equal("stop");
+    expect(b.usage.prompt_tokens).to.be.a("number");
+    expect(b.usage.completion_tokens).to.be.a("number");
+    expect(b.usage.total_tokens).to.be.a("number");
+  });
+  test("additive-only: no OpenAI key removed, extras tolerated", function() {
+    // The default POST shape may only GAIN fields. This asserts the
+    // OpenAI-required keys are all present at each level; it deliberately
+    // does NOT fail on extra keys (additive extensions are allowed).
+    const b = res.getBody();
+    ["id", "object", "created", "model", "choices", "usage"].forEach(k =>
+      expect(b, "top-level " + k).to.have.property(k));
+    ["index", "message", "finish_reason"].forEach(k =>
+      expect(b.choices[0], "choice " + k).to.have.property(k));
+    ["role", "content"].forEach(k =>
+      expect(b.choices[0].message, "message " + k).to.have.property(k));
+  });
+  test("LC-6: sources trailer present when expectSourcesTrailer=true", function() {
+    // Marker from routes/_sources_trailer.py: SOURCES_TRAILER_LABEL
+    // (line 47) rendered by build_sources_trailer (line 77) as
+    // "\n\n**Sources consultées**\n- <source_ref>..." and appended to the
+    // client-facing content only by routes/chat.py:1890-1896 when
+    // AUDITTRACE_RESPONSE_SOURCES=trailer and finish_reason == "stop".
+    if (bru.getEnvVar("expectSourcesTrailer") !== "true") {
+      return;
+    }
+    const content = res.getBody().choices[0].message.content;
+    expect(content).to.match(/\n\n\*\*Sources consultées\*\*(\n- [^\n]+)+\s*$/);
+  });
+}
+
+docs {
+  Parameterised sibling of 02-chat-completions (BRUNO-CHAT-PARAM, closes
+  v1.30.0 candidate verify F2). Inputs (env vars, defaults in
+  environments/*.bru):
+
+  - `chatPrompt` -- the user prompt. Default asks for the ratified
+    memory-mode decision so the model performs a recall in
+    memory_mode=tools.
+  - `chatSessionId` -- optional `X-Session-Id`; empty means generate one.
+  - `expectSourcesTrailer` -- `true` asserts the LC-6 "Sources consultées"
+    trailer is at the end of the answer (the deploy must run
+    AUDITTRACE_RESPONSE_SOURCES=trailer).
+
+  Stashes runtime var `paramChatSessionId`. A recall turn can take
+  minutes on the local model; there is no request timeout in the CLI.
+}

@@ -1,0 +1,31 @@
+meta {
+  name: GET /interactions?trace_id=<SERVER> — positive control, exactly the 04 interaction
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/interactions?trace_id={{serverTraceId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200 with exactly the interaction written by 04", function() {
+    expect(res.getStatus()).to.equal(200);
+    const rows = res.getBody().interactions;
+    expect(rows).to.have.lengthOf(1);
+    expect(String(rows[0].id)).to.equal(bru.getVar("serverInteractionId"));
+    expect(rows[0].trace_id).to.equal(bru.getVar("serverTraceId"));
+    expect(rows[0].session_id).to.equal(bru.getVar("inboundSessionId"));
+  });
+}
+
+docs {
+  TRACEPARENT-TRUST step 4: positive control for 06. Same filter, server
+  trace id -> the one interaction 04 produced.
+}
