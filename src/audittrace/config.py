@@ -4,7 +4,7 @@ import os
 from functools import lru_cache
 from typing import Literal, Self
 
-from pydantic import field_validator, model_validator
+from pydantic import ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -608,6 +608,25 @@ class Settings(BaseSettings):
     decision_quantisation: str = ""
     # ``off`` | ``shadow``. ``acting`` is rejected in this slice.
     memory_routing_mode: str = "off"
+    # #459 WU-459-2: the artefact record (Q9/B3) and the shadow-mode bounds.
+    # Licence and model provenance: see the artefact record's ``licence`` block and docs/guides/decision-model-shadow-mode.md.
+    # The record file: an absolute path, or a file name under
+    # ``services/decision/artefacts/``; required when ``decision_url`` is set.
+    decision_artefact_record: str = ""
+    # sha256 (lowercase hex) the record file must have; checked at startup.
+    decision_artefact_record_sha256: str = ""
+    # The shadow state is ``question[:decision_state_max_chars]`` (every row).
+    decision_state_max_chars: int = 4000
+    # At most this many shadow decisions run at once (S2).
+    decision_shadow_max_inflight: int = 1
+    # Waiting decisions beyond this become ``skipped`` rows (0 = shed, never queue).
+    decision_shadow_queue_max: int = 8
+    # Consecutive BREAKER_CODES results that open the breaker (S5).
+    decision_breaker_threshold: int = 5
+    # Seconds the open breaker makes no network call.
+    decision_breaker_cooldown_s: float = 60.0
+    # Seconds a ``GET /props`` identity attestation stays valid (SF-e).
+    decision_identity_ttl_s: float = 300.0
 
     @field_validator("decision_timeout_ms")
     @classmethod
@@ -633,18 +652,58 @@ class Settings(BaseSettings):
             )
         return v
 
+    @field_validator(
+        "decision_state_max_chars",
+        "decision_shadow_max_inflight",
+        "decision_breaker_threshold",
+    )
+    @classmethod
+    def _decision_positive_int(cls, v: int, info: ValidationInfo) -> int:
+        if v < 1:
+            raise ValueError(f"{info.field_name} must be >= 1")
+        return v
+
+    @field_validator("decision_shadow_queue_max")
+    @classmethod
+    def _decision_non_negative_int(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("decision_shadow_queue_max must be >= 0")
+        return v
+
+    @field_validator("decision_breaker_cooldown_s", "decision_identity_ttl_s")
+    @classmethod
+    def _decision_positive_finite_float(cls, v: float, info: ValidationInfo) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(f"{info.field_name} must be > 0 and finite")
+        return v
+
     @model_validator(mode="after")
     def _decision_cross_field(self) -> Self:
         if self.decision_url:
             # Imported here: the decision package imports this module.
-            from audittrace.services.decision.token_tables import table_for
+            from audittrace.services.decision.record import (
+                RecordError,
+                load_record,
+                resolve_record_path,
+            )
 
-            if table_for(self.decision_model_digest) is None:
+            if not self.decision_artefact_record:
                 raise ValueError(
-                    "decision_model_digest has no vendored added-token table "
-                    "(must be the lowercase sha256 of a pinned model): an "
-                    "unknown model has no control-token denylist and may not "
-                    "take decisions"
+                    "decision_artefact_record is required when decision_url is set"
+                )
+            try:
+                record = load_record(
+                    resolve_record_path(self.decision_artefact_record),
+                    self.decision_artefact_record_sha256,
+                )
+            except RecordError as exc:
+                raise ValueError(
+                    f"decision_artefact_record {exc.code}: {exc.detail}"
+                ) from exc
+            if self.decision_model_digest not in record.digests:
+                raise ValueError(
+                    "decision_model_digest is not a weights[].digest of the "
+                    "artefact record"
                 )
             if not self.decision_model_alias:
                 raise ValueError(

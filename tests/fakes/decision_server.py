@@ -13,6 +13,7 @@ Two flavours, both ``httpx.MockTransport`` handlers that record every call:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -21,11 +22,18 @@ from typing import Any
 import httpx
 
 from audittrace.config import Settings
+from audittrace.services.decision.record import resolve_record_path
 from tests.fakes.decision_added_tokens import ID_OF, LEAKY
 
 DIGEST = "4f8a3d7fc2c8eda2601751ace44690ba1080e508842df88644cedcc08af82cdf"
 URL = "http://decision.test"
 ALIAS = "tev1-test"
+RECORD_NAME = "tev1-0.8B-experimental.json"
+# sha256 of the SHIPPED record file, computed at import: the fixtures stay valid
+# when the record changes, and a mismatch is still refused by the config.
+RECORD_SHA256 = hashlib.sha256(
+    resolve_record_path(RECORD_NAME).read_bytes()
+).hexdigest()
 
 # Added-token ids of the fake tokenizer (same ids the real tokenizer returns).
 CONTROL_IDS = dict(ID_OF)
@@ -42,6 +50,8 @@ def make_settings(**overrides: Any) -> Settings:
         "decision_model": "tev1-test-model",
         "decision_model_alias": ALIAS,
         "decision_model_digest": DIGEST,
+        "decision_artefact_record": RECORD_NAME,
+        "decision_artefact_record_sha256": RECORD_SHA256,
         "decision_timeout_ms": 2000,
         "decision_temperature": 1.0,
         "decision_backend": "vulkan",
