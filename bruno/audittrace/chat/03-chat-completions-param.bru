@@ -43,7 +43,6 @@ script:pre-request {
   const given = bru.getEnvVar("chatSessionId");
   const sid = given ? given : "bru-chat-param-" + Date.now();
   req.setHeader("X-Session-Id", sid);
-  bru.setVar("paramChatSessionId", sid);
 }
 
 tests {
@@ -103,6 +102,6 @@ docs {
     trailer is at the end of the answer (the deploy must run
     AUDITTRACE_RESPONSE_SOURCES=trailer).
 
-  Stashes runtime var `paramChatSessionId`. A recall turn can take
+  A recall turn can take
   minutes on the local model; there is no request timeout in the CLI.
 }

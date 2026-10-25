@@ -1,7 +1,7 @@
 meta {
   name: GET /interactions?trace_id=<SERVER> — positive control, exactly the 04 interaction
   type: http
-  seq: 7
+  seq: 8
 }
 
 get {
@@ -15,6 +15,10 @@ auth:bearer {
 }
 
 tests {
+  test("precondition: 05 stashed the server ids (not vacuous)", function() {
+    expect(bru.getVar("serverTraceId")).to.match(/^[0-9a-f]{32}$/);
+    expect(bru.getVar("serverInteractionId")).to.match(/^[0-9]+$/);
+  });
   test("returns 200 with exactly the interaction written by 04", function() {
     expect(res.getStatus()).to.equal(200);
     const rows = res.getBody().interactions;
@@ -26,6 +30,6 @@ tests {
 }
 
 docs {
-  TRACEPARENT-TRUST step 4: positive control for 06. Same filter, server
+  TRACEPARENT-TRUST step 5: positive control for 06. Same filter, server
   trace id -> the one interaction 04 produced.
 }

@@ -73,7 +73,7 @@ docs {
   plus the `audittrace.inbound.*` attributes. The interaction must
   therefore be persisted under a SERVER-minted trace id.
 
-  Must be followed, in the SAME `bru run`, by 05 -> 06 -> 07 which
+  Must be followed, in the SAME `bru run`, by 05 -> 09 (06 proves the header ARRIVED, 07 that it was not adopted) which
   assert that. Run them together (see README); run alone this proves
   nothing. Stashes runtime vars `inboundTraceId`, `inboundSessionId`.
 }

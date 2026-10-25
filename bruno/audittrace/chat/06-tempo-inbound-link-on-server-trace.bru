@@ -1,0 +1,99 @@
+meta {
+  name: Tempo — the server trace RECEIVED the inbound traceparent (link + audittrace.inbound.*)
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{tempoUrl}}/api/traces/{{serverTraceId}}
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+script:pre-request {
+  // Bounded poll for Tempo ingest delay: up to 12 tries, 5 s apart (60 s).
+  // A partial trace (200 without the inbound attribute yet) is NOT enough
+  // to stop: the poll waits for the attribute, and if it never appears the
+  // request below still runs and its tests go RED. The poll asserts
+  // nothing and prints nothing (the body holds a Langfuse key literal).
+  const url = bru.getEnvVar("tempoUrl") + "/api/traces/" + bru.getVar("serverTraceId");
+  const inbound = bru.getVar("inboundTraceId");
+  for (let i = 0; i < 12; i++) {
+    let hit = false;
+    try {
+      const r = await bru.sendRequest({ method: "GET", url: url, headers: { Accept: "application/json" } });
+      hit = r.status === 200 && JSON.stringify(r.data).indexOf(inbound) !== -1;
+    } catch (e) {
+      hit = false;
+    }
+    if (hit) { return; }
+    await bru.sleep(5000);
+  }
+}
+
+script:post-response {
+  // The span JSON of a chat trace holds a Langfuse key literal
+  // (audittrace.auth.require_user input.value). Extract ONLY the inbound
+  // attributes and links, then replace the body so the key literal can
+  // never reach the console, a --output capture or a stash.
+  const found = { attrs: [], links: [], spans: 0 };
+  if (res.getStatus() === 200) {
+    const body = res.getBody();
+    const hexToB64 = (h) => Buffer.from(h, "hex").toString("base64");
+    for (const b of (body.batches || [])) {
+      for (const ss of (b.scopeSpans || [])) {
+        for (const s of (ss.spans || [])) {
+          found.spans += 1;
+          for (const a of (s.attributes || [])) {
+            if (a.key === "audittrace.inbound.trace_id" || a.key === "audittrace.inbound.traceparent") {
+              found.attrs.push({ key: a.key, value: a.value && a.value.stringValue });
+            }
+          }
+          for (const l of (s.links || [])) {
+            found.links.push(String(l.traceId));
+          }
+        }
+      }
+    }
+  }
+  bru.setVar("tempoInboundFound", JSON.stringify(found));
+  res.setBody({ redacted: true, status: res.getStatus(), spans: found.spans, inbound_attrs: found.attrs, link_trace_ids: found.links });
+}
+
+tests {
+  test("precondition: 04/05 ran in this run (inbound + server ids stashed)", function() {
+    expect(bru.getVar("inboundTraceId")).to.match(/^[0-9a-f]{32}$/);
+    expect(bru.getVar("serverTraceId")).to.match(/^[0-9a-f]{32}$/);
+    expect(bru.getVar("serverTraceId")).to.not.equal(bru.getVar("inboundTraceId"));
+  });
+  test("returns 200 — the server trace reached Tempo", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().spans).to.be.above(0);
+  });
+  test("RECEIVED, not just not-adopted: audittrace.inbound.trace_id on the server trace == inbound id", function() {
+    // Fails if the header was never sent (04 regression) or was stripped
+    // by the gateway: telemetry.py inbound_trace_context_hook (line 145)
+    // only sets these attributes for a parsed inbound context.
+    const vals = res.getBody().inbound_attrs.filter(a => a.key === "audittrace.inbound.trace_id").map(a => a.value);
+    expect(vals).to.include(bru.getVar("inboundTraceId"));
+  });
+  test("a span link to the inbound trace id exists on the server trace", function() {
+    const hex = bru.getVar("inboundTraceId");
+    const b64 = Buffer.from(hex, "hex").toString("base64");
+    const links = res.getBody().link_trace_ids;
+    expect(links.some(l => l === hex || l === b64)).to.equal(true);
+  });
+}
+
+docs {
+  TRACEPARENT-TRUST step 3 (closes review R1): proves the inbound
+  `traceparent` actually ARRIVED at the server (recorded as a span link
+  plus audittrace.inbound.* attributes) while 07 proves it was not
+  adopted. Together: received AND not adopted. Needs Tempo reachable at
+  `tempoUrl` (cluster default http://localhost:3200). The response body is
+  replaced by an extract so no Langfuse key literal can be captured.
+}

@@ -1,7 +1,7 @@
 meta {
   name: GET /interactions?trace_id=<INBOUND> — must return 0 rows
   type: http
-  seq: 6
+  seq: 7
 }
 
 get {
@@ -27,7 +27,7 @@ tests {
 }
 
 docs {
-  TRACEPARENT-TRUST step 3 (the proof): the audit trail has NO row keyed
+  TRACEPARENT-TRUST step 4 (the proof): the audit trail has NO row keyed
   by the caller-supplied trace id. 07 is the positive control showing the
   same filter does find a row when given the real (server) id, so a
   0-row result here is not a broken filter.

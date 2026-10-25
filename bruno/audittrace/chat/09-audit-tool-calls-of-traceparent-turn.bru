@@ -1,7 +1,7 @@
 meta {
   name: GET /interactions/{id}/tool-calls — the recall rows of the 04 turn
   type: http
-  seq: 8
+  seq: 9
 }
 
 get {
@@ -36,14 +36,15 @@ tests {
       expect(c.granted_scope).to.be.a("string");
     });
   });
-  test("recall turn: at least one memory tool call when expectSourcesTrailer=true", function() {
+  test("recall turn: at least one recall tool (recall_* / read_decision) when expectSourcesTrailer=true", function() {
     // The default chatPrompt is designed to trigger a recall; a deploy
     // expecting the LC-6 trailer must also show tool_calls rows (the
     // trailer is rendered from them).
     if (bru.getEnvVar("expectSourcesTrailer") !== "true") {
       return;
     }
-    expect(res.getBody().tool_calls.length).to.be.above(0);
+    const names = res.getBody().tool_calls.map(c => c.tool_name);
+    expect(names.some(n => n.startsWith("recall_") || n === "read_decision")).to.equal(true);
   });
 }
 
