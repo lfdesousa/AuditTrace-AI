@@ -16,9 +16,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from tests._hermetic_env import override_sentinel
@@ -28,6 +30,7 @@ REAL_SCRIPT = REPO_ROOT / "scripts" / "ci" / "run-tests.sh"
 REAL_SKIP_CHECK = REPO_ROOT / "scripts" / "check-no-skipped-tests.py"
 REAL_COVERAGE_CHECK = REPO_ROOT / "scripts" / "check-per-file-coverage.py"
 REAL_VENV_LOCK_CHECK = REPO_ROOT / "scripts" / "ci" / "check_venv_matches_lock.py"
+REAL_FREEZE_CHECK = REPO_ROOT / "scripts" / "ci" / "check_freeze_matches_lock.py"
 HELM_RULE_CASES = json.loads(
     (REPO_ROOT / "tests" / "data" / "helm_rule_cases.json").read_text()
 )["cases"]
@@ -52,6 +55,15 @@ def _scratch_script_root(tmp_path: Path) -> Path:
     )
     shutil.copy(REPO_ROOT / "requirements-dev.txt", root / "requirements-dev.txt")
     shutil.copy(REPO_ROOT / "pyproject.toml", root / "pyproject.toml")
+    # WU-2: G5 also covers the gate venv (second lock environment) through the
+    # freeze comparator. The scratch root gets the REAL comparator, the REAL gate
+    # lock and the REAL gate venv (symlinked; `make gate-venv` makes it, CI runs
+    # that before the suite) — a bypass would defeat the point of the test.
+    shutil.copy(
+        REAL_FREEZE_CHECK, root / "scripts" / "ci" / "check_freeze_matches_lock.py"
+    )
+    shutil.copy(REPO_ROOT / "requirements-gate.txt", root / "requirements-gate.txt")
+    (root / ".gate-venv").symlink_to(REPO_ROOT / ".gate-venv")
     return root
 
 
@@ -559,3 +571,304 @@ def test_a_scratch_run_with_an_altered_lock_copy_is_refused_before_pytest(
     assert "check-venv-matches-lock" in result.stderr
     assert "rm -rf .venv && make venv" in result.stderr
     assert not ran.exists(), "pytest ran although the venv does not match the lock"
+
+
+# --------------------------------------------------------------------------
+# DEP-LOCK-AT WU-2: G5 on every lock environment, after pytest, on $PYTEST's
+# interpreter (BL-1), and the SIGTERM trap (BL-4).
+# --------------------------------------------------------------------------
+
+
+def _fakes(tmp_path: Path, **pytest_kwargs: object) -> tuple[Path, Path]:
+    root = _scratch_script_root(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    _fake_pytest(bin_dir, **pytest_kwargs)  # type: ignore[arg-type]
+    _fake_python_passthrough(bin_dir)
+    _fake_real_helm(bin_dir)
+    return root, bin_dir
+
+
+def test_g5_runs_again_after_pytest_and_refuses_a_run_that_broke_the_lock(
+    tmp_path: Path,
+):
+    """Residual 4: the pre-pytest check passes, then the (fake) suite changes
+    the environment's contract; the run must NOT pass. Neuter: delete the
+    `check_environments post` line -> this goes RED (exit 0)."""
+    root, bin_dir = _fakes(
+        tmp_path,
+        body=("sed -i 's/^fastapi==0.146.0 /fastapi==0.141.1 /' requirements-dev.txt"),
+    )
+    result = _run_script(root, bin_dir)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "G5 (post-pytest)" in result.stdout
+    assert "check-venv-matches-lock" in result.stderr
+    assert "fastapi" in result.stderr
+
+
+def test_g5_checks_the_interpreter_pytest_runs_under_not_only_python(tmp_path: Path):
+    """BL-1: $PYTHON is green, but the pytest console script's shebang names a
+    different interpreter that is NOT the lock. Neuter: check only $PYTHON
+    (delete the PYTEST_PYTHON branch) -> this goes RED."""
+    root, bin_dir = _fakes(tmp_path)
+    other = bin_dir / "other" / "python3"
+    other.parent.mkdir()
+    _write_exec(
+        other,
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  *check_venv_matches_lock.py)\n"
+        '    echo "STALE-INTERPRETER: this is not the lock" >&2; exit 1 ;;\n'
+        "esac\n"
+        f'exec "{sys.executable}" "$@"\n',
+    )
+    ran = tmp_path / "pytest.ran"
+    pytest_tool = bin_dir / "pytest"
+    body = pytest_tool.read_text().split("\n", 1)[1]
+    _write_exec(
+        pytest_tool,
+        f"#!{other}\n" + body.replace("exit 0\n", f'touch "{ran}"\nexit 0\n'),
+    )
+
+    result = _run_script(root, bin_dir)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "STALE-INTERPRETER" in result.stderr
+    assert not ran.exists(), "pytest ran under an interpreter that is not the lock"
+
+
+def test_a_pytest_whose_interpreter_cannot_be_identified_is_refused(tmp_path: Path):
+    """BL-1 fail closed: a pytest that is neither a python-shebang script nor has
+    a sibling python is refused, never assumed to be $PYTHON."""
+    root = _scratch_script_root(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    _fake_pytest(bin_dir)
+    # `python` lives elsewhere on PATH, not next to pytest.
+    py_dir = tmp_path / "pydir"
+    py_dir.mkdir()
+    _fake_python_passthrough(py_dir)
+    _fake_real_helm(bin_dir)
+
+    result = _run_script(
+        root,
+        bin_dir,
+        extra_env={"PATH": f"{bin_dir}{os.pathsep}{py_dir}{os.pathsep}/usr/bin:/bin"},
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "cannot identify the interpreter" in result.stderr
+
+
+def test_g5_refuses_a_gate_venv_that_is_not_the_gate_lock(tmp_path: Path):
+    """Second lock environment. A gate venv whose `pip freeze --all` is wrong is
+    refused before pytest. Neuter: drop the gate-venv freeze call -> RED."""
+    root, bin_dir = _fakes(tmp_path)
+    (root / ".gate-venv").unlink()
+    gate_bin = root / ".gate-venv" / "bin"
+    gate_bin.mkdir(parents=True)
+    _write_exec(gate_bin / "python", "#!/usr/bin/env bash\necho 'semgrep==0.0.1'\n")
+    ran = tmp_path / "pytest.ran"
+    _fake_pytest(bin_dir, body=f'touch "{ran}"')
+
+    result = _run_script(root, bin_dir)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "gate venv is NOT requirements-gate.txt" in result.stderr
+    assert not ran.exists()
+
+
+def test_a_missing_gate_venv_is_refused_not_skipped(tmp_path: Path):
+    root, bin_dir = _fakes(tmp_path)
+    (root / ".gate-venv").unlink()
+
+    result = _run_script(root, bin_dir)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "make gate-venv" in result.stderr
+
+
+def _fake_docker(bin_dir: Path, log: Path) -> None:
+    """A docker that lists two containers for the run label and logs `rm -f`."""
+    _write_exec(
+        bin_dir / "docker",
+        "#!/usr/bin/env bash\n"
+        f'echo "$@" >> "{log}"\n'
+        'if [ "$1" = ps ]; then echo cid-one; echo cid-two; fi\n'
+        "exit 0\n",
+    )
+
+
+def _default_sigint() -> None:
+    """A parent started as `cmd &` from a non-interactive shell (CI, nohup chains)
+    has SIGINT ignored, and an ignored-on-entry signal cannot be trapped by bash.
+    The child under test is given the default disposition a terminal user has."""
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_sigterm_to_the_wrapper_stops_pytest_its_children_and_the_containers(
+    tmp_path: Path,
+):
+    """BL-4. Send SIGTERM to run-tests.sh itself while a (fake) pytest and a child
+    of it are running: both must be gone, the run's labelled containers must be
+    force-removed, and the exit status is 143. Neuter: delete the TERM trap ->
+    the fake pytest is orphaned and this goes RED."""
+    root, bin_dir = _fakes(tmp_path)
+    pids = tmp_path / "pids"
+    docker_log = tmp_path / "docker.log"
+    _fake_docker(bin_dir, docker_log)
+    tool = bin_dir / "pytest"
+    _write_exec(
+        tool,
+        f'#!/usr/bin/env bash\nsleep 300 &\necho "$$ $!" > "{pids}"\nwait\n',
+    )
+    argv = ["bash", str(root / "scripts" / "ci" / "run-tests.sh"), "--subset", "x"]
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin",
+        "HOME": os.environ.get("HOME", "/tmp"),
+    }
+    with override_sentinel(shim_dir=str(bin_dir), kubeconfig=None, required=False):
+        proc = subprocess.Popen(
+            argv,
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            preexec_fn=_default_sigint,
+        )
+        deadline = time.time() + 30
+        while not pids.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        assert pids.exists(), "the fake pytest never started"
+        time.sleep(0.2)
+        pytest_pid, child_pid = (int(x) for x in pids.read_text().split())
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=30)
+
+    assert proc.returncode == 143, out + err
+    assert "caught SIGTERM" in err
+    deadline = time.time() + 5
+    while (_alive(pytest_pid) or _alive(child_pid)) and time.time() < deadline:
+        time.sleep(0.1)
+    assert not _alive(pytest_pid), "the pytest child was orphaned"
+    assert not _alive(child_pid), "a grandchild of pytest was orphaned"
+    log = docker_log.read_text()
+    assert "label=audittrace.run-tests-id=run-tests-" in log
+    assert "rm -f cid-one cid-two" in log
+
+
+def test_sigint_is_handled_the_same_way(tmp_path: Path):
+    root, bin_dir = _fakes(tmp_path)
+    pids = tmp_path / "pids"
+    docker_log = tmp_path / "docker.log"
+    _fake_docker(bin_dir, docker_log)
+    _write_exec(
+        bin_dir / "pytest",
+        f'#!/usr/bin/env bash\necho "$$" > "{pids}"\nsleep 300 &\nwait\n',
+    )
+    argv = ["bash", str(root / "scripts" / "ci" / "run-tests.sh"), "--subset", "x"]
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin",
+        "HOME": os.environ.get("HOME", "/tmp"),
+    }
+    with override_sentinel(shim_dir=str(bin_dir), kubeconfig=None, required=False):
+        proc = subprocess.Popen(
+            argv,
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            preexec_fn=_default_sigint,
+        )
+        deadline = time.time() + 30
+        while not pids.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        time.sleep(0.2)
+        pytest_pid = int(pids.read_text().split()[0])
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=30)
+
+    assert proc.returncode == 130, out + err
+    assert not _alive(pytest_pid)
+    assert "rm -f cid-one cid-two" in docker_log.read_text()
+
+
+def test_a_normal_run_removes_its_labelled_containers_too(tmp_path: Path):
+    """The label cleanup is not signal-only: a run that ends normally with a
+    container left behind (atexit skipped) is reaped as well."""
+    root, bin_dir = _fakes(tmp_path)
+    docker_log = tmp_path / "docker.log"
+    _fake_docker(bin_dir, docker_log)
+
+    result = _run_script(root, bin_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "rm -f cid-one cid-two" in docker_log.read_text()
+
+
+def test_ephemeral_postgres_is_labelled_with_the_run_id_only_when_one_is_set():
+    """BL-4 half two: the label is what lets the wrapper find the containers.
+    Neuter: return [] unconditionally -> the SIGTERM cleanup finds nothing."""
+    from tests._pg_ephemeral import run_label_args
+
+    assert run_label_args({"AUDITTRACE_RUN_TESTS_ID": "run-tests-1-2"}) == [
+        "--label",
+        "audittrace.run-tests-id=run-tests-1-2",
+    ]
+    assert run_label_args({}) == []
+    assert run_label_args() == run_label_args(dict(os.environ))
+
+
+def test_a_pytest_that_ignores_sigterm_is_killed_after_the_grace_period(tmp_path: Path):
+    """BL-4 escalation: TERM is not enough for a hung pytest. Neuter: delete the
+    `kill -KILL` after the grace loop -> the ignoring child survives and this goes
+    RED. (The scratch copy shortens the 10 s grace to 1 s.)"""
+    root, bin_dir = _fakes(tmp_path)
+    script = root / "scripts" / "ci" / "run-tests.sh"
+    text = script.read_text()
+    assert "TERM_GRACE_POLLS=50" in text
+    script.write_text(text.replace("TERM_GRACE_POLLS=50", "TERM_GRACE_POLLS=5"))
+    pids = tmp_path / "pids"
+    _write_exec(
+        bin_dir / "pytest",
+        "#!/usr/bin/env bash\n"
+        "trap '' TERM\n"
+        f'echo "$$" > "{pids}"\n'
+        "while true; do sleep 0.1; done\n",
+    )
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin",
+        "HOME": os.environ.get("HOME", "/tmp"),
+    }
+    with override_sentinel(shim_dir=str(bin_dir), kubeconfig=None, required=False):
+        proc = subprocess.Popen(
+            ["bash", str(script), "--subset", "x"],
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.time() + 30
+        while not pids.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        time.sleep(0.3)
+        hung_pid = int(pids.read_text())
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=30)
+    assert proc.returncode == 143, out + err
+    deadline = time.time() + 5
+    while _alive(hung_pid) and time.time() < deadline:
+        time.sleep(0.1)
+    assert not _alive(hung_pid), "a pytest that ignores SIGTERM was left running"

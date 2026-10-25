@@ -71,12 +71,63 @@ resolve_tool() {
 PYTEST="$(resolve_tool pytest)"
 PYTHON="$(resolve_tool python)"
 
-# ---- G5 (DEP-LOCK-AT C2): the interpreter running the suite MUST be the
-# hashed lock, exactly — fail closed, no flag, no env bypass. A venv that
+# ---- G5 (DEP-LOCK-AT C2, WU-2): every environment this run depends on MUST be
+# its hashed lock, exactly — fail closed, no flag, no env bypass. A venv that
 # drifted from requirements-dev.txt (the 2026-10-18 otel 1.44.0 / fastapi
-# 0.140.7 venvs) is refused BEFORE a single test runs. Recovery:
-# `rm -rf .venv && make venv`. ----
-"$PYTHON" scripts/ci/check_venv_matches_lock.py requirements-dev.txt
+# 0.140.7 venvs) is refused BEFORE a single test runs, and the same check runs
+# again AFTER pytest (a test that installs or upgrades a package is caught, not
+# just a stale venv: residual 4). Recovery: `rm -rf .venv && make venv`.
+#
+# BL-1: the suite runs under $PYTEST's interpreter, which is not necessarily
+# $PYTHON (a console script's shebang decides). G5 checks BOTH.
+# The gate venv (semgrep, requirements-gate.txt) is the second lock
+# environment; the three images are checked by check-images-match-locks.sh.
+GATE_VENV="${GATE_VENV:-.gate-venv}"
+DEV_LOCK=requirements-dev.txt
+GATE_LOCK=requirements-gate.txt
+
+resolve_pytest_python() {
+  # The interpreter the pytest console script runs under: its shebang when that
+  # names a python, else a sibling `python` in the same directory; else fail
+  # closed (an interpreter we cannot identify is an interpreter we cannot check).
+  local first interp="" word2
+  first="$(head -n 1 "$PYTEST" 2>/dev/null || true)"
+  case "$first" in
+    '#!'*)
+      read -r interp word2 <<< "${first#'#!'}"
+      if [ "$(basename "$interp")" = "env" ]; then
+        interp="$(command -v "$word2" 2>/dev/null || true)"
+      fi
+      ;;
+  esac
+  if [ -n "$interp" ] && [ -x "$interp" ] && [[ "$(basename "$interp")" == python* ]]; then
+    echo "$interp"
+  elif [ -x "$(dirname "$PYTEST")/python" ]; then
+    echo "$(dirname "$PYTEST")/python"
+  else
+    echo "❌ run-tests.sh: cannot identify the interpreter $PYTEST runs under (G5/BL-1)" >&2
+    return 1
+  fi
+}
+
+PYTEST_PYTHON="$(resolve_pytest_python)"
+
+check_environments() { # check_environments <when: pre|post>
+  local when="$1"
+  echo "run-tests: G5 ($when-pytest): $PYTHON / $PYTEST_PYTHON == $DEV_LOCK, $GATE_VENV == $GATE_LOCK"
+  "$PYTHON" scripts/ci/check_venv_matches_lock.py "$DEV_LOCK"
+  if [ "$PYTEST_PYTHON" != "$PYTHON" ]; then
+    "$PYTEST_PYTHON" scripts/ci/check_venv_matches_lock.py "$DEV_LOCK"
+  fi
+  if [ ! -x "$GATE_VENV/bin/python" ]; then
+    echo "❌ run-tests.sh: gate venv $GATE_VENV/bin/python not found — run: make gate-venv" >&2
+    exit 1
+  fi
+  "$PYTHON" scripts/ci/check_freeze_matches_lock.py \
+    --lock "$GATE_LOCK" --python "$GATE_VENV/bin/python" --label "gate venv"
+}
+
+check_environments pre
 
 # ---- R4/A3-8: resolve the REAL helm BEFORE the PATH change — the shim
 # execs this absolute path on an allowed call. Fail at start if missing;
@@ -162,7 +213,61 @@ export HERMETIC_SHIM_DIR="$SHIM_DIR"
 export HERMETIC_KUBECONFIG="$KUBECONFIG"
 export HERMETIC_REQUIRED=1
 
-cleanup() { rm -rf "$SHIM_DIR"; }
+# ---- BL-4: signal handling. An unexplained SIGTERM (2026-10-21 13:57) orphaned
+# a pytest and 4 ephemeral postgres containers: bash defers a trap while a
+# foreground child runs, pytest's SIGTERM default skips atexit, and the
+# containers are named after the pytest pid, which the wrapper never knew. So:
+# (1) pytest runs as a background job in ITS OWN process group (`set -m`) and the
+# wrapper `wait`s, so the trap runs at once; (2) the trap TERMs that whole group,
+# KILLs it after a grace period, then (3) removes every container labelled with
+# this run's id (tests/_pg_ephemeral.py labels them from AUDITTRACE_RUN_TESTS_ID).
+RUN_ID="run-tests-$$-$(date +%s)"
+export AUDITTRACE_RUN_TESTS_ID="$RUN_ID"
+CHILD_PID=""
+TERM_GRACE_POLLS=50   # x 0.2 s = 10 s between TERM and KILL
+
+reap_containers() {
+  command -v docker >/dev/null 2>&1 || return 0
+  local ids
+  ids="$(docker ps -aq --filter "label=audittrace.run-tests-id=$RUN_ID" 2>/dev/null || true)"
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086
+    docker rm -f $ids >/dev/null 2>&1 || true
+  fi
+}
+
+terminate() { # terminate <signal> <exit code>
+  trap '' TERM INT
+  echo "run-tests: caught SIG$1 — stopping pytest (pid ${CHILD_PID:-none}) and its containers" >&2
+  if [ -n "$CHILD_PID" ]; then
+    kill -TERM -- "-$CHILD_PID" 2>/dev/null || kill -TERM "$CHILD_PID" 2>/dev/null || true
+    # Grace period (10 s) polled, not a background watchdog: a leftover `sleep`
+    # would hold the caller's stdout/stderr pipes open after this script exits.
+    for _ in $(seq 1 "$TERM_GRACE_POLLS"); do
+      kill -0 "$CHILD_PID" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill -KILL -- "-$CHILD_PID" 2>/dev/null || true
+    wait "$CHILD_PID" 2>/dev/null || true
+  fi
+  reap_containers
+  exit "$2"
+}
+
+run_pytest() { # run_pytest <pytest args...> — foreground semantics, signal-safe
+  trap 'terminate TERM 143' TERM
+  trap 'terminate INT 130' INT
+  set -m   # job control stays on: the pin test forbids any `set +` line
+  "$PYTEST" "$@" &
+  CHILD_PID=$!
+  local rc=0
+  wait "$CHILD_PID" || rc=$?
+  CHILD_PID=""
+  reap_containers
+  return "$rc"
+}
+
+cleanup() { reap_containers; rm -rf "$SHIM_DIR"; }
 trap cleanup EXIT
 
 echo "run-tests: forcing CI shape — KUBECONFIG=$KUBECONFIG (does not exist), kubectl+helm shim at $SHIM_DIR"
@@ -176,7 +281,8 @@ if [ -n "$SUBSET_EXPR" ]; then
   # zero-skip check — but no --cov-fail-under enforcement (a filtered
   # subset can't meaningfully satisfy the per-file gate). ----
   echo "run-tests: subset mode -k \"$SUBSET_EXPR\" -> $JUNIT_PATH"
-  "$PYTEST" tests/ -v -k "$SUBSET_EXPR" --no-cov --junit-xml="$JUNIT_PATH"
+  run_pytest tests/ -v -k "$SUBSET_EXPR" --no-cov --junit-xml="$JUNIT_PATH"
+  check_environments post
 
   echo "🚫 Enforcing zero-skip policy on the subset run..."
   "$PYTHON" scripts/check-no-skipped-tests.py "$JUNIT_PATH"
@@ -184,7 +290,7 @@ else
   # ---- R1: THE pytest invocation — the --cov set, the reports,
   # --cov-fail-under, --junit-xml. Nothing else in this repo may hand-type
   # this line. ----
-  "$PYTEST" tests/ -v \
+  run_pytest tests/ -v \
     --cov=src \
     --cov=bff \
     --cov=scripts/deploy \
@@ -203,6 +309,10 @@ else
     --cov-report=html:htmlcov \
     --cov-fail-under=90 \
     --junit-xml="$JUNIT_PATH"
+
+  # ---- G5 again, AFTER pytest: closes residual 4 (a test that installed or
+  # upgraded a package leaves the lock violated; the run must not pass). ----
+  check_environments post
 
   # ---- the zero-skip check and the per-file coverage check run INSIDE
   # this same script, so CI and local apply IDENTICAL gates. ----

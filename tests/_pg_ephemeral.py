@@ -19,6 +19,7 @@ import shutil
 import socket
 import subprocess
 import time
+from collections.abc import Mapping
 
 from sqlalchemy import create_engine, text
 
@@ -40,6 +41,18 @@ def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+#: Set by scripts/ci/run-tests.sh (BL-4). The label lets the wrapper find and
+#: remove this run's containers when SIGTERM skips this module's ``atexit``.
+RUN_ID_ENV = "AUDITTRACE_RUN_TESTS_ID"
+RUN_ID_LABEL = "audittrace.run-tests-id"
+
+
+def run_label_args(environ: Mapping[str, str] | None = None) -> list[str]:
+    """``--label`` args binding a container to the run-tests.sh run, if any."""
+    run_id = (os.environ if environ is None else environ).get(RUN_ID_ENV)
+    return ["--label", f"{RUN_ID_LABEL}={run_id}"] if run_id else []
 
 
 def start_ephemeral_postgres(name_prefix: str, password: str, db: str) -> str | None:
@@ -67,6 +80,7 @@ def start_ephemeral_postgres(name_prefix: str, password: str, db: str) -> str | 
                 "--rm",
                 "--name",
                 name,
+                *run_label_args(),
                 "-e",
                 f"POSTGRES_PASSWORD={password}",
                 "-e",

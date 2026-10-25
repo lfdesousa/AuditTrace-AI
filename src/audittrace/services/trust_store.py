@@ -480,8 +480,9 @@ class EuLotlTrustStoreBuilder(TrustStoreBuilder):
         except ImportError as exc:
             raise TrustStoreBuilderUnavailableError(
                 "EuLotlTrustStoreBuilder: pyhanko[etsi,async-http] "
-                "extras not installed. Reinstall with `pip install "
-                "pyhanko[etsi,async-http]` or switch to "
+                "extras not installed. They are part of the hashed lock: "
+                "rebuild the environment from it (`make venv`, or rebuild "
+                "the image), or switch to "
                 "StaticTrustStoreBuilder via "
                 "AUDITTRACE_PDF_TRUST_STORE_BUILDER=static."
             ) from exc
@@ -579,8 +580,9 @@ class SwissTslTrustStoreBuilder(TrustStoreBuilder):
         except ImportError as exc:
             raise TrustStoreBuilderUnavailableError(
                 "SwissTslTrustStoreBuilder: pyhanko[etsi,async-http] "
-                "extras + asn1crypto required. Reinstall with "
-                "`pip install pyhanko[etsi,async-http]`."
+                "extras + asn1crypto required. They are part of the hashed "
+                "lock: rebuild the environment from it (`make venv`, or "
+                "rebuild the image)."
             ) from exc
 
         # Load the OOB-vendored TSLO cert.
