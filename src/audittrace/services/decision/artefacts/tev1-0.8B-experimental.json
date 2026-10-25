@@ -1,0 +1,230 @@
+{
+ "evaluation": {
+  "phase0_evidence_ref": "evidence/2026-10-01-459-phase0-setup/FINDINGS-latency-determinism.md",
+  "state_max_chars": 4000,
+  "temperature": 1.0,
+  "timeout_ms": 2000
+ },
+ "licence": {
+  "accepted_on": "2026-10-17",
+  "base_licence": "Apache-2.0",
+  "base_model": "Qwen3.5-0.8B",
+  "checked_on": "2026-10-17",
+  "disclaimer": "Model Tev1-0.8B-experimental (HF commit 6bb2dff14b38fea90ddb14d870166ccaf77374e9). The fine-tuned weights' licence is \"being finalized\" per the upstream model card as of 2026-10-17. Base model Qwen3.5-0.8B under Apache-2.0. The operator accepted the risk for this deployment. The feature IS ENABLED (shadow) in this deployment and OFF in the shipped defaults.",
+  "risk_accepted_by": "operator",
+  "source_card_commit": "6bb2dff14b38fea90ddb14d870166ccaf77374e9",
+  "status": "being finalized"
+ },
+ "model": {
+  "family": "qwen3.5",
+  "hf_commit": "6bb2dff14b38fea90ddb14d870166ccaf77374e9",
+  "hf_repo": "togethercomputer/Tev1-0.8B-experimental",
+  "id": "Tev1-0.8B-experimental"
+ },
+ "record_version": 1,
+ "template": {
+  "family": "chatml-think-off-v1",
+  "pieces": {
+   "after_think": "\n\n",
+   "assistant_role": "assistant\n",
+   "newline": "\n",
+   "think_body": "\n\n",
+   "user_role": "user\n"
+  },
+  "special_tokens": {
+   "im_end": "<|im_end|>",
+   "im_start": "<|im_start|>",
+   "think_close": "</think>",
+   "think_open": "<think>"
+  },
+  "template_id": "tev1-choice-v1",
+  "upstream_chat_template_sha256": "d78de6bee4c952ca3145eb161921560a6ede7b59a34e7e4be815f3c5386b4364",
+  "user_content_literals": {
+   "instruction": "\nAnswer with the option letter only.",
+   "option_sep": "\n",
+   "options_head": "\nOptions:\n",
+   "question_head": "\n\nQuestion: ",
+   "state_head": "State:\n"
+  }
+ },
+ "tokenizer": {
+  "added_tokens": [
+   {
+    "content": "<|endoftext|>",
+    "id": 248044,
+    "special": true
+   },
+   {
+    "content": "<|im_start|>",
+    "id": 248045,
+    "special": true
+   },
+   {
+    "content": "<|im_end|>",
+    "id": 248046,
+    "special": true
+   },
+   {
+    "content": "<|object_ref_start|>",
+    "id": 248047,
+    "special": true
+   },
+   {
+    "content": "<|object_ref_end|>",
+    "id": 248048,
+    "special": true
+   },
+   {
+    "content": "<|box_start|>",
+    "id": 248049,
+    "special": true
+   },
+   {
+    "content": "<|box_end|>",
+    "id": 248050,
+    "special": true
+   },
+   {
+    "content": "<|quad_start|>",
+    "id": 248051,
+    "special": true
+   },
+   {
+    "content": "<|quad_end|>",
+    "id": 248052,
+    "special": true
+   },
+   {
+    "content": "<|vision_start|>",
+    "id": 248053,
+    "special": true
+   },
+   {
+    "content": "<|vision_end|>",
+    "id": 248054,
+    "special": true
+   },
+   {
+    "content": "<|vision_pad|>",
+    "id": 248055,
+    "special": true
+   },
+   {
+    "content": "<|image_pad|>",
+    "id": 248056,
+    "special": true
+   },
+   {
+    "content": "<|video_pad|>",
+    "id": 248057,
+    "special": true
+   },
+   {
+    "content": "<tool_call>",
+    "id": 248058,
+    "special": false
+   },
+   {
+    "content": "</tool_call>",
+    "id": 248059,
+    "special": false
+   },
+   {
+    "content": "<|fim_prefix|>",
+    "id": 248060,
+    "special": false
+   },
+   {
+    "content": "<|fim_middle|>",
+    "id": 248061,
+    "special": false
+   },
+   {
+    "content": "<|fim_suffix|>",
+    "id": 248062,
+    "special": false
+   },
+   {
+    "content": "<|fim_pad|>",
+    "id": 248063,
+    "special": false
+   },
+   {
+    "content": "<|repo_name|>",
+    "id": 248064,
+    "special": false
+   },
+   {
+    "content": "<|file_sep|>",
+    "id": 248065,
+    "special": false
+   },
+   {
+    "content": "<tool_response>",
+    "id": 248066,
+    "special": false
+   },
+   {
+    "content": "</tool_response>",
+    "id": 248067,
+    "special": false
+   },
+   {
+    "content": "<think>",
+    "id": 248068,
+    "special": false
+   },
+   {
+    "content": "</think>",
+    "id": 248069,
+    "special": false
+   },
+   {
+    "content": "<|audio_start|>",
+    "id": 248070,
+    "special": true
+   },
+   {
+    "content": "<|audio_end|>",
+    "id": 248071,
+    "special": true
+   },
+   {
+    "content": "<tts_pad>",
+    "id": 248072,
+    "special": true
+   },
+   {
+    "content": "<tts_text_bos>",
+    "id": 248073,
+    "special": true
+   },
+   {
+    "content": "<tts_text_eod>",
+    "id": 248074,
+    "special": true
+   },
+   {
+    "content": "<tts_text_bos_single>",
+    "id": 248075,
+    "special": true
+   },
+   {
+    "content": "<|audio_pad|>",
+    "id": 248076,
+    "special": true
+   }
+  ],
+  "config_sha256": "4ed764fafae09ed7390f85ab1ddc28baa34a4805b4119048ba8d922abaaebcaf",
+  "source": "HF togethercomputer/Tev1-0.8B-experimental @ 6bb2dff14b38fea90ddb14d870166ccaf77374e9"
+ },
+ "weights": [
+  {
+   "alias": "tev1-0.8B-f16",
+   "backend_measured": "vulkan",
+   "digest": "4f8a3d7fc2c8eda2601751ace44690ba1080e508842df88644cedcc08af82cdf",
+   "file_basename": "tev1-0.8B-f16.gguf",
+   "quantisation": "f16"
+  }
+ ]
+}

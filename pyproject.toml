@@ -202,6 +202,9 @@ audittrace = "audittrace.server:main"
 where = ["src"]
 namespaces = false
 
+[tool.setuptools.package-data]
+"audittrace.services.decision" = ["artefacts/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
