@@ -65,6 +65,9 @@ EXPECTED_KEYS = {
     "acted",
     "result",
     "error_code",
+    "state_max_chars",
+    "state_source",
+    "artefact_record_sha256",
 }
 
 
@@ -115,7 +118,7 @@ async def test_s2_pending_tool_call_carries_all_three_identity_values() -> None:
 
 def test_args_keys_constant_equals_the_literal_set() -> None:
     assert set(ARGS_KEYS) == EXPECTED_KEYS
-    assert len(ARGS_KEYS) == len(EXPECTED_KEYS) == 29
+    assert len(ARGS_KEYS) == len(EXPECTED_KEYS) == 32
 
 
 async def test_t7_ok_row_keys_equal_literal_set_and_every_value_by_value() -> None:
@@ -208,6 +211,9 @@ async def test_t7_ok_row_keys_equal_literal_set_and_every_value_by_value() -> No
     assert args["acted"] is False
     assert args["result"] == "ok"
     assert args["error_code"] is None
+    assert args["state_max_chars"] is None
+    assert args["state_source"] is None
+    assert args["artefact_record_sha256"] is None
 
     assert p.user_id == "u-1" and p.agent_type == "agent-x"
     assert p.started_at == started and isinstance(p.started_at, datetime)
@@ -375,3 +381,77 @@ async def test_build_args_is_pure_and_does_not_mutate_the_result() -> None:
     assert "x" not in (
         build_args(r, mode="shadow", acted=False)["raw_top_logprobs"] or {}
     )
+
+
+# ------------------------------------------------- the three shadow keys (WU-2)
+
+
+async def test_shadow_keys_land_under_their_names_by_value() -> None:
+    r = await _result()
+    sha = "ab" * 32
+    p = build_pending_tool_call(
+        r,
+        user_id="u",
+        agent_type="a",
+        mode="shadow",
+        state_max_chars=4000,
+        state_source="last_user_message",
+        artefact_record_sha256=sha,
+    )
+    args = _args(p)
+    assert set(args) == EXPECTED_KEYS
+    assert args["state_max_chars"] == 4000
+    assert args["state_source"] == "last_user_message"
+    assert args["artefact_record_sha256"] == sha
+    direct = build_args(
+        r,
+        mode="shadow",
+        acted=False,
+        state_max_chars=4000,
+        state_source="last_user_message",
+        artefact_record_sha256=sha,
+    )
+    assert (
+        direct["state_max_chars"],
+        direct["state_source"],
+        direct["artefact_record_sha256"],
+    ) == (4000, "last_user_message", sha)
+
+
+async def test_shadow_keys_are_none_on_the_default_call() -> None:
+    r = await _result()
+    for args in (
+        build_args(r, mode="shadow", acted=False),
+        _args(build_pending_tool_call(r, user_id="u", agent_type="a", mode="shadow")),
+    ):
+        assert set(args) == EXPECTED_KEYS
+        assert args["state_max_chars"] is None
+        assert args["state_source"] is None
+        assert args["artefact_record_sha256"] is None
+
+
+@pytest.mark.parametrize("source", ["context_query", "last_user_message", "empty"])
+async def test_every_closed_state_source_is_accepted(source: str) -> None:
+    r = await _result()
+    assert (
+        build_args(r, mode="shadow", acted=False, state_source=source)["state_source"]
+        == source
+    )
+    assert (
+        _args(
+            build_pending_tool_call(
+                r, user_id="u", agent_type="a", mode="shadow", state_source=source
+            )
+        )["state_source"]
+        == source
+    )
+
+
+async def test_bogus_state_source_is_refused() -> None:
+    r = await _result()
+    with pytest.raises(ValueError, match="state_source"):
+        build_args(r, mode="shadow", acted=False, state_source="bogus")
+    with pytest.raises(ValueError, match="state_source"):
+        build_pending_tool_call(
+            r, user_id="u", agent_type="a", mode="shadow", state_source="bogus"
+        )

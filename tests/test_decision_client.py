@@ -729,8 +729,12 @@ def test_error_vocabulary_is_closed() -> None:
         "model_identity_mismatch",
         "invalid_input",
         "internal_error",
+        "skipped",
+        "cancelled",
     }
     assert result_for("internal_error") == "error"
+    assert result_for("skipped") == "unavailable"
+    assert result_for("cancelled") == "unavailable"
     with pytest.raises(ValueError, match="unknown error_code"):
         DecisionError("made_up")
     assert DecisionError("timeout").error_code == "timeout"

@@ -16,6 +16,11 @@ with EXACTLY the keys in :data:`ARGS_KEYS`; failure rows carry every key, with
 ``null`` where a value is unknown. No state, question or option text is ever
 placed in ``args``, ``result_summary`` or ``error``: hashes only. ``args`` is
 stored untruncated (``Text`` column; the flush path copies it verbatim).
+
+Identity and clock (Addendum 1 S6): a decision row's id is ``tool_calls.id``
+(client-side UUID); its clock anchor is ``tool_calls.started_at``, naive local
+time from ``datetime.now()`` in the client; ``tool_calls`` has no
+``created_at``.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import json
 from typing import Any
 
 from audittrace.routes._memory_tool_loop import PendingToolCall
+from audittrace.services.decision.errors import STATE_SOURCES
 from audittrace.services.decision.result import DecisionResult
 
 TOOL_NAME = "system_one_route"
@@ -62,11 +68,32 @@ ARGS_KEYS: tuple[str, ...] = (
     "acted",
     "result",
     "error_code",
+    "state_max_chars",
+    "state_source",
+    "artefact_record_sha256",
 )
 
 
-def build_args(result: DecisionResult, *, mode: str, acted: bool) -> dict[str, Any]:
-    """The args mapping (every key of :data:`ARGS_KEYS`, nothing else)."""
+def build_args(
+    result: DecisionResult,
+    *,
+    mode: str,
+    acted: bool,
+    state_max_chars: int | None = None,
+    state_source: str | None = None,
+    artefact_record_sha256: str | None = None,
+) -> dict[str, Any]:
+    """The args mapping (every key of :data:`ARGS_KEYS`, nothing else).
+
+    The three shadow keys (WU-459-2) are copied verbatim; ``None`` means
+    "unknown here" (the router fills them). A ``state_source`` outside
+    :data:`STATE_SOURCES` is refused: the vocabulary is closed and the P2
+    report partitions by it (Addendum 1 S8).
+    """
+    if state_source is not None and state_source not in STATE_SOURCES:
+        raise ValueError(
+            f"state_source must be one of {sorted(STATE_SOURCES)}, got {state_source!r}"
+        )
     raw = result.raw_top_logprobs
     return {
         "template_id": result.template_id,
@@ -105,6 +132,9 @@ def build_args(result: DecisionResult, *, mode: str, acted: bool) -> dict[str, A
         "acted": acted,
         "result": result.result,
         "error_code": result.error_code,
+        "state_max_chars": state_max_chars,
+        "state_source": state_source,
+        "artefact_record_sha256": artefact_record_sha256,
     }
 
 
@@ -115,6 +145,9 @@ def build_pending_tool_call(
     agent_type: str,
     mode: str,
     acted: bool = False,
+    state_max_chars: int | None = None,
+    state_source: str | None = None,
+    artefact_record_sha256: str | None = None,
 ) -> PendingToolCall:
     """Build the audit record for ``result``.
 
@@ -126,7 +159,14 @@ def build_pending_tool_call(
         raise ValueError(f"mode must be one of {sorted(ROW_MODES)}, got {mode!r}")
     if acted and mode != "acting":
         raise ValueError("acted=True is only valid for an 'acting' row")
-    args = build_args(result, mode=mode, acted=acted)
+    args = build_args(
+        result,
+        mode=mode,
+        acted=acted,
+        state_max_chars=state_max_chars,
+        state_source=state_source,
+        artefact_record_sha256=artefact_record_sha256,
+    )
     summary = f"result={result.result}"
     if result.choice_index is not None:
         summary += f" choice_index={result.choice_index}"
