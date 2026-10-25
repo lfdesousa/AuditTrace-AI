@@ -44,7 +44,7 @@ from typing import Any
 try:
     from packaging.markers import InvalidMarker, Marker
     from packaging.utils import canonicalize_name
-except ModuleNotFoundError:  # pragma: no cover - bare runner python (e2e-compose AC-6)
+except ModuleNotFoundError:  # bare runner python (e2e-compose AC-6)
     # A runner python without the dev lock installed has no ``packaging`` but its
     # pip vendors the same library; using it avoids an unhashed install (G4).
     from pip._vendor.packaging.markers import (  # type: ignore[no-redef]

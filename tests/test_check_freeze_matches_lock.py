@@ -286,3 +286,31 @@ def test_run_as_a_script_without_the_repo_on_sys_path(tmp_path: Path) -> None:
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_a_runner_python_without_packaging_falls_back_to_the_pips_vendored_copy(
+    tmp_path: Path,
+) -> None:
+    """The e2e-compose job runs on a bare runner python. With `packaging` made
+    unimportable the comparator must still work through pip's vendored copy.
+    Neuter: delete the except-branch in check_venv_matches_lock -> RED."""
+    lock = _write(tmp_path, "lock.txt", LOCK)
+    fr = _write(tmp_path, "fr", GOOD)
+    code = (
+        "import runpy, sys\n"
+        "for m in ('packaging', 'packaging.markers', 'packaging.utils'):\n"
+        "    sys.modules[m] = None\n"
+        "script, lock, freeze = sys.argv[1:4]\n"
+        "sys.argv = [script, '--lock', lock, '--freeze', freeze]\n"
+        "sys.path.insert(0, script.rsplit('/', 1)[0])\n"
+        "runpy.run_path(script, run_name='__main__')\n"
+    )
+    script = str(REPO_ROOT / "scripts/ci/check_freeze_matches_lock.py")
+    proc = subprocess.run(
+        [sys.executable, "-c", code, script, str(lock), str(fr)],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
