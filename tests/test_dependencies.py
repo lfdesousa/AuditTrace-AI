@@ -159,6 +159,45 @@ def test_register_default_dependencies_wires_manifest_into_semantic_service(
     assert semantic._manifest is manifest
 
 
+def test_register_default_dependencies_wires_embed_api_key_into_semantic_service(
+    monkeypatch,
+):
+    """LC-5 / M3-WU-4 -- production-wiring gate for the embed server's key.
+
+    ``_register_memory_services`` must pass ``embed_api_key=settings.
+    embed_api_key`` into the real ``ChromaSemanticService``; without it every
+    recall embed call 401s against the locked embed server while the rest of
+    the suite stays green (``ChromaSemanticService`` defaults the key to "").
+    Asserts the VALUE reaching the service, not merely that it was built.
+    Neuter: delete the kwarg in ``dependencies.py`` -> RED.
+    """
+    from audittrace import dependencies as deps_module
+    from audittrace.config import Settings
+    from audittrace.services.semantic import ChromaSemanticService
+
+    monkeypatch.setattr(
+        deps_module,
+        "HTTPChromaDBFactory",
+        lambda url, token=None: MockChromaDBFactory(),
+    )
+    monkeypatch.setattr(
+        deps_module,
+        "_create_object_storage_provider",
+        lambda settings: object(),
+    )
+    monkeypatch.setattr(deps_module, "_create_minio_client", lambda settings: object())
+
+    settings = Settings(
+        chroma_url="http://localhost:8000",
+        embed_api_key="sentinel-embed-key-lc5",
+    )
+    register_default_dependencies(settings)
+
+    semantic = deps_module.container._instances["semantic"]
+    assert isinstance(semantic, ChromaSemanticService)
+    assert semantic._embed_api_key == "sentinel-embed-key-lc5"
+
+
 def test_register_default_dependencies_raises_when_minio_missing(monkeypatch):
     """The 2026-05-03 sweep removed the FS fallback for layers 1+2.
     A missing ``AUDITTRACE_MINIO_SECRET_KEY`` MUST surface as a startup-time

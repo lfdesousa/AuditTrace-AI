@@ -200,12 +200,38 @@ seed_kv() {
   echo "  ✓ ${KV_MOUNT}/audittrace/${path}"
 }
 
+# LC-5 / M3-WU-4 -- seed ONE value from a host file through STDIN, so the value
+# is never on any argv (`vault kv put ... key=-` reads the value from stdin).
+# seed_kv above puts values on the `kubectl exec` argv (pre-existing, not
+# widened by this unit); the llama key does not join it. The value must match
+# [A-Za-z0-9]{48} (scripts/generate-llama-api-key.sh): it is exported inside a
+# single-quoted shell template (PM-4), so any other shape is refused here.
+# Whitespace (the trailing newline) is stripped before the put.
+seed_kv_stdin() {
+  local path="$1" key="$2" file="$3"
+  if [[ ! -f "${SECRETS_DIR}/${file}" ]]; then
+    echo "  ⊝ skipped ${path} (missing ${SECRETS_DIR}/${file})"
+    return 0
+  fi
+  local value
+  value="$(tr -d '[:space:]' < "${SECRETS_DIR}/${file}")"
+  if [[ ! "${value}" =~ ^[A-Za-z0-9]{48}$ ]]; then
+    echo "  ❌ ${SECRETS_DIR}/${file} is not [A-Za-z0-9]{48}; refusing to seed ${path}" >&2
+    return 1
+  fi
+  printf '%s' "${value}" | vault_exec_stdin kv put "${KV_MOUNT}/audittrace/${path}" "${key}=-" >/dev/null
+  echo "  ✓ ${KV_MOUNT}/audittrace/${path} (value via stdin, not printed)"
+}
+
 seed_kv postgres/superuser password=postgres_password.txt
 seed_kv postgres/app password=postgres_password.txt
 seed_kv summariser/db password=postgres_password.txt
 seed_kv redis/main password=redis_password.txt
 seed_kv chromadb/main token=chroma_token.txt
 seed_kv minio/root secret_key=minio_secret_key.txt kms_master_key=minio_kms_key.txt
+# LC-5 / M3-WU-4 -- the shared llama API key (the host key file every llama
+# launcher reads with --api-key-file; ONE value, two agreeing witnesses).
+seed_kv_stdin llm/api-key api_key llama-api-key.txt
 
 # ── ADR-048 PR-B7 — MinIO IAM split (audittrace_app + content_control) ──
 # Two scoped users provisioned by `charts/audittrace/templates/minio/

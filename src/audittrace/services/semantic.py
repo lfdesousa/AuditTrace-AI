@@ -296,6 +296,7 @@ class ChromaSemanticService(SemanticService):
         embed_url: str = "",
         embed_model: str = "nomic-embed-text",
         manifest: _ManifestTombstoneCheck | None = None,
+        embed_api_key: str = "",
     ):
         self._client = client
         self._default_collections = default_collections or ["audittrace"]
@@ -304,6 +305,9 @@ class ChromaSemanticService(SemanticService):
         # ChromaDB never embeds client-side.
         self._embed_url = embed_url
         self._embed_model = embed_model
+        # LC-5 — forwarded to embed_via_nomic as the per-request bearer key;
+        # empty (the default) keeps every existing call site unchanged.
+        self._embed_api_key = embed_api_key
         # ADR-062 §6 (WU-A5) — optional so every existing call site /
         # test double that constructs this class with just ``client=``
         # keeps working unchanged; production wiring
@@ -316,7 +320,10 @@ class ChromaSemanticService(SemanticService):
     async def _embed_one(self, text: str) -> list[float]:
         """Vectorise a single string on the nomic server."""
         vectors = await embed_via_nomic(
-            [text], embed_url=self._embed_url, model=self._embed_model
+            [text],
+            embed_url=self._embed_url,
+            model=self._embed_model,
+            api_key=self._embed_api_key,
         )
         return vectors[0]
 

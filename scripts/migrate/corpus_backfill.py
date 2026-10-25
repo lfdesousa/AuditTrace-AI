@@ -536,7 +536,12 @@ async def _amain(argv: list[str] | None = None) -> int:
 
     async def _embed(text: str) -> list[float]:
         vectors = await embed_via_nomic(
-            [text], embed_url=settings.embed_url, model=settings.embed_model
+            [text],
+            embed_url=settings.embed_url,
+            model=settings.embed_model,
+            # LC-5: the locked embed server needs the bearer key; this
+            # operator-run backfill is a consumer too. Empty sends no header.
+            api_key=settings.embed_api_key,
         )
         return vectors[0]
 

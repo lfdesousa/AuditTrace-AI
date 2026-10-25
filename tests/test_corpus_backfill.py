@@ -518,6 +518,53 @@ class TestCLI:
         assert "decisions: 2 candidate(s)" in out
         assert "M1-plan" in out
 
+    def test_main_wires_embed_api_key_from_settings(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        """LC-5 / M3-WU-4: the operator-run backfill is an embed consumer. Once
+        the embed server is locked (LC-5), every embed call must carry ``settings.embed_api_key`` or it
+        401s. Asserts the actual VALUE reaching ``embed_via_nomic`` — not
+        merely that the call happened (`feedback_coverage_is_a_floor_not_a_
+        proof`) — so removing the ``api_key=settings.embed_api_key`` kwarg
+        from ``_amain`` fails this test.
+        """
+
+        async def _seed():
+            factory = MockChromaDBFactory()
+            client = await factory.get_client()
+            col = await client.get_or_create_collection(name="decisions_v2")
+            await col.add(
+                ids=["d1"], documents=["legacy"], metadatas=[{"user_id": "operator"}]
+            )
+            return client
+
+        client = asyncio.run(_seed())
+
+        class _FakeHTTPFactory:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def get_client(self):
+                return client
+
+        monkeypatch.setattr(corpus_backfill, "HTTPChromaDBFactory", _FakeHTTPFactory)
+        fake_settings = corpus_backfill.get_settings().model_copy(
+            update={"embed_api_key": "sentinel-embed-key-f3"}
+        )
+        monkeypatch.setattr(corpus_backfill, "get_settings", lambda: fake_settings)
+        embed_mock = AsyncMock(
+            side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]
+        )
+        monkeypatch.setattr(corpus_backfill, "embed_via_nomic", embed_mock)
+
+        rc = corpus_backfill.main(
+            ["--collections", "decisions", "--out-dir", str(tmp_path)]
+        )
+        assert rc == 0
+
+        assert embed_mock.await_args is not None
+        assert embed_mock.await_args.kwargs["api_key"] == "sentinel-embed-key-f3"
+
     def test_main_dry_run_happy_path(self, monkeypatch, capsys):
         async def _seed():
             factory = MockChromaDBFactory()

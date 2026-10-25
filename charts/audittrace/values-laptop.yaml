@@ -56,6 +56,12 @@
 console:
   enabled: true
   frontDoorNodeName: "pcluislinux"
+  # LC-5 / M3-WU-4 gate 5: the console's egress NetworkPolicy is ON for the
+  # laptop reference profile (default false in values.yaml). The window turns it
+  # on at step 4b, after node enforcement is measured; values-netpol-off.yaml is
+  # the explicit off switch (step 4b-rollback).
+  networkPolicy:
+    enabled: true
   librechat:
     host: "librechat.audittrace.local"
 

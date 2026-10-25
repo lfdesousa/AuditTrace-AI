@@ -1,0 +1,6 @@
+# LC-5 / M3-WU-4 -- one-key overlay: stop delivering the llama API key.
+# Explicit false because --reset-then-reuse-values keeps a stored `true`.
+# Window rollback only, AFTER the locks are off (scripts/apply-llama-endpoint-locks.sh --rollback).
+memoryServer:
+  llmApiKey:
+    enabled: false

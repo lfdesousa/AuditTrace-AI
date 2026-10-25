@@ -3966,3 +3966,197 @@ class TestLlamaHttpxKeepaliveLimits:
         source = inspect.getsource(chat_mod._record_langfuse_output)
         assert "httpx.AsyncClient(timeout=5)" in source
         assert "LLAMA_HTTPX_LIMITS" not in source
+
+
+class TestLlamaAuthHeadersHelper:
+    """LC-5 / M3-WU-4 -- the pure helper every llama-facing call site imports."""
+
+    def test_empty_key_returns_empty_dict(self):
+        from audittrace.routes._llama_client import llama_auth_headers
+
+        assert llama_auth_headers("") == {}
+
+    def test_configured_key_returns_bearer_header(self):
+        from audittrace.routes._llama_client import llama_auth_headers
+
+        assert llama_auth_headers("abc123") == {"Authorization": "Bearer abc123"}
+
+    def test_every_llama_facing_module_imports_the_same_helper(self):
+        """No per-site literal ``{"Authorization": f"Bearer ..."}`` — every
+        consumer imports and calls the ONE helper (mirrors the
+        ``LLAMA_HTTPX_LIMITS`` #371 lockstep pattern this file already
+        tests above)."""
+        from audittrace.routes import _llama_client, _memory_tool_loop, chat
+        from audittrace.services import embedder, session_summarizer
+
+        assert chat.llama_auth_headers is _llama_client.llama_auth_headers
+        assert _memory_tool_loop.llama_auth_headers is _llama_client.llama_auth_headers
+        assert embedder.llama_auth_headers is _llama_client.llama_auth_headers
+        assert session_summarizer.llama_auth_headers is _llama_client.llama_auth_headers
+
+
+class TestLlamaApiKeyHeaderWiring:
+    """LC-5 / M3-WU-4 (llama endpoint isolation locks) — every llama-facing
+    ``httpx.AsyncClient`` this proxy constructs must carry
+    ``Authorization: Bearer <settings.llama_api_key>`` so a llama-server
+    started with ``--api-key-file`` (the launcher-script side of this WU)
+    keeps receiving authenticated requests from this backend. Mirrors
+    ``TestLlamaHttpxKeepaliveLimits`` site-for-site — the same five
+    construction sites, a different property."""
+
+    @pytest.fixture
+    def _tools_mode_fixture(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    @pytest.fixture
+    def _llama_api_key_fixture(self, monkeypatch):
+        """Set AUDITTRACE_LLAMA_API_KEY for the duration of one test,
+        clearing the @lru_cache'd get_settings before and after (same
+        pattern as ``TestToolsModeIntegration._flip_to_tools_mode``)."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_LLAMA_API_KEY", "test-llama-key")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    # ── default (no key configured) — back-compat, no header sent ───────
+
+    def test_non_streaming_no_key_sends_no_header(self, client):
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                },
+            )
+        assert response.status_code == 200
+        assert mock_ctor.call_args.kwargs.get("headers") == {}
+
+    # ── key configured — every site carries the bearer header ───────────
+
+    def test_non_streaming_chat_completions_carries_bearer(
+        self, client, _llama_api_key_fixture
+    ):
+        """Inject-mode non-streaming branch (``chat_completions``)."""
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                },
+            )
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("headers") == {
+            "Authorization": "Bearer test-llama-key"
+        }
+
+    def test_streaming_chat_completions_carries_bearer(
+        self, client, _llama_api_key_fixture
+    ):
+        """Inject-mode streaming branch (``_iter_and_capture``)."""
+        stream_lines = [
+            'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        fake = _FakeAsyncClient(stream_lines=stream_lines)
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("headers") == {
+            "Authorization": "Bearer test-llama-key"
+        }
+
+    def test_models_endpoint_carries_bearer(self, client, _llama_api_key_fixture):
+        """``GET /v1/models`` proxy client."""
+        fake = _FakeAsyncClient(get_json={"object": "list", "data": []})
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.get("/v1/models")
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("headers") == {
+            "Authorization": "Bearer test-llama-key"
+        }
+
+    def test_tools_mode_streaming_carries_bearer(
+        self, client, _tools_mode_fixture, _llama_api_key_fixture
+    ):
+        """Tools-mode streaming turn (``_stream_memory_tool_loop``) —
+        constructed in ``chat.py`` itself."""
+        fake = _SequencedStreamClient([_sse_content_lines(["Hi"])])
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("headers") == {
+            "Authorization": "Bearer test-llama-key"
+        }
+
+    def test_tools_mode_buffered_loop_carries_bearer(
+        self, client, _tools_mode_fixture, _llama_api_key_fixture
+    ):
+        """Tools-mode buffered turn (``_memory_tool_loop.run_memory_tool_loop``)
+        — constructed in a DIFFERENT module than the streaming site above,
+        proving the key reached that module's own call site too (mirrors
+        ``TestLlamaHttpxKeepaliveLimits.test_tools_mode_buffered_loop_client_capped``)."""
+        fake = _SequencedClient([_tools_mode_response_text("Just text.")])
+        with _patch_tool_loop_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "project": "AuditTrace",
+                },
+            )
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("headers") == {
+            "Authorization": "Bearer test-llama-key"
+        }
+
+    def test_models_endpoint_no_key_sends_no_header(self, client):
+        fake = _FakeAsyncClient(get_json={"object": "list", "data": []})
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.get("/v1/models")
+        assert response.status_code == 200
+        assert mock_ctor.call_args.kwargs.get("headers") == {}
+
+    def test_the_langfuse_client_never_carries_the_llama_key(self):
+        """The Langfuse ingestion client is NOT a llama endpoint: sending the
+        llama key there would hand it to a third service. The call site
+        stays on the unauthenticated-by-us constructor."""
+        import inspect
+
+        from audittrace.routes import chat as chat_mod
+
+        source = inspect.getsource(chat_mod._record_langfuse_output)
+        assert "llama_auth_headers" not in source
+        assert "llama_api_key" not in source

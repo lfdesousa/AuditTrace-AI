@@ -1,0 +1,5 @@
+# LC-5 / M3-WU-4 -- one-key overlay: console NetworkPolicy OFF.
+# Explicit false so it wins over values-laptop.yaml's true (window step 4b-rollback).
+console:
+  networkPolicy:
+    enabled: false
