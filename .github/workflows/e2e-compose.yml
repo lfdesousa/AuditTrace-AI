@@ -113,6 +113,19 @@ jobs:
           echo "::error::docker compose pull failed 5 times (~7min of backoff) — likely a Docker Hub registry outage; re-run the job"
           exit 1
 
+      - name: AC-6 gate - freeze inside each built image == git show HEAD:<lock> (DEP-LOCK-AT WU-2)
+        # Build-not-pull (AUDITTRACE-RELEASE s3): scripts/ci/check-images-match-locks.sh
+        # BUILDS the memory-server, BFF and llm-stub images from this checkout (it
+        # never pulls the possibly-unpublished release tag), lists every installed
+        # distribution inside each image and compares it with the lock COMMITTED at
+        # HEAD (`git show HEAD:<lock>`), plus the VCS package at its pyproject SHA.
+        # Any difference, an unparseable line, a failed build or a failed `git show`
+        # exits non-zero: this step fails closed and has no skip or override.
+        # Runs on the runner python (no .venv, no lock install: the comparator
+        # needs only the stdlib and the `packaging` copy the runner's own tooling
+        # vendors). The image builds are cached for the `up --build` below.
+        run: bash scripts/ci/check-images-match-locks.sh
+
       - name: Bring up compose stack with `mock-llm` profile
         # .env.ci sets COMPOSE_PROFILES=mock-llm so the mock-llm
         # service joins the up command. --build builds both the

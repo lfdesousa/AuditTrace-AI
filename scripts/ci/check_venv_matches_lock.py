@@ -41,8 +41,19 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
-from packaging.markers import InvalidMarker, Marker
-from packaging.utils import canonicalize_name
+try:
+    from packaging.markers import InvalidMarker, Marker
+    from packaging.utils import canonicalize_name
+except ModuleNotFoundError:  # bare runner python (e2e-compose AC-6)
+    # A runner python without the dev lock installed has no ``packaging`` but its
+    # pip vendors the same library; using it avoids an unhashed install (G4).
+    from pip._vendor.packaging.markers import (  # type: ignore[no-redef]
+        InvalidMarker,
+        Marker,
+    )
+    from pip._vendor.packaging.utils import (  # type: ignore[no-redef]
+        canonicalize_name,
+    )
 
 #: Distributions legitimately installed OUTSIDE the hashed lock.
 ALLOWED_EXTRAS = frozenset({"audittrace-ai", "audittrace-object-storage"})
@@ -158,7 +169,9 @@ def check(
         )
 
     if header_pyver is None:
-        problems.append("lock header has no --python-version (not a compiler-generated lock?)")
+        problems.append(
+            "lock header has no --python-version (not a compiler-generated lock?)"
+        )
     elif header_pyver != f"{python_version[0]}.{python_version[1]}":
         problems.append(
             f"interpreter is {python_version[0]}.{python_version[1]} but the lock "

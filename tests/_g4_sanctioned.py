@@ -55,9 +55,44 @@ SANCTIONED_STATEMENTS: frozenset[tuple[str, str]] = frozenset(
             "images/llm-stub/Dockerfile",
             "RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r /app/requirements.txt",
         ),
+        # WU-2 (AC-6/G5). Read-only freeze listings and lock-name constants: nothing here installs.
+        ("scripts/ci/run-tests.sh", "DEV_LOCK=requirements-dev.txt"),
+        ("scripts/ci/run-tests.sh", "GATE_LOCK=requirements-gate.txt"),
         (
-            "scripts/ci/run-tests.sh",
-            '"$PYTHON" scripts/ci/check_venv_matches_lock.py requirements-dev.txt',
+            "scripts/ci/check-images-match-locks.sh",
+            '  docker run --rm ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} --entrypoint python "$image" -c \'import json; from pip._vendor.packaging.markers import default_environment as d; print(json.dumps(d()))\' > "$SCRATCH/$label.markers.json"',
+        ),
+        (
+            "scripts/ci/check-images-match-locks.sh",
+            '  docker run --rm ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} --entrypoint python "$image" -m pip freeze --all > "$SCRATCH/$label.freeze"',
+        ),
+        (
+            "scripts/ci/check-images-match-locks.sh",
+            'check memory-server "$MS" requirements.txt --allow-extra audittrace-ai --allow-extra audittrace-object-storage --vcs-package audittrace-object-storage --pyproject pyproject.toml || RC=1',
+        ),
+        (
+            "scripts/ci/check-images-match-locks.sh",
+            'check bff "$BFF" bff/requirements.txt || RC=1',
+        ),
+        (
+            "scripts/ci/check-images-match-locks.sh",
+            "BASE_IMAGE_TOOLING=(--allow-extra-pinned pip)",
+        ),
+        (
+            "scripts/ci/check-images-match-locks.sh",
+            'check llm-stub "$STUB" images/llm-stub/requirements.txt || RC=1',
+        ),
+        (
+            "scripts/ci/check_freeze_matches_lock.py",
+            '            [python, "-m", "pip", "freeze", "--all"],',
+        ),
+        (
+            "scripts/ci/check_venv_matches_lock.py",
+            "    from pip._vendor.packaging.markers import (  # type: ignore[no-redef]",
+        ),
+        (
+            "scripts/ci/check_venv_matches_lock.py",
+            "    from pip._vendor.packaging.utils import (  # type: ignore[no-redef]",
         ),
         ("scripts/setup.sh", "bash scripts/install-locked.sh .venv/bin/pip"),
     }
@@ -99,24 +134,7 @@ ALLOWED_CONFIGURATION: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
-# Product-facing exception text that tells the user to run the forbidden command. Allow-listed in
-# WU-1, reworded in WU-2 with live evidence (ADR-049 hook on services/**).
-ALLOWED_UNTIL_WU2_REWORD: frozenset[tuple[str, str]] = frozenset(
-    {
-        (
-            "src/audittrace/services/trust_store.py",
-            '                "extras not installed. Reinstall with `pip install "',
-        ),
-        (
-            "src/audittrace/services/trust_store.py",
-            '                "`pip install pyhanko[etsi,async-http]`."',
-        ),
-    }
-)
-
-SANCTIONED: frozenset[tuple[str, str]] = (
-    SANCTIONED_STATEMENTS | ALLOWED_CONFIGURATION | ALLOWED_UNTIL_WU2_REWORD
-)
+SANCTIONED: frozenset[tuple[str, str]] = SANCTIONED_STATEMENTS | ALLOWED_CONFIGURATION
 
 # Chokepoint scripts: byte-identical to their pin, or RED until the pin is updated on purpose.
 HASH_PINNED: dict[str, str] = {
