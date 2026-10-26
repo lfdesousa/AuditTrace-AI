@@ -2,7 +2,7 @@
 # Exact pins (DEP-LOCK-AT C1): installs run --no-build-isolation against the
 # hashed copies in the locks, so these are documentation + the isolated-build
 # fallback; tests/test_dep_lock_sync.py asserts they equal requirements-build.in.
-requires = ["setuptools==84.0.0", "wheel==0.48.0"]
+requires = ["setuptools==84.2.1", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,15 +28,15 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "fastapi==0.146.0",
+    "fastapi==0.161.1",
     "uvicorn[standard]==0.54.0",
     "pydantic==2.14.1",
-    "pydantic-settings==2.16.0",
+    "pydantic-settings==2.16.1",
     # langchain and langchain-community dropped in ADR-025 — the repo only
     # used them passively via `from langchain_core.documents import Document`.
     # langchain-core is retained explicitly so the dataclass import keeps
     # working without pulling the full Langchain + langchain-community tree.
-    "langchain-core==1.6.12",
+    "langchain-core==1.7.0",
     # chromadb 1.x — provides AsyncHttpClient (memory-server uses the async
     # Chroma client so vector I/O never blocks the event loop). The .venv is
     # already on 1.5.7 and the suite is green on it.
@@ -45,9 +45,9 @@ dependencies = [
     "python-multipart==0.0.32",
     "httpx==0.28.1",
     "langfuse==4.18.0",
-    "openai==3.35.1",
-    "alembic==1.20.0",
-    "sqlalchemy[asyncio]==2.0.55",
+    "openai==3.37.0",
+    "alembic==1.20.1",
+    "sqlalchemy[asyncio]==2.1.6",
     # asyncpg = production async Postgres driver. psycopg2-binary kept for
     # Alembic + the sync RLS oracle test (out-of-band of the request loop).
     # aiosqlite = async SQLite for the in-memory test engine.
@@ -92,8 +92,8 @@ dependencies = [
     # its sync/async wrapper surface change between minors (0.36 added the
     # `validation_time` argument that silently broke the Swiss TSL builder).
     # Bump deliberately, with the AC6/AC9 guard tests, never by drift.
-    "pyhanko[etsi,async-http]==0.37.0",
-    "pyhanko-certvalidator==0.32.1",
+    "pyhanko[etsi,async-http]==0.38.0",
+    "pyhanko-certvalidator==0.33.0",
     # pytesseract: tier-B item #1 — OCR for scanned pages. Python
     # binding only; the actual `tesseract` binary + language packs
     # (eng+deu+fra+ita) are installed via apt in the Dockerfile.
@@ -141,7 +141,7 @@ dev = [
     "pytest-mock==3.17.0",
     "fakeredis==2.40.0",
     "httpx==0.28.1",
-    "ruff==0.17.1",
+    "ruff==0.17.2",
     "mypy==2.4.0",
     "black==26.10.1",
     "pre-commit==4.7.0",
@@ -154,8 +154,8 @@ dev = [
     # DEP-LOCK-AT Q1/Q5 + C1: the lock compiler and the installer are pinned
     # IN the dev lock (hashed) so every checkout and CI job compiles and
     # installs with the same uv/pip. Never `pip install --upgrade pip`.
-    "uv==0.13.1",
-    "pip==26.2.1",
+    "uv==0.13.5",
+    "pip==26.2.2",
 ]
 
 # CI-Agent gate tooling — GATEKEEPER, NOT a runtime/test dependency; NEVER
@@ -186,7 +186,7 @@ dev = [
 # + same engine → same findings, no wall-clock, no network. See
 # ci/semgrep/rules.yml and the `security-lint` Makefile target.
 gate = [
-    "semgrep==1.171.0",
+    "semgrep==1.182.1",
 ]
 
 [project.urls]
