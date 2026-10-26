@@ -71,18 +71,31 @@ def test_assertion_fires_and_no_log_line_on_wrong_path(tmp_path, monkeypatch):
     assert not log_path.exists()
 
 
-def test_chokepoint_unconditional_token_missing_exits(monkeypatch):
-    """Review round 4, requirement E1: the check is now UNCONDITIONAL --
-    no NEUTER_CHOKEPOINT_REQUIRED flag needed to trigger it, closing the
-    hermetic-env bypass (an env with only PATH/HOME strips any single
-    flag, but there is no longer a flag whose absence means "permissive")."""
+def test_chokepoint_token_missing_exits_when_a_pool_is_active(monkeypatch, tmp_path):
+    """Review round 4, requirement E1 (kept, re-based for #368): a hermetic
+    env with only PATH/HOME strips any single flag, so the refusal must not
+    hinge on one. Since the plugin now auto-loads in ordinary runs (pytest11
+    entry point), the signal that it applies is a pool holding the heavy-cap
+    lock -- read from the filesystem, not from the caller's env. See
+    ``tests/test_neuter_pathcheck_entry_point.py`` for the full matrix."""
+    import fcntl
+
+    from scripts.neuter import lock as lockmod
+
+    lock_file = tmp_path / "pool.lock"
+    monkeypatch.setenv("AUDITTRACE_NEUTER_LOCK", str(lock_file))
     monkeypatch.delenv("NEUTER_CHOKEPOINT_SKIP", raising=False)
-    monkeypatch.delenv("NEUTER_CHOKEPOINT_TOKEN", raising=False)
-    monkeypatch.delenv("NEUTER_CHOKEPOINT_TOKEN_FILE", raising=False)
+    for var in neuter_pathcheck._CLAIM_VARS:
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv("NEUTER_PATHCHECK_EXPECT", raising=False)
 
-    with pytest.raises(pytest.exit.Exception) as exc_info:
-        neuter_pathcheck.pytest_configure(config=None)
+    fd = lockmod.open_lock_file(lock_file)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with pytest.raises(pytest.exit.Exception) as exc_info:
+            neuter_pathcheck.pytest_configure(config=None)
+    finally:
+        os.close(fd)
     assert "no valid NEUTER_CHOKEPOINT_TOKEN/_FILE" in str(exc_info.value)
 
 

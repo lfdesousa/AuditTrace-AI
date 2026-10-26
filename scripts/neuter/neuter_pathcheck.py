@@ -37,6 +37,18 @@ launcher, OR a hermetic env that discards the ambient environ) never gets
 a token to omit; it fails by construction the instant pytest starts --
 never reaching a single test.
 
+**Entry-point auto-load and the activity signal (#368).** The plugin is also
+registered as a ``pytest11`` entry point (``src/neuter_pathcheck_entry.py``),
+so it loads in EVERY pytest run of the project venv whatever the caller's
+environment -- including a from-scratch env with no ``PYTEST_PLUGINS``. Since
+that includes ordinary ``make test`` / IDE runs, the unconditional refusal
+became conditional on :func:`enforcement_active`: a claim of the chokepoint
+in the env (token must then verify), or a neuter pool holding its heavy-cap
+lock exclusively (read from the filesystem, not from the caller's env). With
+neither, the plugin is inert; ``NEUTER_CHOKEPOINT_SKIP=1`` still opts out.
+Residual: a pool started with a custom ``--lock-path`` outside the default
+locations AND a stripped env is not seen (documented, tests-only usage).
+
 **Marker-based self-check (review round 4 requirement E2).** A SEPARATE
 bypass is a stray ``-p no:neuter_pathcheck`` reaching ``pytest_args``
 (disabling the plugin outright, so it never loads and this file's own
@@ -59,15 +71,101 @@ path-checking.
 
 from __future__ import annotations
 
+import fcntl
 import importlib
 import os
+import tempfile
 from pathlib import Path
 
 import pytest
 
+#: Mirrors ``scripts.neuter.lock`` (``LOCK_FILENAME`` / ``ENV_LOCK_PATH``).
+#: Duplicated on purpose: this module is loaded as a TOP-LEVEL plugin
+#: (``PYTEST_PLUGINS=neuter_pathcheck`` or the ``pytest11`` entry point) in
+#: processes where ``scripts`` is not importable, so it cannot import it.
+#: ``tests/test_neuter_pathcheck.py`` pins the two copies together.
+_LOCK_FILENAME = "audittrace-neuter-pool.lock"
+_ENV_LOCK_PATH = "AUDITTRACE_NEUTER_LOCK"
+
+#: Env vars that mean "the caller claims to be inside the chokepoint". Any one
+#: of them present makes the token check mandatory (a half-set claim is a
+#: bypass attempt, never a reason to relax).
+_CLAIM_VARS = (
+    "NEUTER_CHOKEPOINT_REQUIRED",
+    "NEUTER_CHOKEPOINT_TOKEN",
+    "NEUTER_CHOKEPOINT_TOKEN_FILE",
+    "NEUTER_CHOKEPOINT_MARKER_FILE",
+)
+
+
+def _candidate_lock_paths() -> list[Path]:
+    """Every place a neuter pool's heavy-cap lock may live.
+
+    The caller's environment is NOT trusted to point at the lock (a stripped
+    env discards ``XDG_RUNTIME_DIR`` / ``AUDITTRACE_NEUTER_LOCK``), so besides
+    the env-derived paths this also tries the per-user runtime dir and the
+    tempdir default that ``scripts.neuter.lock.resolve_lock_path`` can pick.
+    """
+    candidates: list[Path] = []
+    override = os.environ.get(_ENV_LOCK_PATH)
+    if override:
+        candidates.append(Path(override))
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        candidates.append(Path(xdg) / _LOCK_FILENAME)
+    candidates.append(Path(f"/run/user/{os.getuid()}") / _LOCK_FILENAME)
+    candidates.append(Path(tempfile.gettempdir()) / _LOCK_FILENAME)
+    unique: list[Path] = []
+    for path in candidates:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
+def _pool_lock_held_exclusive(path: Path) -> bool:
+    """True iff some process holds ``LOCK_EX`` on ``path`` right now.
+
+    Never creates the file and never keeps a lock: a non-blocking ``LOCK_SH``
+    probe on a fresh descriptor fails exactly when an exclusive holder exists
+    (the neuter pool). ``make test``'s ``hold-shared`` holds ``LOCK_SH``, which
+    does not conflict, so an ordinary run reads as "no pool active".
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def enforcement_active() -> bool:
+    """Must THIS pytest session prove it came through the chokepoint?
+
+    The plugin auto-loads in every run of the project venv (``pytest11``
+    entry point), so ``make test`` and IDE runs load it too and must stay
+    untouched. The signal is deliberately NOT a single caller-supplied flag
+    (a hermetic env strips any flag, review round 4): enforcement is active
+    when EITHER the caller claims the chokepoint (any ``_CLAIM_VARS`` set --
+    then the token must verify) OR a neuter pool is running, observed
+    OUTSIDE the caller's environment as an exclusive hold on the pool's
+    heavy-cap lock (:func:`_pool_lock_held_exclusive`).
+    """
+    if any(os.environ.get(var) for var in _CLAIM_VARS):
+        return True
+    return any(_pool_lock_held_exclusive(p) for p in _candidate_lock_paths())
+
 
 def pytest_configure(config) -> None:  # noqa: ANN001 - pytest hook signature
-    if not os.environ.get("NEUTER_CHOKEPOINT_SKIP"):
+    if not os.environ.get("NEUTER_CHOKEPOINT_SKIP") and enforcement_active():
         token = os.environ.get("NEUTER_CHOKEPOINT_TOKEN")
         token_file = os.environ.get("NEUTER_CHOKEPOINT_TOKEN_FILE")
         if not token or not token_file:

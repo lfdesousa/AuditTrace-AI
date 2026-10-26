@@ -198,6 +198,15 @@ Issues = "https://github.com/lfdesousa/AuditTrace-AI/issues"
 [project.scripts]
 audittrace = "audittrace.server:main"
 
+# #368: the neuter chokepoint plugin loads through a pytest11 entry point so a
+# from-scratch environment (no PYTEST_PLUGINS) cannot skip it. Packaging
+# metadata only: no dependency changes (DEP-LOCK unaffected).
+[project.entry-points.pytest11]
+neuter_pathcheck = "neuter_pathcheck_entry"
+
+[tool.setuptools]
+py-modules = ["neuter_pathcheck_entry"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 namespaces = false
