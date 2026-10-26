@@ -3,9 +3,9 @@
 # lock bff/requirements.txt is compiled constrained by the server's
 # requirements.txt (-c) so the shared libraries resolve to the SAME versions
 # in both images. Bumped only by `make lock-upgrade` (Dependabot covers `/` only).
-fastapi==0.146.0
+fastapi==0.161.1
 uvicorn[standard]==0.54.0
 pydantic==2.14.1
-pydantic-settings==2.16.0
+pydantic-settings==2.16.1
 python-jose[cryptography]==3.5.0
 httpx==0.28.1
