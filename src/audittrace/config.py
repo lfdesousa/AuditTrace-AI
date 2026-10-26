@@ -95,10 +95,21 @@ class Settings(BaseSettings):
     # mistral` Service (--set externalLLM.mistral.enabled=true), e.g.:
     #   {"mistral": "http://audittrace-llm-mistral:11438/v1"}
     model_routes: dict[str, str] = {}
+    # LC-5 / M3-WU-4 (llama endpoint isolation locks) — the ONE shared bearer
+    # key the three host llama-servers (chat :11435, embed :11436, summariser
+    # :11437) are launched with (``--api-key-file``). It is delivered to the
+    # pod as three settings so a later split of the key costs nothing; the
+    # chart's Vault agent template exports the same value under all three
+    # names (``memoryServer.llmApiKey.enabled``). Empty (the default) sends
+    # no ``Authorization`` header, so an unlocked environment keeps working
+    # (an unlocked llama-server ignores the header). Never a literal in git.
+    llama_api_key: str = ""
     embed_url: str = "http://host.docker.internal:11436/v1"
     # ADR-047 — embedding always runs on the dedicated nomic-embed-server;
     # the request gateway hosts no in-process model. 768-dim.
     embed_model: str = "nomic-embed-text"
+    # LC-5 — bearer key for the dedicated embed server (see ``llama_api_key``).
+    embed_api_key: str = ""
 
     # ChromaDB configuration (server mode — ADR-020)
     chroma_url: str = "http://localhost:8000"
@@ -255,6 +266,9 @@ class Settings(BaseSettings):
     # crashes.
     summarizer_url: str = "http://host.docker.internal:11437/v1"
     summarizer_model: str = "mistral-7b-summarizer"
+    # LC-5 — bearer key for the dedicated summariser server (see
+    # ``llama_api_key``); empty sends no header.
+    summarizer_api_key: str = ""
 
     # Optional dedicated database URL for the summariser worker. The
     # main memory-server connects as the non-superuser ``audittrace_app``

@@ -43,6 +43,14 @@ data:
     path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/minio/*" {
       capabilities = ["read"]
     }
+    # LC-5 / M3-WU-4 -- the shared llama API key. Rendered UNCONDITIONALLY
+    # (not behind memoryServer.llmApiKey.enabled): scripts/setup-vault.sh reads
+    # this ConfigMap and writes the policy BETWEEN the two deploy passes, so the
+    # policy must already exist when pass 2 turns the template block on. Read of
+    # an absent path is harmless; the role binds the policy NAME, so no role change.
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/llm/*" {
+      capabilities = ["read"]
+    }
 
   keycloak.hcl: |
     # Keycloak reads its admin password + the postgres app-user creds

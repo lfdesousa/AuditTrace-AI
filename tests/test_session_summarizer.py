@@ -2648,3 +2648,86 @@ class TestOwnershipScopingG9:
 # recorded instead in the build record / PR body as a one-time diff
 # check against the commit this WU actually lands on, which is the
 # correct scope for a build-time invariant, not a standing CI gate.
+
+
+class TestLlamaAuthHeaderPerRequest:
+    """LC-5 / M3-WU-4 -- the summariser endpoint's bearer key is sent PER
+    REQUEST (``/props``, ``/tokenize``, ``/chat/completions``), never as a
+    default of the process-resident client, so a key rotation needs no
+    client rebuild. Real ``httpx`` with a ``MockTransport`` that records the
+    headers the request actually carried."""
+
+    @staticmethod
+    def _recording_client() -> tuple[httpx.AsyncClient, list[httpx.Request]]:
+        seen: list[httpx.Request] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if request.url.path.endswith("/props"):
+                return httpx.Response(
+                    200, json={"default_generation_settings": {"n_ctx": 4096}}
+                )
+            if request.url.path.endswith("/tokenize"):
+                return httpx.Response(200, json={"tokens": [1, 2, 3]})
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "{}"}},
+                    ]
+                },
+            )
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(_handler)), seen
+
+    async def _drive_all_three_sites(self, summariser: SessionSummarizer) -> None:
+        assert await summariser._fetch_server_n_ctx() == 4096
+        assert await summariser._count_tokens("hello") == 3
+        await summariser._call_llm("hello")
+
+    @pytest.mark.asyncio
+    async def test_key_configured_every_request_carries_the_bearer(self, pg_factory):
+        client, seen = self._recording_client()
+        summariser = SessionSummarizer(
+            settings=_settings(summarizer_api_key="summariser-secret"),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=client,
+        )
+        await self._drive_all_three_sites(summariser)
+        assert [r.url.path for r in seen] == [
+            "/props",
+            "/tokenize",
+            "/v1/chat/completions",
+        ]
+        assert [r.headers.get("authorization") for r in seen] == [
+            "Bearer summariser-secret"
+        ] * 3
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_no_key_configured_sends_no_authorization_header(self, pg_factory):
+        client, seen = self._recording_client()
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=client,
+        )
+        await self._drive_all_three_sites(summariser)
+        assert len(seen) == 3
+        assert all("authorization" not in r.headers for r in seen)
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_the_lazily_built_client_holds_no_key_as_a_default(self, pg_factory):
+        """Per request, not per client: the production client built by
+        ``_ensure_client`` carries no Authorization default even with a key
+        configured, so rotating the key never needs a client rebuild."""
+        summariser = SessionSummarizer(
+            settings=_settings(summarizer_api_key="summariser-secret"),
+            session_factory=pg_factory.get_session_factory(),
+        )
+        client = summariser._ensure_client()
+        try:
+            assert "authorization" not in client.headers
+        finally:
+            await client.aclose()

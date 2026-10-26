@@ -1,0 +1,5 @@
+# LC-5 / M3-WU-4 -- one-key overlay: deliver the llama API key to the memory-server.
+# Window pass 2 only, AFTER scripts/setup-vault.sh seeded kv/audittrace/llm/api-key.
+memoryServer:
+  llmApiKey:
+    enabled: true

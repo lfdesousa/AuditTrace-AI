@@ -1,0 +1,11 @@
+/home/lfdesousa/build/llama.cpp/build-vulkan-new/bin/llama-server
+--model
+/home/lfdesousa/models/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf
+--ctx-size
+8192
+--n-gpu-layers
+10
+--host
+0.0.0.0
+--port
+11437

@@ -8,3 +8,8 @@
 # upstream; we never hand-edit it. See docs/reference/openai/README.md
 # and scripts/refresh-openai-spec.sh for provenance.
 docs/reference/openai/openapi.yaml:colleague-names:2257
+
+# LC-5 test fixtures in commit 5a27b15: FAKE 48-char keys (never the real key; verified),
+# replaced by low-entropy fakes in 270ae15. Allowlisted by fingerprint only.
+5a27b15dd1df07a14a03c56f51742f49ab0f3318:tests/test_setup_vault_llm_seed.py:generic-api-key:23
+5a27b15dd1df07a14a03c56f51742f49ab0f3318:tests/_llama_sandbox.py:generic-api-key:50

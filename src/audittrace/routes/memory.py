@@ -902,6 +902,7 @@ async def _upsert_in_batches(
                 batch_docs,
                 embed_url=settings.embed_url,
                 model=settings.embed_model,
+                api_key=settings.embed_api_key,
             ),
         )
 

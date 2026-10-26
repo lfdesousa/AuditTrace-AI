@@ -309,3 +309,18 @@ component wired to the `conversationalSvc`).
   **Trigger to revisit:** sustained GPU utilisation > 80%, a new
   GPU-resident container scheduled to deploy, or a regulatory change
   that tightens data-residency requirements on model weights.
+
+---
+
+## Addendum (LC-5 / M3-WU-4, 2026-10-25): the summariser endpoint is locked
+
+The summariser's `llama-summarizer` unit (:11437) is one of the five host
+llama-servers brought under the endpoint isolation locks: it binds the cni0
+address (not `0.0.0.0`), requires the shared API key (`--api-key-file`) and serves
+no web UI. `scripts/start-summarizer-llama.sh` is now the unit's launcher and
+reproduces the unit's *effective* flags (`--ctx-size 8192`, `--n-gpu-layers 10`;
+`CTX_SIZE` / `GPU_LAYERS` stay the documented overrides) — the larger ctx/Q4-KV
+defaults the script carried before this addendum were never what the unit ran.
+`SessionSummarizer` sends `Authorization: Bearer <AUDITTRACE_SUMMARIZER_API_KEY>`
+per request on `/props`, `/tokenize` and `/chat/completions`; empty sends no
+header. See `docs/guides/deployment-runbook.md`, Step 10b.

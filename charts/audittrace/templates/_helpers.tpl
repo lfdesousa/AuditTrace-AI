@@ -242,6 +242,17 @@ vault.hashicorp.com/agent-inject-template-env: |
   {{ "{{ with secret \"kv/data/audittrace/chromadb/main\" }}" }}
   export AUDITTRACE_CHROMA_TOKEN='{{ "{{ .Data.data.token }}" }}'
   {{ "{{ end }}" }}
+  {{- if .Values.memoryServer.llmApiKey.enabled }}
+  {{ "{{ with secret \"kv/data/audittrace/llm/api-key\" }}" }}
+  # LC-5 / M3-WU-4 -- ONE shared key, three settings (a later split costs
+  # nothing). Alphabet [A-Za-z0-9]{48} (scripts/generate-llama-api-key.sh), so
+  # the single quotes below can never be broken out of (PM-4). Gated by
+  # memoryServer.llmApiKey.enabled: the path must exist in Vault first.
+  export AUDITTRACE_LLAMA_API_KEY='{{ "{{ .Data.data.api_key }}" }}'
+  export AUDITTRACE_EMBED_API_KEY='{{ "{{ .Data.data.api_key }}" }}'
+  export AUDITTRACE_SUMMARIZER_API_KEY='{{ "{{ .Data.data.api_key }}" }}'
+  {{ "{{ end }}" }}
+  {{- end }}
   {{- if eq (include "audittrace.objectStorageBackend" .) "minio" }}
   {{ "{{ with secret \"kv/data/audittrace/minio/audittrace_app\" }}" }}
   # ADR-048 PR-B8 — memory-server's MinIO client uses the scoped

@@ -53,8 +53,13 @@ class _FakeClient:
         self._responses = list(responses)
         self.calls: list[dict[str, Any]] = []
 
-    async def post(self, url: str, json: dict[str, Any]) -> _FakeResp:
-        self.calls.append({"url": url, "json": json})
+    async def post(
+        self,
+        url: str,
+        json: dict[str, Any],
+        headers: dict[str, str] | None = None,
+    ) -> _FakeResp:
+        self.calls.append({"url": url, "json": json, "headers": headers})
         item = self._responses.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -75,6 +80,33 @@ class TestEmbedViaNomic:
         assert vectors == [[0.1, 0.2], [0.3, 0.4]]
         assert client.calls[0]["url"] == "http://embed.test/v1/embeddings"
         assert client.calls[0]["json"]["input"] == ["a", "b"]
+
+    # ── LC-5 / M3-WU-4 -- llama endpoint isolation locks ────────────────────
+
+    async def test_no_auth_header_when_api_key_empty(self):
+        """Default (unset) api_key sends no Authorization header, so an
+        unlocked embed server keeps working unchanged."""
+        client = _FakeClient([_embedding_payload([[0.1]])])
+        await embed_via_nomic(["a"], embed_url=EMBED_URL, client=client)
+        assert client.calls[0]["headers"] == {}
+
+    async def test_sends_bearer_header_per_request_when_api_key_configured(self):
+        """The embedder client is a process-lifetime singleton, so the key
+        rides on EACH request (rotation needs no client rebuild)."""
+        client = _FakeClient([_embedding_payload([[0.1]])])
+        await embed_via_nomic(
+            ["a"], embed_url=EMBED_URL, client=client, api_key="embed-secret"
+        )
+        assert client.calls[0]["headers"] == {"Authorization": "Bearer embed-secret"}
+
+    async def test_every_retry_attempt_carries_the_header(self):
+        client = _FakeClient([httpx.ConnectError("boom"), _embedding_payload([[0.1]])])
+        await embed_via_nomic(
+            ["a"], embed_url=EMBED_URL, client=client, api_key="embed-secret"
+        )
+        assert [c["headers"] for c in client.calls] == [
+            {"Authorization": "Bearer embed-secret"}
+        ] * 2
 
     async def test_reorders_by_response_index(self):
         payload = {
@@ -123,9 +155,12 @@ class TestEmbedViaNomic:
 # ── ChromaSemanticService — always embeds on nomic ───────────────────────
 
 
-def _service(client: Any) -> ChromaSemanticService:
+def _service(client: Any, embed_api_key: str = "") -> ChromaSemanticService:
     return ChromaSemanticService(
-        client=client, default_collections=["decisions"], embed_url=EMBED_URL
+        client=client,
+        default_collections=["decisions"],
+        embed_url=EMBED_URL,
+        embed_api_key=embed_api_key,
     )
 
 
@@ -174,6 +209,22 @@ class TestSemanticNomic:
         query_kwargs = collection.query.call_args.kwargs
         assert "query_embeddings" in query_kwargs
         assert "query_texts" not in query_kwargs
+
+    async def test_embed_one_forwards_embed_api_key(self, monkeypatch, user_context):
+        """LC-5 -- the constructor-level embed_api_key must reach every
+        embed_via_nomic call the service makes, not just be stored."""
+        mock_embed = AsyncMock(return_value=[[0.1, 0.2, 0.3]])
+        monkeypatch.setattr("audittrace.services.semantic.embed_via_nomic", mock_embed)
+        collection = AsyncMock()
+        collection.count = AsyncMock(return_value=0)
+        client = AsyncMock()
+        client.get_or_create_collection = AsyncMock(return_value=collection)
+
+        await _service(client, embed_api_key="chroma-secret").search(
+            user_context, "a query", k=1
+        )
+
+        assert mock_embed.call_args.kwargs["api_key"] == "chroma-secret"
 
     async def test_upsert_supplies_explicit_embeddings(self, monkeypatch, user_context):
         monkeypatch.setattr(
@@ -232,3 +283,22 @@ class TestUpsertInBatches:
         upsert_kwargs = collection.upsert.call_args.kwargs
         assert upsert_kwargs["embeddings"] == [[0.1], [0.2]]
         assert "embedding_function" not in upsert_kwargs
+
+    async def test_forwards_embed_api_key_from_settings(self, monkeypatch):
+        """LC-5 -- the index choke-point forwards settings.embed_api_key, not
+        just embed_url/embed_model (the locked embed server would 401)."""
+        from audittrace.routes import memory
+
+        mock_embed = AsyncMock(return_value=[[0.1], [0.2]])
+        monkeypatch.setattr(memory, "embed_via_nomic", mock_embed)
+        fake_settings = memory.get_settings().model_copy(
+            update={"embed_api_key": "reindex-secret"}
+        )
+        monkeypatch.setattr(memory, "get_settings", lambda: fake_settings)
+
+        collection = AsyncMock()
+        await memory._upsert_in_batches(
+            collection, ids=["a", "b"], documents=["t1", "t2"], metadatas=[{}, {}]
+        )
+
+        assert mock_embed.call_args.kwargs["api_key"] == "reindex-secret"

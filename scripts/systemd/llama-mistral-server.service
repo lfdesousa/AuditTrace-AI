@@ -1,0 +1,49 @@
+# LC-5 / M3-WU-4 (llama endpoint isolation locks) -- versioned source of llama-mistral-server.service.
+#
+# The live unit is /etc/systemd/system/llama-mistral-server.service (root-owned). The operator
+# installs THIS file with `sudo scripts/apply-llama-endpoint-locks.sh --apply`, which
+# substitutes @SCRIPTS_DIR@ (the absolute scripts/ directory of the checkout it
+# runs from) and @KEY_FILE@ (the llama API key file the launcher reads) (so the window can run from the branch worktree, and a re-apply from the
+# merged checkout repoints the unit) and backs up the previous unit + drop-ins first.
+#
+# What changes versus the pre-LC-5 unit: ExecStart= is the launcher (flags pinned
+# to the previous effective ExecStart by tests/fixtures/llama_live_execstart/), the
+# bind moves from 0.0.0.0 to the cni0 address, the API key and --no-webui are added,
+# and the boot ordering/restart pins below. DORMANT: this unit is `disabled` and stays disabled; the apply script installs the definition only, never starts or enables it.
+
+[Unit]
+Description=llama.cpp Server (Mistral-Small-3.1-24B :11437 -- A/B testing, ADR-015; LC-5 isolation locks)
+After=network.target llama-server.service k3s.service
+Wants=llama-server.service k3s.service
+# Boot order (spec ADDENDUM 2 R1'): Wants+After, never Requires (a transient k3s
+# first-boot failure would cancel this unit's start job for good -- DEPLOYMENT s9).
+# After=k3s.service alone is not enough (cni0 appears ~1 s after k3s reports up),
+# so the launcher also polls for the cni0 address, bounded.
+StartLimitIntervalSec=10s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=lfdesousa
+Group=lfdesousa
+
+# One definition of the key-file path for unit, launcher and apply script.
+Environment="LLAMA_API_KEY_FILE=@KEY_FILE@"
+
+# ROCm -- mirrors the pre-LC-5 unit (required for gfx1151 on this older binary)
+Environment="GGML_CUDA_ENABLE_UNIFIED_MEMORY=1"
+Environment="HSA_OVERRIDE_GFX_VERSION=11.5.1"
+Environment="GPU_MAX_HEAP_SIZE=100"
+Environment="GPU_MAX_ALLOC_PERCENT=100"
+
+ExecStart=@SCRIPTS_DIR@/start-mistral-llama.sh
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llama-mistral-server
+
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

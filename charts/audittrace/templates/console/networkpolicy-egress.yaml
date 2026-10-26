@@ -1,0 +1,149 @@
+{{- if and .Values.console.enabled .Values.console.networkPolicy.enabled }}
+# LC-5 / M3-WU-4 gate 5 -- bounded EGRESS for the two console pods.
+#
+# The console pods (LibreChat and its BFF) must never reach the host's llama
+# endpoints (:11435-:11437 on the cni0 address) directly: the API key is the
+# lock, this policy is the second, independent one. Everything not listed
+# below is denied.
+#
+# Selector: `app.kubernetes.io/component In (librechat, librechat-bff)` plus the
+# release instance label. These are the labels the Deployments' pod templates
+# carry (there is NO `app` label on any console pod); a test renders both and
+# evaluates the selector with Kubernetes label-selector semantics, so a label
+# rename that silently un-selects the pods turns it RED. MongoDB is deliberately
+# NOT selected (it is a destination, not a client).
+#
+# Allow-list, enumerated from evidence (spec ADDENDUM 2 section 3 / ADDENDUM 3 section 3).
+# The selector is a UNION of both pods, so each row is permitted to either pod;
+# the "from" column names the pod that actually needs it.
+#   kube-dns :53 (both)         name resolution (the OIDC issuer and every Service name)
+#   BFF :8766 (librechat)       AUDITTRACE_BFF_BASE_URL
+#   memory-server (bff)         AUDITTRACE_BFF_ORCHESTRATOR_BASE_URL
+#   Keycloak :8080 (bff)        AUDITTRACE_BFF_KEYCLOAK_*
+#   MongoDB :27017 (librechat)  MONGO_URI
+#   istiod :15012 (both)        the three Istio sidecars' xDS/CA
+#   Vault :8200 (bff)           ONLY when the BFF renders with the Vault agent
+#                               (audittrace.console.bff.useVault); dormant
+#                               under console.bff.secretSource=values
+#   front door :443 (librechat) OIDC discovery/token/JWKS via https://<front door>.
+#                               Two-hop, DNAT'd: allow BOTH the k3s svclb pods
+#                               (:443) and the istio ingressgateway pods
+#                               (:console.networkPolicy.ingressGatewayTargetPort,
+#                               the Service's `https` targetPort). No ipBlock.
+# Acceptance with the policy ON is a console OIDC login (302 + "OpenID Connect
+# configured successfully."), not a render check. Enforcement on the node is
+# measured BEFORE this is turned on (window step 4a).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-console-egress
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: console-egress-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - librechat
+          - librechat-bff
+  policyTypes:
+    - Egress
+  egress:
+    # kube-dns
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # BFF
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: librechat-bff
+      ports:
+        - protocol: TCP
+          port: {{ .Values.console.bff.port }}
+    # memory-server
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: memory-server
+      ports:
+        - protocol: TCP
+          port: {{ .Values.memoryServer.port }}
+    # Keycloak
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: keycloak
+      ports:
+        - protocol: TCP
+          port: 8080
+    # MongoDB
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: librechat-mongodb
+      ports:
+        - protocol: TCP
+          port: 27017
+    # istiod (the sidecars' xDS / CA)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+          podSelector:
+            matchLabels:
+              app: istiod
+      ports:
+        - protocol: TCP
+          port: 15012
+{{- if eq (include "audittrace.console.bff.useVault" .) "true" }}
+    # Vault :8200 (the BFF's agent sidecar) -- only under useVault
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: vault
+              component: server
+      ports:
+        - protocol: TCP
+          port: 8200
+{{- end }}
+    # front door, hop 1: the k3s svclb pods (hostPort 443)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              svccontroller.k3s.cattle.io/svcname: istio-ingressgateway
+      ports:
+        - protocol: TCP
+          port: 443
+    # front door, hop 2: the istio ingressgateway pods (the Service's https targetPort)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+          podSelector:
+            matchLabels:
+              istio: ingressgateway
+      ports:
+        - protocol: TCP
+          port: {{ .Values.console.networkPolicy.ingressGatewayTargetPort }}
+{{- end }}

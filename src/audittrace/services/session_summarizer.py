@@ -61,6 +61,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.config import Settings
 from audittrace.db.models import InteractionRecord, SessionRecord
+from audittrace.routes._llama_client import llama_auth_headers
 
 logger = logging.getLogger(__name__)
 
@@ -637,7 +638,7 @@ class SessionSummarizer:
         if base.endswith("/v1"):
             base = base[: -len("/v1")]
         url = f"{base}/props"
-        response = await client.get(url, timeout=10)
+        response = await client.get(url, timeout=10, headers=self._auth_headers())
         response.raise_for_status()
         body = response.json()
         gen = body.get("default_generation_settings") or {}
@@ -682,7 +683,12 @@ class SessionSummarizer:
         # 30s (was 10s): a very large transcript can take longer than 10s to
         # tokenise; a timeout here used to propagate and re-queue the session
         # forever. ``_safe_count_tokens`` is the backstop if this still fails.
-        response = await client.post(url, json={"content": content}, timeout=30)
+        response = await client.post(
+            url,
+            json={"content": content},
+            timeout=30,
+            headers=self._auth_headers(),
+        )
         response.raise_for_status()
         body = response.json()
         tokens = body.get("tokens") or []
@@ -848,7 +854,9 @@ class SessionSummarizer:
             "response_format": {"type": "json_object"},
             "stream": False,
         }
-        response = await client.post(url, json=payload, timeout=60)
+        response = await client.post(
+            url, json=payload, timeout=60, headers=self._auth_headers()
+        )
         response.raise_for_status()
         body = response.json()
         choices = body.get("choices") or []
@@ -856,6 +864,15 @@ class SessionSummarizer:
             return ""
         message = choices[0].get("message") or {}
         return str(message.get("content") or "")
+
+    def _auth_headers(self) -> dict[str, str]:
+        """LC-5 — the summariser endpoint's bearer header, built PER REQUEST.
+
+        ``/props``, ``/tokenize`` and ``/chat/completions`` all call this, so
+        a key rotation needs no client rebuild (the client below is
+        process-resident). Empty key -> no header (unlocked server).
+        """
+        return llama_auth_headers(self._settings.summarizer_api_key)
 
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._http_client is None:  # pragma: no cover - production-only path
