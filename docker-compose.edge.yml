@@ -126,7 +126,7 @@ services:
 
   # ── D3 — MongoDB (pinned, named volume, NO external port) ────────────
   librechat-mongodb:
-    image: mongo:7.0@sha256:b6421fd6d1c5ded6377b397d8983e2f82e2100dc5123332dcfda2065a472be5b
+    image: mongo:9.0@sha256:dc28ed5a9d0fc616903c3f463bb1e53b92b49f441721b91926e87d90bf957ce8
     container_name: audittrace-librechat-mongodb
     profiles: ["console"]
     command: ["mongod", "--noauth"]
