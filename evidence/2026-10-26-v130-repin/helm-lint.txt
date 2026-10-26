@@ -1,0 +1,7 @@
+🪖  helm lint (vault.enabled=false)...
+==> Linting charts/audittrace
+[INFO] Chart.yaml: icon is recommended
+
+1 chart(s) linted, 0 chart(s) failed
+🪖  helm template (vault.enabled=true) + vaultSecretFileGuard count...
+✅ vaultSecretFileGuard present in 3 workloads

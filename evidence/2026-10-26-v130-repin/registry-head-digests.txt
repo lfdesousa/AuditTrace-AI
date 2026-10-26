@@ -1,0 +1,5 @@
+HEAD https://registry-1.docker.io/v2/lfds/<repo>/manifests/1.30.0 (Docker-Content-Digest), 2026-10-26
+audittrace-memory-server  sha256:350cbb4014bf9db2af2207eeecb52d269291f0d9b0f5e7ae801ea4525db99b8c (not pinned in values; tag tracks appVersion)
+audittrace-librechat-bff  sha256:5c1cbf332cb43d0994be7adcca7af388ed1a608ada02619ba741d1fc88f0ffcb
+audittrace-tests          sha256:fdb046a2fef9503b04e910ba159e1b24274877e0c243e0a5f7330f53d77820aa
+audittrace-llm-stub       sha256:31815d581c9637ce6bb6df94491103c6cb301a00afeb1094d1a1ed88b2979b29

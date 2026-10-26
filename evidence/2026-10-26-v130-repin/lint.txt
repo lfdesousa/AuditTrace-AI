@@ -1,0 +1,15 @@
+ • Rules run: 2
+ • Targets scanned: 264
+ • Parsed lines: ~100.0%
+ • Scan skipped:
+   ◦ Files matching .semgrepignore patterns: 332
+ • Scan was limited to files tracked by git
+ • For a detailed list of skipped files and lines, run semgrep with the --verbose flag
+Ran 2 rules on 264 files: 0 findings.
+✅ Security-lint passed
+🔍 Running linter...
+All checks passed!
+✅ Linting passed
+📝 Running formatter check...
+514 files already formatted
+✅ Formatting passed
