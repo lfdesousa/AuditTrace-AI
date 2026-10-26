@@ -242,6 +242,25 @@ class TestApply:
         assert "/nonexistent/wait-for-gpu.sh" in result.stderr
         assert sha_tree(sb.systemd_dir) == before and sb.mutating_calls() == []
 
+    def test_sysroot_seam_does_not_mask_a_missing_system_path(self, sb):
+        # the sandbox sysroot supplies wait-for-vulkan-gpu.sh only; a /usr path
+        # it lacks must still be refused (the seam is a prefix, not a bypass),
+        # and the host's real /usr/local/bin is never consulted.
+        tree = copy_scripts_tree(sb.root / "tree")
+        unit = tree / "systemd/llama-server.service"
+        unit.write_text(
+            unit.read_text().replace(
+                "ExecStart=@SCRIPTS_DIR@",
+                "ExecStartPre=/usr/local/bin/not-installed-gate.sh\nExecStart=@SCRIPTS_DIR@",
+            )
+        )
+        before = sha_tree(sb.systemd_dir)
+        result = sb.apply(tree / APPLY.name, "--apply")
+        assert result.returncode == 2
+        assert "/usr/local/bin/not-installed-gate.sh" in result.stderr
+        assert "wait-for-vulkan-gpu.sh" not in result.stderr
+        assert sha_tree(sb.systemd_dir) == before and sb.mutating_calls() == []
+
     def test_a_failed_restart_prints_the_rollback_command_and_exits_3(self, sb):
         result = sb.apply(APPLY, "--apply", SC_OMIT_NOWEBUI="1")
         assert result.returncode == 3

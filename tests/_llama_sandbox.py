@@ -336,6 +336,7 @@ class ApplySandbox(Sandbox):
             KUBECTL_BIN=str(self.nodehosts_reader),
             LLAMA_APPLY_ALLOW_NONROOT="1",
             LLAMA_SERVICE_HOME=str(self.home),
+            LLAMA_APPLY_SYSROOT=str(self.root / "sysroot"),
             LLAMA_APPLY_VERIFY_TIMEOUT="2",
             LLAMA_APPLY_VERIFY_STEP="1",
             **overrides,
@@ -398,6 +399,12 @@ def make_apply_sandbox(tmp_path: Path) -> ApplySandbox:
     _write_exec(base.stubs / "systemctl", STUB_SYSTEMCTL)
     _write_exec(base.stubs / "ss", STUB_SS)
     _write_exec(base.stubs / "runuser", STUB_RUNUSER)
+    # the units' ExecStartPre GPU gate lives under /usr/local/bin on the real
+    # host; a CI runner has none, so the sandbox supplies its own sysroot copy.
+    _write_exec(
+        base.root / "sysroot" / "usr" / "local" / "bin" / "wait-for-vulkan-gpu.sh",
+        "#!/bin/sh\nexit 0\n",
+    )
     vk = f"{LIVE_HOME}/build/llama.cpp/build-vulkan-new/bin/llama-server"
     for unit, (_launcher, port) in UNITS.items():
         (systemd_dir / f"{unit}.service").write_text(

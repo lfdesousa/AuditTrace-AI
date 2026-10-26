@@ -55,11 +55,17 @@ render_unit() {
 check_unit_paths() {
   # Every absolute path an ExecStart/ExecStartPre of the (rendered) unit runs
   # must exist and be executable. Returns 1 and names the missing paths.
-  local unit_file="$1" unit_name path missing=()
+  # LLAMA_APPLY_SYSROOT (default empty = the real host) prefixes only the
+  # system paths (/usr/...), the same seam family as SYSTEMD_DIR / PROC_ROOT, so
+  # a hermetic run does not depend on the host having e.g.
+  # /usr/local/bin/wait-for-vulkan-gpu.sh installed (a CI runner does not).
+  local unit_file="$1" unit_name path probe missing=()
   unit_name="$(basename "$unit_file" .service)"
   while IFS= read -r path; do
     [[ -z "$path" ]] && continue
-    [[ -x "$path" ]] || missing+=("$path")
+    probe="$path"
+    [[ "$path" == /usr/* ]] && probe="${LLAMA_APPLY_SYSROOT:-}${path}"
+    [[ -x "$probe" ]] || missing+=("$path")
   done < <(extract_exec_paths "$unit_file")
   if (( ${#missing[@]} > 0 )); then
     echo "error: $unit_name runs path(s) that do not exist or are not executable on this host:" >&2
