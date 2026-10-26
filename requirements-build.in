@@ -4,5 +4,5 @@
 # setuptools/wheel from PyPI. Must equal [build-system].requires in
 # pyproject.toml (tests/test_dep_lock_sync.py asserts it). Bumped only by
 # `make lock-upgrade`, together with pyproject.toml.
-setuptools==84.0.0
+setuptools==84.1.0
 wheel==0.48.0
