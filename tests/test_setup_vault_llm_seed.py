@@ -20,7 +20,7 @@ import pytest
 from tests._hermetic_env import hermetic_env
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "setup-vault.sh"
-KEY = "Zx9Qw8Er7Ty6" * 4  # 48 chars, [A-Za-z0-9]
+KEY = "Ab1" * 16  # 48 chars, [A-Za-z0-9]; low-entropy fake (never a real key)
 
 
 def _function_source(name: str) -> str:

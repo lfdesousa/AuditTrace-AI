@@ -47,7 +47,7 @@ MODELS = (
     "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
     "mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf",
 )
-KEY_VALUE = "Ab3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0hJ3kL6nP9rS2uV5xY8"[:48]
+KEY_VALUE = "Cd2" * 16  # 48 chars, low-entropy fake (never a real key)
 CNI0_ADDR = "10.42.0.1"
 
 STUB_LLAMA = """#!/usr/bin/env bash
