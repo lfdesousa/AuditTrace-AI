@@ -499,6 +499,34 @@ class TestNoAdminOrCuratorOverride:
         assert mine.storage_key == f"{ADMIN}/decisions/a.md"
         assert (await env.raw("semantic", f"{A}/decisions/a.md")).title == "A"
 
+    @pytest.mark.parametrize("legacy", [False, True], ids=["new-form", "legacy"])
+    async def test_admin_authorize_write_refuses_foreign_private_row(
+        self, env: Env, legacy: bool
+    ) -> None:
+        """F1: no admin short-circuit inside ``authorize_write``. An admin
+        holding the corpus-write scope still gets the owner-free refusal.
+
+        legacy: corpus write over A's bare-key private row.
+        new-form: a corpus write cannot collide with an owner-keyed row by
+        design (RT-5a: distinct rows), so the new-form refusal is the private
+        write whose target ``{admin}/{key}`` is held by a foreign row.
+        """
+        if legacy:
+            await env.seed("semantic", "decisions/a.md", A, title="A")
+            tier = "corpus"
+        else:
+            await env.seed("semantic", f"{ADMIN}/decisions/a.md", A, title="A")
+            tier = "private"
+        before = await env.all_stored_keys("semantic")
+        admin = _user(ADMIN, is_admin=True, scopes=("memory:corpus:decisions:write",))
+        with pytest.raises(CrossOwnerWriteError) as exc:
+            await authorize_write(
+                env.svc, admin, "semantic", "decisions/a.md", requested_tier=tier
+            )
+        assert str(exc.value) == tier_conflict_message("semantic", "decisions/a.md")
+        assert A not in str(exc.value) and ADMIN not in str(exc.value)
+        assert await env.all_stored_keys("semantic") == before
+
     async def test_admin_read_of_a_legacy_row_is_not_found(self, env: Env) -> None:
         await env.seed("semantic", "decisions/a.md", A)
         assert (
