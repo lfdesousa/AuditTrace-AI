@@ -542,7 +542,9 @@ class TestSoftDeleteTombstoneFiltersRecall:
         await self._seed(service, manifest, user_context)
         assert len(await service.search(user_context, "body", k=4)) == 1
 
-        await manifest.record_delete("semantic", "decisions/doc-tomb", "someone")
+        await manifest.record_delete(
+            "semantic", "decisions/doc-tomb", user_context.user_id
+        )
         assert await service.search(user_context, "body", k=4) == []
 
     async def test_search_page_excludes_soft_deleted(
@@ -552,7 +554,9 @@ class TestSoftDeleteTombstoneFiltersRecall:
         page = await service.search_page(user_context, "body", k=4)
         assert page.total == 1
 
-        await manifest.record_delete("semantic", "decisions/doc-tomb", "someone")
+        await manifest.record_delete(
+            "semantic", "decisions/doc-tomb", user_context.user_id
+        )
         page = await service.search_page(user_context, "body", k=4)
         assert page.matches == []
         assert page.total == 0
@@ -561,7 +565,9 @@ class TestSoftDeleteTombstoneFiltersRecall:
         self, service, manifest, user_context
     ) -> None:
         await self._seed(service, manifest, user_context)
-        await manifest.record_delete("semantic", "decisions/doc-tomb", "someone")
+        await manifest.record_delete(
+            "semantic", "decisions/doc-tomb", user_context.user_id
+        )
         assert await service.search(user_context, "body", k=4) == []
 
         # Re-create: manifest revives (record_create clears deleted_at_ms)
@@ -571,6 +577,41 @@ class TestSoftDeleteTombstoneFiltersRecall:
         results = await service.search(user_context, "body", k=4)
         assert len(results) == 1
         assert results[0].page_content == "body v2 revived"
+
+    async def test_legacy_bare_key_tombstone_still_filters(
+        self, service, manifest, user_context
+    ) -> None:
+        """LC-9: a pre-LC-9 (legacy, bare-key) private row's tombstone is
+        still honoured -- the candidates cover BOTH storage shapes."""
+        await service.upsert(user_context, "decisions", "doc-legacy", "legacy body")
+        manifest._rows[("semantic", "decisions/doc-legacy")] = {
+            "id": "legacy-1",
+            "layer": "semantic",
+            "key": "decisions/doc-legacy",
+            "title": None,
+            "size_bytes": 1,
+            "created_at_ms": 1,
+            "modified_at_ms": 1,
+            "created_by_user_id": user_context.user_id,
+            "modified_by_user_id": user_context.user_id,
+            "deleted_at_ms": 2,
+            "deleted_by_user_id": user_context.user_id,
+            "tier": "private",
+        }
+        assert await service.search(user_context, "legacy", k=4) == []
+
+    async def test_another_users_tombstone_does_not_hide_my_document(
+        self, service, manifest, user_context
+    ) -> None:
+        """LC-9: B's tombstone of B's OWN ``doc-tomb`` (stored at
+        ``user-b/decisions/doc-tomb``) never hides A's document of the same
+        id (A's candidates are built from A's owner)."""
+        await self._seed(service, manifest, user_context)
+        await manifest.record_create(
+            "semantic", "decisions/doc-tomb", "B", 1, "someone-else"
+        )
+        await manifest.record_delete("semantic", "decisions/doc-tomb", "someone-else")
+        assert len(await service.search(user_context, "body", k=4)) == 1
 
     async def test_no_manifest_wired_is_a_no_op(self, user_context) -> None:
         """Backward compatibility: a service constructed without

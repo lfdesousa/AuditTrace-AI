@@ -1965,7 +1965,9 @@ async def read_episodic(
     doc = await service.read(user, filename)
     if doc is None:
         raise HTTPException(status_code=404, detail="ADR not found")
-    entry: ManifestEntry | None = await manifest.get("episodic", filename)
+    entry: ManifestEntry | None = await manifest.resolve_read(
+        "episodic", filename, user
+    )
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
@@ -2224,7 +2226,9 @@ async def read_procedural(
     doc = await service.read(user, filename)
     if doc is None:
         raise HTTPException(status_code=404, detail="SKILL not found")
-    entry: ManifestEntry | None = await manifest.get("procedural", filename)
+    entry: ManifestEntry | None = await manifest.resolve_read(
+        "procedural", filename, user
+    )
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
@@ -2950,7 +2954,9 @@ async def read_semantic(
             service, user, collection, document_id, doc
         )
         front_matter = chunk_docs[0]
-        entry = await manifest.get("semantic", _semantic_key(collection, chunk_ids[0]))
+        entry = await manifest.resolve_read(
+            "semantic", _semantic_key(collection, chunk_ids[0]), user
+        )
         if entry is not None and not _manifest_visible(entry, user):
             entry = None
         schedule_read_audit(
@@ -2975,7 +2981,9 @@ async def read_semantic(
             "chunk_keys": [_semantic_key(collection, cid) for cid in chunk_ids],
         }
 
-    entry = await manifest.get("semantic", _semantic_key(collection, document_id))
+    entry = await manifest.resolve_read(
+        "semantic", _semantic_key(collection, document_id), user
+    )
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(

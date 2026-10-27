@@ -22,6 +22,7 @@ from audittrace.db.factory import ChromaDBClient
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
 from audittrace.services.embedder import embed_via_nomic
+from audittrace.services.memory_keys import deleted_key_candidates
 from audittrace.services.pagination import sort_and_paginate
 
 logger = logging.getLogger(__name__)
@@ -499,12 +500,11 @@ class ChromaSemanticService(SemanticService):
         """
         if self._manifest is None or not docs:
             return docs
-        keys = {
-            f"{doc.metadata.get('collection')}/{doc.metadata.get('chunk_id')}"
-            for doc in docs
-        }
+        candidates = [self._tombstone_candidates(doc) for doc in docs]
         try:
-            deleted = await self._manifest.get_deleted_keys("semantic", keys)
+            deleted = await self._manifest.get_deleted_keys(
+                "semantic", set().union(*candidates)
+            )
         except Exception as exc:
             logger.warning(
                 "soft-delete tombstone check failed — candidates NOT "
@@ -516,10 +516,26 @@ class ChromaSemanticService(SemanticService):
             return docs
         return [
             doc
-            for doc in docs
-            if f"{doc.metadata.get('collection')}/{doc.metadata.get('chunk_id')}"
-            not in deleted
+            for doc, keys in zip(docs, candidates, strict=True)
+            if not (keys & deleted)
         ]
+
+    @staticmethod
+    def _tombstone_candidates(doc: Document) -> set[str]:
+        """Every manifest storage key the document's soft-delete tombstone can
+        carry (LC-9 ADDENDUM-1 C3 reader #5): the legacy bare
+        ``{collection}/{chunk_id}`` and, for a PRIVATE chunk, the owner-keyed
+        ``{owner}/{collection}/{logical_id}``. A private chunk's id is not yet
+        owner-prefixed before the ChromaDB id work (WP3), so its owner key is
+        also built from the raw id; both shapes are tried."""
+        meta = doc.metadata
+        collection = str(meta.get("collection"))
+        chunk_id = str(meta.get("chunk_id"))
+        owner = meta.get("user_id") if meta.get("tier") == "private" else None
+        keys = deleted_key_candidates(collection, chunk_id, owner)
+        if owner:
+            keys.add(f"{owner}/{collection}/{chunk_id}")
+        return keys
 
     @staticmethod
     def _shape_query_results(results: dict[str, Any], col_name: str) -> list[Document]:

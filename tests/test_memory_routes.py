@@ -6225,6 +6225,9 @@ class TestBackofficeOwnerScopedManifest:
             async def get(self, layer, key):
                 return alices_row
 
+            async def resolve_read(self, layer, key, user):
+                return alices_row
+
         bob = UserContext(
             user_id="bob",
             username="bob",
