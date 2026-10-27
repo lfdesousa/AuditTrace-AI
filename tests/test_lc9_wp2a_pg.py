@@ -62,39 +62,47 @@ def _svc(pgs: Schema) -> MemoryManifestService:
 
 @pg
 class TestCopyForwardOnPostgres:
-    async def test_copy_forward_is_one_transaction(self, pgs: Schema) -> None:
+    @pytest.mark.parametrize("verb", ["update", "create"])
+    async def test_copy_forward_is_one_transaction(
+        self, pgs: Schema, verb: str
+    ) -> None:
+        """Crash AFTER the legacy tombstone is staged and BEFORE the owner-keyed
+        row is added (the insert raises): the single transaction rolls back, so
+        the legacy row is still live and still answers. A copy-forward done in
+        two commits would leave the tombstone behind with no new row."""
         pgs.insert(
             key="note.md", created_by_user_id=A, created_at_ms=11, modified_at_ms=11
         )
         pgs.migrate("upgrade")
         svc = _svc(pgs)
-        real_commit = AsyncSession.commit
+        real_add = AsyncSession.add
         calls = {"n": 0}
 
-        async def _boom(self: AsyncSession) -> None:
-            calls["n"] += 1
-            if calls["n"] == 1:
-                await self.rollback()
-                raise RuntimeError("crash before the commit")
-            await real_commit(self)
+        def _crash_on_first_owner_row(self: AsyncSession, obj: Any, **kw: Any) -> None:
+            if getattr(obj, "key", "").startswith(f"{A}/"):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("crash before the owner-keyed row")
+            real_add(self, obj, **kw)
 
-        with patch.object(AsyncSession, "commit", _boom):
+        async def _write() -> Any:
+            if verb == "update":
+                return await svc.record_update("episodic", "note.md", 5, A)
+            return await svc.record_create("episodic", "note.md", "t", 5, A)
+
+        with patch.object(AsyncSession, "add", _crash_on_first_owner_row):
             with pytest.raises(RuntimeError):
-                await svc.record_update("episodic", "note.md", 5, A)
-            # crash before the commit: BOTH halves absent -> the legacy row still
-            # answers, nothing owner-keyed exists.
-            legacy = pgs.row("note.md")
-            assert legacy.deleted_at_ms is None
+                await _write()
+            # BOTH halves absent: the legacy row is live and still answers.
+            assert pgs.row("note.md").deleted_at_ms is None
             assert pgs.row(f"{A}/note.md") is None
             entry = await svc.resolve_read("episodic", "note.md", _ctx(A))
             assert entry is not None and entry.storage_key == "note.md"
-            # the retry converges, both halves together
-            out = await svc.record_update("episodic", "note.md", 5, A)
+            out = await _write()  # the retry converges, both halves together
         assert out.storage_key == f"{A}/note.md" and out.created_at_ms == 11
-        assert pgs.row("note.md").deleted_by_user_id == A
-        assert (
-            pgs.row("note.md").deleted_at_ms == pgs.row(f"{A}/note.md").modified_at_ms
-        )
+        tomb, new = pgs.row("note.md"), pgs.row(f"{A}/note.md")
+        assert tomb.deleted_by_user_id == A
+        assert tomb.deleted_at_ms == new.modified_at_ms  # same transaction instant
 
     async def test_create_path_copy_forward_passes_the_check(self, pgs: Schema) -> None:
         pgs.insert(key="note.md", created_by_user_id=A, created_at_ms=11)
