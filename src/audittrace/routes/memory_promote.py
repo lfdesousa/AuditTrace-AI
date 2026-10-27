@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import HTTPException
 from langchain_core.documents import Document
@@ -58,6 +58,11 @@ from audittrace.dependencies import (
 )
 from audittrace.identity import UserContext
 from audittrace.services.memory_audit import emit_memory_audit_event
+from audittrace.services.memory_keys import (
+    ConcurrentManifestWriteError,
+    LogicalKeyTooLongError,
+    check_logical,
+)
 from audittrace.services.memory_manifest import (
     ManifestAuthorizationError,
     authorize_write,
@@ -236,6 +241,7 @@ async def _emit_promote_audit(
     collection: str | None,
     key: str,
     detail_extra: dict[str, Any],
+    op: Literal["write", "delete"] = "write",
 ) -> None:
     """Fail-closed audit-row emission for the promote write — mirrors
     ``routes.memory._emit_write_audit``'s wrapper shape exactly (an
@@ -246,7 +252,7 @@ async def _emit_promote_audit(
     try:
         await emit_memory_audit_event(
             user=user,
-            op="write",
+            op=op,
             layer=layer,
             collection=collection,
             key=key,
@@ -273,13 +279,20 @@ def _raise_manifest_authorization_as_403(
 
 async def _promote_to_episodic(
     user: UserContext, filename: str, stamped_content: str, title: str
-) -> str:
+) -> tuple[str, str | None]:
     """Copy *stamped_content* into the caller's private-tier episodic
     layer, keyed by a ``.md``-safe filename derived from *filename*.
-    Returns the durable key (the episodic filename). Raises
-    ``HTTPException`` (400/403/502) on any failure — never a silent
-    partial write."""
+    Returns ``(durable key, copied_from)``: the episodic filename, and the
+    stored key of the caller's OWN legacy bare-key row this write copied
+    forward (``None`` when it was not a copy-forward; LC-9 WP2a). Raises
+    ``HTTPException`` (400/403/409/502) on any failure — never a silent
+    partial write. A durable name over the logical-key cap is a 400 (LC-9
+    S1/S2), checked before any lookup or write."""
     durable_filename = _durable_episodic_filename(filename)
+    try:
+        check_logical(durable_filename)
+    except LogicalKeyTooLongError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     manifest = get_memory_manifest_service()
     # SPEC security-memory-write-authorization-choke (2026-08-30) — the
     # PRE-WRITE choke, checked before any content lands. Always
@@ -304,8 +317,15 @@ async def _promote_to_episodic(
     # THIS caller may claim shared-write authorship on record_create —
     # same lazy-import discipline authorize_write() itself already uses
     # for the identical reason (see that function's docstring).
-    from audittrace.routes.memory import _corpus_write_authorized  # noqa: PLC0415
+    from audittrace.routes.memory import (  # noqa: PLC0415
+        _corpus_write_authorized,
+        _legacy_copy_forward_source,
+        _raise_concurrent_write_as_409,
+    )
 
+    copied_from = await _legacy_copy_forward_source(
+        manifest, user, "episodic", durable_filename
+    )
     try:
         await manifest.record_create(
             layer="episodic",
@@ -316,9 +336,11 @@ async def _promote_to_episodic(
             tier="private",
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
+    except ConcurrentManifestWriteError as exc:
+        raise _raise_concurrent_write_as_409(exc) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    return durable_filename
+    return durable_filename, copied_from
 
 
 async def _promote_to_semantic(
@@ -468,9 +490,12 @@ async def promote_session_to_durable(
         title = filename
 
     if target_layer == "episodic":
-        durable_key = await _promote_to_episodic(user, filename, stamped_content, title)
+        durable_key, copied_from = await _promote_to_episodic(
+            user, filename, stamped_content, title
+        )
         collection: str | None = None
     else:
+        copied_from = None
         collection_value = payload.get("collection")
         durable_key, collection = await _promote_to_semantic(
             user,
@@ -495,8 +520,20 @@ async def promote_session_to_durable(
             "promoted_from": session_key,
             "promoted_at_ms": promoted_at_ms,
             "promoted_by": promoted_by,
+            **({"copied_from": copied_from} if copied_from else {}),
         },
     )
+    if copied_from:
+        # ADDENDUM-1 S2: one audit row per manifest mutation -- the legacy
+        # row's tombstone, in the same promote.
+        await _emit_promote_audit(
+            user=user,
+            layer=target_layer,
+            collection=collection,
+            key=durable_key,
+            detail_extra={"reason": "copy_forward"},
+            op="delete",
+        )
 
     return {
         "status": "promoted",

@@ -100,6 +100,11 @@ from audittrace.services.memory_audit import (
     emit_memory_audit_event,
     schedule_read_audit,
 )
+from audittrace.services.memory_keys import (
+    ConcurrentManifestWriteError,
+    LogicalKeyTooLongError,
+    check_logical,
+)
 from audittrace.services.memory_manifest import (
     ManifestAuthorizationError,
     ManifestEntry,
@@ -425,6 +430,64 @@ def _raise_manifest_authorization_as_403(
     manifest-tier-authz, 2026-08-30, invariant #4: fail-closed, RAISE, not
     a silent overwrite AND not an opaque 500)."""
     return HTTPException(status_code=403, detail=str(exc))
+
+
+def _raise_concurrent_write_as_409(exc: ConcurrentManifestWriteError) -> HTTPException:
+    """Map a lost ``UNIQUE (layer, key)`` race (two simultaneous writes, e.g.
+    the same owner's concurrent copy-forward) to a retryable 409 -- never a
+    500 (LC-9 WP1 review advisory A2). Nothing was written; a retry
+    converges."""
+    return HTTPException(
+        status_code=409,
+        detail=f"{exc}",
+        headers={"Retry-After": "1"},
+    )
+
+
+async def _legacy_copy_forward_source(
+    manifest: Any, user: UserContext, layer: str, filename: str
+) -> str | None:
+    """The stored key of the caller's OWN live legacy bare-key private row
+    that the coming create/update of *filename* will copy forward, else
+    ``None`` (LC-9 WP2a, ADDENDUM-1 S2: the audit trail records the
+    copy-forward). Decided through ``resolve_read``: the caller's owner key
+    wins; the legacy row counts only when it is the caller's own, private and
+    live. Another user's row is invisible to ``resolve_read``, so it can
+    never be named here."""
+    prior: ManifestEntry | None = await manifest.resolve_read(layer, filename, user)
+    if (
+        prior is not None
+        and prior.tier == "private"
+        and prior.deleted_at_ms is None
+        and prior.created_by_user_id == user.user_id
+        and prior.storage_key == filename
+    ):
+        return prior.storage_key
+    return None
+
+
+async def _emit_write_audits(
+    *, user: UserContext, layer: str, filename: str, copied_from: str | None
+) -> None:
+    """One ``_emit_write_audit`` per manifest mutation (ADDENDUM-1 S2): the
+    create/update row, and -- on a copy-forward -- the legacy tombstone.
+    The write carries ``copied_from``; the tombstone ``reason``. Both keys
+    are additive ``detail`` fields."""
+    await _emit_write_audit(
+        user=user,
+        op="write",
+        layer=layer,
+        key=filename,
+        detail_extra={"copied_from": copied_from} if copied_from else None,
+    )
+    if copied_from:
+        await _emit_write_audit(
+            user=user,
+            op="delete",
+            layer=layer,
+            key=filename,
+            detail_extra={"reason": "copy_forward"},
+        )
 
 
 def _resolve_requested_tier(payload: dict[str, Any] | None, promote: str | None) -> str:
@@ -1611,6 +1674,12 @@ def _validate_filename_or_400(filename: str, layer: str) -> None:
             status_code=400,
             detail="filename must not contain path separators or '..'",
         )
+    try:
+        check_logical(filename)
+    except LogicalKeyTooLongError as exc:
+        # LC-9 S1/S2: a 219+ char logical key cannot be stored under an
+        # owner prefix (String(255) column); a clean 400, never a 500.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _strip_known_key_prefixes(raw: str, layer: str, user_id: str) -> str:
@@ -1700,6 +1769,11 @@ async def create_episodic(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    copied_from = (
+        await _legacy_copy_forward_source(manifest, user, "episodic", filename)
+        if tier == "private"
+        else None
+    )
     try:
         entry: ManifestEntry = await manifest.record_create(
             layer="episodic",
@@ -1710,11 +1784,15 @@ async def create_episodic(
             tier=tier,
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
+    except ConcurrentManifestWriteError as exc:
+        raise _raise_concurrent_write_as_409(exc) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
     # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
     # closed: see services/memory_audit.py module docstring).
-    await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
+    await _emit_write_audits(
+        user=user, layer="episodic", filename=filename, copied_from=copied_from
+    )
     return entry.to_dict()
 
 
@@ -2014,6 +2092,9 @@ async def update_episodic(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    copied_from = await _legacy_copy_forward_source(
+        manifest, user, "episodic", filename
+    )
     try:
         entry: ManifestEntry = await manifest.record_update(
             layer="episodic",
@@ -2023,6 +2104,8 @@ async def update_episodic(
             title=title,
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
+    except ConcurrentManifestWriteError as exc:
+        raise _raise_concurrent_write_as_409(exc) from exc
     except LookupError as exc:
         raise HTTPException(
             status_code=404, detail=f"ADR has no manifest row: {exc}"
@@ -2031,7 +2114,9 @@ async def update_episodic(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
+    await _emit_write_audits(
+        user=user, layer="episodic", filename=filename, copied_from=copied_from
+    )
     return entry.to_dict()
 
 
@@ -2146,6 +2231,11 @@ async def create_procedural(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    copied_from = (
+        await _legacy_copy_forward_source(manifest, user, "procedural", filename)
+        if tier == "private"
+        else None
+    )
     try:
         entry: ManifestEntry = await manifest.record_create(
             layer="procedural",
@@ -2156,9 +2246,13 @@ async def create_procedural(
             tier=tier,
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
+    except ConcurrentManifestWriteError as exc:
+        raise _raise_concurrent_write_as_409(exc) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
+    await _emit_write_audits(
+        user=user, layer="procedural", filename=filename, copied_from=copied_from
+    )
     return entry.to_dict()
 
 
@@ -2272,6 +2366,9 @@ async def update_procedural(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    copied_from = await _legacy_copy_forward_source(
+        manifest, user, "procedural", filename
+    )
     try:
         entry: ManifestEntry = await manifest.record_update(
             layer="procedural",
@@ -2281,6 +2378,8 @@ async def update_procedural(
             title=title,
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
+    except ConcurrentManifestWriteError as exc:
+        raise _raise_concurrent_write_as_409(exc) from exc
     except LookupError as exc:
         raise HTTPException(
             status_code=404, detail=f"SKILL has no manifest row: {exc}"
@@ -2289,7 +2388,9 @@ async def update_procedural(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
+    await _emit_write_audits(
+        user=user, layer="procedural", filename=filename, copied_from=copied_from
+    )
     return entry.to_dict()
 
 

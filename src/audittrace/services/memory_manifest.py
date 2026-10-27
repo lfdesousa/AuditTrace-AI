@@ -24,11 +24,15 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.db.models import MemoryItem
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
+from audittrace.services.memory_keys import (
+    ConcurrentManifestWriteError as ConcurrentManifestWriteError,
+)
 from audittrace.services.memory_keys import (
     CrossOwnerWriteError as CrossOwnerWriteError,
 )
@@ -48,6 +52,7 @@ from audittrace.services.memory_keys import (
     physical_key,
     resolve_read,
     resolve_write,
+    tier_conflict_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +83,38 @@ def _entry_facts(entry: ManifestEntry | None) -> RowFacts | None:
     )
 
 
+def _is_unique_violation(exc: IntegrityError) -> bool:
+    """``True`` iff *exc* is a ``UNIQUE`` violation (Postgres SQLSTATE
+    ``23505``; SQLite's ``UNIQUE constraint failed`` text). A CHECK or NOT
+    NULL violation is NOT one: it stays a hard error (fail-closed)."""
+    orig = exc.orig
+    state = (
+        getattr(orig, "sqlstate", None)
+        or getattr(orig, "pgcode", None)
+        or getattr(getattr(orig, "__cause__", None), "sqlstate", None)
+    )
+    if state is not None:
+        return str(state) == "23505"
+    return "UNIQUE constraint failed" in str(orig)
+
+
+async def _commit_or_conflict(session: AsyncSession, layer: str, key: str) -> None:
+    """Commit; turn losing the ``UNIQUE (layer, key)`` race into the
+    retryable :class:`ConcurrentManifestWriteError` (LC-9 WP1 advisory A2:
+    two simultaneous copy-forwards of one owner's legacy row used to
+    surface as an IntegrityError -> 500). Any other IntegrityError (the 034
+    CHECK included) propagates unchanged."""
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        if _is_unique_violation(exc):
+            raise ConcurrentManifestWriteError(
+                f"concurrent write to layer={layer!r} key={key!r}; retry"
+            ) from exc
+        raise
+
+
 def _now_ms() -> int:
     """Current Unix epoch in milliseconds UTC. Matches `Date.now()` in JS."""
     return int(time.time() * 1000)
@@ -97,6 +134,18 @@ def _tier_write_unauthorized(existing_tier: str, caller_can_write_shared: bool) 
     edit.
     """
     return existing_tier == "corpus" and not caller_can_write_shared
+
+
+def _pdf_private_row_foreign(
+    existing_tier: str, existing_owner: str, caller_user_id: str
+) -> bool:
+    """``True`` iff a PDF-metadata refresh would touch ANOTHER user's
+    **private**-tier row (LC-9 WP1 review advisory A1). Neither the shared-
+    write authorization nor an admin/curator role overrides it (ADR-062
+    curators are not private-data admins, operator row O-3): before this
+    guard a foreign legacy bare private row was refused only by the
+    Postgres CHECK (034), never by the service."""
+    return existing_tier == "private" and existing_owner != caller_user_id
 
 
 def _pdf_metadata_write_unauthorized(
@@ -600,7 +649,7 @@ class MemoryManifestService:
                     tier=tier,
                 )
                 session.add(row)
-            await session.commit()
+            await _commit_or_conflict(session, layer, key)
             await session.refresh(row)
             return ManifestEntry.from_row(row)
 
@@ -671,7 +720,7 @@ class MemoryManifestService:
                 row.size_bytes = size_bytes
                 row.modified_at_ms = now
                 row.modified_by_user_id = user_id
-            await session.commit()
+            await _commit_or_conflict(session, layer, key)
             await session.refresh(row)
             return ManifestEntry.from_row(row)
 
@@ -839,6 +888,8 @@ class MemoryManifestService:
                 )
                 session.add(row)
             else:
+                if _pdf_private_row_foreign(row.tier, row.created_by_user_id, user_id):
+                    raise CrossOwnerWriteError(tier_conflict_message(layer, key))
                 if _pdf_metadata_write_unauthorized(
                     row.tier, row.created_by_user_id, user_id, caller_can_write_shared
                 ):
@@ -1467,6 +1518,12 @@ class MockMemoryManifestService(MemoryManifestService):
             }
             self._rows[(layer, key)] = existing
         else:
+            if _pdf_private_row_foreign(
+                existing.get("tier", "corpus"),
+                existing.get("created_by_user_id", ""),
+                user_id,
+            ):
+                raise CrossOwnerWriteError(tier_conflict_message(layer, key))
             if _pdf_metadata_write_unauthorized(
                 existing.get("tier", "corpus"),
                 existing.get("created_by_user_id", ""),

@@ -90,6 +90,17 @@ class LogicalKeyTooLongError(ValueError):
     400 (ADDENDUM-1 S1, gate S2)."""
 
 
+class ConcurrentManifestWriteError(Exception):
+    """A concurrent same-item write won the ``UNIQUE (layer, key)`` race
+    (typically two simultaneous copy-forwards of the caller's own legacy
+    row). Nothing was written by the loser; a retry converges. Routes map it
+    to 409 (retryable), never 500 (LC-9 WP1 review advisory A2).
+
+    Deliberately NOT a ``ManifestAuthorizationError``/``RuntimeError``: it is
+    neither a refusal nor the soft-deleted-row conflict some routes already
+    catch as ``RuntimeError``."""
+
+
 def tier_conflict_message(layer: str, logical: str) -> str:
     """The ONE refusal text for every cross-owner / tier-conflict cause."""
     return f"tier conflict: {layer} key {logical!r} is not available for this write"
