@@ -30,6 +30,7 @@
 **/htmlcov/
 **/.coverage
 **/coverage.xml
+**/coverage.json
 **/junit.xml
 
 # ── Virtual environments ─────────────────────────────────────────────

@@ -101,6 +101,7 @@ memory/procedural/SKILL-*.md
 
 # Generated artifacts
 coverage.xml
+coverage.json
 junit.xml
 test_data/
 
