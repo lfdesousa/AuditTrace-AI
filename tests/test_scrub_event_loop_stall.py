@@ -29,6 +29,7 @@ import string
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -1236,43 +1237,72 @@ _GP4_ISSUER = "http://keycloak:8080/realms/audittrace"
 _GP4_AUDIENCE = "audittrace-server"
 
 
-class _LoopWatchdog:
-    """Observes event-loop responsiveness from a REAL OS thread, not an
-    asyncio task scheduled on the loop it is watching.
+@dataclass(frozen=True)
+class _LoopReport:
+    """What :class:`_LoopBlockProbe` observed about ONE request window."""
 
-    RE-REVIEW 2026-10-14 R1/N35 (BLOCKER) — the previous instrument was
-    an ``asyncio.create_task`` ticker that ``await``ed itself every
-    0.05s. That is COOPERATIVE scheduling: a SYNCHRONOUS blocking call
-    inside the request handler (``time.sleep`` planted directly in
-    ``render_payload`` — N35) never yields back to the loop, so the
-    ticker task is never given a chance to run at all. Its tick list
-    stayed empty (or held a single pre-request tick), ``gaps`` was
-    computed as ``[]``, and ``max(gaps) if gaps else 0.0`` reported
-    "no stall" — the guard was fail-OPEN on exactly the failure mode
-    the WU exists to catch; the test passed after 208s with `gap=0.0`.
+    ticks: int
+    max_wall_gap: float  # RECORDED only -- load-sensitive, never a criterion
+    max_cpu_gap: float  # loop-thread CPU seconds between two heartbeats
+    loop_sleep_seconds: float  # total time.sleep() requested ON the loop thread
+    heartbeat_threads: frozenset[int]
+    loop_thread: int
 
-    This watchdog submits a trivial callback to the loop via
-    ``call_soon_threadsafe`` from an independent thread every
-    ``interval`` seconds, and records the wall-clock time at which each
-    callback ACTUALLY RUNS. ``call_soon_threadsafe`` only queues the
-    callback — if the loop is busy executing a synchronous blocking
-    call, the queued callback simply waits, so the GAP between two
-    callback executions is a true, externally-observed measurement of
-    loop responsiveness, unaffected by whether the blocking code inside
-    the loop ever cooperates.
+
+class _LoopBlockProbe:
+    """Deterministic detector for "blocking work ran on the event-loop thread".
+
+    LC-9 GATE FIX C2 (2026-10-28). The previous criterion was the WALL-CLOCK
+    gap between two heartbeats (``<= 1.0s``). Wall-clock is load-dependent:
+    on a busy machine (or a container sharing cores) the loop thread is
+    simply descheduled and the gap exceeds 1.0s with NO blocking code in the
+    tree (observed: 1.536s on python:3.12.15, uid 1000). The property the
+    ratified spec cares about (SCRUB-EVENT-LOOP-STALL, A1 §6 (i): "the
+    liveness kill sits at ~60s; this is liveness-facing") is that the request
+    does not hold the loop thread in a synchronous block. That property is
+    observed here through two load-immune instruments, and a wall-clock
+    figure is only RECORDED:
+
+    * **CPU gap.** A real OS thread queues a heartbeat on the loop every
+      ``interval`` seconds (``call_soon_threadsafe`` -- RE-REVIEW 2026-10-14
+      R1: a cooperative asyncio ticker cannot see a synchronous block). The
+      callback runs ON the loop thread and samples ``time.thread_time()``
+      (that thread's on-CPU seconds). The CPU consumed between two
+      consecutive heartbeats is exactly the synchronous work done while the
+      loop could not service the heartbeat; being descheduled adds wall time
+      but not CPU time. Bound: 1.0 CPU-second (the spec's number).
+    * **Blocking waits.** A synchronous ``time.sleep`` burns no CPU, so the
+      CPU gap cannot see it (the N35 shape). ``time.sleep`` is wrapped for the
+      window; sleeps requested from the loop thread are summed (bound
+      0.05s). Sleeps from other threads (the threadpool) are legitimate.
     """
 
-    def __init__(self, loop: Any, interval: float = 0.05) -> None:
+    def __init__(
+        self, loop: Any, monkeypatch: pytest.MonkeyPatch, interval: float = 0.05
+    ) -> None:
         self._loop = loop
         self._interval = interval
-        self._ticks: list[float] = []
+        self._loop_thread = threading.get_ident()  # built ON the loop thread
+        self._samples: list[tuple[float, float, int]] = []
+        self._sleep_on_loop = 0.0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        real_sleep = time.sleep
+
+        def _spy_sleep(seconds: float) -> None:
+            if threading.get_ident() == self._loop_thread:
+                with self._lock:
+                    self._sleep_on_loop += seconds
+            real_sleep(seconds)
+
+        monkeypatch.setattr(time, "sleep", _spy_sleep)
 
     def _heartbeat(self) -> None:
         with self._lock:
-            self._ticks.append(time.monotonic())
+            self._samples.append(
+                (time.monotonic(), time.thread_time(), threading.get_ident())
+            )
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -1285,28 +1315,67 @@ class _LoopWatchdog:
     def start(self) -> None:
         self._thread.start()
 
-    def stop(self) -> list[float]:
+    def stop(self) -> _LoopReport:
         self._stop.set()
         self._thread.join(timeout=10)
         with self._lock:
-            return list(self._ticks)
-
-
-def _max_gap_fail_closed(ticks: list[float], *, min_ticks: int = 3) -> float:
-    """The lower-bound-respecting companion to a naive
-    ``max(gaps) if gaps else 0.0`` — RE-REVIEW 2026-10-14 R1: an EMPTY or
-    too-sparse tick list is ITSELF a failure (the watchdog could not
-    observe the loop enough to compute a meaningful gap — exactly N35's
-    failure mode), never silently treated as "0.0 = no stall"."""
-    if len(ticks) < min_ticks:
-        raise AssertionError(
-            f"event-loop watchdog recorded only {len(ticks)} tick(s) "
-            f"(need >= {min_ticks} to compute a meaningful gap) — the "
-            f"loop was unresponsive for the whole observation window, "
-            f"or the watchdog never ran"
+            samples = list(self._samples)
+            slept = self._sleep_on_loop
+        wall = [b[0] - a[0] for a, b in zip(samples, samples[1:])]
+        cpu = [b[1] - a[1] for a, b in zip(samples, samples[1:])]
+        return _LoopReport(
+            ticks=len(samples),
+            max_wall_gap=max(wall, default=0.0),
+            max_cpu_gap=max(cpu, default=0.0),
+            loop_sleep_seconds=slept,
+            heartbeat_threads=frozenset(t for _, _, t in samples),
+            loop_thread=self._loop_thread,
         )
-    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
-    return max(gaps)
+
+
+def _assert_loop_not_blocked(
+    report: _LoopReport,
+    *,
+    min_ticks: int = 3,
+    cpu_bound: float = 1.0,
+    sleep_bound: float = 0.05,
+    wall_ceiling: float = 30.0,
+) -> None:
+    """The G-P4 (i) criterion. Fail-CLOSED on a blind instrument (RE-REVIEW
+    2026-10-14 R1): too few ticks, or heartbeats that did not execute on the
+    loop thread, mean the probe observed nothing and is itself a failure --
+    never "0.0 = no stall"."""
+    if report.ticks < min_ticks:
+        raise AssertionError(
+            f"event-loop probe recorded only {report.ticks} tick(s) "
+            f"(need >= {min_ticks}) -- the loop never serviced the heartbeat "
+            f"or the probe never ran"
+        )
+    if report.heartbeat_threads != {report.loop_thread}:
+        raise AssertionError(
+            "event-loop probe heartbeats did not all run on the loop thread "
+            f"({sorted(report.heartbeat_threads)} vs {report.loop_thread}): "
+            "the CPU-gap instrument is measuring the wrong thread"
+        )
+    if report.loop_sleep_seconds > sleep_bound:
+        raise AssertionError(
+            f"time.sleep({report.loop_sleep_seconds:.3f}s) ran on the "
+            f"event-loop thread (bound {sleep_bound}s): a synchronous block"
+        )
+    if report.max_cpu_gap > cpu_bound:
+        raise AssertionError(
+            f"event loop thread burned {report.max_cpu_gap:.3f}s CPU between "
+            f"two heartbeats (bound {cpu_bound}s): a synchronous CPU stall"
+        )
+    # Catastrophe backstop only (half the ~60s liveness kill, ADDENDUM A1 §6):
+    # catches a blocking WAIT that is neither CPU nor time.sleep (sync I/O, a
+    # lock). Far above any scheduling noise, so it is not load-sensitive in
+    # practice; the sub-second wall gap is recorded, never a criterion.
+    if report.max_wall_gap > wall_ceiling:
+        raise AssertionError(
+            f"event loop heartbeat gap {report.max_wall_gap:.1f}s exceeds the "
+            f"{wall_ceiling}s catastrophe ceiling: the loop was blocked"
+        )
 
 
 def _mint_padded_jwt(min_len: int = 1500) -> str:
@@ -1395,26 +1464,59 @@ def _build_gp4_app_and_manifest(monkeypatch):
     return app, manifest
 
 
-@pytest.mark.asyncio
-async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_env):
-    """Through the real public route (``httpx.ASGITransport`` — the whole
-    FastAPI stack, no ``kubectl exec``, no mocked serializer): a
-    thread-based watchdog (``_LoopWatchdog`` — RE-REVIEW 2026-10-14 R1,
-    not an asyncio-task ticker, which fails to observe a SYNCHRONOUS
-    blocking call: see N35 below) observing the SAME loop as the
-    request must never see a gap wider than 1.0s (the liveness kill
-    sits at ~60s; this is liveness-facing, not a tight micro-bound —
-    ratified ADDENDUM A1 §6), and must record enough ticks to make that
-    measurement meaningful at all (``_max_gap_fail_closed`` — an empty
-    or too-sparse tick list is itself a failure, never silently 0.0).
-    A phase-free companion check sums the CPU time spent INSIDE
-    ``render_payload`` during the request and requires it stay <= 0.05s.
-    Positive control: >= 2 ``list_for_layer`` seam spans are exported,
-    each carrying the truncation suffix and the redaction marker, with no
-    raw fragment of the token anywhere."""
+async def _probe_request(app, token) -> tuple[Any, _LoopReport]:
+    """One GET of the real route, observed by a :class:`_LoopBlockProbe`
+    with settle windows before/after so the probe is guaranteed to record
+    ticks even when the request itself is sub-millisecond."""
     import asyncio
 
     import httpx
+
+    transport = httpx.ASGITransport(app=app)
+    with pytest.MonkeyPatch.context() as mp:  # time.sleep spy lives one window
+        probe = _LoopBlockProbe(asyncio.get_running_loop(), mp)
+        probe.start()
+        try:
+            await asyncio.sleep(0.15)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                resp = await client.get(
+                    "/memory/semantic",
+                    params={
+                        "collection": "decisions",
+                        "limit": 25,
+                        "sort": "created_at",
+                    },
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            await asyncio.sleep(0.15)
+        finally:
+            report = probe.stop()
+    return resp, report
+
+
+@pytest.mark.asyncio
+async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_env):
+    """Through the real public route (``httpx.ASGITransport`` — the whole
+    FastAPI stack, no ``kubectl exec``, no mocked serializer): the request
+    must not hold the event-loop thread in a synchronous block.
+
+    LC-9 GATE FIX C2 (2026-10-28) — criterion (i) is now DETERMINISTIC
+    (``_LoopBlockProbe`` / ``_assert_loop_not_blocked``): the loop thread's
+    CPU seconds between two heartbeats (<= 1.0) and the ``time.sleep`` time
+    requested on the loop thread (<= 0.05s), both immune to machine load.
+    The old wall-clock gap (<= 1.0s) failed with 1.536s on a loaded runner
+    with no blocking code; it is now only RECORDED (printed). Falsifiability:
+    N35 (sleep in ``render_payload``) and N36 (CPU spin in
+    ``render_payload``) each redden ``_assert_loop_not_blocked``.
+    ``_assert_loop_not_blocked`` is also fail-closed on a blind probe (too
+    few ticks / heartbeats off the loop thread). A phase-free companion
+    check sums the CPU time spent INSIDE ``render_payload`` during the
+    request and requires it stay <= 0.05s. Positive control: >= 2
+    ``list_for_layer`` seam spans are exported, each carrying the
+    truncation suffix and the redaction marker, with no raw fragment of the
+    token anywhere."""
     from opentelemetry import trace as otel_trace
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -1461,37 +1563,15 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
 
     monkeypatch.setattr(lc, "render_payload", _spying_render_payload)
 
-    transport = httpx.ASGITransport(app=app)
-    loop = asyncio.get_running_loop()
-    watchdog = _LoopWatchdog(loop)
-    watchdog.start()
-    try:
-        # Settle windows before/after the request so the watchdog has
-        # accumulated ticks even when the request itself is sub-ms —
-        # "guaranteed to record many ticks" (R1), not dependent on the
-        # request's own duration.
-        await asyncio.sleep(0.15)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://test"
-        ) as client:
-            resp = await client.get(
-                "/memory/semantic",
-                params={"collection": "decisions", "limit": 25, "sort": "created_at"},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        await asyncio.sleep(0.15)
-    finally:
-        ticks = watchdog.stop()
-
+    resp, report = await _probe_request(app, token)
     assert resp.status_code == 200, resp.text
 
-    max_gap = _max_gap_fail_closed(ticks)
-    assert max_gap <= 1.0, f"event loop stalled for {max_gap:.3f}s during the request"
+    _assert_loop_not_blocked(report)
 
     summed_render_cpu = sum(render_payload_cpu_seconds)
     assert summed_render_cpu <= 0.05, (
         f"render_payload summed CPU time {summed_render_cpu:.4f}s exceeds "
-        f"the 0.05s bound (phase-free companion to the watchdog-gap check)"
+        f"the 0.05s bound (phase-free companion to the loop-block probe)"
     )
 
     seam_spans = [
@@ -1511,36 +1591,22 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
     # the SAME route, same request, same watchdog, with `render_payload`
     # stubbed to return "" (the route's own synchronous, non-serialisation
     # work — auth, the mock manifest's list/sort passes, dedupe/group, all
-    # under coverage tracing). `gap_fixed` (measured above) minus
-    # `gap_floor` isolates what THIS WU's serialiser costs on the loop,
+    # under coverage tracing). the fixed run's gap minus
+    # the floor gap isolates what THIS WU's serialiser costs on the loop,
     # independent of everything else the route does. Printed (not just
     # asserted) so a `-s` run captures both numbers for the build
     # record/evidence — this is a recorded MEASUREMENT, not an additional
     # pass/fail gate.
     monkeypatch.setattr(lc, "render_payload", lambda value, *, limit: "")
 
-    floor_watchdog = _LoopWatchdog(loop)
-    floor_watchdog.start()
-    try:
-        await asyncio.sleep(0.15)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://test"
-        ) as client:
-            floor_resp = await client.get(
-                "/memory/semantic",
-                params={"collection": "decisions", "limit": 25, "sort": "created_at"},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        await asyncio.sleep(0.15)
-    finally:
-        floor_ticks = floor_watchdog.stop()
-
+    floor_resp, floor_report = await _probe_request(app, token)
     assert floor_resp.status_code == 200, floor_resp.text
-    gap_floor = _max_gap_fail_closed(floor_ticks)
     print(
-        f"\nG-P4 gap_floor={gap_floor:.4f}s  gap_fixed={max_gap:.4f}s  "
-        f"(gap_fixed - gap_floor = {max_gap - gap_floor:.4f}s)  "
-        f"ticks={len(ticks)} floor_ticks={len(floor_ticks)}"
+        f"\nG-P4 cpu_gap_fixed={report.max_cpu_gap:.4f}s "
+        f"cpu_gap_floor={floor_report.max_cpu_gap:.4f}s  "
+        f"wall_gap_fixed={report.max_wall_gap:.4f}s "
+        f"wall_gap_floor={floor_report.max_wall_gap:.4f}s (wall: recorded only)  "
+        f"ticks={report.ticks} floor_ticks={floor_report.ticks}"
     )
 
     telemetry._reset_for_tests()
@@ -1556,18 +1622,13 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
 async def test_g_p4_neuter_n35_sleep_in_render_payload_blocks_the_loop_and_reddens(
     monkeypatch, _gp4_env
 ):
-    """NEUTER N35 (RE-REVIEW 2026-10-14 R1, BLOCKER) — plant a
-    SYNCHRONOUS ``time.sleep`` directly inside ``render_payload`` (no
-    CPU cost, no ``await`` — exactly the liveness failure mode the WU
-    exists for) and confirm the watchdog-based guard goes RED. Sleeps
-    only on the FIRST call (not every one) so the reproduction stays
-    fast (~1.5s) while still being an unambiguous, correctly-attributed
-    stall — the gap it produces (>=1.5s) is already far past the 1.0s
-    bound regardless of how many further calls would have added to it."""
-    import asyncio
-
-    import httpx
-
+    """NEUTER N35 (RE-REVIEW 2026-10-14 R1, BLOCKER; re-pointed at the
+    deterministic criterion by LC-9 gate fix C2) — plant a SYNCHRONOUS
+    ``time.sleep`` directly inside ``render_payload`` (no CPU cost, no
+    ``await`` — exactly the liveness failure mode the WU exists for) and
+    confirm ``_assert_loop_not_blocked`` goes RED, on the SLEEP leg (the
+    CPU leg cannot see a sleep). Sleeps only on the FIRST call so the
+    reproduction stays fast (~1.5s)."""
     token = _mint_padded_jwt(min_len=1500)
     app, manifest = _build_gp4_app_and_manifest(monkeypatch)
 
@@ -1582,33 +1643,100 @@ async def test_g_p4_neuter_n35_sleep_in_render_payload_blocks_the_loop_and_redde
 
     monkeypatch.setattr(lc, "render_payload", _blocking_render_payload)
 
-    transport = httpx.ASGITransport(app=app)
-    loop = asyncio.get_running_loop()
-    watchdog = _LoopWatchdog(loop)
-    watchdog.start()
-    try:
-        await asyncio.sleep(0.15)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://test"
-        ) as client:
-            resp = await client.get(
-                "/memory/semantic",
-                params={"collection": "decisions", "limit": 25, "sort": "created_at"},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        await asyncio.sleep(0.15)
-    finally:
-        ticks = watchdog.stop()
-
+    resp, report = await _probe_request(app, token)
     assert resp.status_code == 200, resp.text
     assert slept["done"], "NEUTER SANITY: the planted sleep must have fired"
 
-    max_gap = _max_gap_fail_closed(ticks)
-    assert max_gap > 1.0, (
-        "NEUTER SANITY: a 1.5s synchronous sleep inside render_payload "
-        f"must blow the 1.0s gap bound open; got max_gap={max_gap:.3f}s "
-        f"over {len(ticks)} ticks"
+    with pytest.raises(AssertionError, match=r"time\.sleep\(.*event-loop thread"):
+        _assert_loop_not_blocked(report)
+
+
+@pytest.mark.asyncio
+async def test_g_p4_neuter_n36_cpu_spin_in_render_payload_blocks_the_loop_and_reddens(
+    monkeypatch, _gp4_env
+):
+    """NEUTER N36 (LC-9 gate fix C2) — the CPU leg of the new criterion:
+    plant a 1.2s busy-spin of the loop thread's OWN CPU clock
+    (``time.thread_time``, so the spin length is load-independent) inside
+    the first ``render_payload`` and confirm ``_assert_loop_not_blocked``
+    goes RED on the CPU-gap leg (and not the sleep leg)."""
+    token = _mint_padded_jwt(min_len=1500)
+    app, manifest = _build_gp4_app_and_manifest(monkeypatch)
+
+    orig_render_payload = lc.render_payload
+    spun = {"done": False}
+
+    def _spinning_render_payload(value, *, limit):
+        if not spun["done"]:
+            spun["done"] = True
+            start = time.thread_time()
+            while time.thread_time() - start < 1.2:  # N36 — synchronous CPU burn
+                pass
+        return orig_render_payload(value, limit=limit)
+
+    monkeypatch.setattr(lc, "render_payload", _spinning_render_payload)
+
+    resp, report = await _probe_request(app, token)
+    assert resp.status_code == 200, resp.text
+    assert spun["done"], "NEUTER SANITY: the planted spin must have fired"
+    assert report.loop_sleep_seconds <= 0.05, "NEUTER SANITY: spin must not sleep"
+
+    with pytest.raises(AssertionError, match=r"burned .*CPU between two heartbeats"):
+        _assert_loop_not_blocked(report)
+
+
+def test_g_p4_neuter_blind_probe_is_fail_closed():
+    """NEUTER (LC-9 gate fix C2) — the probe's own fail-closed legs. A
+    report with too few ticks, or whose heartbeats ran off the loop thread,
+    is a BLIND instrument and must raise, never read as "0.0 = no stall"
+    (RE-REVIEW 2026-10-14 R1). A clean report must pass (so the helper is
+    not trivially always-raising)."""
+    ok = _LoopReport(
+        ticks=10,
+        max_wall_gap=0.1,
+        max_cpu_gap=0.1,
+        loop_sleep_seconds=0.0,
+        heartbeat_threads=frozenset({7}),
+        loop_thread=7,
     )
+    _assert_loop_not_blocked(ok)
+    with pytest.raises(AssertionError, match="only 2 tick"):
+        _assert_loop_not_blocked(replace(ok, ticks=2))
+    with pytest.raises(AssertionError, match="wrong thread"):
+        _assert_loop_not_blocked(replace(ok, heartbeat_threads=frozenset({7, 8})))
+    with pytest.raises(AssertionError, match="synchronous CPU stall"):
+        _assert_loop_not_blocked(replace(ok, max_cpu_gap=1.01))
+    with pytest.raises(AssertionError, match="a synchronous block"):
+        _assert_loop_not_blocked(replace(ok, loop_sleep_seconds=0.06))
+    # the wall-clock gap is RECORDED, not a criterion, below the ceiling ...
+    _assert_loop_not_blocked(replace(ok, max_wall_gap=5.0))
+    # ... and only a catastrophe-sized one (liveness-kill territory) fails
+    with pytest.raises(AssertionError, match="catastrophe ceiling"):
+        _assert_loop_not_blocked(replace(ok, max_wall_gap=30.5))
+
+
+@pytest.mark.asyncio
+async def test_g_p4_cpu_gap_is_immune_to_non_cpu_wall_time():
+    """LC-9 gate fix C2 — the property that makes the criterion
+    load-independent: time the loop thread spends NOT on a CPU (here a
+    0.3s ``Event.wait`` on the loop thread, standing in for being
+    descheduled by a busy machine) widens the WALL gap but not the CPU gap.
+    Neuter: sample the wall clock instead of ``thread_time`` -> the CPU
+    gap becomes >= 0.3 and this test goes RED."""
+    import asyncio
+
+    with pytest.MonkeyPatch.context() as mp:
+        probe = _LoopBlockProbe(asyncio.get_running_loop(), mp)
+        probe.start()
+        try:
+            await asyncio.sleep(0.1)
+            threading.Event().wait(0.3)  # blocks the loop thread, burns no CPU
+            await asyncio.sleep(0.1)
+        finally:
+            report = probe.stop()
+    assert report.max_wall_gap >= 0.25
+    assert report.max_cpu_gap < 0.1
+    _assert_loop_not_blocked(report)
 
 
 @pytest.mark.asyncio
