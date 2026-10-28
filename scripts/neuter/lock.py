@@ -114,7 +114,7 @@ def assert_lock_held(path: Path) -> None:
         os.close(fd)
 
 
-def foreign_docker_build_running() -> bool:
+def foreign_docker_build_running(proc_root: Path = Path("/proc")) -> bool:
     """``/proc/*/cmdline`` scan for a ``docker build``/``buildx`` process (§10 H4).
 
     Own PID is excluded; no ``pgrep`` (the self-matching pgrep lesson).
@@ -131,9 +131,14 @@ def foreign_docker_build_running() -> bool:
     The real signal is narrower: argv[0]'s basename is literally
     ``docker``/``docker-buildx``, and one of ITS OWN subsequent args is
     exactly ``build`` or ``buildx``.
+
+    ``proc_root`` is a test seam (LC-9 gate fix C1): production callers use
+    the default ``/proc``; tests point it at a fake tree under ``tmp_path`` so
+    every branch is covered deterministically instead of depending on what
+    the host's real ``/proc`` happens to contain.
     """
     own_pid = os.getpid()
-    for entry in Path("/proc").glob("[0-9]*"):
+    for entry in proc_root.glob("[0-9]*"):
         try:
             pid = int(entry.name)
         except ValueError:
