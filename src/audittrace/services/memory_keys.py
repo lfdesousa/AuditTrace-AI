@@ -125,6 +125,16 @@ def check_logical(logical: str) -> str:
     return logical
 
 
+def semantic_logical_key(collection: str, document_id: str) -> str:
+    """The LOGICAL manifest key of a semantic document, ``{collection}/{id}``,
+    capped at :data:`LOGICAL_KEY_MAX` for EVERY tier (a corpus key is stored
+    bare, so :func:`physical_key` never sees it). The one builder the five
+    semantic write sites share (REST create/update/delete, promote, MCP); an
+    over-long key raises :class:`LogicalKeyTooLongError` (LC-9 WP2b: 400 on
+    REST, an ``{"error"}`` tool result on MCP)."""
+    return check_logical(f"{collection}/{document_id}")
+
+
 def physical_key(owner_sub: str, logical: str) -> str:
     """Stored manifest key of a NEW private row: ``{owner}/{logical}``.
 

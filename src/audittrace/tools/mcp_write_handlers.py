@@ -76,6 +76,11 @@ from typing import Any
 from audittrace.dependencies import get_memory_manifest_service, get_semantic_service
 from audittrace.identity import UserContext
 from audittrace.services.memory_audit import emit_memory_audit_event
+from audittrace.services.memory_keys import (
+    ConcurrentManifestWriteError,
+    LogicalKeyTooLongError,
+    semantic_logical_key,
+)
 from audittrace.services.memory_manifest import (
     ManifestAuthorizationError,
     authorize_write,
@@ -119,7 +124,13 @@ async def _write_semantic_document(
     if title is not None and not isinstance(title, str):
         return {"error": "title must be a string if provided"}
     metadata = _sanitize_metadata(clean_args.get("metadata"))
-    key = f"{collection}/{document_id}"
+    try:
+        key = semantic_logical_key(collection, document_id)
+    except LogicalKeyTooLongError as exc:
+        # LC-9 WP2b: the MCP counterpart of the REST 400 -- a tool-level
+        # ``{"error"}`` (``isError: true`` through ``mcp_write_bridge``), not
+        # a JSON-RPC protocol error, exactly like every other known-bad input.
+        return {"error": str(exc)}
 
     manifest = get_memory_manifest_service()
     # SPEC security-memory-write-authorization-choke (2026-08-30) —
@@ -161,6 +172,16 @@ async def _write_semantic_document(
         )
         return {"error": f"{exc.__class__.__name__}: write failed"}
 
+    # LC-9 WP2b (ADDENDUM-1 S2): name the caller's OWN legacy bare-key row
+    # this write will copy forward, for the audit trail. Lazy import: the
+    # probe lives with the REST routes (same precedent as ``authorize_write``).
+    from audittrace.routes.memory import (  # noqa: PLC0415
+        _legacy_copy_forward_source,
+    )
+
+    copied_from = await _legacy_copy_forward_source(
+        manifest, user_context, "semantic", key
+    )
     try:
         # ``caller_can_write_shared`` is deliberately OMITTED (defaults
         # False): the manifest-layer DEFENSE-IN-DEPTH guard behind the
@@ -174,6 +195,11 @@ async def _write_semantic_document(
             user_id=user_context.user_id,
             tier="private",
         )
+    except ConcurrentManifestWriteError as exc:
+        # LC-9 WP2b: the MCP counterpart of the REST 409. Nothing was
+        # written; the tool result tells the caller to retry (a tool-level
+        # ``{"error"}``, ``isError: true``; the MCP schema is unchanged).
+        return {"error": f"{exc}"}
     except ManifestAuthorizationError as exc:
         logger.info(
             "mcp write tool denied — existing corpus row collection=%s "
@@ -196,7 +222,17 @@ async def _write_semantic_document(
             layer="semantic",
             collection=collection,
             key=document_id,
+            detail_extra={"copied_from": copied_from} if copied_from else None,
         )
+        if copied_from:
+            await emit_memory_audit_event(
+                user=user_context,
+                op="delete",
+                layer="semantic",
+                collection=collection,
+                key=document_id,
+                detail_extra={"reason": "copy_forward"},
+            )
     except Exception as exc:
         # Fail-closed like routes/memory.py::_emit_write_audit — the
         # mutation above already landed (same known limitation that

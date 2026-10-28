@@ -91,6 +91,11 @@ from audittrace.routes.memory_semantic_documents import (
     dedupe_semantic_chunks,
     group_semantic_chunks_by_document,
 )
+from audittrace.routes.memory_semantic_writes import (
+    concurrent_write_409,
+    require_visible_row_or_404,
+    semantic_write_errors_as_http,
+)
 from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.episodic import EpisodicService
 from audittrace.services.index_routing import collection_for_key
@@ -104,6 +109,7 @@ from audittrace.services.memory_keys import (
     ConcurrentManifestWriteError,
     LogicalKeyTooLongError,
     check_logical,
+    semantic_logical_key,
 )
 from audittrace.services.memory_manifest import (
     ManifestAuthorizationError,
@@ -433,15 +439,9 @@ def _raise_manifest_authorization_as_403(
 
 
 def _raise_concurrent_write_as_409(exc: ConcurrentManifestWriteError) -> HTTPException:
-    """Map a lost ``UNIQUE (layer, key)`` race (two simultaneous writes, e.g.
-    the same owner's concurrent copy-forward) to a retryable 409 -- never a
-    500 (LC-9 WP1 review advisory A2). Nothing was written; a retry
-    converges."""
-    return HTTPException(
-        status_code=409,
-        detail=f"{exc}",
-        headers={"Retry-After": "1"},
-    )
+    """A lost ``UNIQUE (layer, key)`` race is a retryable 409, never a 500
+    (LC-9 WP1 review A2); the body lives in ``memory_semantic_writes``."""
+    return concurrent_write_409(exc)
 
 
 async def _legacy_copy_forward_source(
@@ -467,7 +467,12 @@ async def _legacy_copy_forward_source(
 
 
 async def _emit_write_audits(
-    *, user: UserContext, layer: str, filename: str, copied_from: str | None
+    *,
+    user: UserContext,
+    layer: str,
+    filename: str,
+    copied_from: str | None,
+    collection: str | None = None,
 ) -> None:
     """One ``_emit_write_audit`` per manifest mutation (ADDENDUM-1 S2): the
     create/update row, and -- on a copy-forward -- the legacy tombstone.
@@ -477,6 +482,7 @@ async def _emit_write_audits(
         user=user,
         op="write",
         layer=layer,
+        collection=collection,
         key=filename,
         detail_extra={"copied_from": copied_from} if copied_from else None,
     )
@@ -485,6 +491,7 @@ async def _emit_write_audits(
             user=user,
             op="delete",
             layer=layer,
+            collection=collection,
             key=filename,
             detail_extra={"reason": "copy_forward"},
         )
@@ -1769,10 +1776,8 @@ async def create_episodic(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    copied_from = (
-        await _legacy_copy_forward_source(manifest, user, "episodic", filename)
-        if tier == "private"
-        else None
+    copied_from = await _legacy_copy_forward_source(
+        manifest, user, "episodic", filename
     )
     try:
         entry: ManifestEntry = await manifest.record_create(
@@ -2231,10 +2236,8 @@ async def create_procedural(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    copied_from = (
-        await _legacy_copy_forward_source(manifest, user, "procedural", filename)
-        if tier == "private"
-        else None
+    copied_from = await _legacy_copy_forward_source(
+        manifest, user, "procedural", filename
     )
     try:
         entry: ManifestEntry = await manifest.record_create(
@@ -2505,46 +2508,41 @@ async def create_semantic(
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
     # SPEC security-memory-write-authorization-choke (2026-08-30) — the
-    # PRE-WRITE choke, before the ChromaDB write below. Semantic already
-    # gated the "requested tier=corpus" case above via
-    # _require_corpus_scope; this ALSO covers overwriting an EXISTING
-    # corpus-tier row when the caller requested private (the exploit
-    # class three reviews found on the .md/PDF index paths — this route
-    # was never actually vulnerable to it, since service.upsert only
-    # targets the tier-specific physical collection, but the choke is
-    # applied uniformly per the ratified spec).
-    try:
-        await authorize_write(
-            manifest,
-            user,
-            "semantic",
-            _semantic_key(collection, document_id),
-            requested_tier=tier,
-        )
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    try:
-        await service.upsert(user, collection, document_id, text, metadata, tier=tier)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    try:
-        entry: ManifestEntry = await manifest.record_create(
-            layer="semantic",
-            key=_semantic_key(collection, document_id),
-            title=title,
-            size_bytes=len(text.encode("utf-8")),
-            user_id=user.user_id,
-            tier=tier,
-            caller_can_write_shared=_corpus_write_authorized(user, collection),
-        )
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audit(
+    # PRE-WRITE choke, before the ChromaDB write below (also covers
+    # overwriting an EXISTING corpus-tier row when the caller requested
+    # private). LC-9 WP2b: an over-long key is a 400 and a lost UNIQUE race a
+    # 409 (``semantic_write_errors_as_http``).
+    with semantic_write_errors_as_http():
+        key = semantic_logical_key(collection, document_id)
+        try:
+            await authorize_write(manifest, user, "semantic", key, requested_tier=tier)
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+        try:
+            await service.upsert(
+                user, collection, document_id, text, metadata, tier=tier
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        copied_from = await _legacy_copy_forward_source(manifest, user, "semantic", key)
+        try:
+            entry: ManifestEntry = await manifest.record_create(
+                layer="semantic",
+                key=key,
+                title=title,
+                size_bytes=len(text.encode("utf-8")),
+                user_id=user.user_id,
+                tier=tier,
+                caller_can_write_shared=_corpus_write_authorized(user, collection),
+            )
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+    await _emit_write_audits(
         user=user,
-        op="write",
         layer="semantic",
         collection=collection,
-        key=document_id,
+        filename=document_id,
+        copied_from=copied_from,
     )
     return entry.to_dict()
 
@@ -3130,41 +3128,45 @@ async def update_semantic(
     title = payload.get("title")
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
-    key = _semantic_key(collection, document_id)
     # SPEC security-memory-write-authorization-choke (2026-08-30) — the
-    # PRE-WRITE choke, before the ChromaDB write below.
-    try:
-        await authorize_write(manifest, user, "semantic", key)
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    try:
-        await service.upsert(user, collection, document_id, text, metadata)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    try:
-        entry: ManifestEntry = await manifest.record_update(
-            layer="semantic",
-            key=key,
-            size_bytes=len(text.encode("utf-8")),
-            user_id=user.user_id,
-            title=title,
-            caller_can_write_shared=_corpus_write_authorized(user, collection),
-        )
-    except LookupError as exc:
-        raise HTTPException(
-            status_code=404,
-            detail=f"semantic doc has no manifest row: {exc}",
-        ) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audit(
+    # PRE-WRITE choke, before the ChromaDB write below. LC-9 WP2b: 400 / 409
+    # mapping and the copy-forward audit, as in ``create_semantic``.
+    with semantic_write_errors_as_http():
+        key = semantic_logical_key(collection, document_id)
+        try:
+            await authorize_write(manifest, user, "semantic", key)
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+        await require_visible_row_or_404(manifest, user, key)
+        try:
+            await service.upsert(user, collection, document_id, text, metadata)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        copied_from = await _legacy_copy_forward_source(manifest, user, "semantic", key)
+        try:
+            entry: ManifestEntry = await manifest.record_update(
+                layer="semantic",
+                key=key,
+                size_bytes=len(text.encode("utf-8")),
+                user_id=user.user_id,
+                title=title,
+                caller_can_write_shared=_corpus_write_authorized(user, collection),
+            )
+        except LookupError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"semantic doc has no manifest row: {exc}",
+            ) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+    await _emit_write_audits(
         user=user,
-        op="write",
         layer="semantic",
         collection=collection,
-        key=document_id,
+        filename=document_id,
+        copied_from=copied_from,
     )
     return entry.to_dict()
 
@@ -3188,24 +3190,27 @@ async def delete_semantic(
         )
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
-    key = _semantic_key(collection, document_id)
     # SPEC security-memory-write-authorization-choke (2026-08-30) — the
-    # PRE-WRITE choke, before the soft-delete.
-    try:
-        await authorize_write(manifest, user, "semantic", key)
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    try:
-        entry: ManifestEntry = await manifest.record_delete(
-            "semantic",
-            key,
-            user.user_id,
-            caller_can_write_shared=_corpus_write_authorized(user, collection),
-        )
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
+    # PRE-WRITE choke, before the soft-delete. LC-9 WP2b: the 400 / 409
+    # mapping applies here too (``record_delete`` cannot lose the UNIQUE race
+    # today; the contract holds if a delete ever copies forward).
+    with semantic_write_errors_as_http():
+        key = semantic_logical_key(collection, document_id)
+        try:
+            await authorize_write(manifest, user, "semantic", key)
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+        try:
+            entry: ManifestEntry = await manifest.record_delete(
+                "semantic",
+                key,
+                user.user_id,
+                caller_can_write_shared=_corpus_write_authorized(user, collection),
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete_document(user, collection, document_id)

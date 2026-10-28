@@ -57,11 +57,13 @@ from audittrace.dependencies import (
     get_session_memory_service,
 )
 from audittrace.identity import UserContext
+from audittrace.routes.memory_semantic_writes import semantic_write_errors_as_http
 from audittrace.services.memory_audit import emit_memory_audit_event
 from audittrace.services.memory_keys import (
     ConcurrentManifestWriteError,
     LogicalKeyTooLongError,
     check_logical,
+    semantic_logical_key,
 )
 from audittrace.services.memory_manifest import (
     ManifestAuthorizationError,
@@ -139,20 +141,6 @@ def _require_durable_write_scope(user: UserContext, target_layer: str) -> None:
         status_code=403,
         detail=f"Required scope: {required} (or audittrace:admin)",
     )
-
-
-def _semantic_key(collection: str, document_id: str) -> str:
-    """Manifest lookup key for a semantic doc: ``<collection>/<doc_id>``.
-
-    Duplicated (not imported) from ``routes.memory._semantic_key`` — that
-    module already imports FROM this one at module-load time (the thin
-    ``/promote`` route delegates here), so a module-level import back
-    would deadlock the import graph; this is a one-line pure function,
-    the same duplication precedent ``services/session_memory.py`` and
-    ``services/episodic.py`` already each carry their own filename
-    validator rather than share one.
-    """
-    return f"{collection}/{document_id}"
 
 
 def _namespaced_semantic_document_id(user_id: str, filename: str) -> str:
@@ -350,7 +338,7 @@ async def _promote_to_semantic(
     title: str,
     collection: Any,
     extra_metadata: dict[str, Any],
-) -> tuple[str, str]:
+) -> tuple[str, str, str | None]:
     """Copy *stamped_content* into the caller's private-tier semantic
     collection (default :data:`_DEFAULT_PROMOTE_COLLECTION`), keyed by a
     PER-USER-NAMESPACED, single-URL-segment ``document_id`` (see
@@ -386,6 +374,12 @@ async def _promote_to_semantic(
     broader, pre-existing ``authorize_write`` corpus-collision primitive
     gap (ADR-062 §B4) — that stays the documented separate follow-up;
     this closes the specific hijack this promote path introduced.
+
+    **LC-9 WP2b.** The return is ``(durable_key, collection, copied_from)``:
+    ``copied_from`` is the stored key of the caller's OWN legacy bare-key row
+    this write copied forward (``None`` otherwise), audited by the caller. A
+    durable key over the logical-key cap is a 400 and a lost ``UNIQUE``
+    race a 409 (``semantic_write_errors_as_http``).
     """
     if collection is None:
         collection = _DEFAULT_PROMOTE_COLLECTION
@@ -393,40 +387,47 @@ async def _promote_to_semantic(
         raise HTTPException(status_code=400, detail="collection must be a string")
     document_id = _namespaced_semantic_document_id(user.user_id, filename)
     manifest = get_memory_manifest_service()
-    durable_key = _semantic_key(collection, document_id)
-    try:
-        await authorize_write(
-            manifest, user, "semantic", durable_key, requested_tier="private"
+    with semantic_write_errors_as_http():
+        durable_key = semantic_logical_key(collection, document_id)
+        try:
+            await authorize_write(
+                manifest, user, "semantic", durable_key, requested_tier="private"
+            )
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+        service = get_semantic_service()
+        try:
+            await service.upsert(
+                user,
+                collection,
+                document_id,
+                stamped_content,
+                extra_metadata,
+                tier="private",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        from audittrace.routes.memory import (  # noqa: PLC0415
+            _corpus_write_authorized,
+            _legacy_copy_forward_source,
         )
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    service = get_semantic_service()
-    try:
-        await service.upsert(
-            user,
-            collection,
-            document_id,
-            stamped_content,
-            extra_metadata,
-            tier="private",
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    from audittrace.routes.memory import _corpus_write_authorized  # noqa: PLC0415
 
-    try:
-        await manifest.record_create(
-            layer="semantic",
-            key=durable_key,
-            title=title,
-            size_bytes=len(stamped_content.encode("utf-8")),
-            user_id=user.user_id,
-            tier="private",
-            caller_can_write_shared=_corpus_write_authorized(user, collection),
+        copied_from = await _legacy_copy_forward_source(
+            manifest, user, "semantic", durable_key
         )
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    return durable_key, collection
+        try:
+            await manifest.record_create(
+                layer="semantic",
+                key=durable_key,
+                title=title,
+                size_bytes=len(stamped_content.encode("utf-8")),
+                user_id=user.user_id,
+                tier="private",
+                caller_can_write_shared=_corpus_write_authorized(user, collection),
+            )
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+    return durable_key, collection, copied_from
 
 
 async def promote_session_to_durable(
@@ -495,9 +496,8 @@ async def promote_session_to_durable(
         )
         collection: str | None = None
     else:
-        copied_from = None
         collection_value = payload.get("collection")
-        durable_key, collection = await _promote_to_semantic(
+        durable_key, collection, copied_from = await _promote_to_semantic(
             user,
             filename,
             stamped_content,
