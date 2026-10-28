@@ -15,6 +15,7 @@ harness test run against a ``tmp_path`` lock file instead of the real one.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import logging
 import os
@@ -100,8 +101,9 @@ def assert_lock_held(path: Path) -> None:
     chokepoint invocation happening outside the lock's protection), so the
     probe's own accidental lock is released immediately and this raises.
     """
-    fd = open_lock_file(path)
-    try:
+    with contextlib.ExitStack() as stack:
+        fd = open_lock_file(path)
+        stack.callback(os.close, fd)  # probe fd closed on EVERY exit path
         try:
             try_flock(fd, fcntl.LOCK_EX)
         except LockHeldError:
@@ -110,8 +112,6 @@ def assert_lock_held(path: Path) -> None:
         raise RuntimeError(
             f"chokepoint: {path} is not held -- pytest invoked outside the heavy-cap lock"
         )
-    finally:
-        os.close(fd)
 
 
 def foreign_docker_build_running(proc_root: Path = Path("/proc")) -> bool:
