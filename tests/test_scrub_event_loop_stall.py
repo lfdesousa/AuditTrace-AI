@@ -1564,6 +1564,18 @@ async def _probe_request(app, token) -> tuple[Any, _LoopReport]:
     return resp, report
 
 
+async def _warm_probe_request(app, token) -> None:
+    """One UN-MEASURED request (LC-9 WP2b round 2, review-r1 F1). The first
+    request in a process pays cold-path imports/initialisation on the loop
+    thread (~0.4 s CPU under ``--cov``, 0.56-0.77 s on a busy host), which
+    would land inside one heartbeat gap of the first measured probe and
+    make the CPU-burn sanity bound load-sensitive. Warm it away BEFORE any
+    plant is installed. Neuter: drop the call -> the ``[lock]`` neuter's
+    ``max_cpu_gap < 0.5`` sanity assert flakes (20/20 RED under load)."""
+    resp, _ = await _probe_request(app, token)
+    assert resp.status_code == 200, resp.text
+
+
 @pytest.mark.asyncio
 async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_env):
     """Through the real public route (``httpx.ASGITransport`` — the whole
@@ -1620,6 +1632,8 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
     # measuring, so it cannot land on the loop during the measured window.
     lc._get_render_allowlists()
     lc.render_payload({"warm": "up"}, limit=100)
+
+    await _warm_probe_request(app, token)
 
     render_payload_cpu_seconds: list[float] = []
     orig_render_payload = lc.render_payload
@@ -1705,6 +1719,8 @@ async def test_g_p4_neuter_n35_sleep_in_render_payload_blocks_the_loop_and_redde
     token = _mint_padded_jwt(min_len=1500)
     app, manifest = _build_gp4_app_and_manifest(monkeypatch)
 
+    await _warm_probe_request(app, token)
+
     orig_render_payload = lc.render_payload
     slept = {"done": False}
 
@@ -1739,6 +1755,8 @@ async def test_g_p4_neuter_n36_cpu_spin_in_render_payload_blocks_the_loop_and_re
     goes RED on the CPU-gap leg (and not the sleep leg)."""
     token = _mint_padded_jwt(min_len=1500)
     app, manifest = _build_gp4_app_and_manifest(monkeypatch)
+
+    await _warm_probe_request(app, token)
 
     orig_render_payload = lc.render_payload
     spun = {"done": False}
@@ -1836,6 +1854,8 @@ async def test_g_p4_neuter_non_cpu_non_sleep_block_in_render_payload_reddens(
     ``stalled`` criterion must go RED on each."""
     token = _mint_padded_jwt(min_len=1500)
     app, manifest = _build_gp4_app_and_manifest(monkeypatch)
+
+    await _warm_probe_request(app, token)
 
     orig_render_payload = lc.render_payload
     fired = {"done": False}

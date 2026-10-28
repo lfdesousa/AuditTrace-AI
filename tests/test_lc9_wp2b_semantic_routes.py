@@ -447,8 +447,12 @@ class TestLegacyRows:
     """RT-10: legacy bare rows seeded for A (manifest + Chroma)."""
 
     def test_a_get_200_b_get_404(self, rig: Rig) -> None:
-        """Neuter: the dual-lookup owner equality accepts any legacy owner ->
-        B's GET returns A's manifest (RED)."""
+        """B's GET of A's legacy key is 404 and A's is 200. Neuter note
+        (review-r1 F2): the ``resolve_read`` owner equality in the dual
+        lookup is NOT what reddens THIS test; the GET already 404s B via
+        the Chroma owner-or-corpus predicate and ``_manifest_visible``
+        (defense in depth). That neuter reddens the B PUT / B DELETE tests
+        below (Mock and SQL)."""
         rig.seed_legacy("x", A)
         ra, rb = rig.get(A, "x"), rig.get(B, "x")
         assert ra.status_code == 200 and ra.json()["content"] == "legacy body"
