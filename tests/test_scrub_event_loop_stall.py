@@ -1570,8 +1570,11 @@ async def _warm_probe_request(app, token) -> None:
     thread (~0.4 s CPU under ``--cov``, 0.56-0.77 s on a busy host), which
     would land inside one heartbeat gap of the first measured probe and
     make the CPU-burn sanity bound load-sensitive. Warm it away BEFORE any
-    plant is installed. Neuter: drop the call -> the ``[lock]`` neuter's
-    ``max_cpu_gap < 0.5`` sanity assert flakes (20/20 RED under load)."""
+    plant is installed. Round 3: the plant test's "not a CPU burn" sanity
+    now judges the plant's OWN thread CPU, so removing this warm-up there is
+    harmless (measured 5/5 green loaded, r3/neuter-r3.log); the warm-up is
+    kept for the main G-P4 test and N35/N36, whose ``stalled`` criteria must
+    not absorb the cold-start CPU (ADDENDUM-A1 s6)"""
     resp, _ = await _probe_request(app, token)
     assert resp.status_code == 200, resp.text
 
@@ -1598,7 +1601,13 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
     request and requires it stay <= 0.05s. Positive control: >= 2
     ``list_for_layer`` seam spans are exported, each carrying the
     truncation suffix and the redaction marker, with no raw fragment of the
-    token anywhere."""
+    token anywhere.
+
+    SCOPE (review-r2 advisory A1): exactly ONE un-measured warm-up request
+    runs before the measured probes, by design — scrub-event-loop-stall
+    ADDENDUM-A1 §6 sanctions "one warm-up request ... before measuring". A
+    stall that happens ONLY on the first request in a process (cold start)
+    is therefore OUT of this guard's scope; it would need its own test."""
     from opentelemetry import trace as otel_trace
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -1816,6 +1825,12 @@ def test_g_p4_neuter_blind_probe_is_fail_closed():
         _assert_loop_not_blocked(replace(ok, max_wall_gap=30.5))
 
 
+# Bound on the plant's OWN thread CPU (round 3). Measured blocking plants:
+# ~0.0001-0.001 s (r3/PROGRESS.md); a 1.5 s spin: ~1.5 s. 0.05 s is >50x the
+# measured plant and 30x below a spin, and is independent of host load.
+_PLANT_CPU_BOUND = 0.05
+
+
 def _plant_lock_wait() -> None:
     held = threading.Lock()
     held.acquire()
@@ -1859,11 +1874,14 @@ async def test_g_p4_neuter_non_cpu_non_sleep_block_in_render_payload_reddens(
 
     orig_render_payload = lc.render_payload
     fired = {"done": False}
+    plant_cpu: list[float] = []
 
     def _blocking_render_payload(value, *, limit):
         if not fired["done"]:
             fired["done"] = True
+            cpu_start = time.thread_time()
             plant()
+            plant_cpu.append(time.thread_time() - cpu_start)
         return orig_render_payload(value, limit=limit)
 
     monkeypatch.setattr(lc, "render_payload", _blocking_render_payload)
@@ -1872,7 +1890,13 @@ async def test_g_p4_neuter_non_cpu_non_sleep_block_in_render_payload_reddens(
     assert resp.status_code == 200, resp.text
     assert fired["done"], "NEUTER SANITY: the planted block must have fired"
     assert report.loop_sleep_seconds <= 0.05, "NEUTER SANITY: not a time.sleep"
-    assert report.max_cpu_gap < 0.5, "NEUTER SANITY: not a CPU burn"
+    # Not a CPU burn: judge the PLANT's own thread CPU, never the whole-gap
+    # max (that includes the route's normal per-request CPU under --cov:
+    # 0.15 s idle, 0.21-0.26 s loaded, 0.40-0.57 s spikes; r2 review F1).
+    # A blocking lock/recv/select burns ~0.000 s; a spin burns ~1.5 s.
+    assert plant_cpu and plant_cpu[0] < _PLANT_CPU_BOUND, (
+        f"NEUTER SANITY: not a CPU burn (plant CPU {plant_cpu})"
+    )
 
     with pytest.raises(AssertionError, match=r"stalled \d+\.\d+s between two"):
         _assert_loop_not_blocked(report)

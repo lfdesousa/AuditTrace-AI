@@ -451,8 +451,9 @@ class TestLegacyRows:
         (review-r1 F2): the ``resolve_read`` owner equality in the dual
         lookup is NOT what reddens THIS test; the GET already 404s B via
         the Chroma owner-or-corpus predicate and ``_manifest_visible``
-        (defense in depth). That neuter reddens the B PUT / B DELETE tests
-        below (Mock and SQL)."""
+        (defense in depth). That neuter reddens the B PUT tests below in this
+        class and the B DELETE test above (``TestForeignDeleteIsNotFound``),
+        each on Mock and SQL."""
         rig.seed_legacy("x", A)
         ra, rb = rig.get(A, "x"), rig.get(B, "x")
         assert ra.status_code == 200 and ra.json()["content"] == "legacy body"
