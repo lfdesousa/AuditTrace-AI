@@ -119,6 +119,10 @@ def _run_typecheck(
 ) -> subprocess.CompletedProcess[str]:
     """Run the REAL typecheck recipe from a scratch dir that has NO .venv."""
     (tmp_path / "Makefile").write_text(MAKEFILE.read_text())
+    # the Makefile `include`s the single Postgres-pin fragment (LC-9 PG parity)
+    (tmp_path / "scripts" / "ci").mkdir(parents=True, exist_ok=True)
+    pin = ROOT / "scripts" / "ci" / "pg_image.mk"
+    (tmp_path / "scripts" / "ci" / "pg_image.mk").write_text(pin.read_text())
     (tmp_path / "src").mkdir(exist_ok=True)
     make = shutil.which("make")
     assert make

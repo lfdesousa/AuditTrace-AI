@@ -5,13 +5,10 @@
        release-bump-files release release-cut
 
 # LC-9 TEST-PG-PARITY-18 -- the ONE Postgres image for test/CI (prod parity,
-# PG 18.3). Single definition: scripts/ci/pg_image.py. Read textually (no
-# Python/.venv needed, so it resolves the same locally and on a CI runner) and
-# fail closed if the assignment cannot be found.
-PG_TEST_IMAGE := $(shell sed -n 's/^PG_TEST_IMAGE = "\(.*\)"$$/\1/p' scripts/ci/pg_image.py)
-ifeq ($(strip $(PG_TEST_IMAGE)),)
-$(error PG_TEST_IMAGE not found in scripts/ci/pg_image.py)
-endif
+# PG 18.3). Single definition: scripts/ci/pg_image.mk, `include`d (no external
+# tool, so it resolves with a stripped PATH); `-include` is NOT used, a missing
+# file is a hard error.
+include scripts/ci/pg_image.mk
 
 # SPEC #441 — the obs-stack (ADR-028, external docker-compose project) is a
 # sibling checkout, not part of this repo. Its Grafana file-provider dir is a

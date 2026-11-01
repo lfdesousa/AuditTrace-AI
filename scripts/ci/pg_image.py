@@ -1,18 +1,29 @@
 """The ONE Postgres image every test/CI Postgres runs (LC-9 TEST-PG-PARITY-18).
 
-Production runs PostgreSQL 18.3 (operator decision "POSTGRES 18 EVERYWHERE",
-2026-10-28), so every throwaway Postgres used by the test suites, the
-``test-rls-local`` make target, the neuter harness and the CI service
-container runs the same major.minor. This module is the single definition:
-
-* Python spawn sites import :data:`PG_TEST_IMAGE`.
-* The Makefile reads it with ``sed`` (see ``PG_TEST_IMAGE`` there).
-* ``.github/workflows/ci.yml`` cannot import anything (``services.*.image``
-  has no ``env`` context), so it carries a literal that
-  ``tests/test_pg_image_pin.py`` asserts equals this constant.
-
-The line below must stay a plain ``PG_TEST_IMAGE = "<image>"`` assignment: the
-Makefile parses it textually.
+The definition lives in ``scripts/ci/pg_image.mk`` (a make fragment the
+Makefile ``include``s, so make needs no external tool and CI-shaped runs with
+a stripped ``PATH`` still resolve it). This module parses that one line and
+exposes it to Python spawn sites as :data:`PG_TEST_IMAGE`; it fails closed
+if the assignment is missing or ambiguous.
 """
 
-PG_TEST_IMAGE = "postgres:18.3"
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+_MK = Path(__file__).with_name("pg_image.mk")
+_ASSIGN_RX = re.compile(r"^PG_TEST_IMAGE\s*[:?]?=\s*(\S+)\s*$", re.MULTILINE)
+
+
+def read_pg_test_image(mk_text: str) -> str:
+    """Parse the single ``PG_TEST_IMAGE = <image>`` assignment from make text."""
+    found = _ASSIGN_RX.findall(mk_text)
+    if len(found) != 1:
+        raise ValueError(
+            f"expected exactly one PG_TEST_IMAGE assignment, found {len(found)}"
+        )
+    return found[0]
+
+
+PG_TEST_IMAGE = read_pg_test_image(_MK.read_text(encoding="utf-8"))

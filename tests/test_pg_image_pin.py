@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import inspect
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
-from scripts.ci.pg_image import PG_TEST_IMAGE
+from scripts.ci.pg_image import PG_TEST_IMAGE, read_pg_test_image
 from scripts.neuter import pg as neuter_pg
 
 REPO = Path(__file__).resolve().parent.parent
@@ -144,3 +146,31 @@ def test_python_spawn_sites_consume_the_constant() -> None:
     src = (REPO / "tests/_pg_ephemeral.py").read_text()
     assert "PG_TEST_IMAGE," in src
     assert 'postgres:"' not in src
+
+
+def test_mk_fragment_is_the_single_definition_and_parser_fails_closed() -> None:
+    mk = (REPO / "scripts/ci/pg_image.mk").read_text()
+    assert read_pg_test_image(mk) == PG_TEST_IMAGE
+    assert read_pg_test_image("PG_TEST_IMAGE := postgres:99\n") == "postgres:99"
+    for bad in ("", "# nothing\n", "PG_TEST_IMAGE = a\nPG_TEST_IMAGE = b\n"):
+        with pytest.raises(ValueError, match="exactly one PG_TEST_IMAGE"):
+            read_pg_test_image(bad)
+
+
+def test_makefile_resolves_the_pin_with_a_stripped_path() -> None:
+    """Regression for the CI-shaped gate: tests/test_ci_make_targets_resolve_tools
+    run make with a PATH that has no sed/awk, so the pin must resolve with make
+    builtins only (``include``), never a ``$(shell ...)`` helper."""
+    assert "include scripts/ci/pg_image.mk" in (REPO / "Makefile").read_text()
+    make = shutil.which("make")
+    assert make is not None
+    out = subprocess.run(
+        [make, "-n", "test-rls-local"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+        env={"PATH": str(Path(make).parent)},
+    ).stdout
+    assert f"{PG_TEST_IMAGE} -c fsync=off" in out
