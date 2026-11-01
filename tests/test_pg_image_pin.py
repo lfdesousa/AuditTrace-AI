@@ -50,14 +50,20 @@ _PRUNE_DIRS = {
     "__pycache__",
 }
 
-#: A reference to the official Postgres image: ``postgres:<tag>``,
-#: ``postgres@sha256:<digest>`` and their canonical spellings with a
-#: ``docker.io/`` and/or ``library/`` prefix (the same image). Not matched:
-#: DSN hosts (``@postgres:5432``), ports, ``bitnami/postgresql``, other
-#: registries/namespaces (``ghcr.io/x/postgres``) -- the lookbehind rejects a
-#: preceding word char, ``@``, ``/``, ``.`` or ``-``.
+#: Registry hosts that Docker (or the same hub) serve the official image
+#: from. Matched case-insensitively: a spelling variant must not be a way
+#: round the guard.
+_REGISTRY_RX = re.compile(
+    r"^(?:index\.docker\.io|registry-1\.docker\.io|docker\.io)/", re.IGNORECASE
+)
+#: A candidate image token: an optional path of segments, then a repository
+#: whose LAST segment is exactly ``postgres``, then ``:<tag>`` or
+#: ``@sha256:<digest>``. The lookbehind stops a match starting inside a word
+#: (``audittrace-postgres``), after ``@`` (a DSN host) or after ``.``/``-``.
+#: Whether the repository IS the official image is decided by
+#: :func:`normalise_repo`, not by this pattern.
 _IMAGE_RX = re.compile(
-    r"(?<![\w@/.\-])(?:docker\.io/)?(?:library/)?postgres"
+    r"(?<![\w@/.\-])(?P<repo>(?:[\w.\-]+/)*postgres)"
     r"(?:"
     r":(?P<tag>\d+(?:\.\d+)*(?:-[\w.]+)?|latest|alpine[\w.\-]*|bookworm[\w.\-]*)"
     r"(?![\w.\-]*:)"
@@ -69,9 +75,34 @@ _IMAGE_RX = re.compile(
 #: The bare word "postgres" elsewhere (users, hosts, prose) is deliberately not
 #: matched -- see :func:`_bare_in_docker_argv` for Python argv.
 _BARE_IMAGE_RX = re.compile(
-    r"(?im)^\s*(?:image:|FROM(?:\s+--\S+)?)\s*[\"']?"
-    r"(?:docker\.io/)?(?:library/)?postgres[\"']?(?:\s+AS\s+\S+)?\s*(?:#.*)?$"
+    r"(?im)^\s*(?:image:|FROM(?:\s+--\S+)?)\s*(?:&\w+\s+)?[\"']?"
+    r"(?P<repo>(?:[\w.\-]+/)*postgres)[\"']?(?:\s+AS\s+\S+)?\s*(?:#.*)?$"
 )
+#: ``${VAR:-x}``, ``${VAR-x}``, ``${VAR:=x}``, ``${VAR=x}``, ``${VAR:?x}`` and
+#: ``${VAR?x}``: innermost first (the value class excludes braces).
+_PARAM_DEFAULT_RX = re.compile(r"\$\{[A-Za-z_]\w*:?[-=?+]?([^{}]*)\}")
+_PARAM_OPERATOR_RX = re.compile(r"\$\{[A-Za-z_]\w*(:?[-=?])([^{}]*)\}")
+
+
+def expand_param_defaults(text: str) -> str:
+    """Replace shell/compose parameter expansions that carry a default with
+    that default, so ``image: ${PG_IMAGE:-postgres:16}`` is scanned as
+    ``image: postgres:16`` (nested expansions resolve innermost first). A
+    purely dynamic ``${TAG}`` with no default is left alone: what it resolves
+    to is not in the file."""
+    while True:
+        new = _PARAM_OPERATOR_RX.sub(lambda m: m.group(2), text)
+        if new == text:
+            return text
+        text = new
+
+
+def normalise_repo(repo: str) -> str:
+    """``index.docker.io/library/postgres`` -> ``postgres``; any other
+    namespace (``bitnami/postgres``, ``team/postgres``, ``ghcr.io/x/postgres``)
+    is returned unchanged, so it never equals the official ``postgres``."""
+    repo = _REGISTRY_RX.sub("", repo)
+    return repo[len("library/") :] if repo.lower().startswith("library/") else repo
 
 
 def _is_port(tag: str) -> bool:
@@ -79,8 +110,10 @@ def _is_port(tag: str) -> bool:
 
 
 def _canonical(ref: str) -> str:
-    """``docker.io/library/postgres:18.3`` -> ``postgres:18.3``."""
-    return ref.removeprefix("docker.io/").removeprefix("library/")
+    """Normalised form of a whole ``repo[:tag|@digest]`` reference."""
+    m = re.match(r"^(?P<repo>[^:@]*)(?P<rest>.*)$", ref)
+    assert m is not None  # the pattern matches any string
+    return normalise_repo(m.group("repo")) + m.group("rest")
 
 
 def _bare_in_docker_argv(text: str) -> list[str]:
@@ -101,23 +134,33 @@ def _bare_in_docker_argv(text: str) -> list[str]:
             if isinstance(e, ast.Constant) and isinstance(e.value, str)
         ]
         if items[:1] == ["docker"] and any(
-            _canonical(i) == "postgres" for i in items[1:]
+            normalise_repo(i) == "postgres" for i in items[1:]
         ):
             out.append("postgres")
     return out
 
 
 def find_foreign_images(text: str, pin: str) -> list[str]:
-    """Every reference to the Postgres image in ``text`` that is not ``pin``."""
+    """Every reference to the OFFICIAL Postgres image in ``text`` that is not
+    ``pin``. Parameter defaults are expanded first, every candidate token's
+    repository is normalised, and only repositories that normalise to exactly
+    ``postgres`` count."""
+    text = expand_param_defaults(text)
     out: list[str] = []
     for m in _IMAGE_RX.finditer(text):
+        if normalise_repo(m.group("repo")) != "postgres":
+            continue
         tag = m.group("tag")
         if tag is not None and _is_port(tag):
             continue
-        ref = _canonical(m.group(0))
+        ref = "postgres" + m.group(0)[len(m.group("repo")) :]
         if ref != pin:
             out.append(ref)
-    out.extend("postgres" for _ in _BARE_IMAGE_RX.finditer(text))
+    out.extend(
+        "postgres"
+        for m in _BARE_IMAGE_RX.finditer(text)
+        if normalise_repo(m.group("repo")) == "postgres"
+    )
     out.extend(_bare_in_docker_argv(text))
     return out
 
@@ -265,9 +308,27 @@ def test_makefile_resolves_the_pin_with_a_stripped_path(tmp_path: Path) -> None:
         ("FROM postgres", ["postgres"]),
         ("FROM --platform=linux/amd64 postgres AS db", ["postgres"]),
         ('x = ["docker", "run", "--rm", "postgres"]', ["postgres"]),
+        ("index.docker.io/library/postgres:" + "16", ["postgres:16"]),
+        ("registry-1.docker.io/library/postgres:" + "16", ["postgres:16"]),
+        ("DOCKER.IO/library/postgres:" + "16", ["postgres:16"]),
+        ("Docker.Io/Library/postgres:" + "16", ["postgres:16"]),
+        ("image: ${PG_IMAGE:-postgres:" + "16}", ["postgres:16"]),
+        ("image: ${PG_IMAGE-postgres:" + "16}", ["postgres:16"]),
+        ("image: ${PG_IMAGE:=postgres:" + "16}", ["postgres:16"]),
+        ("image: ${PG_IMAGE=postgres:" + "16}", ["postgres:16"]),
+        ("image: ${PG_IMAGE:?postgres:" + "16}", ["postgres:16"]),
+        (
+            "image: ${A:-${B:-index.docker.io/library/postgres:" + "16}}",
+            ["postgres:16"],
+        ),
+        ("image: &pg postgres:" + "16", ["postgres:16"]),
+        ("image: ${PG_IMAGE:-postgres}", ["postgres"]),
         # the pin in any canonical spelling is fine
         ("docker.io/library/" + PG_TEST_IMAGE, []),
         ("library/" + PG_TEST_IMAGE, []),
+        ("image: ${PG_IMAGE:-" + PG_TEST_IMAGE + "}", []),
+        ("index.docker.io/library/" + PG_TEST_IMAGE, []),
+        ("image: postgres:${PG_TAG}", []),  # purely dynamic: out of contract
     ],
 )
 def test_scanner_catches_every_spelling_of_the_official_image(
@@ -289,6 +350,11 @@ def test_scanner_has_no_false_positives_on_prose_users_hosts_or_urls() -> None:
         "see https://www.postgresql.org/docs/ and https://hub.docker.com/_/postgres\n"
         "image: ghcr.io/lfdesousa/audittrace-postgresql:18.3-bitnami-frozen-apr17\n"
         "image: bitnami/postgresql:" + "16\n"
+        "image: ${PG_IMAGE:-ghcr.io/lfdesousa/audittrace-postgresql:18.3}\n"
+        "image: ${PG_IMAGE:-bitnami/postgres:" + "16}\n"
+        "image: localhost:5000/postgres:" + "16\n"
+        "host: ${DB_HOST:-postgres}\n"
+        "url=postgresql://u:${PW:-x}@postgres:5432/db\n"
         "image: registry.example.com/team/postgres:" + "16\n"
         'USERS = ["postgres", "audittrace"]\n'
         'argv = ["psql", "-U", "postgres"]\n'
