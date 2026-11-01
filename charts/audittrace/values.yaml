@@ -44,6 +44,12 @@
 # -- Global -------------------------------------------------------------------
 global:
   namespace: audittrace
+  # The Bitnami subcharts refuse (NOTES.txt validation) any image they do not
+  # recognise. The first-party ghcr.io mirrors (postgresql, redis) are
+  # deliberately not Bitnami's, so the chart default must opt in, exactly as
+  # the live release does. Required by the default postgresql.image below.
+  security:
+    allowInsecureImages: true
   # Set to true for production deploys. When true, the chart refuses to
   # render if any `secrets.*` value matches a known dev default. See the
   # SECURITY NOTICE above.
@@ -525,8 +531,23 @@ tls:
 
 postgresql:
   enabled: true
+  # SINGLE SOURCE OF TRUTH for the Postgres image (2026-11-01, CHART-PG-TAG-FALLBACK-16).
+  # The StatefulSet (Bitnami subchart) and every chart-owned Job that runs
+  # psql (templates/postgres/job-summariser-role.yaml) read these three keys
+  # and nothing else; the Job template has NO default of its own and fails
+  # the render (`required`) if one is missing. This is the SAME image prod
+  # runs and docker-compose.yml:136/:485 use: the frozen PG 18.3 Bitnami
+  # build mirrored to ghcr.io (PRIVATE, like the chroma/minio/mc mirrors:
+  # a default install needs `global.imagePullSecrets`, see
+  # tests/test_chart_private_image_pull_secrets.py). The upstream tag
+  # `17.6.0-debian-12-r4` the subchart would otherwise supply is mislabelled
+  # and ships PG 18.3 (project_bitnami_systemic_tag_mislabel). Tag, not
+  # digest: the other first-party ghcr mirrors in this file (chroma, minio,
+  # mc, redis-exporter) are tag-pinned too.
   image:
-    repository: bitnamilegacy/postgresql
+    registry: ghcr.io
+    repository: lfdesousa/audittrace-postgresql
+    tag: 18.3-bitnami-frozen-apr17
   auth:
     database: audittrace
     username: audittrace

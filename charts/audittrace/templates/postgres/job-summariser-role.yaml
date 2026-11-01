@@ -76,18 +76,14 @@ spec:
       {{- end }}
       containers:
         - name: psql
-          # 2026-05-13 — was hardcoded `bitnami/postgresql:16`, which
-          # now 404s on Docker Hub after Bitnami's August-2025
-          # free-image sunset. Parameterised same as the rabbitmq
-          # AMQP bootstrap Job: prefer the subchart's image override
-          # (so a values-side flip propagates here), default to the
-          # bitnamilegacy mirror that still serves the pinned tags.
-          # 2026-05-14 — include the registry too, since the subchart
-          # now uses the registry/repository split (e.g.
-          # `ghcr.io` + `lfdesousa/audittrace-postgresql`). Without
-          # this, the bare `lfdesousa/…` form resolves to
-          # `docker.io/lfdesousa/…` which doesn't exist.
-          image: "{{ .Values.postgresql.image.registry | default "docker.io" }}/{{ .Values.postgresql.image.repository | default "bitnamilegacy/postgresql" }}:{{ .Values.postgresql.image.tag | default "16" }}"
+          # Same image as the Postgres StatefulSet, from the same three
+          # values keys (postgresql.image.{registry,repository,tag}; an
+          # optional digest replaces the tag exactly as the Bitnami
+          # subchart renders it). There is deliberately NO fallback value
+          # here: a silent fallback to another Postgres version let the
+          # Job and the StatefulSet diverge. A missing key fails the
+          # render instead. 2026-11-01, CHART-PG-TAG-FALLBACK-16.
+          image: "{{ required "postgresql.image.registry is required (single source of truth for the Postgres image)" .Values.postgresql.image.registry }}/{{ required "postgresql.image.repository is required (single source of truth for the Postgres image)" .Values.postgresql.image.repository }}{{ $pgTag := required "postgresql.image.tag is required (single source of truth for the Postgres image)" .Values.postgresql.image.tag }}{{ if .Values.postgresql.image.digest }}@{{ .Values.postgresql.image.digest }}{{ else }}:{{ $pgTag }}{{ end }}"
           env:
             - name: PGHOST
               value: "{{ .Release.Name }}-postgresql"
