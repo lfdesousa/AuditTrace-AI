@@ -12,7 +12,7 @@
 #   * Network is compose-managed (no `external: true`).
 #
 # OPERATOR CAVEAT — WIPE VOLUMES ON FIRST UP AFTER B7 STEP 1:
-#   The previous compose used vanilla `postgres:16-alpine` writing
+#   The previous compose used vanilla PG16 alpine image writing
 #   to /var/lib/postgresql/data and `redis:7-alpine` with command-
 #   line auth. Bitnami pins are PG 18.3 / Redis 8.6.2 (same binary
 #   prod runs) and write to /bitnami/postgresql + /bitnami/redis/data.

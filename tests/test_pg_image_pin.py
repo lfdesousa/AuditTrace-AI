@@ -16,7 +16,9 @@ own behaviour is also pinned by the synthetic-text tests below):
 
 from __future__ import annotations
 
+import ast
 import inspect
+import os
 import re
 import shutil
 import subprocess
@@ -31,17 +33,44 @@ from tests._hermetic_env import hermetic_env
 
 REPO = Path(__file__).resolve().parent.parent
 _SCAN_ROOTS = ("src", "scripts", "tests", ".github", "Makefile")
-_SCAN_SUFFIXES = {".py", ".yml", ".yaml", ".sh", ".toml", ".md", ""}
+_SCAN_SUFFIXES = {".py", ".yml", ".yaml", ".sh", ".toml", ".md", ".json", ""}
+#: Compose files and Dockerfiles (any suffix, any depth) are scanned wherever
+#: they live, e.g. the root ``docker-compose*.yml`` (e2e.yml runs them) and
+#: ``tests/Dockerfile.pg``.
+_IMAGE_FILE_RX = re.compile(r"^(Dockerfile.*|(docker-)?compose.*\.ya?ml)$")
+_PRUNE_DIRS = {
+    ".git",
+    ".venv",
+    ".gate-venv",
+    "node_modules",
+    "evidence",
+    "docs",
+    "charts",
+    "htmlcov",
+    "__pycache__",
+}
 
-#: ``postgres:<tag>`` image references. A tag starts with a digit
-#: (``16``, ``18.3``, ``16-alpine``) or is a named tag. Not matched: DSN hosts
-#: (``@postgres:5432``), ports, ``bitnami/postgresql`` and other-namespace
-#: images -- the lookbehind rejects a preceding word char, ``@``, ``/``, ``.``
-#: or ``-``.
+#: A reference to the official Postgres image: ``postgres:<tag>``,
+#: ``postgres@sha256:<digest>`` and their canonical spellings with a
+#: ``docker.io/`` and/or ``library/`` prefix (the same image). Not matched:
+#: DSN hosts (``@postgres:5432``), ports, ``bitnami/postgresql``, other
+#: registries/namespaces (``ghcr.io/x/postgres``) -- the lookbehind rejects a
+#: preceding word char, ``@``, ``/``, ``.`` or ``-``.
 _IMAGE_RX = re.compile(
-    r"(?<![\w@/.\-])postgres:"
-    r"(?P<tag>(?:\d+(?:\.\d+)*(?:-[\w.]+)?|latest|alpine[\w.\-]*|bookworm[\w.\-]*))"
+    r"(?<![\w@/.\-])(?:docker\.io/)?(?:library/)?postgres"
+    r"(?:"
+    r":(?P<tag>\d+(?:\.\d+)*(?:-[\w.]+)?|latest|alpine[\w.\-]*|bookworm[\w.\-]*)"
     r"(?![\w.\-]*:)"
+    r"|@(?P<digest>sha256:[0-9a-f]+)"
+    r")"
+)
+#: An untagged (implicit ``:latest``) image, only where it IS an image
+#: reference: a compose/workflow ``image:`` value or a Dockerfile ``FROM``.
+#: The bare word "postgres" elsewhere (users, hosts, prose) is deliberately not
+#: matched -- see :func:`_bare_in_docker_argv` for Python argv.
+_BARE_IMAGE_RX = re.compile(
+    r"(?im)^\s*(?:image:|FROM(?:\s+--\S+)?)\s*[\"']?"
+    r"(?:docker\.io/)?(?:library/)?postgres[\"']?(?:\s+AS\s+\S+)?\s*(?:#.*)?$"
 )
 
 
@@ -49,35 +78,70 @@ def _is_port(tag: str) -> bool:
     return tag.isdigit() and len(tag) >= 4
 
 
+def _canonical(ref: str) -> str:
+    """``docker.io/library/postgres:18.3`` -> ``postgres:18.3``."""
+    return ref.removeprefix("docker.io/").removeprefix("library/")
+
+
+def _bare_in_docker_argv(text: str) -> list[str]:
+    """Untagged ``"postgres"`` as an element of a Python ``["docker", ...]``
+    argv literal (the spawn position). A literal ``"postgres"`` in any other
+    list (a user name) is ignored."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    out: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.List | ast.Tuple):
+            continue
+        items = [
+            e.value
+            for e in node.elts
+            if isinstance(e, ast.Constant) and isinstance(e.value, str)
+        ]
+        if items[:1] == ["docker"] and any(
+            _canonical(i) == "postgres" for i in items[1:]
+        ):
+            out.append("postgres")
+    return out
+
+
 def find_foreign_images(text: str, pin: str) -> list[str]:
-    """Every ``postgres:<tag>`` image reference in ``text`` that is not ``pin``."""
+    """Every reference to the Postgres image in ``text`` that is not ``pin``."""
     out: list[str] = []
     for m in _IMAGE_RX.finditer(text):
         tag = m.group("tag")
-        if _is_port(tag):
+        if tag is not None and _is_port(tag):
             continue
-        ref = f"postgres:{tag}"
+        ref = _canonical(m.group(0))
         if ref != pin:
             out.append(ref)
+    out.extend("postgres" for _ in _BARE_IMAGE_RX.finditer(text))
+    out.extend(_bare_in_docker_argv(text))
     return out
 
 
 def _scanned_files() -> list[Path]:
-    files: list[Path] = []
+    files: dict[Path, None] = {}
     for root in _SCAN_ROOTS:
         p = REPO / root
         if p.is_file():
-            files.append(p)
+            files[p] = None
             continue
         for f in p.rglob("*"):
             if (
                 f.is_file()
                 and "__pycache__" not in f.parts
                 and f.suffix in _SCAN_SUFFIXES
-                and f.name != Path(__file__).name
             ):
-                files.append(f)
-    return files
+                files[f] = None
+    for dirpath, dirnames, filenames in os.walk(REPO):
+        dirnames[:] = [d for d in dirnames if d not in _PRUNE_DIRS]
+        for name in filenames:
+            if _IMAGE_FILE_RX.match(name):
+                files[Path(dirpath) / name] = None
+    return [f for f in files if f.name != Path(__file__).name]
 
 
 def test_pin_is_postgres_18_3() -> None:
@@ -88,7 +152,15 @@ def test_no_executable_site_references_another_postgres_image() -> None:
     files = _scanned_files()
     # positive control: the scan reaches the sites that must carry the pin
     names = {f.relative_to(REPO).as_posix() for f in files}
-    assert {"Makefile", ".github/workflows/ci.yml", "tests/_pg_ephemeral.py"} <= names
+    assert {
+        "Makefile",
+        ".github/workflows/ci.yml",
+        "tests/_pg_ephemeral.py",
+        "docker-compose.yml",
+        "docker-compose.edge.yml",
+        "Dockerfile",
+        "Dockerfile.tests",
+    } <= names
     offenders = {
         f.relative_to(REPO).as_posix(): bad
         for f in files
@@ -178,3 +250,57 @@ def test_makefile_resolves_the_pin_with_a_stripped_path(tmp_path: Path) -> None:
         check=True,
     ).stdout
     assert f"{PG_TEST_IMAGE} -c fsync=off" in out
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("docker.io/library/postgres:" + "16", ["postgres:16"]),
+        ("library/postgres:" + "16", ["postgres:16"]),
+        ("docker.io/postgres:" + "16", ["postgres:16"]),
+        ("postgres@sha256:" + "ab12" * 16, ["postgres@sha256:" + "ab12" * 16]),
+        ("docker.io/library/postgres@sha256:" + "ab12" * 16, None),
+        ("image: postgres", ["postgres"]),
+        ("    image: 'docker.io/library/postgres'  # dev", ["postgres"]),
+        ("FROM postgres", ["postgres"]),
+        ("FROM --platform=linux/amd64 postgres AS db", ["postgres"]),
+        ('x = ["docker", "run", "--rm", "postgres"]', ["postgres"]),
+        # the pin in any canonical spelling is fine
+        ("docker.io/library/" + PG_TEST_IMAGE, []),
+        ("library/" + PG_TEST_IMAGE, []),
+    ],
+)
+def test_scanner_catches_every_spelling_of_the_official_image(
+    text: str, expected: list[str] | None
+) -> None:
+    found = find_foreign_images(text, PG_TEST_IMAGE)
+    if expected is None:  # digest behind the canonical prefix: one hit, digest form
+        assert len(found) == 1
+        assert found[0].startswith("postgres@sha256:")
+    else:
+        assert found == expected
+
+
+def test_scanner_has_no_false_positives_on_prose_users_hosts_or_urls() -> None:
+    ok = (
+        "The postgres user owns it; connect as postgres to the postgres host.\n"
+        "POSTGRES_USER=postgres\n"
+        "psql -U postgres -d audit\n"
+        "see https://www.postgresql.org/docs/ and https://hub.docker.com/_/postgres\n"
+        "image: ghcr.io/lfdesousa/audittrace-postgresql:18.3-bitnami-frozen-apr17\n"
+        "image: bitnami/postgresql:" + "16\n"
+        "image: registry.example.com/team/postgres:" + "16\n"
+        'USERS = ["postgres", "audittrace"]\n'
+        'argv = ["psql", "-U", "postgres"]\n'
+    )
+    assert find_foreign_images(ok, PG_TEST_IMAGE) == []
+
+
+def test_compose_and_dockerfiles_are_scanned() -> None:
+    names = {f.relative_to(REPO).as_posix() for f in _scanned_files()}
+    assert "docker-compose.yml" in names  # positive control (F2)
+    assert {"docker-compose.edge.yml", "Dockerfile", "bff/Dockerfile"} <= names
+    assert _IMAGE_FILE_RX.match("Dockerfile.pg")
+    assert _IMAGE_FILE_RX.match("docker-compose.test-pg.yml")
+    assert _IMAGE_FILE_RX.match("compose.yaml")
+    assert not _IMAGE_FILE_RX.match("test_compose_drift.py")
