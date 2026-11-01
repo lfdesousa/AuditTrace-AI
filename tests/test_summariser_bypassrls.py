@@ -17,7 +17,7 @@ BYPASSRLS`` — mirroring ``test_rls_isolation.py``'s own documented
 precedent for why these proofs use ``SET ROLE`` rather than a direct LOGIN
 role: a non-superuser LOGIN role would need its own password-rotation
 story in a throwaway schema, whereas ``SET ROLE`` from the admin connection
-(itself a superuser in the ephemeral container, as every ``postgres:16``
+(itself a superuser in the ephemeral container, as every ``postgres:18.3``
 default user is) is simpler and matches the harness convention everywhere
 else in this repo. Unlike a direct DBAPI-level ``cursor.execute()`` inside
 a plain test body, this file issues the ``SET ROLE`` from an SQLAlchemy
@@ -66,10 +66,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from audittrace.config import Settings
 from audittrace.db.models import Base
 from audittrace.services.session_summarizer import EligibleSession, SessionSummarizer
+from scripts.ci.pg_image import PG_TEST_IMAGE
 
 # ───────────────────── ephemeral postgres scaffolding ────────────────────
 # Same convention as test_acl_ownership_rls.py / test_rls_isolation.py /
-# test_console_store_rls_postgres.py: a throwaway postgres:16 brought up at
+# test_console_store_rls_postgres.py: a throwaway Postgres (PG_TEST_IMAGE) brought up at
 # collection, torn down at exit, or AUDITTRACE_TEST_POSTGRES_URL used when
 # set (the target is a parameter, never a hardcoded host).
 
@@ -98,7 +99,7 @@ _SKIP_REASON = (
     "unavailable. SQLite does not enforce RLS or BYPASSRLS: this proof is "
     "REQUIRED, not optional, before the fix's Postgres-level claim can be "
     "trusted. Set AUDITTRACE_TEST_POSTGRES_URL or make Docker available so "
-    "a throwaway postgres:16 can be started."
+    "a throwaway postgres:18.3 can be started."
 )
 if _ADMIN_URL is None:
     warnings.warn(_SKIP_REASON, UserWarning, stacklevel=1)
@@ -111,8 +112,8 @@ pytestmark = pytest.mark.skipif(_ADMIN_URL is None, reason=_SKIP_REASON)
 
 
 def _resolved_postgres_image_digest() -> str:
-    """The resolved ``postgres:16`` image digest actually running, for the
-    build record (A1 §2 / the digest's "record the resolved postgres:16
+    """The resolved ``postgres:18.3`` image digest actually running, for the
+    build record (A1 §2 / the digest's "record the resolved postgres:18.3
     image digest" instruction). Best-effort: a missing/unparseable digest
     is recorded as such rather than raising — this is evidence capture,
     not a test assertion."""
@@ -123,7 +124,7 @@ def _resolved_postgres_image_digest() -> str:
                 "inspect",
                 "--format",
                 "{{index .RepoDigests 0}}",
-                "postgres:16",
+                PG_TEST_IMAGE,
             ],
             capture_output=True,
             text=True,
@@ -707,14 +708,14 @@ class TestAC4RealPostgresBypassRls:
 
 @pytest.mark.asyncio
 async def test_resolved_versions_and_image_digest_recorded() -> None:
-    """Build-record evidence (A1 §8): resolved postgres:16 digest +
+    """Build-record evidence (A1 §8): resolved postgres:18.3 digest +
     driver versions, captured once, not asserted against."""
     import asyncpg
     import psycopg2
 
     digest = _resolved_postgres_image_digest()
     print(
-        f"\n[AC4 evidence] postgres:16 digest={digest} "
+        f"\n[AC4 evidence] postgres:18.3 digest={digest} "
         f"asyncpg={asyncpg.__version__} psycopg2={psycopg2.__version__}\n"
     )
     assert digest  # non-empty string either way (resolved or "unresolved (...)")
@@ -742,6 +743,6 @@ async def test_find_eligible_duration_before_and_after(schema, bypass_factory):
 
     print(
         f"\n[AC4 evidence] _find_eligible duration: before={before_s * 1000:.2f}ms "
-        f"after={after_s * 1000:.2f}ms (real postgres:16, one collision)\n"
+        f"after={after_s * 1000:.2f}ms (real postgres:18.3, one collision)\n"
     )
     assert before_s >= 0 and after_s >= 0

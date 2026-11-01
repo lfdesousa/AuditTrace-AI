@@ -47,7 +47,7 @@ A, B = "user-a", "user-b"
 
 @pytest.fixture
 def pgs() -> Iterator[Schema]:
-    """A fresh schema on the shared throwaway postgres:16 (see the 034 module)."""
+    """A fresh schema on the shared throwaway postgres:18.3 (see the 034 module)."""
     assert _ADMIN_URL is not None
     s = Schema(_ADMIN_URL)
     try:

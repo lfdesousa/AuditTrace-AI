@@ -104,7 +104,7 @@ def test_wait_ready_times_out_on_an_unreachable_dsn():
 
 @requires_docker
 def test_real_container_lifecycle_settings_and_catalog():
-    """Real ``postgres:16`` end-to-end: start (non-fake), SHOW read-back,
+    """Real ``postgres:18.3`` end-to-end: start (non-fake), SHOW read-back,
     catalog snapshot, stop -- the code path the self-proofs' ``fake=True``
     seam stands in for.
 

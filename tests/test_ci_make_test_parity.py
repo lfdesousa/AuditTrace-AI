@@ -48,7 +48,7 @@ CI_TEST_JOB_GOLDEN: dict = {
     "runs-on": "ubuntu-latest",
     "services": {
         "postgres": {
-            "image": "postgres:16",
+            "image": "postgres:18.3",
             "env": {
                 "POSTGRES_USER": "postgres",
                 "POSTGRES_PASSWORD": "postgres",
@@ -330,7 +330,7 @@ WORKFLOW_PYTEST_EXEMPTIONS: frozenset[tuple[str, str, int, str]] = frozenset(
 #: vetted target.
 MAKEFILE_PYTEST_EXEMPTIONS: dict[str, str] = {
     "test-rls-local": (
-        "\t# Runs tests/test_rls_isolation.py against a throwaway postgres:16\n"
+        "\t# Runs tests/test_rls_isolation.py against a throwaway $(PG_TEST_IMAGE)\n"
         "\t# container on localhost:15432. CRITICALLY: does NOT port-forward the\n"
         "\t# k3s production Postgres — the test file includes a positive test\n"
         "\t# (test_alice_cannot_insert_as_bob) that deliberately provokes an RLS\n"
@@ -344,7 +344,7 @@ MAKEFILE_PYTEST_EXEMPTIONS: dict[str, str] = {
         "\t  -e POSTGRES_PASSWORD=test \\\n"
         "\t  -e POSTGRES_DB=audittrace \\\n"
         "\t  -p 15432:5432 \\\n"
-        "\t  postgres:16 -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null\n"
+        "\t  $(PG_TEST_IMAGE) -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null\n"
         '\t@echo "⏳ Waiting for Postgres to accept connections ..."\n'
         "\t@for i in 1 2 3 4 5 6 7 8; do \\\n"
         "\t  docker exec audittrace-test-pg pg_isready -U postgres >/dev/null 2>&1 && break ; \\\n"

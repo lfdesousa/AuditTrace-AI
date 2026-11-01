@@ -2,7 +2,7 @@
 Tool-Favorites domain (ADDENDUM A §3: "SQLite does not enforce RLS, so a
 SQLite-only isolation proof is vacuous by construction").
 
-Set-up mirrors ``tests/test_rls_isolation.py``: a throwaway ``postgres:16``
+Set-up mirrors ``tests/test_rls_isolation.py``: a throwaway ``postgres:18.3``
 container is brought UP at collection and torn DOWN at exit (or
 ``AUDITTRACE_TEST_POSTGRES_URL`` is used when set — portability: the
 target is a parameter, never a hardcoded host). Inside it, every test gets
@@ -92,7 +92,7 @@ _SKIP_REASON = (
     "and AUDITTRACE_TEST_POSTGRES_URL are both unavailable. SQLite does not "
     "enforce RLS: this proof is REQUIRED, not optional, before the "
     "console-store RLS claim can be trusted. Set AUDITTRACE_TEST_POSTGRES_URL "
-    "or make Docker available so a throwaway postgres:16 can be started."
+    "or make Docker available so a throwaway postgres:18.3 can be started."
 )
 if _ADMIN_URL is None:
     warnings.warn(_SKIP_REASON, UserWarning, stacklevel=1)

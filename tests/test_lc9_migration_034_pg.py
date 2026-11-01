@@ -3,7 +3,7 @@ real manifest service against the live CHECK.
 
 Static half (no Docker): revision identity, the single head, the exact
 substring comparison, ``NOT VALID``, the Postgres guard. PG half (throwaway
-``postgres:16``, or ``AUDITTRACE_TEST_POSTGRES_URL``): upgrade/downgrade, a
+``postgres:18.3``, or ``AUDITTRACE_TEST_POSTGRES_URL``): upgrade/downgrade, a
 legacy row survives and can be tombstoned but not revived or edited, an
 owner-prefixed insert passes, a foreign / bare private insert is refused, and
 ``MemoryManifestService`` (record_create / copy-forward / update / delete)

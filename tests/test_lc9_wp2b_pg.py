@@ -3,7 +3,7 @@ the REAL HTTP routes (``httpx.ASGITransport`` over ``create_app()``, so the app,
 the manifest and the test share ONE event loop) and the MCP entry.
 
 Reuses the throwaway-container scaffolding of ``test_lc9_migration_034_pg`` (one
-postgres:16 container per session; Docker is available in the gate container).
+postgres:18.3 container per session; Docker is available in the gate container).
 
 * RT-22: fault-inject after copy-forward step 1 (the Chroma upsert, before the
   manifest transaction) and after step 2 (the committed manifest transaction,

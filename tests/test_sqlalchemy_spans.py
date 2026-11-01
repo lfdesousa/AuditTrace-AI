@@ -7,7 +7,7 @@ set the dashboards and Tempo queries depend on (``db.system="postgresql"``,
 ``db.statement``, ``db.operation``, ``db.name``, ``net.peer.name``) is asserted
 rather than assumed. SQLite cannot stand in for it (``db.system="sqlite"``).
 
-The Postgres precondition FAILS (never skips): CI provides the ``postgres:16``
+The Postgres precondition FAILS (never skips): CI provides the ``postgres:18.3``
 service via ``AUDITTRACE_TEST_POSTGRES_URL``; locally the throwaway container
 of ``tests/_pg_ephemeral.py`` is used. The URL is normalised to asyncpg with
 ``config._as_async_url`` because the CI URL is psycopg2 and
@@ -67,7 +67,7 @@ def pg_async_url() -> str:
         pytest.fail(
             "G1 needs a real PostgreSQL and none is available: set "
             "AUDITTRACE_TEST_POSTGRES_URL or make Docker available so "
-            "tests/_pg_ephemeral.py can start postgres:16. This is a FAILURE, "
+            "tests/_pg_ephemeral.py can start postgres:18.3. This is a FAILURE, "
             "not a skip: a telemetry guard that skips guards nothing."
         )
     return _as_async_url(url)

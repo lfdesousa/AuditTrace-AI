@@ -1,6 +1,6 @@
 """One throwaway, non-durable Postgres per worker (SPEC v3 §8, §9; SF-3).
 
-Harness containers run ``postgres:16 -c fsync=off -c synchronous_commit=off
+Harness containers run ``postgres:18.3 -c fsync=off -c synchronous_commit=off
 -c full_page_writes=off`` -- crash-durability only; MVCC/RLS/rollback are
 unaffected, no test restarts Postgres. The instrument never trusts the
 launch flags: it reads the server back (``SHOW ...``) and refuses (exit 6)
@@ -22,6 +22,8 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from scripts.ci.pg_image import PG_TEST_IMAGE
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +87,7 @@ def start_container(
     run_id: str,
     worker_idx: int,
     *,
-    tag: str = "postgres:16",
+    tag: str = PG_TEST_IMAGE,
     tmpfs: bool = False,
     fake: bool = False,
     fake_dir: Path | None = None,
@@ -93,7 +95,7 @@ def start_container(
     """Start (or fake) one worker's throwaway Postgres.
 
     ``fake=True`` writes an initial "server settings" sidecar reflecting the
-    requested (non-durable) flags -- exactly what a real ``postgres:16``
+    requested (non-durable) flags -- exactly what a real ``postgres:18.3``
     would report back over ``SHOW`` -- and a stub catalog snapshot.
     """
     name = f"audittrace-neuter-{run_id}-w{worker_idx}"
@@ -136,7 +138,10 @@ def start_container(
         f"127.0.0.1:{port}:5432",
     ]
     if tmpfs:
-        cmd += ["--tmpfs", "/var/lib/postgresql/data"]
+        # PG18+ images set PGDATA=/var/lib/postgresql/18/docker and VOLUME
+        # /var/lib/postgresql; a mount at the pre-18 /var/lib/postgresql/data
+        # makes the entrypoint refuse to start ("unused mount/volume").
+        cmd += ["--tmpfs", "/var/lib/postgresql"]
     cmd += [tag, *NONDURABLE_FLAGS]
     try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=120)

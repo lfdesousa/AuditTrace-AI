@@ -299,7 +299,7 @@ def test_continuous_watch_catches_a_container_removed_via_atexit_live(tmp_path):
         '_NAME = f"audittrace-acl-wu2a-pg-rev{os.getpid()}"\n'
         "def test_starts_a_durable_container_removed_at_atexit():\n"
         "    subprocess.run(\n"
-        '        ["docker", "run", "-d", "--rm", "--name", _NAME, "postgres:16"],\n'
+        '        ["docker", "run", "-d", "--rm", "--name", _NAME, "postgres:18.3"],\n'
         "        check=True, capture_output=True, timeout=120,\n"
         "    )\n"
         "    atexit.register(\n"
@@ -393,7 +393,7 @@ def test_slow_docker_events_attach_yields_watch_unproven_not_silent_clean(
         f'_NAME = "{name}"\n'
         "def test_starts_a_durable_container_immediately():\n"
         "    subprocess.run(\n"
-        '        ["docker", "run", "-d", "--rm", "--name", _NAME, "postgres:16"],\n'
+        '        ["docker", "run", "-d", "--rm", "--name", _NAME, "postgres:18.3"],\n'
         "        check=True, capture_output=True, timeout=120,\n"
         "    )\n"
         "    atexit.register(\n"

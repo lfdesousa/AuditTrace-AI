@@ -20,7 +20,7 @@ insert (O-6) can freely accumulate history. On Postgres,
 ``tenant_id = NULL`` today, migration 031's ``tenant_id`` column being
 nullable) — **rendered identical on SQLAlchemy 2.0.51 and 2.1.0** (spec
 §2 Fact 2 / ADDENDUM U-7). PG15+ syntax; the real-Postgres harness here
-is ``postgres:16``, live is PG 18.3 (both support it). **On SQLite the
+is PostgreSQL 18.3, the same as live (first measured on 16; PG15+ syntax). **On SQLite the
 index exists but ``NULLS DISTINCT`` applies** (SQLite has no
 ``NULLS NOT DISTINCT`` syntax at all) — two active rows that both carry
 ``tenant_id IS NULL`` do NOT collide there. **The O-3 constraint is
