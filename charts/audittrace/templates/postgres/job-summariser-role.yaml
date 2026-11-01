@@ -77,13 +77,17 @@ spec:
       containers:
         - name: psql
           # Same image as the Postgres StatefulSet, from the same three
-          # values keys (postgresql.image.{registry,repository,tag}; an
-          # optional digest replaces the tag exactly as the Bitnami
-          # subchart renders it). There is deliberately NO fallback value
+          # values keys, assembled by the subchart's own helper
+          # (common.images.image) so global.imageRegistry and an optional
+          # digest are honoured exactly as the StatefulSet honours them. There is deliberately NO fallback value
           # here: a silent fallback to another Postgres version let the
           # Job and the StatefulSet diverge. A missing key fails the
           # render instead. 2026-11-01, CHART-PG-TAG-FALLBACK-16.
-          image: "{{ required "postgresql.image.registry is required (single source of truth for the Postgres image)" .Values.postgresql.image.registry }}/{{ required "postgresql.image.repository is required (single source of truth for the Postgres image)" .Values.postgresql.image.repository }}{{ $pgTag := required "postgresql.image.tag is required (single source of truth for the Postgres image)" .Values.postgresql.image.tag }}{{ if .Values.postgresql.image.digest }}@{{ .Values.postgresql.image.digest }}{{ else }}:{{ $pgTag }}{{ end }}"
+          {{- $pgImage := .Values.postgresql.image }}
+          {{- $_ := required "postgresql.image.registry is required (single source of truth for the Postgres image)" $pgImage.registry }}
+          {{- $_ := required "postgresql.image.repository is required (single source of truth for the Postgres image)" $pgImage.repository }}
+          {{- $_ := required "postgresql.image.tag is required (single source of truth for the Postgres image)" $pgImage.tag }}
+          image: {{ include "common.images.image" (dict "imageRoot" $pgImage "global" .Values.global) | quote }}
           env:
             - name: PGHOST
               value: "{{ .Release.Name }}-postgresql"

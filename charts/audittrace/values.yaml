@@ -44,12 +44,6 @@
 # -- Global -------------------------------------------------------------------
 global:
   namespace: audittrace
-  # The Bitnami subcharts refuse (NOTES.txt validation) any image they do not
-  # recognise. The first-party ghcr.io mirrors (postgresql, redis) are
-  # deliberately not Bitnami's, so the chart default must opt in, exactly as
-  # the live release does. Required by the default postgresql.image below.
-  security:
-    allowInsecureImages: true
   # Set to true for production deploys. When true, the chart refuses to
   # render if any `secrets.*` value matches a known dev default. See the
   # SECURITY NOTICE above.
@@ -531,6 +525,14 @@ tls:
 
 postgresql:
   enabled: true
+  # The Bitnami postgresql subchart refuses (NOTES.txt, common.errors.insecureImages)
+  # any image it does not recognise, and the first-party ghcr.io mirror is
+  # deliberately not Bitnami's. The opt-in is scoped to THIS subchart on purpose
+  # (least privilege): the global form would silently pre-authorise any other
+  # Bitnami subchart (redis, rabbitmq) that later adds the same check.
+  global:
+    security:
+      allowInsecureImages: true
   # SINGLE SOURCE OF TRUTH for the Postgres image (2026-11-01, CHART-PG-TAG-FALLBACK-16).
   # The StatefulSet (Bitnami subchart) and every chart-owned Job that runs
   # psql (templates/postgres/job-summariser-role.yaml) read these three keys
