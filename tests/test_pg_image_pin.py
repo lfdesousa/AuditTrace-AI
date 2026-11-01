@@ -27,6 +27,7 @@ import yaml
 
 from scripts.ci.pg_image import PG_TEST_IMAGE, read_pg_test_image
 from scripts.neuter import pg as neuter_pg
+from tests._hermetic_env import hermetic_env
 
 REPO = Path(__file__).resolve().parent.parent
 _SCAN_ROOTS = ("src", "scripts", "tests", ".github", "Makefile")
@@ -157,20 +158,23 @@ def test_mk_fragment_is_the_single_definition_and_parser_fails_closed() -> None:
             read_pg_test_image(bad)
 
 
-def test_makefile_resolves_the_pin_with_a_stripped_path() -> None:
+def test_makefile_resolves_the_pin_with_a_stripped_path(tmp_path: Path) -> None:
     """Regression for the CI-shaped gate: tests/test_ci_make_targets_resolve_tools
     run make with a PATH that has no sed/awk, so the pin must resolve with make
     builtins only (``include``), never a ``$(shell ...)`` helper."""
     assert "include scripts/ci/pg_image.mk" in (REPO / "Makefile").read_text()
     make = shutil.which("make")
     assert make is not None
-    out = subprocess.run(
-        [make, "-n", "test-rls-local"],
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "make").symlink_to(make)
+    out = subprocess.run(  # noqa: S603 - fixed argv
+        [str(shim / "make"), "-n", "test-rls-local"],
         cwd=REPO,
+        env=hermetic_env({"PATH": str(shim)}),
         capture_output=True,
         text=True,
         timeout=60,
         check=True,
-        env={"PATH": str(Path(make).parent)},
     ).stdout
     assert f"{PG_TEST_IMAGE} -c fsync=off" in out
