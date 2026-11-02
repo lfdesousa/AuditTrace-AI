@@ -1,0 +1,7 @@
+# Provenance pin for the vendored contracts/v1.yaml (checked by
+# scripts/check-contracts-sync.sh in public CI; no network, no token).
+# Re-vendoring is a deliberate act: update v1.yaml AND this file together.
+# The private repo's own contract-sync guard is the drift detector.
+repo=AllaboutdataEu/audittrace-content-control
+commit=97588dcdcc11f0a82b55db00e191c0945e67b86a
+sha256=9faa87eec3702d3bfe67e8491703789b302b9c630b36efc29907380c0addcda3

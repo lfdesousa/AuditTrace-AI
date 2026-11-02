@@ -442,7 +442,7 @@ captured in auto-memory `project_adr048_design_session`). This
 section is the immutable design header; future PRs reference it
 rather than re-arguing.
 
-1. **Two repos.** Repo A (private) — `https://github.com/lfdesousa/audittrace-content-control`
+1. **Two repos.** Repo A (private) — `https://github.com/AllaboutdataEu/audittrace-content-control`
    ships the scanner service + sibling Helm chart. Repo B (this repo,
    public) ships the consumer + manifest schema + chart-side wiring.
 2. **Verdict and scan-request transport: Redis Streams behind a
