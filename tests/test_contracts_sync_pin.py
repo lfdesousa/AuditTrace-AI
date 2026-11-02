@@ -20,6 +20,7 @@ Falsifiability (each guard has a test that fails when the guard is removed):
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -275,7 +276,14 @@ def test_script_runs_with_only_an_allowlist_of_commands(tmp_path: Path) -> None:
         (shims / tool).symlink_to(found)
     bash = shutil.which("bash")
     assert bash
-    env = hermetic_env(PATH=str(shims), GH_TOKEN="", GITHUB_TOKEN="")
+    # The hermetic guard requires its own shim dir at PATH[0] (it holds only
+    # kubectl/helm shims); the allowlist dir follows and nothing else is on PATH.
+    base = hermetic_env(GH_TOKEN="", GITHUB_TOKEN="")
+    env = hermetic_env(
+        PATH=os.pathsep.join([base["PATH"].split(os.pathsep)[0], str(shims)]),
+        GH_TOKEN="",
+        GITHUB_TOKEN="",
+    )
     res = subprocess.run(
         [bash, str(SCRIPT)],
         env=env,
