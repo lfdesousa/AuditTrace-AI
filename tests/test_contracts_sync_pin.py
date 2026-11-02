@@ -12,13 +12,16 @@ Falsifiability (each guard has a test that fails when the guard is removed):
 * the script ignores the pin       -> ``test_pin_sha_mismatch_fails`` RED
 * the script tolerates a bad pin   -> ``test_malformed_pin_fails`` RED
 * the script tolerates no pin      -> ``test_missing_pin_fails`` RED
-* a fetch / token creeps back in   -> ``test_no_network_no_token_*`` RED
+* a fetch / token creeps back in   -> ``test_workflow_*`` / ``test_script_*`` RED
+* a symlink is accepted             -> ``test_symlink_*`` RED
+* the duplicate check fails open   -> ``test_malformed_pin_fails`` empty-first cases RED
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -64,7 +67,12 @@ def _run(root: Path) -> subprocess.CompletedProcess[str]:
         GITHUB_TOKEN="",
     )
     return subprocess.run(
-        ["bash", str(SCRIPT)], env=env, capture_output=True, text=True, check=False
+        ["bash", str(SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
     )
 
 
@@ -115,6 +123,18 @@ _SHA = hashlib.sha256(BODY).hexdigest()
         (f"repo=no-slash\ncommit={COMMIT}\nsha256={_SHA}\n", "repo must be"),
         (f"repo=Owner/r\ncommit={COMMIT}\nsha256={_SHA}\nextra=1\n", "unrecognised"),
         (f"repo=Owner/r\ncommit={COMMIT}\nsha256={_SHA}\nrepo=O/x\n", "duplicate repo"),
+        # F1: an EMPTY first value must still count as seen.
+        (f"repo=\nrepo=a/b\ncommit={COMMIT}\nsha256={_SHA}\n", "duplicate repo"),
+        (
+            f"repo=Owner/r\ncommit=\ncommit={COMMIT}\nsha256={_SHA}\n",
+            "duplicate commit",
+        ),
+        (
+            f"repo=Owner/r\ncommit={COMMIT}\nsha256=\nsha256={_SHA}\n",
+            "duplicate sha256",
+        ),
+        (f"repo=../..x\ncommit={COMMIT}\nsha256={_SHA}\n", "repo must be"),
+        (f"repo=Owner/.hidden\ncommit={COMMIT}\nsha256={_SHA}\n", "repo must be"),
         (
             f"repo=Owner/r\ncommit={COMMIT}\ncommit={COMMIT}\nsha256={_SHA}\n",
             "duplicate commit",
@@ -148,27 +168,135 @@ def test_committed_pin_matches_committed_vendored_file() -> None:
     assert re.search(r"^commit=[0-9a-f]{40}$", pin, re.M)
 
 
-def test_no_network_no_token_in_script_or_workflow() -> None:
-    """Public CI never reaches the private repo: no fetch, no token, no old slug."""
-    script = SCRIPT.read_text()
-    workflow = WORKFLOW.read_text()
-    for blob in (script, workflow):
-        assert "CONTRACT_SYNC_TOKEN" not in blob
-        assert "lfdesousa/audittrace-content-control" not in blob
-        assert "raw.githubusercontent.com" not in blob
-    code = "\n".join(
-        ln for ln in script.splitlines() if not ln.lstrip().startswith("#")
-    )
-    assert not re.search(r"\b(curl|wget)\b", code)
-    wf = yaml.safe_load(workflow)
-    assert "secrets." not in workflow.replace("# ", "#").split("\njobs:")[1]
-    for job in wf["jobs"].values():
-        for step in job["steps"]:
-            assert "env" not in step, "no token/env wiring on the pin check"
+def test_symlinked_vendored_file_is_refused(tmp_path: Path) -> None:
+    """F2: git would publish the link text, not the contract."""
+    root = _make_root(tmp_path)
+    real = tmp_path / "elsewhere.yaml"
+    real.write_bytes(BODY)  # same content: sha256 would match if followed
+    (root / VENDORED).unlink()
+    (root / VENDORED).symlink_to(real)
+    res = _run(root)
+    assert res.returncode == 5, (res.stdout, res.stderr)
+    assert "vendored copy is a symlink" in res.stderr
+
+
+def test_symlinked_pin_file_is_refused(tmp_path: Path) -> None:
+    root = _make_root(tmp_path)
+    real = tmp_path / "elsewhere.source"
+    real.write_text(_good_pin(_SHA))
+    (root / PIN).unlink()
+    (root / PIN).symlink_to(real)
+    res = _run(root)
+    assert res.returncode == 5, (res.stdout, res.stderr)
+    assert "pin file is a symlink" in res.stderr
+
+
+def test_committed_files_are_regular_files() -> None:
+    assert not (ROOT / VENDORED).is_symlink()
+    assert not (ROOT / PIN).is_symlink()
+
+
+def _strip_comments(text: str) -> str:
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def _keys(node: object) -> set[str]:
+    """Every mapping key anywhere in a parsed YAML tree."""
+    found: set[str] = set()
+    if isinstance(node, dict):
+        for k, v in node.items():
+            found.add(str(k))
+            found |= _keys(v)
+    elif isinstance(node, list):
+        for v in node:
+            found |= _keys(v)
+    return found
+
+
+def test_workflow_is_exactly_the_offline_pin_check() -> None:
+    """F3: no env at ANY level, no secrets/vars/ROOT, one exact run line."""
+    text = WORKFLOW.read_text()
+    code = _strip_comments(text)
+    for banned in (
+        "secrets.",
+        "vars.",
+        "CONTRACTS_SYNC_ROOT",
+        "${{",
+        "CONTRACT_SYNC_TOKEN",
+    ):
+        assert banned not in code, banned
+    assert "lfdesousa/audittrace-content-control" not in text
+    wf = yaml.safe_load(text)
+    assert "env" not in _keys(wf), "no env at workflow, job or step level"
+    # PyYAML parses the bare key ``on`` as boolean True.
+    top = {"on" if k is True else k for k in wf}
+    assert top == {"name", "on", "permissions", "jobs"}
+    assert wf["permissions"] == {"contents": "read"}
+    (job,) = wf["jobs"].values()
+    assert set(job) == {"runs-on", "steps"}
+    assert job["steps"] == [
+        {"uses": "actions/checkout@v6"},
+        {
+            "name": "Verify vendored contract against its pin",
+            "run": "./scripts/check-contracts-sync.sh",
+        },
+    ]
 
 
 def test_workflow_triggers_are_pr_and_push_only() -> None:
     wf = yaml.safe_load(WORKFLOW.read_text())
     triggers = wf.get("on", wf.get(True))
     assert set(triggers) == {"pull_request", "push"}
-    assert wf["permissions"] == {"contents": "read"}
+
+
+_NETWORK_TOKENS = re.compile(
+    r"(?<![\w./-])(curl|wget|gh|nc|ncat|socat|ssh|scp|sftp|telnet|python3?|perl|ruby"
+    r"|node|php|lua|openssl)(?![\w-])"
+    r"|\bgit\s+(fetch|clone|ls-remote|pull|remote)\b|/dev/(tcp|udp)/|https?://",
+)
+
+
+def test_script_code_has_no_network_capable_command() -> None:
+    """F3: broad denylist over the script's non-comment text."""
+    hits = _NETWORK_TOKENS.findall(_strip_comments(SCRIPT.read_text()))
+    assert not hits, hits
+
+
+def test_script_runs_with_only_an_allowlist_of_commands(tmp_path: Path) -> None:
+    """F3: the script succeeds with ONLY dirname/sha256sum/awk reachable on PATH
+    (bash itself is invoked by absolute path), so it cannot shell out to a
+    network tool; and, where the kernel allows it, also inside an empty
+    network namespace. No skip: the namespace leg is simply additional."""
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    for tool in ("dirname", "sha256sum", "awk"):
+        found = shutil.which(tool)
+        assert found, tool
+        (shims / tool).symlink_to(found)
+    bash = shutil.which("bash")
+    assert bash
+    env = hermetic_env(PATH=str(shims), GH_TOKEN="", GITHUB_TOKEN="")
+    res = subprocess.run(
+        [bash, str(SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert res.returncode == 0, res.stderr
+    unshare = shutil.which("unshare")
+    if unshare:
+        probe = subprocess.run(
+            [unshare, "-rn", "true"], capture_output=True, check=False, timeout=60
+        )
+        if probe.returncode == 0:
+            netns = subprocess.run(
+                [unshare, "-rn", bash, str(SCRIPT)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+            assert netns.returncode == 0, netns.stderr

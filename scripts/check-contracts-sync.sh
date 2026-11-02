@@ -25,7 +25,10 @@
 #   1  MISMATCH: vendored file differs from the pin
 #   2  vendored file missing
 #   3  pin file missing
-#   4  pin file malformed (unknown/duplicate/missing key, bad format)
+#   4  pin file malformed (unknown/duplicate/missing key, bad format);
+#      a key counts as duplicated even when its first value was empty
+#   5  vendored file or pin file is a symlink (git would publish the link
+#      text, not the contract: refused for both)
 #
 # Portability: CONTRACTS_SYNC_ROOT overrides the repo root (default: the
 # repository containing this script); used by the tests to drive fixtures.
@@ -41,6 +44,14 @@ REPO_ROOT="${CONTRACTS_SYNC_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pw
 LOCAL_FILE="${REPO_ROOT}/${VENDORED_PATH}"
 PIN_FILE="${REPO_ROOT}/${PIN_PATH}"
 
+if [ -L "${LOCAL_FILE}" ]; then
+    echo "✗ vendored copy is a symlink (refused): ${LOCAL_FILE}" >&2
+    exit 5
+fi
+if [ -L "${PIN_FILE}" ]; then
+    echo "✗ pin file is a symlink (refused): ${PIN_FILE}" >&2
+    exit 5
+fi
 if [ ! -f "${LOCAL_FILE}" ]; then
     echo "✗ vendored copy missing: ${LOCAL_FILE}" >&2
     exit 2
@@ -54,25 +65,26 @@ fi
 # Parse the pin as DATA (never sourced). Accepted lines: blank, '#' comment,
 # or exactly one of repo=, commit=, sha256= (each once).
 PIN_REPO="" PIN_COMMIT="" PIN_SHA=""
+SEEN_REPO=0 SEEN_COMMIT=0 SEEN_SHA=0   # "seen" is a flag, never value emptiness
 while IFS= read -r line || [ -n "${line}" ]; do
     case "${line}" in
         "" | "#"*) continue ;;
         repo=*)
-            [ -z "${PIN_REPO}" ] || { echo "✗ pin malformed: duplicate repo" >&2; exit 4; }
-            PIN_REPO="${line#repo=}" ;;
+            [ "${SEEN_REPO}" -eq 0 ] || { echo "✗ pin malformed: duplicate repo" >&2; exit 4; }
+            SEEN_REPO=1; PIN_REPO="${line#repo=}" ;;
         commit=*)
-            [ -z "${PIN_COMMIT}" ] || { echo "✗ pin malformed: duplicate commit" >&2; exit 4; }
-            PIN_COMMIT="${line#commit=}" ;;
+            [ "${SEEN_COMMIT}" -eq 0 ] || { echo "✗ pin malformed: duplicate commit" >&2; exit 4; }
+            SEEN_COMMIT=1; PIN_COMMIT="${line#commit=}" ;;
         sha256=*)
-            [ -z "${PIN_SHA}" ] || { echo "✗ pin malformed: duplicate sha256" >&2; exit 4; }
-            PIN_SHA="${line#sha256=}" ;;
+            [ "${SEEN_SHA}" -eq 0 ] || { echo "✗ pin malformed: duplicate sha256" >&2; exit 4; }
+            SEEN_SHA=1; PIN_SHA="${line#sha256=}" ;;
         *)
             echo "✗ pin malformed: unrecognised line in ${PIN_FILE}" >&2
             exit 4 ;;
     esac
 done <"${PIN_FILE}"
 
-if ! [[ "${PIN_REPO}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+if ! [[ "${PIN_REPO}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
     echo "✗ pin malformed: repo must be <owner>/<name>" >&2
     exit 4
 fi
