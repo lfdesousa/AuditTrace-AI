@@ -9,6 +9,9 @@ request (manifest materialise, to_dict, dedupe, group, sort) ran as ONE
 non-yielding loop step, so the watchdog gap scaled with CPU speed and row
 count (3000 rows: ~0.41s with coverage; 100 rows: ~0.14s). Each guard below
 fails when its ``asyncio.to_thread`` is removed (see the neuter notes).
+The REAL ``MemoryManifestService`` (production class) is guarded in
+``test_services_memory_manifest.py::TestListForLayerOffLoopPostgres``; the
+route is compared against the pre-change implementation below (r2 F4).
 """
 
 from __future__ import annotations
@@ -21,6 +24,10 @@ import pytest
 from audittrace.db import rls
 from audittrace.db.models import MemoryItem
 from audittrace.identity import UserContext
+from audittrace.routes.memory_semantic_documents import (
+    dedupe_semantic_chunks,
+    group_semantic_chunks_by_document,
+)
 from audittrace.services import memory_manifest as mm
 from audittrace.services.memory_manifest import MockMemoryManifestService
 
@@ -30,7 +37,7 @@ def _row(i: int, *, owner: str, tier: str, deleted: bool = False) -> dict:
         "id": f"id-{i:04d}",
         "layer": "semantic",
         "key": f"decisions/doc-{i:04d}",
-        "title": f"t{i}",
+        "title": f"t{i // 3}",  # three chunks share a title: grouping matters
         "size_bytes": 10,
         "created_at_ms": 1000 + i,
         "modified_at_ms": 1000 + (i * 7) % 13,  # non-monotonic: sort matters
@@ -146,28 +153,94 @@ def test_rows_to_entries_filters_and_materialises():
     assert [e.id for e in mm._rows_to_entries(rows, None)] == ["r0", "r1", "r2"]
 
 
-@pytest.mark.asyncio
-async def test_list_semantic_cpu_work_runs_off_loop_with_identical_response(
-    monkeypatch,
-):
-    """Through the real route (ASGI transport): every extracted CPU unit
-    executes on a worker thread, not the loop thread, and the response is
-    byte-identical to the pre-offload shape (items/total/limit/offset/
-    granularity/total_documents/total_chunks). NEUTER: inline any
-    ``asyncio.to_thread`` in ``list_semantic``/``_merge_semantic_with_chroma``
-    -> that unit's thread id equals the loop thread -> RED."""
-    import httpx
+def _user(uid, scopes=(), admin=False) -> UserContext:
+    return UserContext(
+        user_id=uid, username=uid, agent_type="t", scopes=list(scopes), is_admin=admin
+    )
 
+
+async def _app_with_seeded_manifest():
     from audittrace import dependencies
-    from audittrace.routes import memory as routes_memory
     from audittrace.server import create_app
 
     test_container = dependencies.create_test_container()
     manifest = _seeded()
     test_container._instances["memory_manifest"] = manifest
     dependencies.container = test_container
-    app = create_app()
+    chroma = dependencies.get_chromadb()
+    col = await chroma.get_or_create_collection(
+        name="decisions_v2", embedding_function=None
+    )
+    # Discovered-only rows (some overlapping the manifest chunk ids).
+    await col.add(
+        ids=[f"doc-{i:04d}" for i in range(0, 60, 5)],
+        documents=["x"] * 12,
+        metadatas=[
+            {"tier": ("corpus" if i % 2 else "private"), "user_id": "alice"}
+            for i in range(12)
+        ],
+    )
+    return create_app(), manifest
 
+
+async def _legacy_response(
+    manifest,
+    user,
+    *,
+    collection,
+    include_deleted,
+    granularity,
+    sort,
+    order,
+    limit,
+    offset,
+):
+    """The PRE-CHANGE ``list_semantic`` pipeline, inline and synchronous
+    (f708042): old inline ``list_for_layer`` filter, old inline prefix filter,
+    then the old inline corpus-gate / dedupe / group / sort / paginate tail.
+    Only ``_merge_semantic_with_chroma`` (whose two changed lines are
+    trivially equal) is the live function."""
+    from audittrace.routes import memory as rm
+
+    entries = _reference(manifest, include_deleted=include_deleted, caller=user)
+    if collection is not None:
+        prefix = f"{collection}/"
+        entries = [e for e in entries if e.key.startswith(prefix)]
+    items = await rm._merge_semantic_with_chroma(entries, collection, user)
+    items = rm._filter_corpus_read_gate(items, user)
+    chunk_items = dedupe_semantic_chunks(items)
+    total_chunks = len(chunk_items)
+    if granularity == "chunk":
+        view_items = chunk_items
+        total_documents = len(group_semantic_chunks_by_document(chunk_items))
+    else:
+        view_items = group_semantic_chunks_by_document(chunk_items)
+        total_documents = len(view_items)
+    page, total = rm._sort_and_paginate(
+        view_items, sort=sort, order=order, limit=limit, offset=offset
+    )
+    return {
+        "items": page,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "granularity": granularity,
+        "total_documents": total_documents,
+        "total_chunks": total_chunks,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_semantic_cpu_work_runs_off_loop(monkeypatch):
+    """Through the real route (ASGI transport): every extracted CPU unit
+    executes on a worker thread, not the loop thread. NEUTER: inline any
+    ``asyncio.to_thread`` in ``list_semantic``/``_merge_semantic_with_chroma``
+    -> that unit's thread id equals the loop thread -> RED."""
+    import httpx
+
+    from audittrace.routes import memory as routes_memory
+
+    app, _ = await _app_with_seeded_manifest()
     loop_tid = threading.get_ident()
     seen: dict[str, int] = {}
 
@@ -180,12 +253,13 @@ async def test_list_semantic_cpu_work_runs_off_loop_with_identical_response(
 
         monkeypatch.setattr(routes_memory, name, wrapper)
 
-    for name in (
-        "_entries_to_dicts",
-        "_entry_keys",
-        "_entries_with_prefix",
-        "_semantic_list_view",
-    ):
+    names = (
+        "entries_to_dicts",
+        "entry_keys",
+        "entries_with_prefix",
+        "semantic_list_view",
+    )
+    for name in names:
         spy(name)
 
     transport = httpx.ASGITransport(app=app)
@@ -197,23 +271,76 @@ async def test_list_semantic_cpu_work_runs_off_loop_with_identical_response(
         await asyncio.sleep(0)
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert set(body) == {
-        "items",
-        "total",
-        "limit",
-        "offset",
-        "granularity",
-        "total_documents",
-        "total_chunks",
-    }
-    assert body["total"] > 0 and len(body["items"]) == min(25, body["total"])
-    # created_at desc, key-ascending tie-break: strictly the documented order.
-    created = [i["created_at_ms"] for i in body["items"]]
-    assert created == sorted(created, reverse=True)
-    assert set(seen) == {
-        "_entries_to_dicts",
-        "_entry_keys",
-        "_entries_with_prefix",
-        "_semantic_list_view",
-    }
+    assert body["total"] > 0
+    assert set(seen) == set(names)
     assert all(tid != loop_tid for tid in seen.values()), seen
+
+
+@pytest.mark.asyncio
+async def test_list_semantic_byte_identical_to_pre_change_implementation():
+    """F4 (review r1): the route output equals, BYTE FOR BYTE (canonical
+    JSON), the pre-change inline implementation across identities x
+    collection x include_deleted x granularity x sort x order. NEUTER: flip
+    the order, skip the dedupe, drop the gate or give a worker another user
+    -> the bytes differ -> RED."""
+    import itertools
+    import json
+
+    import httpx
+
+    from audittrace.auth import require_user
+
+    app, manifest = await _app_with_seeded_manifest()
+    users = {
+        "alice": _user("alice", ("memory:semantic:read",)),
+        "alice_corpus": _user(
+            "alice", ("memory:semantic:read", "memory:corpus:decisions:read")
+        ),
+        "bob": _user("bob", ("memory:semantic:read",)),
+        "stranger": _user("zed", ("memory:semantic:read",)),
+        "admin": _user("root", (), True),
+    }
+    nonempty = 0
+    count = 0
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        for uname, user in users.items():
+            app.dependency_overrides[require_user] = lambda u=user: u
+            grid = itertools.product(
+                [None, "decisions", "nope"],
+                [False, True],
+                ["document", "chunk"],
+                ["created_at", "modified_at", "key", "size"],
+                ["asc", "desc"],
+            )
+            for coll, inc, gran, sort, order in grid:
+                params = {
+                    "include_deleted": str(inc).lower(),
+                    "granularity": gran,
+                    "sort": sort,
+                    "order": order,
+                    "limit": 7,
+                    "offset": 3,
+                }
+                if coll:
+                    params["collection"] = coll
+                resp = await c.get("/memory/semantic", params=params)
+                assert resp.status_code == 200, (uname, params, resp.text)
+                want = await _legacy_response(
+                    manifest,
+                    user,
+                    collection=coll,
+                    include_deleted=inc,
+                    granularity=gran,
+                    sort=sort,
+                    order=order,
+                    limit=7,
+                    offset=3,
+                )
+                canon = lambda o: json.dumps(o, sort_keys=True).encode()  # noqa: E731
+                assert canon(resp.json()) == canon(want), (uname, params)
+                count += 1
+                nonempty += bool(want["items"])
+    app.dependency_overrides.clear()
+    assert count == 5 * 3 * 2 * 2 * 4 * 2
+    assert nonempty > count // 3  # the comparison is not vacuously all-empty

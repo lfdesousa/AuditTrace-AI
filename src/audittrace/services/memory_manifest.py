@@ -667,13 +667,17 @@ class MemoryManifestService:
                 .scalars()
                 .all()
             )
-            # GP4-CI (2026-11-02): O(rows) pure-Python materialisation +
-            # owner-or-corpus filter. Run off the event loop so a large
-            # manifest cannot starve /health (PYTHON-ENGINEERING §3);
-            # ``asyncio.to_thread`` copies the ContextVars (identity / trace)
-            # into the worker. ``rows`` are already-loaded ORM objects, so
-            # the thread performs no I/O and no lazy loads.
-            return await asyncio.to_thread(_rows_to_entries, rows, caller)
+        # GP4-CI (2026-11-02): O(rows) pure-Python materialisation +
+        # owner-or-corpus filter, run off the event loop so a large manifest
+        # cannot starve /health (PYTHON-ENGINEERING section 3). The hop is
+        # AFTER the session closed: the pooled connection is returned before
+        # we wait for a default-executor worker. The detached rows are safe
+        # to read: ``expire_on_commit=False``, nothing committed, and
+        # ``MemoryItem`` has only loaded column attributes (no deferred
+        # columns, no relationships), so the worker does no I/O and no lazy
+        # load. ``asyncio.to_thread`` copies the ContextVars (identity /
+        # trace) into the worker.
+        return await asyncio.to_thread(_rows_to_entries, rows, caller)
 
     @log_call(logger=logger)
     async def upsert_pdf_metadata(
