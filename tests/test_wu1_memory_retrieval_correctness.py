@@ -38,6 +38,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from audittrace.routes import memory as m
+from audittrace.routes import memory_list_view as list_view
 from audittrace.routes.memory import _chunk_text
 
 
@@ -347,7 +348,11 @@ class TestDocumentCountDedup:
         assert r_before.json()["total_documents"] == 2
 
         # NEUTER: grouping becomes a no-op passthrough (the pre-fix shape).
-        monkeypatch.setattr(m, "group_semantic_chunks_by_document", lambda items: items)
+        # (GP4-CI r2: the tail of list_semantic moved to ``memory_list_view``,
+        # so the patch target is where ``semantic_list_view`` looks it up.)
+        monkeypatch.setattr(
+            list_view, "group_semantic_chunks_by_document", lambda items: items
+        )
 
         r_neutered = client.get("/memory/semantic?collection=decisions")
         assert r_neutered.status_code == 200, r_neutered.text
