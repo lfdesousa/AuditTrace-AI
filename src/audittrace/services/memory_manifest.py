@@ -19,11 +19,11 @@ import asyncio
 import logging
 import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import Row, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.db.models import MemoryItem
@@ -164,7 +164,7 @@ class ManifestEntry:
     tier: str = "corpus"
 
     @classmethod
-    def from_row(cls, row: MemoryItem) -> ManifestEntry:
+    def from_row(cls, row: MemoryItem | Row[Any]) -> ManifestEntry:
         return cls(
             id=row.id,
             layer=row.layer,
@@ -381,6 +381,12 @@ class IndexStatusSummary:
     pending: int
     dead_lettered: int
     matched: list[MatchedUnindexed]
+
+
+# The manifest columns ``list_for_layer`` selects: exactly the
+# ``ManifestEntry`` fields, so the query returns plain ``Row`` tuples and no
+# session-bound ORM instance (#364: nothing may outlive its session).
+_MANIFEST_COLUMNS = tuple(getattr(MemoryItem, f.name) for f in fields(ManifestEntry))
 
 
 def _rows_to_entries(
@@ -659,24 +665,21 @@ class MemoryManifestService:
         this column existed)."""
         _validate_layer(layer)
         async with self._session_factory() as session:
-            q = select(MemoryItem).filter_by(layer=layer)
+            q = select(*_MANIFEST_COLUMNS).where(MemoryItem.layer == layer)
             if not include_deleted:
-                q = q.filter(MemoryItem.deleted_at_ms.is_(None))
+                q = q.where(MemoryItem.deleted_at_ms.is_(None))
             rows = (
-                (await session.execute(q.order_by(MemoryItem.modified_at_ms.desc())))
-                .scalars()
-                .all()
-            )
+                await session.execute(q.order_by(MemoryItem.modified_at_ms.desc()))
+            ).all()
         # GP4-CI (2026-11-02): O(rows) pure-Python materialisation +
         # owner-or-corpus filter, run off the event loop so a large manifest
         # cannot starve /health (PYTHON-ENGINEERING section 3). The hop is
         # AFTER the session closed: the pooled connection is returned before
-        # we wait for a default-executor worker. The detached rows are safe
-        # to read: ``expire_on_commit=False``, nothing committed, and
-        # ``MemoryItem`` has only loaded column attributes (no deferred
-        # columns, no relationships), so the worker does no I/O and no lazy
-        # load. ``asyncio.to_thread`` copies the ContextVars (identity /
-        # trace) into the worker.
+        # we wait for a default-executor worker. ``rows`` are plain ``Row``
+        # tuples of column values (NOT session-bound ORM instances, which the
+        # #364 session-scope guard forbids reading after the block), so the
+        # worker does no I/O and no lazy load. ``asyncio.to_thread`` copies
+        # the ContextVars (identity / trace) into the worker.
         return await asyncio.to_thread(_rows_to_entries, rows, caller)
 
     @log_call(logger=logger)
