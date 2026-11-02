@@ -15,6 +15,7 @@ timestamp column (``created_at_ms`` / ``modified_at_ms`` /
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Iterable, Sequence
@@ -382,6 +383,22 @@ class IndexStatusSummary:
     matched: list[MatchedUnindexed]
 
 
+def _rows_to_entries(
+    rows: Sequence[Any], caller: UserContext | None
+) -> list[ManifestEntry]:
+    """Materialise ``rows`` into ``ManifestEntry`` and apply the ADR-062
+    owner-or-corpus predicate. Pure CPU, no I/O: safe to run in a worker
+    thread. ``caller=None`` or an admin caller is UNFILTERED."""
+    entries = [ManifestEntry.from_row(r) for r in rows]
+    if caller is not None and not caller.is_admin:
+        entries = [
+            e
+            for e in entries
+            if e.created_by_user_id == caller.user_id or e.tier == "corpus"
+        ]
+    return entries
+
+
 class MemoryManifestService:
     """Postgres-backed manifest of operator-managed memory items.
 
@@ -650,14 +667,13 @@ class MemoryManifestService:
                 .scalars()
                 .all()
             )
-            entries = [ManifestEntry.from_row(r) for r in rows]
-            if caller is not None and not caller.is_admin:
-                entries = [
-                    e
-                    for e in entries
-                    if e.created_by_user_id == caller.user_id or e.tier == "corpus"
-                ]
-            return entries
+            # GP4-CI (2026-11-02): O(rows) pure-Python materialisation +
+            # owner-or-corpus filter. Run off the event loop so a large
+            # manifest cannot starve /health (PYTHON-ENGINEERING §3);
+            # ``asyncio.to_thread`` copies the ContextVars (identity / trace)
+            # into the worker. ``rows`` are already-loaded ORM objects, so
+            # the thread performs no I/O and no lazy loads.
+            return await asyncio.to_thread(_rows_to_entries, rows, caller)
 
     @log_call(logger=logger)
     async def upsert_pdf_metadata(
@@ -1124,6 +1140,14 @@ class MockMemoryManifestService(MemoryManifestService):
         v1.29.3; only a real-route test through the real decorator can
         catch a regression here."""
         _validate_layer(layer)
+        # GP4-CI: same off-loop CPU discipline as the Postgres class.
+        return await asyncio.to_thread(
+            self._list_entries_sync, layer, include_deleted, caller
+        )
+
+    def _list_entries_sync(
+        self, layer: str, include_deleted: bool, caller: UserContext | None
+    ) -> list[ManifestEntry]:
         rows = [row for (row_layer, _), row in self._rows.items() if row_layer == layer]
         if not include_deleted:
             rows = [r for r in rows if r.get("deleted_at_ms") is None]

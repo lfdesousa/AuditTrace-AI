@@ -29,6 +29,7 @@ content itself lives in S3 (episodic/procedural) or ChromaDB
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import logging
 import time
@@ -2513,6 +2514,52 @@ async def _discover_rows_for_caller(
     return ids, docs, metas
 
 
+def _entries_to_dicts(entries: list[ManifestEntry]) -> list[dict[str, Any]]:
+    """``[e.to_dict() ...]`` as a pure-CPU, I/O-free unit for ``asyncio.to_thread``."""
+    return [e.to_dict() for e in entries]
+
+
+def _entries_with_prefix(
+    entries: list[ManifestEntry], prefix: str
+) -> list[ManifestEntry]:
+    """Collection-prefix filter, a pure-CPU unit for ``asyncio.to_thread``."""
+    return [e for e in entries if e.key.startswith(prefix)]
+
+
+def _entry_keys(entries: list[ManifestEntry]) -> set[str]:
+    """The dedup key set, a pure-CPU unit for ``asyncio.to_thread``."""
+    return {e.key for e in entries}
+
+
+def _semantic_list_view(
+    items: list[dict[str, Any]],
+    user: UserContext,
+    *,
+    granularity: str,
+    sort: str,
+    order: str,
+    limit: int,
+    offset: int,
+) -> tuple[list[dict[str, Any]], int, int, int]:
+    """The pure-CPU tail of ``list_semantic`` (corpus gate, dedupe, group,
+    sort, paginate) returning ``(page, total, total_documents, total_chunks)``.
+    No I/O and no awaits, so the route runs it via ``asyncio.to_thread`` and
+    a large manifest cannot hold the event loop (GP4-CI)."""
+    items = _filter_corpus_read_gate(items, user)
+    chunk_items = dedupe_semantic_chunks(items)
+    total_chunks = len(chunk_items)
+    if granularity == "chunk":
+        view_items = chunk_items
+        total_documents = len(group_semantic_chunks_by_document(chunk_items))
+    else:
+        view_items = group_semantic_chunks_by_document(chunk_items)
+        total_documents = len(view_items)
+    page, total = _sort_and_paginate(
+        view_items, sort=sort, order=order, limit=limit, offset=offset
+    )
+    return page, total, total_documents, total_chunks
+
+
 async def _merge_semantic_with_chroma(
     visible_entries: list[ManifestEntry],
     collection: str | None,
@@ -2551,13 +2598,16 @@ async def _merge_semantic_with_chroma(
     still can't leak through as a "discovered" row for someone else's
     private vector).
     """
-    items: list[dict[str, Any]] = [e.to_dict() for e in visible_entries]
+    # GP4-CI: O(rows) pure-Python work is kept off the event loop.
+    items: list[dict[str, Any]] = await asyncio.to_thread(
+        _entries_to_dicts, visible_entries
+    )
 
     manifest = get_memory_manifest_service()
     all_known: list[ManifestEntry] = await manifest.list_for_layer(
         "semantic", include_deleted=True, caller=user
     )
-    known_keys = {e.key for e in all_known}
+    known_keys = await asyncio.to_thread(_entry_keys, all_known)
 
     chroma = get_chromadb()
     # Discovery target collections: filter param if given, else all
@@ -2764,19 +2814,19 @@ async def list_semantic(
     )
     if collection is not None:
         prefix = f"{collection}/"
-        entries = [e for e in entries if e.key.startswith(prefix)]
+        entries = await asyncio.to_thread(_entries_with_prefix, entries, prefix)
     items = await _merge_semantic_with_chroma(entries, collection, user)
-    items = _filter_corpus_read_gate(items, user)
-    chunk_items = dedupe_semantic_chunks(items)
-    total_chunks = len(chunk_items)
-    if granularity == "chunk":
-        view_items = chunk_items
-        total_documents = len(group_semantic_chunks_by_document(chunk_items))
-    else:
-        view_items = group_semantic_chunks_by_document(chunk_items)
-        total_documents = len(view_items)
-    page, total = _sort_and_paginate(
-        view_items, sort=sort, order=order, limit=limit, offset=offset
+    page, total, total_documents, total_chunks = await asyncio.to_thread(
+        functools.partial(
+            _semantic_list_view,
+            items,
+            user,
+            granularity=granularity,
+            sort=sort,
+            order=order,
+            limit=limit,
+            offset=offset,
+        )
     )
     schedule_read_audit(
         background_tasks,
