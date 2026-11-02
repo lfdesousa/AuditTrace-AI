@@ -1,22 +1,22 @@
 name: Contract Sync
 
-# Cross-repo contract drift detector — AT-AI side.
+# Vendored-contract pin check, AT-AI side. No token, no network.
 #
-# AT-AI vendors a copy of audittrace-content-control's canonical
-# contracts/v1.yaml at docs/reference/content-control/contracts/v1.yaml.
-# B5 PR-B12 asserts shape parity at test-run time; this workflow closes
-# the second half — that the vendored file is the CURRENT canonical,
-# not a stale snapshot.
+# AT-AI vendors a copy of audittrace-content-control's contracts/v1.yaml at
+# docs/reference/content-control/contracts/v1.yaml, pinned by the sibling
+# v1.yaml.source (repo, commit, sha256). This job verifies the vendored file
+# still equals its pin, so an accidental edit fails here and re-vendoring is
+# a deliberate act (file AND pin).
 #
-# cc-repo is private, so the cross-repo raw fetch needs a token. The
-# operator must add a repo secret named ``CONTRACT_SYNC_TOKEN`` with
-# at least ``repo:contents:read`` scope on lfdesousa/audittrace-content-control
-# before either job can succeed. Until then the workflow fails loudly
-# (silent skip would mask the gap).
+# The content-control repo is private, so this public repo never fetches it.
+# The DRIFT detector (canonical vs vendored) lives on the private side:
+# content-control's own .github/workflows/contract-sync.yml reads this repo's
+# public vendored copy anonymously and diffs it against its canonical.
 #
-# Paired with the symmetric guard in the cc-repo at
-# .github/workflows/contract-sync.yml (cc-side reads its own canonical
-# natively + anonymously reads AT-AI's public vendored copy).
+# Triggers: PR and push to main only. The old daily cron existed to catch
+# upstream drift while AT-AI was idle; with no upstream read it would re-run
+# an identical offline check on an unchanged tree, so it is dropped (the
+# private-side guard owns time-based drift detection).
 
 on:
   pull_request:
@@ -25,11 +25,6 @@ on:
   push:
     branches:
       - main
-  schedule:
-    # Daily at 08:00 UTC catches drift even when AT-AI is otherwise
-    # quiet (e.g. cc lands a contract change while AT-AI is idle for
-    # a week). The per-PR job covers the merge-blocking shape.
-    - cron: "0 8 * * *"
 
 permissions:
   contents: read
@@ -40,7 +35,5 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Diff vendored vs cc canonical
-        env:
-          GH_TOKEN: ${{ secrets.CONTRACT_SYNC_TOKEN }}
+      - name: Verify vendored contract against its pin
         run: ./scripts/check-contracts-sync.sh
