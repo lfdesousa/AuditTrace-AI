@@ -26,7 +26,6 @@ from unittest.mock import AsyncMock
 
 import chromadb
 import pytest
-from chromadb.config import Settings
 
 from audittrace.identity import UserContext
 from audittrace.services.semantic import ChromaSemanticService
@@ -60,9 +59,12 @@ class _AsyncCollection:
 
 class _AsyncClient:
     def __init__(self) -> None:
-        self._real = chromadb.EphemeralClient(
-            settings=Settings(anonymized_telemetry=False)
-        )
+        # The same constructor call as
+        # ``db/factory.py``: chromadb keeps ONE process-wide system per
+        # identifier and refuses a second one with different settings, so any
+        # custom ``Settings`` here would break whichever test constructs the
+        # default client first (found by the full suite, not by this module).
+        self._real = chromadb.EphemeralClient()
         self.cols: dict[str, _AsyncCollection] = {}
 
     async def get_or_create_collection(self, name: str, **_: Any) -> _AsyncCollection:
