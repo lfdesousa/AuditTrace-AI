@@ -232,6 +232,8 @@ class TestSemanticNomic:
             AsyncMock(return_value=[[0.9, 0.8]]),
         )
         collection = AsyncMock()
+        # LC-9 ADDENDUM-5 D1: a private upsert first reads its target id
+        collection.get = AsyncMock(return_value={"ids": [], "metadatas": []})
         client = AsyncMock()
         client.get_or_create_collection = AsyncMock(return_value=collection)
 
