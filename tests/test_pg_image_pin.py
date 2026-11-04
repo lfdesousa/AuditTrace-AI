@@ -444,6 +444,17 @@ def test_makefile_resolves_the_pin_with_a_stripped_path(tmp_path: Path) -> None:
         ("../postgres:16", ["postgres:16"]),
         ("docker://postgres://postgres:16", []),  # prefix ends in a postgres DSN
         ("xpostgresql+://postgres:16", ["postgres:16"]),  # empty driver is not one
+        # r8: the DSN prefix must END the text before the match ("immediately"):
+        # a DSN earlier in the window never excuses a later reference
+        ("postgres:// postgres:16", ["postgres:16"]),
+        ("postgres://\npostgres:16", ["postgres:16"]),
+        ("postgresql://u:p@db/x docker://postgres:16", ["postgres:16"]),
+        (
+            "environment:\n"
+            "  DATABASE_URL: postgresql+asyncpg://app:pw@db:5432/audit\n"
+            "  image: postgres:16",
+            ["postgres:16"],
+        ),
         # the pin in any canonical spelling is fine
         ("docker.io/library/" + PG_TEST_IMAGE, []),
         ("library/" + PG_TEST_IMAGE, []),
