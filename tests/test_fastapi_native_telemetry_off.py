@@ -26,6 +26,7 @@ Neuters (each run INDIVIDUALLY, RED recorded in the build record):
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib.metadata
 import re
 import shutil
@@ -133,9 +134,39 @@ def test_ac_1_1_stub_lock_is_constrained_by_the_server_lock() -> None:
 # --------------------------------------------------------------------------
 # AC-1.2  static guard: every FastAPI( carries the five-key all-False config
 # --------------------------------------------------------------------------
-def _is_fastapi_ctor(node: ast.Call) -> bool:
+_FASTAPI_MODULES = frozenset({"fastapi", "fastapi.applications"})
+
+
+def _fastapi_names(tree: ast.AST) -> set[str]:
+    """Local names bound to the FastAPI class in this module (alias-resolving).
+
+    ``from fastapi import FastAPI as _F`` and ``_F = FastAPI`` both count; the
+    attribute form (``fastapi.FastAPI(...)``, ``fa.FastAPI(...)``) is matched on
+    the attribute name in :func:`_is_fastapi_ctor`.
+    """
+    names = {"FastAPI"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in _FASTAPI_MODULES:
+            names.update(a.asname or a.name for a in node.names if a.name == "FastAPI")
+    changed = True
+    while changed:  # `_F = FastAPI` chains
+        changed = False
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in names
+            ):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id not in names:
+                        names.add(t.id)
+                        changed = True
+    return names
+
+
+def _is_fastapi_ctor(node: ast.Call, names: set[str] | None = None) -> bool:
     f = node.func
-    return (isinstance(f, ast.Name) and f.id == "FastAPI") or (
+    return (isinstance(f, ast.Name) and f.id in (names or {"FastAPI"})) or (
         isinstance(f, ast.Attribute) and f.attr == "FastAPI"
     )
 
@@ -154,10 +185,11 @@ def find_fastapi_constructions(
             if "tests" in rel_parts or ".venv" in rel_parts:
                 continue
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            names = _fastapi_names(tree)
             found.extend(
                 (path, n)
                 for n in ast.walk(tree)
-                if isinstance(n, ast.Call) and _is_fastapi_ctor(n)
+                if isinstance(n, ast.Call) and _is_fastapi_ctor(n, names)
             )
     return found
 
@@ -248,6 +280,14 @@ def test_guard_accepts_a_clean_synthetic_tree(tmp_path: Path) -> None:
             "not a dict literal",
         ),
         (
+            "from fastapi import FastAPI as _F\napp = _F()\n",
+            "no telemetry= keyword",
+        ),
+        (
+            "from fastapi.applications import FastAPI as G\nH = G\napp = H()\n",
+            "no telemetry= keyword",
+        ),
+        (
             "from fastapi import FastAPI\nB = {}\napp = FastAPI(telemetry={**B})\n",
             "non-literal key",
         ),
@@ -291,7 +331,7 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
 
     The OTel global provider is set-once per process, so the lookup function
     both layers call at request time is patched instead. The global textmap is
-    saved/restored and started from the vulnerable default so ``create_app()``
+    saved/restored and started from the SDK default composite propagator so ``create_app()``
     is the thing that installs the TRACEPARENT-TRUST policy (N-1.4 observable).
     """
     exporter = InMemorySpanExporter()
@@ -339,8 +379,8 @@ def _probe_app(
 
 def _request(app: FastAPI) -> None:
     # No ``with``: the lifespan (ChromaDB, Postgres, ...) is not under test here.
-    client = TestClient(app)
-    resp = client.get("/__wp1/probe", headers={"traceparent": INBOUND_TRACEPARENT})
+    with contextlib.closing(TestClient(app)) as client:
+        resp = client.get("/__wp1/probe", headers={"traceparent": INBOUND_TRACEPARENT})
     assert resp.status_code == 200
 
 
@@ -464,15 +504,11 @@ _HELM_BASE = (
     ids=["external-llm", "llm-stub"],
 )
 def test_ac_1_5_switch_absent_from_rendered_manifests(extra: tuple[str, ...]) -> None:
-    """``helm template`` (memory-server, BFF-side values and the llm-stub).
-
-    Not a skip: without helm the static scan above is the whole check, and this
-    test says so by asserting the sources it scanned.
-    """
+    """``helm template`` (memory-server, BFF-side values and the llm-stub)."""
     helm = shutil.which("helm")
-    if helm is None:
-        assert list(_tracked_text_files()), "static scan covered the sources"
-        return
+    assert helm is not None, (
+        "helm is required (the CI `test` job uses the runner image's helm)"
+    )
     out = subprocess.run(
         [
             helm,
