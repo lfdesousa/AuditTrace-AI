@@ -700,3 +700,25 @@ class TestHardDeleteSkipsForeignLegacyRow:
         assert r.status_code == 200, r.text
         assert set(rig.raw()) == {"x"}
         assert rig.get(A, "x").json()["content"] == "A-legacy"
+
+
+# ── B2: RT-11 for the LEGACY promoted shape ────────────────────────────────
+
+
+class TestRt11LegacyPromotedListedOnce:
+    """A pre-LC-9 promoted document (bare manifest row ``decisions/user-a__p.md``
+    + bare chunk ``user-a__p.md``) lists exactly once. Neuter: ``logical_id``
+    strips the owner prefix from the legacy bare id with no check against the
+    manifest -> ``decisions_v2/p.md`` lists beside the manifest row -> RED."""
+
+    def test_legacy_promoted_row_is_listed_once(self, rig: Rig) -> None:
+        rig.seed_legacy(f"{A}__p.md", A, "promoted-legacy")
+        keys = [i["key"] for i in rig.chunk_items(A)]
+        assert [k.rsplit("/", 1)[-1] for k in keys] == [f"{A}__p.md"], keys
+
+    def test_all_three_promoted_shapes_beside_each_other(self, rig: Rig) -> None:
+        rig.seed_legacy(f"{A}__old.md", A)
+        assert rig.create(A, f"{A}__new.md", "new-form promoted").status_code == 200
+        assert rig.create(A, "plain", "plain").status_code == 200
+        ids = sorted(i["key"].rsplit("/", 1)[-1] for i in rig.chunk_items(A))
+        assert ids == sorted([f"{A}__old.md", f"{A}__new.md", "plain"])

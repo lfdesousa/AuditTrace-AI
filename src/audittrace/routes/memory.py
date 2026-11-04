@@ -2670,6 +2670,15 @@ async def _merge_semantic_with_chroma(
             # dedups against its own manifest row (one item per document).
             owner = meta.get("user_id") if meta.get("tier") == "private" else None
             key = _semantic_key(col_name, logical_id(doc_id, owner))
+            # A pre-LC-9 PROMOTED chunk has the bare id ``{owner}__{file}`` and
+            # a bare manifest row ``{collection}/{owner}__{file}``: the id's
+            # prefix is part of its LOGICAL id there, so when the manifest
+            # knows that exact bare key the row keeps its id as is (it would
+            # otherwise list twice, as ``{file}`` and as ``{owner}__{file}``).
+            if owner and _semantic_key(col_name.removesuffix("_v2"), doc_id) in (
+                known_keys
+            ):
+                key = _semantic_key(col_name, doc_id)
             if key in known_keys:
                 continue
             content = docs[i] if i < len(docs) else ""
