@@ -32,7 +32,6 @@ import contextlib
 import hashlib
 import logging
 import time
-from collections.abc import Callable
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -83,13 +82,16 @@ from audittrace.models import (
 # working unchanged.
 from audittrace.routes import memory_pdf as _pdf  # noqa: E402
 from audittrace.routes import memory_scan as _scan  # noqa: E402
+from audittrace.routes.memory_list_view import (
+    entries_to_dicts,
+    entries_with_prefix,
+    entry_keys,
+    semantic_list_view,
+)
+from audittrace.routes.memory_list_view import sort_and_paginate as _sort_and_paginate
 from audittrace.routes.memory_md_manifest import _flush_md_manifest
 from audittrace.routes.memory_promote import (
     promote_session_to_durable as _promote_session_to_durable,
-)
-from audittrace.routes.memory_semantic_documents import (
-    dedupe_semantic_chunks,
-    group_semantic_chunks_by_document,
 )
 from audittrace.routes.memory_semantic_writes import (
     concurrent_write_409,
@@ -116,7 +118,6 @@ from audittrace.services.memory_manifest import (
     ManifestEntry,
     authorize_write,
 )
-from audittrace.services.pagination import sort_and_paginate as _core_sort_and_paginate
 from audittrace.services.procedural import ProceduralService
 from audittrace.services.recall_telemetry import (
     classify_recall_source_from_request,
@@ -1814,58 +1815,6 @@ _LIST_MAX_LIMIT = 500
 ListSort = Literal["created_at", "modified_at", "key", "size"]
 ListOrder = Literal["asc", "desc"]
 
-_SORT_FIELD_MS = {"created_at": "created_at_ms", "modified_at": "modified_at_ms"}
-
-
-def _sort_and_paginate(
-    items: list[dict[str, Any]],
-    *,
-    sort: str,
-    order: str,
-    limit: int,
-    offset: int,
-) -> tuple[list[dict[str, Any]], int]:
-    """Return ``(page, total)`` — a total-order-safe sorted, paginated slice.
-
-    ``total`` is the full pre-limit count so a client can page. Sorting is
-    total-order safe: timestamp/size keys coalesce ``None`` → ``0`` and the
-    ``key`` sort coalesces to ``""``, so no comparison ever touches ``None``
-    (backlog #15, R5). Ties break on the object ``key`` ascending regardless
-    of ``order`` (stable secondary sort) so paging is deterministic.
-
-    The sort/slice mechanic itself is the shared
-    :func:`audittrace.services.pagination.sort_and_paginate` core (backlog
-    #15 R2b / #375) — only the field-name-to-key-function mapping below is
-    specific to this endpoint's manifest-row shape.
-    """
-
-    def _int_key(field: str) -> Callable[[dict[str, Any]], Any]:
-        def key(item: dict[str, Any]) -> Any:
-            value = item.get(field)
-            return value if isinstance(value, int) else 0
-
-        return key
-
-    def _str_key(item: dict[str, Any]) -> Any:
-        return str(item.get("key") or "")
-
-    primary: Callable[[dict[str, Any]], Any]
-    if sort == "key":
-        primary = _str_key
-    elif sort == "size":
-        primary = _int_key("size_bytes")
-    else:
-        primary = _int_key(_SORT_FIELD_MS.get(sort, "created_at_ms"))
-
-    return _core_sort_and_paginate(
-        items,
-        key_fn=primary,
-        tiebreak_fn=_str_key,
-        reverse=(order != "asc"),
-        limit=limit,
-        offset=offset,
-    )
-
 
 async def _merge_layer_items_with_s3(
     layer: str,
@@ -2654,13 +2603,15 @@ async def _merge_semantic_with_chroma(
     still can't leak through as a "discovered" row for someone else's
     private vector).
     """
-    items: list[dict[str, Any]] = [e.to_dict() for e in visible_entries]
+    items: list[dict[str, Any]] = await asyncio.to_thread(
+        entries_to_dicts, visible_entries
+    )
 
     manifest = get_memory_manifest_service()
     all_known: list[ManifestEntry] = await manifest.list_for_layer(
         "semantic", include_deleted=True, caller=user
     )
-    known_keys = {e.key for e in all_known}
+    known_keys = await asyncio.to_thread(entry_keys, all_known)
 
     chroma = get_chromadb()
     # Discovery target collections: filter param if given, else all
@@ -2867,19 +2818,18 @@ async def list_semantic(
     )
     if collection is not None:
         prefix = f"{collection}/"
-        entries = [e for e in entries if e.key.startswith(prefix)]
+        entries = await asyncio.to_thread(entries_with_prefix, entries, prefix)
     items = await _merge_semantic_with_chroma(entries, collection, user)
-    items = _filter_corpus_read_gate(items, user)
-    chunk_items = dedupe_semantic_chunks(items)
-    total_chunks = len(chunk_items)
-    if granularity == "chunk":
-        view_items = chunk_items
-        total_documents = len(group_semantic_chunks_by_document(chunk_items))
-    else:
-        view_items = group_semantic_chunks_by_document(chunk_items)
-        total_documents = len(view_items)
-    page, total = _sort_and_paginate(
-        view_items, sort=sort, order=order, limit=limit, offset=offset
+    page, total, total_documents, total_chunks = await asyncio.to_thread(
+        semantic_list_view,
+        items,
+        user,
+        granularity=granularity,
+        sort=sort,
+        order=order,
+        limit=limit,
+        offset=offset,
+        corpus_gate=_filter_corpus_read_gate,
     )
     schedule_read_audit(
         background_tasks,

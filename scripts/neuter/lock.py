@@ -132,7 +132,7 @@ def foreign_docker_build_running(proc_root: Path = Path("/proc")) -> bool:
     ``docker``/``docker-buildx``, and one of ITS OWN subsequent args is
     exactly ``build`` or ``buildx``.
 
-    ``proc_root`` is a test seam (LC-9 gate fix C1): production callers use
+    ``proc_root`` is a test seam: production callers use
     the default ``/proc``; tests point it at a fake tree under ``tmp_path`` so
     every branch is covered deterministically instead of depending on what
     the host's real ``/proc`` happens to contain.

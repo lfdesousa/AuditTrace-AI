@@ -15,15 +15,16 @@ timestamp column (``created_at_ms`` / ``modified_at_ms`` /
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import Row, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -244,10 +245,11 @@ class ManifestEntry:
     storage_key: str = ""
 
     @classmethod
-    def from_row(cls, row: MemoryItem) -> ManifestEntry:
+    def from_row(cls, row: MemoryItem | Row[Any]) -> ManifestEntry:
         """THE single stored -> logical conversion point (LC-9 ADDENDUM-1 C3,
         reader #1); the Mock twin's ``_to_entry`` applies the same
-        :func:`logical_key`."""
+        :func:`logical_key`. *row* is an ORM ``MemoryItem`` or a plain-column
+        ``Row`` from ``list_for_layer`` (``_MANIFEST_COLUMNS``)."""
         return cls(
             id=row.id,
             layer=row.layer,
@@ -490,6 +492,38 @@ class IndexStatusSummary:
     pending: int
     dead_lettered: int
     matched: list[MatchedUnindexed]
+
+
+# ``ManifestEntry`` fields that are NOT ``memory_items`` columns: LC-9's
+# ``storage_key`` is derived by ``from_row`` from the ``key`` column (which
+# ``from_row`` turns into the LOGICAL key). Named explicitly so any other
+# non-column field still fails loudly at import (``getattr`` below).
+_DERIVED_ENTRY_FIELDS = frozenset({"storage_key"})
+
+# The manifest columns ``list_for_layer`` selects: exactly the column-backed
+# ``ManifestEntry`` fields, so the query returns plain ``Row`` tuples and no
+# session-bound ORM instance (#364: nothing may outlive its session).
+_MANIFEST_COLUMNS = tuple(
+    getattr(MemoryItem, f.name)
+    for f in fields(ManifestEntry)
+    if f.name not in _DERIVED_ENTRY_FIELDS
+)
+
+
+def _rows_to_entries(
+    rows: Sequence[Any], caller: UserContext | None
+) -> list[ManifestEntry]:
+    """Materialise ``rows`` into ``ManifestEntry`` and apply the ADR-062
+    owner-or-corpus predicate. Pure CPU, no I/O: safe to run in a worker
+    thread. ``caller=None`` or an admin caller is UNFILTERED."""
+    entries = [ManifestEntry.from_row(r) for r in rows]
+    if caller is not None and not caller.is_admin:
+        entries = [
+            e
+            for e in entries
+            if e.created_by_user_id == caller.user_id or e.tier == "corpus"
+        ]
+    return entries
 
 
 class MemoryManifestService:
@@ -793,22 +827,22 @@ class MemoryManifestService:
         this column existed)."""
         _validate_layer(layer)
         async with self._session_factory() as session:
-            q = select(MemoryItem).filter_by(layer=layer)
+            q = select(*_MANIFEST_COLUMNS).where(MemoryItem.layer == layer)
             if not include_deleted:
-                q = q.filter(MemoryItem.deleted_at_ms.is_(None))
+                q = q.where(MemoryItem.deleted_at_ms.is_(None))
             rows = (
-                (await session.execute(q.order_by(MemoryItem.modified_at_ms.desc())))
-                .scalars()
-                .all()
-            )
-            entries = [ManifestEntry.from_row(r) for r in rows]
-            if caller is not None and not caller.is_admin:
-                entries = [
-                    e
-                    for e in entries
-                    if e.created_by_user_id == caller.user_id or e.tier == "corpus"
-                ]
-            return entries
+                await session.execute(q.order_by(MemoryItem.modified_at_ms.desc()))
+            ).all()
+        # GP4-CI (2026-11-02): O(rows) pure-Python materialisation +
+        # owner-or-corpus filter, run off the event loop so a large manifest
+        # cannot starve /health (PYTHON-ENGINEERING section 3). The hop is
+        # AFTER the session closed: the pooled connection is returned before
+        # we wait for a default-executor worker. ``rows`` are plain ``Row``
+        # tuples of column values (NOT session-bound ORM instances, which the
+        # #364 session-scope guard forbids reading after the block), so the
+        # worker does no I/O and no lazy load. ``asyncio.to_thread`` copies
+        # the ContextVars (identity / trace) into the worker.
+        return await asyncio.to_thread(_rows_to_entries, rows, caller)
 
     @log_call(logger=logger)
     async def upsert_pdf_metadata(
@@ -1355,6 +1389,14 @@ class MockMemoryManifestService(MemoryManifestService):
         v1.29.3; only a real-route test through the real decorator can
         catch a regression here."""
         _validate_layer(layer)
+        # GP4-CI: same off-loop CPU discipline as the Postgres class.
+        return await asyncio.to_thread(
+            self._list_entries_sync, layer, include_deleted, caller
+        )
+
+    def _list_entries_sync(
+        self, layer: str, include_deleted: bool, caller: UserContext | None
+    ) -> list[ManifestEntry]:
         rows = [row for (row_layer, _), row in self._rows.items() if row_layer == layer]
         if not include_deleted:
             rows = [r for r in rows if r.get("deleted_at_ms") is None]
