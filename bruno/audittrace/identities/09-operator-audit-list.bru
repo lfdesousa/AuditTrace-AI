@@ -1,0 +1,35 @@
+meta {
+  name: GET /interactions — operator audit read (paged)
+  type: http
+  seq: 10
+}
+
+get {
+  url: {{baseUrl}}/interactions?limit={{listLimit}}&offset={{listOffset}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  limit: {{listLimit}}
+  offset: {{listOffset}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("envelope shape", function() {
+    expect(res.getBody().interactions).to.be.an("array");
+    expect(res.getBody().total).to.be.a("number");
+  });
+}
+
+docs {
+  Audit rows are read with the operator's `{{accessToken}}` (its default
+  scopes include `audittrace:audit`). Page with listLimit/listOffset.
+}

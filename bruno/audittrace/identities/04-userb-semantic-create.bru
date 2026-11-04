@@ -1,0 +1,39 @@
+meta {
+  name: POST /memory/semantic — user B writes the identity doc
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/memory/semantic
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{tokenUserB}}
+}
+
+body:json {
+  {
+    "collection": "{{exampleCollection}}",
+    "document_id": "{{identityDocId}}",
+    "text": "Identity check written by user B.",
+    "title": "Identity check B"
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("key is <collection>/<doc_id>", function() {
+    expect(res.getBody().key).to.equal(`${bru.getEnvVar("exampleCollection")}/${bru.getEnvVar("identityDocId")}`);
+  });
+}
+
+docs {
+  Identity B (realm user, base memory write scopes). Token comes from
+  `{{tokenUserB}}`, mirrored by `audittrace-login --env-key tokenUserB` run with
+  that user's AUDITTRACE_TOKENS_DIR.
+}

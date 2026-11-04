@@ -1,0 +1,32 @@
+meta {
+  name: GET /memory/semantic/{collection}/{doc_id} — user B reads the shared logical key
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{identityDocId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{tokenUserB}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("content is user B's own text and none of user A's", function() {
+    const content = res.getBody().content;
+    expect(content).to.contain("Identity check written by user B.");
+    expect(content).to.not.contain("written by user A");
+  });
+}
+
+docs {
+  Runs after 04 (user B writes under the same logical key as user A), so one
+  state only: 200, with B's own text and none of A's. A missing or invalid
+  `tokenUserB` answers 401 and fails the status assertion.
+}

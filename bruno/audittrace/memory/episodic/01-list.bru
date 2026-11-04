@@ -5,7 +5,7 @@ meta {
 }
 
 get {
-  url: {{baseUrl}}/memory/episodic?include_deleted=false
+  url: {{baseUrl}}/memory/episodic?include_deleted=false&limit={{listLimit}}&offset={{listOffset}}
   body: none
   auth: bearer
 }
@@ -16,6 +16,8 @@ auth:bearer {
 
 query {
   include_deleted: false
+  limit: {{listLimit}}
+  offset: {{listOffset}}
 }
 
 tests {
@@ -43,4 +45,9 @@ docs {
   feat/webui-memory-tab v1.0.5). Pre-existing MinIO objects appear
   with `discovered: true` and null timestamps. `include_deleted=true`
   also surfaces soft-deleted manifest rows.
+
+  Paging: `listLimit` (default 100, max 500) and `listOffset` (default 0)
+  select the page; `total` is the full pre-limit count. Step
+  `listOffset` by `listLimit` until `offset + len(items) >= total` to
+  enumerate every row.
 }

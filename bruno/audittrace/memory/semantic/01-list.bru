@@ -5,7 +5,7 @@ meta {
 }
 
 get {
-  url: {{baseUrl}}/memory/semantic?include_deleted=false&collection={{exampleCollection}}
+  url: {{baseUrl}}/memory/semantic?include_deleted=false&limit={{listLimit}}&offset={{listOffset}}&collection={{exampleCollection}}
   body: none
   auth: bearer
 }
@@ -16,6 +16,8 @@ auth:bearer {
 
 query {
   include_deleted: false
+  limit: {{listLimit}}
+  offset: {{listOffset}}
   collection: {{exampleCollection}}
 }
 
@@ -41,4 +43,9 @@ docs {
   the `collection` query param is omitted — capped at 5 collections
   × 200 docs per call to keep latency bounded). Discovered entries
   surface from ChromaDB; tracked entries from the manifest.
+
+  Paging: `listLimit` (default 100, max 500) and `listOffset` (default 0)
+  select the page; `total` is the full pre-limit count. Step
+  `listOffset` by `listLimit` until `offset + len(items) >= total` to
+  enumerate every row.
 }
