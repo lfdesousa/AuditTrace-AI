@@ -1491,3 +1491,53 @@ class TestD1409AtEachSite:
         assert r.status_code == 409, r.text
         assert r.json()["detail"] == _conflict_text("semantic", f"{A}__n.md")
         assert _snapshot(rig, f"{A}__{A}__n.md", "semantic") == before
+
+
+# ── Round 3 (review R2-1, V9): the owner-prefixed branch has its own cases ──
+
+
+class TestOwnedRowStampReachable:
+    """A legacy promoted document (bare manifest row ``decisions/user-a__p.md`` +
+    UNSTAMPED chunk ``user-a__p.md``) sits at the physical id that logical ``p.md``
+    would own. It must answer ONLY its own logical id ``user-a__p.md``.
+    Neuter (V7): the owner-prefixed branch of ``_resolve_private`` accepts
+    ``user_id == U`` alone -> logical ``p.md`` is answered by the legacy row."""
+
+    def test_the_short_logical_id_is_404_and_the_promoted_id_reads_back(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_legacy(f"{A}__p.md", A, "PROMOTED-LEGACY")
+        r = rig.get(A, "p.md")
+        assert r.status_code == 404, r.text
+        assert "PROMOTED-LEGACY" not in r.text
+        back = rig.get(A, f"{A}__p.md")
+        assert back.status_code == 200
+        assert back.json()["content"] == "PROMOTED-LEGACY"
+
+    def test_service_level_batched_read_answers_only_the_promoted_id(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_legacy(f"{A}__p.md", A, "PROMOTED-LEGACY")
+        got = asyncio.run(
+            rig.semantic.get_documents(_ctx(A), "decisions", ["p.md", f"{A}__p.md"])
+        )
+        assert got[0] is None
+        assert got[1] is not None and got[1].page_content == "PROMOTED-LEGACY"
+
+
+class TestHardDeleteOwnerRowStamp:
+    """Neuter (V9): the owner-row stamp check in ``delete_document`` accepts
+    ``user_id == U`` alone -> A's hard delete of logical ``p.md`` removes A's
+    legacy promoted chunk ``user-a__p.md`` (a different logical document)."""
+
+    def test_deleting_p_md_never_removes_the_legacy_promoted_chunk(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_legacy(f"{A}__p.md", A, "PROMOTED-LEGACY")
+        before = _snapshot(rig, f"{A}__p.md")
+        assert (
+            asyncio.run(rig.semantic.delete_document(_ctx(A), "decisions", "p.md"))
+            is False
+        )
+        assert _snapshot(rig, f"{A}__p.md") == before
+        assert rig.get(A, f"{A}__p.md").json()["content"] == "PROMOTED-LEGACY"
