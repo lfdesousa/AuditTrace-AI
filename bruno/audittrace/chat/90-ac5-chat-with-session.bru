@@ -1,0 +1,30 @@
+meta {
+  name: AC5 one-off chat with X-Session-Id
+  type: http
+  seq: 90
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+headers {
+  X-Session-Id: {{ac5Sid}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": "AC5 v1.29.5 ownership probe. Reply with a single word: ownership" }
+    ],
+    "stream": false,
+    "max_tokens": 512
+  }
+}

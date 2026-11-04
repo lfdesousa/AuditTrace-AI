@@ -5,7 +5,7 @@ meta {
 }
 
 get {
-  url: {{baseUrl}}/interactions?limit=20
+  url: {{baseUrl}}/interactions?limit={{auditLimit}}&since={{auditSince}}
   body: none
   auth: bearer
 }
@@ -15,7 +15,8 @@ auth:bearer {
 }
 
 query {
-  limit: 20
+  limit: {{auditLimit}}
+  since: {{auditSince}}
 }
 
 tests {
@@ -26,7 +27,7 @@ tests {
     const body = res.getBody();
     expect(body.interactions).to.be.an("array");
     expect(body.total).to.be.a("number");
-    expect(body.limit).to.equal(20);
+    expect(body.limit).to.equal(Number(bru.getEnvVar("auditLimit")));
   });
 }
 
@@ -39,4 +40,8 @@ docs {
 
   Filters: project, user_id, session_id, source, since (ISO ts),
   status (success|failed), limit, offset.
+
+  `limit` and `since` come from the environment (`auditLimit`, default 20;
+  `auditSince`, default the epoch) and are overridable per run:
+  `--env-var auditLimit=5 --env-var auditSince=2026-11-01T00:00:00Z`.
 }
