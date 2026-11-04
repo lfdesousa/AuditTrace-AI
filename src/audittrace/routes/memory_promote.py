@@ -58,11 +58,13 @@ from audittrace.dependencies import (
 )
 from audittrace.identity import UserContext
 from audittrace.routes.memory_semantic_writes import (
+    chroma_id_conflict_409,
     drop_copied_forward_chunk,
     semantic_write_errors_as_http,
 )
 from audittrace.services.memory_audit import emit_memory_audit_event
 from audittrace.services.memory_keys import (
+    ChromaIdConflictError,
     ConcurrentManifestWriteError,
     LogicalKeyTooLongError,
     check_logical,
@@ -408,6 +410,8 @@ async def _promote_to_semantic(
                 extra_metadata,
                 tier="private",
             )
+        except ChromaIdConflictError as exc:
+            raise chroma_id_conflict_409(exc) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         from audittrace.routes.memory import (  # noqa: PLC0415

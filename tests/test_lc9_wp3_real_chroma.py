@@ -94,6 +94,8 @@ async def test_missing_ids_are_omitted_and_the_read_is_one_call(env: Any) -> Non
     for doc in ("c0", "c1"):
         await svc.upsert(_ctx(A), coll, doc, f"text-{doc}", {})
     ids = ["c0", "c1", "c2", "c3"]
+    private = client.cols[f"{coll}_v2"]
+    before = len(private.get_calls)  # the two writes above each pre-checked once
     docs = await svc.get_documents(_ctx(A), coll, ids)
     assert [d.page_content if d else None for d in docs] == [
         "text-c0",
@@ -101,18 +103,18 @@ async def test_missing_ids_are_omitted_and_the_read_is_one_call(env: Any) -> Non
         None,
         None,
     ]
-    private = client.cols[f"{coll}_v2"]
     # 4 logical ids -> 8 physical ids (owner + legacy) in ONE get
-    assert private.get_calls == [8]
+    assert private.get_calls[before:] == [8]
 
 
 async def test_five_hundred_chunk_sequence_is_one_private_get(env: Any) -> None:
     svc, client, coll = env
     await svc.upsert(_ctx(A), coll, "c0", "first", {})
     ids = [f"c{i}" for i in range(500)]
+    before = len(client.cols[f"{coll}_v2"].get_calls)
     docs = await svc.get_documents(_ctx(A), coll, ids)
     assert docs[0] is not None and docs[1] is None
-    assert client.cols[f"{coll}_v2"].get_calls == [1000]
+    assert client.cols[f"{coll}_v2"].get_calls[before:] == [1000]
 
 
 async def test_other_users_legacy_id_is_not_returned(env: Any) -> None:

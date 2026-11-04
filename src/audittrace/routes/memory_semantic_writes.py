@@ -36,6 +36,7 @@ from fastapi import HTTPException
 
 from audittrace.identity import UserContext
 from audittrace.services.memory_keys import (
+    ChromaIdConflictError,
     ConcurrentManifestWriteError,
     LogicalKeyTooLongError,
 )
@@ -46,6 +47,13 @@ logger = logging.getLogger(__name__)
 def concurrent_write_409(exc: ConcurrentManifestWriteError) -> HTTPException:
     """The retryable 409 for a lost ``UNIQUE (layer, key)`` race."""
     return HTTPException(status_code=409, detail=f"{exc}", headers={"Retry-After": "1"})
+
+
+def chroma_id_conflict_409(exc: ChromaIdConflictError) -> HTTPException:
+    """The PERMANENT 409 for a private write onto a ChromaDB id held by a row
+    the caller does not own as a new-form row (ADDENDUM-5 D1). ``str(exc)`` is
+    the one owner-free text; no ``Retry-After`` (a retry cannot converge)."""
+    return HTTPException(status_code=409, detail=str(exc))
 
 
 @contextlib.contextmanager

@@ -63,12 +63,16 @@ def _minio(content: bytes) -> MagicMock:
     return client
 
 
-async def _fold(monkeypatch: pytest.MonkeyPatch, **kw: str) -> list[str]:
+async def _fold_rows(
+    monkeypatch: pytest.MonkeyPatch, **kw: str
+) -> tuple[list[str], list[dict]]:
     monkeypatch.setattr(
         "audittrace.routes.memory.embed_via_nomic",
         AsyncMock(side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]),
     )
     collection = AsyncMock()
+    # the D1 pre-check reads the target ids: nothing is there yet
+    collection.get = AsyncMock(return_value={"ids": [], "metadatas": []})
     await _index_pdf_objects(
         collection,
         _minio(_pdf_bytes()),
@@ -84,9 +88,15 @@ async def _fold(monkeypatch: pytest.MonkeyPatch, **kw: str) -> list[str]:
         **kw,
     )
     ids: list[str] = []
+    metas: list[dict] = []
     for call in collection.upsert.await_args_list:
         ids.extend(call.kwargs["ids"])
-    return ids
+        metas.extend(call.kwargs["metadatas"])
+    return ids, metas
+
+
+async def _fold(monkeypatch: pytest.MonkeyPatch, **kw: str) -> list[str]:
+    return (await _fold_rows(monkeypatch, **kw))[0]
 
 
 class TestPdfPipelineIds:
@@ -107,3 +117,24 @@ class TestPdfPipelineIds:
     ) -> None:
         ids = await _fold(monkeypatch, tier="corpus")
         assert ids and not any("__" in i for i in ids)
+
+
+class TestPdfChunkMetadata:
+    """ADDENDUM-5 D0 (+ condition C1): the PDF fold now carries ``tier``; a
+    private chunk is stamped ``id_form == "lc9"``, a corpus chunk is NOT and
+    keeps a bare 16-hex id. Neuters: omit ``tier`` / the stamp / stamp corpus."""
+
+    async def test_private_chunks_carry_tier_and_the_form_stamp(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ids, metas = await _fold_rows(monkeypatch, tier="private")
+        assert ids and len(ids) == len(metas)
+        assert all(m["tier"] == "private" and m["id_form"] == "lc9" for m in metas)
+
+    async def test_corpus_chunks_carry_tier_corpus_no_stamp_and_a_bare_hex_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ids, metas = await _fold_rows(monkeypatch, tier="corpus")
+        assert ids and all(m["tier"] == "corpus" for m in metas)
+        assert not any("id_form" in m for m in metas)
+        assert all(len(i) == 16 and int(i, 16) >= 0 for i in ids)

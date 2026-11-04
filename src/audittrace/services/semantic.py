@@ -23,8 +23,11 @@ from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
 from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.memory_keys import (
+    ID_FORM_LC9,
+    ChromaIdConflictError,
     InvalidPrivateSubjectError,
     deleted_key_candidates,
+    new_form_owner,
     private_physical_id,
 )
 from audittrace.services.pagination import sort_and_paginate
@@ -552,16 +555,15 @@ class ChromaSemanticService(SemanticService):
     @staticmethod
     def _tombstone_candidates(doc: Document) -> set[str]:
         """Every manifest storage key the document's soft-delete tombstone can
-        carry (LC-9 ADDENDUM-1 C3 reader #5): the legacy bare
-        ``{collection}/{chunk_id}`` and, for a PRIVATE chunk, the owner-keyed
-        ``{owner}/{collection}/{logical_id}``. A private chunk's ChromaDB id is
-        ``{owner}__{id}`` (:func:`private_physical_id`), so
-        :func:`deleted_key_candidates` derives both from the physical id."""
+        carry (LC-9 ADDENDUM-1 C3 reader #5, ADDENDUM-5 section 4): exactly ONE
+        key per row, decided by the row's own stamp (:func:`new_form_owner`),
+        never by the caller or the id string: the owner-keyed
+        ``{owner}/{collection}/{logical_id}`` for a NEW-form chunk, the bare
+        ``{collection}/{chunk_id}`` for a legacy one."""
         meta = doc.metadata
         collection = str(meta.get("collection"))
         chunk_id = str(meta.get("chunk_id"))
-        owner = meta.get("user_id") if meta.get("tier") == "private" else None
-        return deleted_key_candidates(collection, chunk_id, owner)
+        return deleted_key_candidates(collection, chunk_id, new_form_owner(meta))
 
     @staticmethod
     def _shape_query_results(results: dict[str, Any], col_name: str) -> list[Document]:
@@ -864,6 +866,10 @@ class ChromaSemanticService(SemanticService):
         # stored value.
         meta = dict(metadata or {})
         meta["user_id"] = user_context.user_id
+        # LC-9 ADDENDUM-5 D0: the form stamp is server-side and total -- it is
+        # assigned here (never ``setdefault``) and stripped from caller
+        # metadata at every entry point, so no caller can forge a new-form row.
+        meta.pop("id_form", None)
         if tier == "corpus":
             # ADR-062 Phase B (D1): the corpus write TARGET. The
             # promote SCOPE-GATE (memory:corpus:<collection>:write) is
@@ -873,6 +879,7 @@ class ChromaSemanticService(SemanticService):
         else:
             physical_name = self._physical(collection)
             meta["tier"] = "private"
+            meta["id_form"] = ID_FORM_LC9
         # LC-9 WP3 (ADDENDUM-1 S5): a PRIVATE chunk's ChromaDB id is ALWAYS
         # ``{owner}__{id}``, derived from the token's identity -- never
         # idempotent, so ``foo`` and ``user-a__foo`` stay two documents. Corpus
@@ -885,6 +892,10 @@ class ChromaSemanticService(SemanticService):
         col = await self._client.get_or_create_collection(
             name=physical_name, embedding_function=None
         )
+        if tier != "corpus":
+            await self.check_private_targets(
+                col, user_context, collection, [document_id]
+            )
         # ChromaDB's `upsert` is exactly what we want — insert or replace.
         # The vector is computed on the nomic server and supplied explicitly;
         # an embed failure propagates so a write never silently drops the doc.
@@ -920,6 +931,27 @@ class ChromaSemanticService(SemanticService):
         }
 
     @staticmethod
+    async def check_private_targets(
+        col: Any, user_context: UserContext, collection: str, logical_ids: list[str]
+    ) -> None:
+        """ADDENDUM-5 D1: refuse a private write whose target id holds a row the
+        caller does not own as a NEW-form row. ONE ``get`` on the private
+        physical collection *col*; for each target ``{caller}__{id}`` that holds a
+        row with ``new_form_owner(meta) != caller`` raise
+        :class:`ChromaIdConflictError` BEFORE any write. Shared by ``upsert``
+        and both fold sinks."""
+        targets = {private_physical_id(user_context, i): i for i in logical_ids}
+        if not targets:
+            return
+        result = await col.get(ids=list(targets), include=["metadatas"])
+        found = result.get("ids") or []
+        metadatas = result.get("metadatas") or []
+        for i, cid in enumerate(found):
+            meta = (metadatas[i] if i < len(metadatas) else None) or {}
+            if new_form_owner(meta) != user_context.user_id:
+                raise ChromaIdConflictError(collection, targets[cid])
+
+    @staticmethod
     def _owner_id(user_context: UserContext, document_id: str) -> str | None:
         """The caller's owner-prefixed ChromaDB id, or ``None`` when the caller's
         subject cannot own a private id (such a caller has no private chunks,
@@ -945,11 +977,18 @@ class ChromaSemanticService(SemanticService):
         for document_id in document_ids:
             owner_id = owner_ids[document_id]
             owned = rows.get(owner_id) if owner_id is not None else None
-            if owned is not None and owned[1].get("user_id") == user_context.user_id:
+            if owned is not None and new_form_owner(owned[1]) == user_context.user_id:
                 out[document_id] = owned
                 continue
+            # The bare row answers logical ``X`` only when it is LEGACY (no
+            # new-form stamp) and admitted: a stamped row at the bare id is some
+            # owner's NEW-form row for a different logical id (ADDENDUM-5 D1).
             legacy = rows.get(document_id)
-            if legacy is not None and self._tier_authorized(legacy[1], user_context):
+            if (
+                legacy is not None
+                and new_form_owner(legacy[1]) is None
+                and self._tier_authorized(legacy[1], user_context)
+            ):
                 out[document_id] = legacy
         return out
 
@@ -975,14 +1014,19 @@ class ChromaSemanticService(SemanticService):
         private_ids = [i for i in (owner_id, document_id) if i is not None]
         rows = await self._fetch_by_ids(self._physical(collection), private_ids)
         doomed: list[str] = []
-        if owner_id is not None and owner_id in rows:
-            if rows[owner_id][1].get("user_id") == user_context.user_id:
-                doomed.append(owner_id)
-        # A bare-id row that is not the caller's (and not corpus-tier) is
-        # SKIPPED, never a reason to abort: it must not stop the caller's own
-        # owner-id row from being deleted (review B6).
-        if document_id in rows and self._tier_authorized(
-            rows[document_id][1], user_context
+        if (
+            owner_id is not None
+            and owner_id in rows
+            and new_form_owner(rows[owner_id][1]) == user_context.user_id
+        ):
+            doomed.append(owner_id)
+        # A bare-id row that is not the caller's LEGACY row (foreign, stamped,
+        # or not admitted) is SKIPPED, never a reason to abort: it must not
+        # stop the caller's own owner-id row from being deleted (review B6).
+        if (
+            document_id in rows
+            and new_form_owner(rows[document_id][1]) is None
+            and self._tier_authorized(rows[document_id][1], user_context)
         ):
             doomed.append(document_id)
         if doomed:
@@ -1070,6 +1114,7 @@ class ChromaSemanticService(SemanticService):
             for cid, (_, meta) in rows.items()
             if meta.get("user_id") == user_context.user_id
             and meta.get("tier") != "corpus"
+            and new_form_owner(meta) is None
         ]
         if not doomed:
             return 0

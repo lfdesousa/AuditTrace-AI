@@ -30,7 +30,9 @@ import pytest
 
 from audittrace.identity import UserContext
 from audittrace.services.memory_keys import (
+    ID_FORM_LC9,
     LOGICAL_KEY_MAX,
+    ChromaIdConflictError,
     CrossOwnerWriteError,
     InvalidPrivateSubjectError,
     LogicalKeyTooLongError,
@@ -41,6 +43,7 @@ from audittrace.services.memory_keys import (
     deleted_key_candidates,
     logical_id,
     logical_key,
+    new_form_owner,
     physical_key,
     private_physical_id,
     private_storage_key,
@@ -180,19 +183,52 @@ class TestLogicalId:
 
 
 class TestDeletedKeyCandidates:
-    def test_legacy_and_owner_keyed(self) -> None:
+    """ADDENDUM-5 section 4 #5: EXACTLY ONE candidate per row, decided by the
+    row's own stamp (``owner`` is ``new_form_owner(meta)``)."""
+
+    def test_new_form_chunk_has_only_the_owner_keyed_candidate(self) -> None:
         assert deleted_key_candidates("decisions", "user-a__d1", "user-a") == {
-            "decisions/user-a__d1",
-            "user-a/decisions/d1",
+            "user-a/decisions/d1"
         }
 
-    def test_unowned_chunk_only_legacy(self) -> None:
+    def test_legacy_chunk_has_only_the_bare_candidate(self) -> None:
         assert deleted_key_candidates("decisions", "d1", None) == {"decisions/d1"}
-
-    def test_foreign_prefixed_chunk_only_legacy(self) -> None:
-        assert deleted_key_candidates("decisions", "user-b__d1", "user-a") == {
-            "decisions/user-b__d1"
+        assert deleted_key_candidates("decisions", "user-a__d1", None) == {
+            "decisions/user-a__d1"
         }
+
+
+class TestNewFormOwner:
+    """ADDENDUM-5 D0: the identity pin. Anything but a private row stamped
+    ``lc9`` with a non-empty string owner is LEGACY (``None``)."""
+
+    def test_stamped_private_row_names_its_owner(self) -> None:
+        meta = {"tier": "private", "id_form": ID_FORM_LC9, "user_id": "user-a"}
+        assert new_form_owner(meta) == "user-a"
+
+    @pytest.mark.parametrize(
+        "meta",
+        [
+            None,
+            {},
+            {"tier": "private", "user_id": "u"},
+            {"tier": "private", "id_form": "zzz", "user_id": "u"},
+            {"tier": "corpus", "id_form": ID_FORM_LC9, "user_id": "u"},
+            {"id_form": ID_FORM_LC9, "user_id": "u"},
+            {"tier": "private", "id_form": ID_FORM_LC9},
+            {"tier": "private", "id_form": ID_FORM_LC9, "user_id": ""},
+            {"tier": "private", "id_form": ID_FORM_LC9, "user_id": 7},
+        ],
+    )
+    def test_every_other_row_is_legacy(self, meta: dict | None) -> None:
+        assert new_form_owner(meta) is None
+
+
+class TestChromaIdConflictError:
+    def test_one_owner_free_text(self) -> None:
+        err = ChromaIdConflictError("decisions", "foo")
+        assert str(err) == tier_conflict_message("semantic", "decisions/foo")
+        assert not isinstance(err, ManifestAuthorizationError)
 
 
 class TestResolveWrite:

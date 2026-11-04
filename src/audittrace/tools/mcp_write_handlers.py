@@ -78,6 +78,7 @@ from audittrace.identity import UserContext
 from audittrace.routes.memory_semantic_writes import drop_copied_forward_chunk
 from audittrace.services.memory_audit import emit_memory_audit_event
 from audittrace.services.memory_keys import (
+    ChromaIdConflictError,
     ConcurrentManifestWriteError,
     LogicalKeyTooLongError,
     semantic_logical_key,
@@ -99,7 +100,7 @@ _IDENTITY_ARG_KEYS = frozenset({"user_id", "sub", "userId"})
 # mirrors ``routes/memory.py::_sanitize_semantic_metadata``: ``tier`` and
 # ``user_id`` are token-derived/route-authorized values, never
 # caller-supplied, even from an operator holding write scope.
-_SECURITY_METADATA_KEYS = frozenset({"tier", "user_id"})
+_SECURITY_METADATA_KEYS = frozenset({"tier", "user_id", "id_form"})
 
 
 def _sanitize_metadata(metadata: Any) -> dict[str, Any]:
@@ -165,6 +166,11 @@ async def _write_semantic_document(
         await service.upsert(
             user_context, collection, document_id, text, metadata, tier="private"
         )
+    except ChromaIdConflictError as exc:
+        # ADDENDUM-5 D1: a tool-level ``{"error"}`` (``isError: true``) carrying
+        # the one owner-free conflict text, like the 400/409 twins above; it
+        # must not reach the generic ``<Class>: write failed`` arm.
+        return {"error": str(exc)}
     except Exception as exc:
         logger.exception(
             "mcp write tool upsert failed collection=%s document_id=%s",

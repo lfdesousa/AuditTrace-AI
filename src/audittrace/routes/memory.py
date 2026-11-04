@@ -94,6 +94,7 @@ from audittrace.routes.memory_promote import (
     promote_session_to_durable as _promote_session_to_durable,
 )
 from audittrace.routes.memory_semantic_writes import (
+    chroma_id_conflict_409,
     concurrent_write_409,
     drop_copied_forward_chunk,
     require_visible_row_or_404,
@@ -109,10 +110,13 @@ from audittrace.services.memory_audit import (
     schedule_read_audit,
 )
 from audittrace.services.memory_keys import (
+    ID_FORM_LC9,
+    ChromaIdConflictError,
     ConcurrentManifestWriteError,
     LogicalKeyTooLongError,
     check_logical,
     logical_id,
+    new_form_owner,
     private_physical_id,
     semantic_logical_key,
 )
@@ -126,6 +130,7 @@ from audittrace.services.recall_telemetry import (
     classify_recall_source_from_request,
     emit_recall_telemetry,
 )
+from audittrace.services.semantic import ChromaSemanticService
 from audittrace.services.session_memory import SessionMemoryService
 from audittrace.services.write_telemetry import emit_chunks_indexed, emit_memory_write
 
@@ -564,7 +569,7 @@ def _manifest_visible(entry: ManifestEntry, user: UserContext) -> bool:
     return entry.created_by_user_id == user.user_id or entry.tier == "corpus"
 
 
-_SEMANTIC_METADATA_SECURITY_KEYS = frozenset({"tier", "user_id"})
+_SEMANTIC_METADATA_SECURITY_KEYS = frozenset({"tier", "user_id", "id_form"})
 
 
 def _sanitize_semantic_metadata(metadata: Any) -> Any:
@@ -1152,6 +1157,16 @@ async def _index_md_objects(
         # ``{owner}__{hash}``, derived from ``user`` (the token), always
         # prepended. The authorize_write check above and the manifest keys
         # below keep the LOGICAL ``ids``. Corpus ids are unchanged.
+        if tier != "corpus":
+            # ADDENDUM-5 D0/D1: stamp the new-form rows, and refuse the whole
+            # file (nothing is written) if a target id holds a row this caller
+            # does not own as a new-form row. ``ChromaIdConflictError`` is not
+            # caught here: ``index_memory`` maps it to 409.
+            for m in metadatas:
+                m["id_form"] = ID_FORM_LC9
+            await ChromaSemanticService.check_private_targets(
+                collection, user, col_name, ids
+            )
         await _upsert_in_batches(
             collection, _chroma_ids(user, tier, ids), chunks, metadatas
         )
@@ -1572,6 +1587,12 @@ async def index_memory(
                 )
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
+        except ChromaIdConflictError as exc:
+            # ADDENDUM-5 D1: a private target id is held by a row the caller
+            # does not own as a new-form row. Permanent, so 409 without
+            # Retry-After. A multi-file request may have indexed earlier files
+            # before this one was refused (advisory N2, build record).
+            raise chroma_id_conflict_409(exc) from exc
 
         results[col_name] = chunk_count
         total_chunks += chunk_count
@@ -2491,6 +2512,8 @@ async def create_semantic(
             await service.upsert(
                 user, collection, document_id, text, metadata, tier=tier
             )
+        except ChromaIdConflictError as exc:
+            raise chroma_id_conflict_409(exc) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         copied_from = await _legacy_copy_forward_source(manifest, user, "semantic", key)
@@ -2665,20 +2688,13 @@ async def _merge_semantic_with_chroma(
             continue
         for i, doc_id in enumerate(ids):
             meta = metas[i] if i < len(metas) and metas[i] else {}
-            # LC-9 WP3 (ADDENDUM-1 C3 #8 / R4): a private chunk's ChromaDB id is
-            # ``{owner}__{id}``; the row is listed under its LOGICAL id so it
-            # dedups against its own manifest row (one item per document).
-            owner = meta.get("user_id") if meta.get("tier") == "private" else None
+            # LC-9 WP3 (ADDENDUM-1 C3 #8, ADDENDUM-5 section 4): a NEW-form chunk
+            # (stamped ``id_form``) has the id ``{owner}__{id}`` and lists under
+            # its LOGICAL id, so it dedups against its own manifest row; a legacy
+            # chunk maps to its bare id, which is its legacy manifest key. The
+            # owner comes from the chunk's own metadata, never from the id.
+            owner = new_form_owner(meta)
             key = _semantic_key(col_name, logical_id(doc_id, owner))
-            # A pre-LC-9 PROMOTED chunk has the bare id ``{owner}__{file}`` and
-            # a bare manifest row ``{collection}/{owner}__{file}``: the id's
-            # prefix is part of its LOGICAL id there, so when the manifest
-            # knows that exact bare key the row keeps its id as is (it would
-            # otherwise list twice, as ``{file}`` and as ``{owner}__{file}``).
-            if owner and _semantic_key(col_name.removesuffix("_v2"), doc_id) in (
-                known_keys
-            ):
-                key = _semantic_key(col_name, doc_id)
             if key in known_keys:
                 continue
             content = docs[i] if i < len(docs) else ""
@@ -3124,6 +3140,8 @@ async def update_semantic(
         await require_visible_row_or_404(manifest, user, key)
         try:
             await service.upsert(user, collection, document_id, text, metadata)
+        except ChromaIdConflictError as exc:
+            raise chroma_id_conflict_409(exc) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         copied_from = await _legacy_copy_forward_source(manifest, user, "semantic", key)

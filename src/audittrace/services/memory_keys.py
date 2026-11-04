@@ -36,6 +36,7 @@ Guards (each has a neuter in ``tests/test_lc9_*``):
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from audittrace.identity import UserContext
@@ -49,6 +50,29 @@ SUB_MAX = 36
 LOGICAL_KEY_MAX = STORAGE_KEY_MAX - SUB_MAX - 1
 
 _TIERS = frozenset({"private", "corpus"})
+
+#: The form stamp every NEW private ChromaDB row carries (ADDENDUM-5 D0). Set
+#: server-side only (direct assignment, never taken from a caller); a row
+#: without it is LEGACY whatever else it carries.
+ID_FORM_LC9 = "lc9"
+
+
+def new_form_owner(meta: Mapping[str, object] | None) -> str | None:
+    """The identity pin of ADDENDUM-5 D0: ``meta["user_id"]`` iff the row is a
+    private row stamped ``id_form == "lc9"`` with a non-empty string owner, else
+    ``None`` (LEGACY: no tier, no owner, a corpus tier, a wrong stamp, another
+    owner's row -- all read as legacy, which is what makes D1 total)."""
+    if not meta:
+        return None
+    owner = meta.get("user_id")
+    if (
+        meta.get("tier") == "private"
+        and meta.get("id_form") == ID_FORM_LC9
+        and isinstance(owner, str)
+        and owner
+    ):
+        return owner
+    return None
 
 
 class ManifestAuthorizationError(PermissionError):
@@ -99,6 +123,22 @@ class ConcurrentManifestWriteError(Exception):
     Deliberately NOT a ``ManifestAuthorizationError``/``RuntimeError``: it is
     neither a refusal nor the soft-deleted-row conflict some routes already
     catch as ``RuntimeError``."""
+
+
+class ChromaIdConflictError(Exception):
+    """A private write whose target ChromaDB id already holds a row the caller
+    does not own as a NEW-form row (ADDENDUM-5 D1): another owner's row (legacy
+    or stamped), the caller's own unstamped legacy row, or a corpus row. Nothing
+    is written. ``str()`` is the ONE owner-free conflict text, so no route can
+    leak an owner or content through it; routes map it to exactly 409 (never
+    502), the MCP tool to an ``{"error"}`` result. Deliberately not a
+    ``ManifestAuthorizationError``: it is a permanent state conflict at the
+    physical id, not an authorization failure."""
+
+    def __init__(self, collection: str, document_id: str) -> None:
+        super().__init__(
+            tier_conflict_message("semantic", f"{collection}/{document_id}")
+        )
 
 
 def tier_conflict_message(layer: str, logical: str) -> str:
@@ -177,14 +217,15 @@ def logical_id(physical: str, owner: str | None) -> str:
 def deleted_key_candidates(
     collection: str, chunk_id: str, owner: str | None
 ) -> set[str]:
-    """Storage keys a Chroma chunk's manifest row can have: the legacy bare
-    ``{collection}/{chunk_id}`` and the owner-keyed
-    ``{owner}/{collection}/{logical_id}`` (the latter only when the chunk id
-    carries its owner's ``__`` prefix)."""
-    out = {f"{collection}/{chunk_id}"}
-    if owner and chunk_id.startswith(owner + "__"):
-        out.add(f"{owner}/{collection}/{logical_id(chunk_id, owner)}")
-    return out
+    """The ONE storage key a Chroma chunk's manifest row can have (ADDENDUM-5
+    section 4 #5): for a NEW-form chunk (*owner* from :func:`new_form_owner`) the
+    owner-keyed ``{owner}/{collection}/{logical_id}``; for a legacy chunk
+    (*owner* ``None``) the bare ``{collection}/{chunk_id}``. Exactly one
+    candidate: a second (legacy) key for a stamped row would let the tombstone
+    of a copied-forward legacy document hide the owner's NEW document."""
+    if owner:
+        return {f"{owner}/{collection}/{logical_id(chunk_id, owner)}"}
+    return {f"{collection}/{chunk_id}"}
 
 
 @dataclass(frozen=True, slots=True)

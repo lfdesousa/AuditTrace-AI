@@ -654,7 +654,7 @@ class TestIndexStatusLogicalKey:
 
 class TestTombstoneCandidates:
     """C3 reader #4: the soft-delete lookup finds a NEW-form tombstone when
-    given ``deleted_key_candidates`` (legacy bare + owner-keyed)."""
+    given ``deleted_key_candidates`` (one candidate per row: owner-keyed for a stamped chunk, bare for a legacy one)."""
 
     async def test_new_form_tombstone_found_through_candidates(self, env: Env) -> None:
         await env.svc.record_create("semantic", "decisions/d1", None, 1, A)
@@ -671,7 +671,7 @@ class TestTombstoneCandidates:
 
     async def test_legacy_tombstone_still_found(self, env: Env) -> None:
         await env.seed("semantic", "decisions/d2", A, deleted=True)
-        candidates = deleted_key_candidates("decisions", "d2", A)
+        candidates = deleted_key_candidates("decisions", "d2", None)
         assert await env.svc.get_deleted_keys("semantic", candidates) == {
             "decisions/d2"
         }
