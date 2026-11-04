@@ -5,7 +5,7 @@ caller's scope set and admin flag, the session, the tool and the canonical
 arguments. This module drives the real ``invoke_tool`` and the real
 ``ToolResultCache`` end to end.
 
-Doubles declared (EVERY one; nothing else is faked):
+Doubles declared (every one used by this module):
 
 - ``fakeredis.FakeRedis`` stands in for the Redis server. It really stores
   and expires entries; it is not faked out.
@@ -17,6 +17,11 @@ Doubles declared (EVERY one; nothing else is faked):
   ``MockTrustStoreProvider``. Each is pinned by its own suite and is a
   collaborator here, not the subject. The mock conversational store really
   filters rows per user.
+- T6 only: ``audittrace.services.semantic.embed_via_nomic`` is replaced by an
+  ``AsyncMock`` returning fixed vectors (no embedding server runs), and the
+  container's ``semantic`` binding is swapped for the real
+  ``ChromaSemanticService`` over the Mock Chroma client. The service is real;
+  its embedder and its Chroma client are the doubles.
 
 The registered handler ``recall_recent_sessions`` is the real one.
 """
