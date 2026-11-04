@@ -56,6 +56,9 @@ _PRUNE_DIRS = {
 _REGISTRY_RX = re.compile(
     r"^(?:index\.docker\.io|registry-1\.docker\.io|docker\.io)/", re.IGNORECASE
 )
+#: Leading ``./`` / ``../`` segments of a relative path (``./postgres:16``): the
+#: repository is still the official image, so they are stripped before comparison.
+_RELATIVE_RX = re.compile(r"^(?:\.{1,2}/)+")
 #: A candidate image token (DENY-BY-DEFAULT, r4/r6): an optional path of
 #: segments, then a repository whose LAST segment is ``postgres`` (any case),
 #: then ANY Docker-grammar tag ``:[\w][\w.\-]{0,127}`` and/or ANY ``@sha256:``
@@ -66,13 +69,16 @@ _REGISTRY_RX = re.compile(
 #: host:port strings out.
 #: RULING (r6, flipped): an ``@`` after ``postgres:<tag>`` NEVER excludes the
 #: reference, whatever follows it (it is captured as ``at`` and kept on the
-#: reference, so it can never equal the pin). The ONLY exclusion is a DSN: the
-#: lookbehind refuses a match that starts after a word char, ``@`` (a DSN
-#: host), ``/`` (so ``scheme://postgres:pw@${HOST}`` is a DSN, never a
-#: candidate) or ``.``/``-``. Whether the repository IS the official image is
-#: decided by :func:`normalise_repo`, not by this pattern.
+#: reference, so it can never equal the pin).
+#: RULING (r7, allowlist): the ONLY exclusion is a DSN, decided in
+#: :func:`find_foreign_images` by :data:`_DSN_PREFIX_RX` on the text before the
+#: match. The lookbehind refuses only a match that starts after a word char,
+#: ``@`` (a DSN host) or ``.``/``-``; it no longer excludes ``/``, so a match
+#: after ``docker://``, ``docker-image://``, ``oci://``, ``/``, ``//`` or ``./``
+#: is a candidate. Whether the repository IS the official image is decided by
+#: :func:`normalise_repo`, not by this pattern.
 _IMAGE_RX = re.compile(
-    r"(?<![\w@/.\-])(?P<repo>(?:[\w.\-]+/)*postgres)"
+    r"(?<![\w@.\-])(?P<repo>(?:[\w.\-]+/)*postgres)"
     r"(?:"
     r":(?P<tag>\w[\w.\-]{0,127}+)(?:@(?P<tagdigest>sha256:\w+))?"
     r"(?![\w.\-]*:)(?P<at>@)?"
@@ -80,6 +86,11 @@ _IMAGE_RX = re.compile(
     r")",
     re.IGNORECASE,
 )
+#: DSN allowlist (r7, case-insensitive): the text immediately before a match
+#: must END with ``postgres://``, ``postgresql://`` or ``postgresql+<driver>://``.
+#: Any other prefix (``docker://``, ``docker-image://``, ``oci://``, ``/``,
+#: ``//``, ``./``, a path) leaves the match a RED candidate.
+_DSN_PREFIX_RX = re.compile(r"postgres(?:ql(?:\+\w+)?)?://\Z", re.IGNORECASE)
 #: An untagged (implicit ``:latest``) image, only where it IS an image
 #: reference: a compose/workflow ``image:`` value or a Dockerfile ``FROM``.
 #: The bare word "postgres" elsewhere (users, hosts, prose) is deliberately not
@@ -108,10 +119,11 @@ def expand_param_defaults(text: str) -> str:
 
 
 def normalise_repo(repo: str) -> str:
-    """``index.docker.io/library/postgres`` -> ``postgres`` (lower-cased); any other
+    """``index.docker.io/library/postgres`` -> ``postgres`` (lower-cased; leading
+    ``./`` or ``../`` stripped); any other
     namespace (``bitnami/postgres``, ``team/postgres``, ``ghcr.io/x/postgres``)
     is returned unchanged, so it never equals the official ``postgres``."""
-    repo = _REGISTRY_RX.sub("", repo).lower()
+    repo = _REGISTRY_RX.sub("", _RELATIVE_RX.sub("", repo)).lower()
     return repo[len("library/") :] if repo.startswith("library/") else repo
 
 
@@ -160,6 +172,8 @@ def find_foreign_images(text: str, pin: str) -> list[str]:
     for m in _IMAGE_RX.finditer(text):
         if normalise_repo(m.group("repo")) != "postgres":
             continue
+        if _DSN_PREFIX_RX.search(text[max(0, m.start() - 128) : m.start()]):
+            continue  # r7 allowlist: a postgres-family DSN, never an image
         tag = m.group("tag")
         if tag is not None and _is_port(tag):
             continue
@@ -408,6 +422,28 @@ def test_makefile_resolves_the_pin_with_a_stripped_path(tmp_path: Path) -> None:
         ("postgresql://postgres:pw@$(HOST)/db", []),
         ("postgresql+asyncpg://postgres:pw@${HOST}:5432/db", []),
         ("postgresql+asyncpg://postgres:secret@postgres:5432", []),
+        ("POSTGRESQL://postgres:pw@${HOST}/db", []),
+        ("PostgreSQL+AsyncPG://u:p@$HOST/db", []),
+        # r7 allowlist: only a postgres-family scheme excludes; every other
+        # prefix (transport schemes, bare slashes, paths) stays RED
+        ("skopeo inspect docker://postgres:16", ["postgres:16"]),
+        (
+            "skopeo copy docker://docker.io/library/postgres:16 oci:x",
+            ["postgres:16"],
+        ),
+        (
+            "docker buildx build --build-context pg=docker-image://postgres:16 .",
+            ["postgres:16"],
+        ),
+        ("FROM docker-image://postgres:16", ["postgres:16"]),
+        ("podman pull docker://postgres:16@$D", ["postgres:16@"]),
+        ("oci://postgres:16", ["postgres:16"]),
+        ("/postgres:16", ["postgres:16"]),
+        ("//postgres:16", ["postgres:16"]),
+        ("./postgres:16", ["postgres:16"]),
+        ("../postgres:16", ["postgres:16"]),
+        ("docker://postgres://postgres:16", []),  # prefix ends in a postgres DSN
+        ("xpostgresql+://postgres:16", ["postgres:16"]),  # empty driver is not one
         # the pin in any canonical spelling is fine
         ("docker.io/library/" + PG_TEST_IMAGE, []),
         ("library/" + PG_TEST_IMAGE, []),
