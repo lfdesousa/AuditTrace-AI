@@ -75,6 +75,7 @@ from typing import Any
 
 from audittrace.dependencies import get_memory_manifest_service, get_semantic_service
 from audittrace.identity import UserContext
+from audittrace.routes.memory_semantic_writes import drop_copied_forward_chunk
 from audittrace.services.memory_audit import emit_memory_audit_event
 from audittrace.services.memory_keys import (
     ConcurrentManifestWriteError,
@@ -215,6 +216,9 @@ async def _write_semantic_document(
             )
         }
 
+    await drop_copied_forward_chunk(
+        service, user_context, collection, document_id, copied_from
+    )
     try:
         await emit_memory_audit_event(
             user=user_context,

@@ -620,6 +620,10 @@ class TestWholeDocumentRead:
         )
         for row in physical.data:
             row["metadata"]["tier"] = "corpus"
+            # LC-9 WP3: a private fold stores ``{owner}__{hash}``; a corpus-tier
+            # chunk in this collection carries the BARE hash id, so the
+            # stand-in drops the owner prefix along with flipping the tier.
+            row["id"] = row["id"].split("__", 1)[1]
 
         chunk0_id = m._doc_id("decisions", title, 0)
         _override_identity(

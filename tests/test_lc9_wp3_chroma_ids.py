@@ -276,6 +276,27 @@ def _body(tag: str, entries: int = 220) -> str:
     return text
 
 
+@pytest.fixture
+def registries() -> Iterator[None]:
+    """Re-register the memory tools and the MCP write tools for this test."""
+    import importlib
+
+    import audittrace.tools.memory_handlers as mh
+    from audittrace.tools import mcp_write_handlers as wh
+    from audittrace.tools import reset_registry_for_tests
+    from audittrace.tools.mcp_write_registry import (
+        reset_mcp_write_registry_for_tests,
+    )
+
+    reset_registry_for_tests()
+    importlib.reload(mh)
+    reset_mcp_write_registry_for_tests()
+    importlib.reload(wh)
+    yield
+    reset_registry_for_tests()
+    reset_mcp_write_registry_for_tests()
+
+
 # ── RT-1 content half ───────────────────────────────────────────────────────
 
 
@@ -330,28 +351,10 @@ class TestRt23AlwaysPrepend:
 # ── RT-8 ────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("registries")
 class TestRt8McpSameDocumentId:
     """The MCP ``write_decision`` tool, two subs, one ``document_id``: disjoint.
     Neuter: ``private_physical_id`` returns the bare id -> RED."""
-
-    @pytest.fixture(autouse=True)
-    def _registries(self) -> Iterator[None]:
-        import importlib
-
-        import audittrace.tools.memory_handlers as mh
-        from audittrace.tools import mcp_write_handlers as wh
-        from audittrace.tools import reset_registry_for_tests
-        from audittrace.tools.mcp_write_registry import (
-            reset_mcp_write_registry_for_tests,
-        )
-
-        reset_registry_for_tests()
-        importlib.reload(mh)
-        reset_mcp_write_registry_for_tests()
-        importlib.reload(wh)
-        yield
-        reset_registry_for_tests()
-        reset_mcp_write_registry_for_tests()
 
     def _write(self, rig: Rig, sub: str, doc: str, text: str) -> Any:
         body = {
@@ -493,6 +496,7 @@ class TestRt11OneItemPerDocument:
 # ── RT-19 ───────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("registries")
 class TestRt19SoftDeleteExcludesRecall:
     """A soft-deleted NEW-form private chunk never surfaces in recall (MCP
     ``recall_semantic``). Neuter: ``_tombstone_candidates`` tries only the

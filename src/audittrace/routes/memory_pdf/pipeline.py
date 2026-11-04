@@ -79,6 +79,7 @@ async def _index_pdf_objects(
     dry_run: bool = False,
     outcomes: list[bool] | None = None,
     caller_can_write_shared: bool = False,
+    tier: str = "private",
 ) -> int:
     """Stream-index ``.pdf`` files into *collection*, per-page.
 
@@ -104,6 +105,10 @@ async def _index_pdf_objects(
     page_count, signature_status, ocr_coverage_pct, attachment_count,
     form_field_count, the structured ``extraction_warnings`` list,
     and document_sha256 (plus the tier-C ADR-056 fields).
+
+    *tier* (LC-9 WP3) -- ``"private"`` (the fail-closed default) stores each
+    chunk at the owner-prefixed id ``{user.user_id}__{hash}``; ``"corpus"``
+    keeps the bare hash id (a shared document has no single owner).
 
     *outcomes* (#430 v3) — when supplied, every object in *objects*
     appends exactly one ``bool``: ``True`` once the document reaches
@@ -144,6 +149,7 @@ async def _index_pdf_objects(
     # cost essentially nothing after the first call (Python module
     # cache).
     from audittrace.routes.memory import (
+        _chroma_ids,
         _chunk_text,
         _doc_id,
         _read_minio_object,
@@ -659,7 +665,11 @@ async def _index_pdf_objects(
                         if md.get("toc_section") is None:
                             md.pop("toc_section", None)
                     if not dry_run:
-                        await _upsert_in_batches(collection, ids, chunks, metadatas)
+                        # LC-9 WP3: a private-tier chunk is stored at
+                        # ``{owner}__{hash}`` (always prepended, ADDENDUM-1 S5).
+                        await _upsert_in_batches(
+                            collection, _chroma_ids(user, tier, ids), chunks, metadatas
+                        )
                         total += len(chunks)
                     # Tier-C #23 — chunks_written_doc reflects what
                     # *would* have been written, so dry-run response

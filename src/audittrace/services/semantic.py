@@ -22,7 +22,11 @@ from audittrace.db.factory import ChromaDBClient
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
 from audittrace.services.embedder import embed_via_nomic
-from audittrace.services.memory_keys import deleted_key_candidates
+from audittrace.services.memory_keys import (
+    InvalidPrivateSubjectError,
+    deleted_key_candidates,
+    private_physical_id,
+)
 from audittrace.services.pagination import sort_and_paginate
 
 logger = logging.getLogger(__name__)
@@ -285,6 +289,32 @@ class SemanticService(ABC):
         a private-tier document returns the SAME ``None`` as a genuine
         miss; no existence disclosure)."""
 
+    async def get_documents(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_ids: list[str],
+    ) -> list[Document | None]:
+        """Batched :meth:`get_document`: one entry per requested id, in order,
+        ``None`` for a miss or an id the caller may not read. The default loops
+        ``get_document``; :class:`ChromaSemanticService` overrides it with ONE
+        ``get`` per physical collection (LC-9 WP3)."""
+        return [
+            await self.get_document(user_context, collection, document_id)
+            for document_id in document_ids
+        ]
+
+    async def drop_legacy_documents(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_ids: list[str],
+    ) -> int:
+        """Delete the caller's OWN pre-LC-9 chunks stored at the bare *document_ids*
+        (copy-forward step 3, ADDENDUM-1 S2). Returns how many were removed. The
+        default removes nothing; :class:`ChromaSemanticService` implements it."""
+        return 0
+
 
 class ChromaSemanticService(SemanticService):
     """ChromaDB-based semantic memory service."""
@@ -525,17 +555,14 @@ class ChromaSemanticService(SemanticService):
         """Every manifest storage key the document's soft-delete tombstone can
         carry (LC-9 ADDENDUM-1 C3 reader #5): the legacy bare
         ``{collection}/{chunk_id}`` and, for a PRIVATE chunk, the owner-keyed
-        ``{owner}/{collection}/{logical_id}``. A private chunk's id is not yet
-        owner-prefixed before the ChromaDB id work (WP3), so its owner key is
-        also built from the raw id; both shapes are tried."""
+        ``{owner}/{collection}/{logical_id}``. A private chunk's ChromaDB id is
+        ``{owner}__{id}`` (:func:`private_physical_id`), so
+        :func:`deleted_key_candidates` derives both from the physical id."""
         meta = doc.metadata
         collection = str(meta.get("collection"))
         chunk_id = str(meta.get("chunk_id"))
         owner = meta.get("user_id") if meta.get("tier") == "private" else None
-        keys = deleted_key_candidates(collection, chunk_id, owner)
-        if owner:
-            keys.add(f"{owner}/{collection}/{chunk_id}")
-        return keys
+        return deleted_key_candidates(collection, chunk_id, owner)
 
     @staticmethod
     def _shape_query_results(results: dict[str, Any], col_name: str) -> list[Document]:
@@ -847,6 +874,15 @@ class ChromaSemanticService(SemanticService):
         else:
             physical_name = self._physical(collection)
             meta["tier"] = "private"
+        # LC-9 WP3 (ADDENDUM-1 S5): a PRIVATE chunk's ChromaDB id is ALWAYS
+        # ``{owner}__{id}``, derived from the token's identity -- never
+        # idempotent, so ``foo`` and ``user-a__foo`` stay two documents. Corpus
+        # ids are unchanged.
+        chroma_id = (
+            document_id
+            if tier == "corpus"
+            else private_physical_id(user_context, document_id)
+        )
         col = await self._client.get_or_create_collection(
             name=physical_name, embedding_function=None
         )
@@ -854,32 +890,69 @@ class ChromaSemanticService(SemanticService):
         # The vector is computed on the nomic server and supplied explicitly;
         # an embed failure propagates so a write never silently drops the doc.
         await col.upsert(
-            ids=[document_id],
+            ids=[chroma_id],
             documents=[text],
             embeddings=[await self._embed_one(text)],
             metadatas=[meta],
         )
 
-    async def _get_from_physical(
-        self, physical_name: str, logical_collection: str, document_id: str
-    ) -> Document | None:
-        """Fetch a document by id from ONE physical ChromaDB collection,
-        with NO ownership check — the caller applies
-        ``_tier_authorized``."""
+    async def _fetch_by_ids(
+        self, physical_name: str, ids: list[str]
+    ) -> dict[str, tuple[str, dict[str, Any]]]:
+        """ONE ``get(ids=...)`` on one physical collection. Missing ids are
+        omitted by ChromaDB; duplicates are removed first (ChromaDB refuses
+        them). Returns ``{id: (text, metadata)}`` with NO ownership check."""
+        unique = list(dict.fromkeys(ids))
+        if not unique:
+            return {}
         col = await self._client.get_or_create_collection(
             name=physical_name, embedding_function=None
         )
-        result = await col.get(ids=[document_id], include=["documents", "metadatas"])
-        if not result.get("ids"):
-            return None
+        result = await col.get(ids=unique, include=["documents", "metadatas"])
+        found_ids = result.get("ids") or []
         documents = result.get("documents") or []
-        if not documents:
+        metadatas = result.get("metadatas") or []
+        # A row with an id but no stored text (an embedding-only record) is not
+        # a readable document: it is skipped, as the single-id read always did.
+        return {
+            cid: (documents[i], (metadatas[i] if i < len(metadatas) else None) or {})
+            for i, cid in enumerate(found_ids)
+            if i < len(documents)
+        }
+
+    @staticmethod
+    def _owner_id(user_context: UserContext, document_id: str) -> str | None:
+        """The caller's owner-prefixed ChromaDB id, or ``None`` when the caller's
+        subject cannot own a private id (such a caller has no private chunks,
+        and a read must not raise)."""
+        try:
+            return private_physical_id(user_context, document_id)
+        except InvalidPrivateSubjectError:
             return None
-        meta = (result.get("metadatas") or [{}])[0] or {}
-        return Document(
-            page_content=documents[0],
-            metadata={**meta, "collection": logical_collection},
+
+    async def _resolve_private(
+        self, user_context: UserContext, collection: str, document_ids: list[str]
+    ) -> dict[str, tuple[str, dict[str, Any]]]:
+        """Dual lookup for many ids with ONE ``get``: for each logical id the
+        caller's owner-prefixed id first, then the bare (legacy) id when
+        ``_tier_authorized`` admits it (the caller's own, a corpus-tier row, or
+        the existing ADR-062 admin read -- see the build record, STOP item 1). Returns ``{logical id: (text, meta)}``."""
+        owner_ids = {i: self._owner_id(user_context, i) for i in document_ids}
+        wanted = [oid for oid in owner_ids.values() if oid is not None]
+        rows = await self._fetch_by_ids(
+            self._physical(collection), [*wanted, *document_ids]
         )
+        out: dict[str, tuple[str, dict[str, Any]]] = {}
+        for document_id in document_ids:
+            owner_id = owner_ids[document_id]
+            owned = rows.get(owner_id) if owner_id is not None else None
+            if owned is not None and owned[1].get("user_id") == user_context.user_id:
+                out[document_id] = owned
+                continue
+            legacy = rows.get(document_id)
+            if legacy is not None and self._tier_authorized(legacy[1], user_context):
+                out[document_id] = legacy
+        return out
 
     @log_call(logger=logger)
     async def delete_document(
@@ -891,36 +964,42 @@ class ChromaSemanticService(SemanticService):
         """Hard-delete a document by id.
 
         ADR-062 Phase B (§3 hole 1) mirrors ``get_document``'s ownership
-        check — this method previously ``del user_context`` unconditionally.
-        Checks the private physical collection first, then the corpus one;
-        returns ``False`` (not a distinct "forbidden" signal) both when
-        the id genuinely doesn't exist AND when it exists but the caller
-        isn't authorized — the same no-existence-disclosure posture as
-        ``get_document``. The route layer additionally requires
-        ``audittrace:admin`` for ``?hard=true`` (``delete_semantic``), so
-        in practice only admins reach this today; the service-level check
-        is defense in depth for any future caller."""
-        for physical_name in (
-            self._physical(collection),
-            self._physical_corpus(collection),
-        ):
-            col = await self._client.get_or_create_collection(
-                name=physical_name, embedding_function=None
-            )
-            # ChromaDB's `delete` is silently idempotent (deleting a non-
-            # existent ID does not raise). To return a faithful boolean we
-            # check existence (and ownership) first.
-            existing = await col.get(
-                ids=[document_id], include=["documents", "metadatas"]
-            )
-            if not existing.get("ids"):
-                continue
-            meta = (existing.get("metadatas") or [{}])[0] or {}
-            if not self._tier_authorized(meta, user_context):
+        check. Looks in the private physical collection first (the caller's
+        owner-prefixed id and, under the dual lookup, the caller's OWN bare
+        legacy id -- both removed), then the corpus one. Returns ``False`` (not a
+        distinct "forbidden" signal) both when the id genuinely doesn't exist AND
+        when it exists but the caller isn't authorized -- the same
+        no-existence-disclosure posture as ``get_document``. The route layer
+        additionally requires ``audittrace:admin`` for ``?hard=true``
+        (``delete_semantic``); the service-level check is defense in depth."""
+        owner_id = self._owner_id(user_context, document_id)
+        private_ids = [i for i in (owner_id, document_id) if i is not None]
+        rows = await self._fetch_by_ids(self._physical(collection), private_ids)
+        doomed: list[str] = []
+        if owner_id is not None and owner_id in rows:
+            if rows[owner_id][1].get("user_id") == user_context.user_id:
+                doomed.append(owner_id)
+        if document_id in rows:
+            if not self._tier_authorized(rows[document_id][1], user_context):
                 return False
-            await col.delete(ids=[document_id])
+            doomed.append(document_id)
+        if doomed:
+            col = await self._client.get_or_create_collection(
+                name=self._physical(collection), embedding_function=None
+            )
+            await col.delete(ids=doomed)
             return True
-        return False
+        corpus_name = self._physical_corpus(collection)
+        corpus_rows = await self._fetch_by_ids(corpus_name, [document_id])
+        if document_id not in corpus_rows:
+            return False
+        if not self._tier_authorized(corpus_rows[document_id][1], user_context):
+            return False
+        col = await self._client.get_or_create_collection(
+            name=corpus_name, embedding_function=None
+        )
+        await col.delete(ids=[document_id])
+        return True
 
     @log_call(logger=logger)
     async def get_document(
@@ -929,29 +1008,74 @@ class ChromaSemanticService(SemanticService):
         collection: str,
         document_id: str,
     ) -> Document | None:
-        """Fetch a single document by id.
+        """Fetch a single document by id (:meth:`get_documents` of one).
 
-        ADR-062 Phase B (§3 hole 1) closes the formerly-unfiltered read:
-        before this change ANY caller with ``memory:semantic:read`` could
-        read ANY document by id regardless of ownership (``del
-        user_context`` at the top of this method). Now a document is
-        returned only if the caller is admin, the document is
-        corpus-tier, or the caller owns it (``_tier_authorized``). A
-        cross-user attempt returns ``None`` — the SAME signal as a
-        genuine miss, so the route layer's 404 never discloses that the
+        ADR-062 Phase B (§3 hole 1): a document is returned only if the caller
+        owns it (owner-prefixed id, or their OWN bare legacy id) or it is
+        corpus-tier. A cross-user attempt returns ``None`` -- the SAME signal as
+        a genuine miss, so the route layer's 404 never discloses that the
         document exists under someone else's identity."""
-        doc = await self._get_from_physical(
-            self._physical(collection), collection, document_id
+        found: list[Document | None] = await self.get_documents(
+            user_context, collection, [document_id]
         )
-        if doc is None:
-            doc = await self._get_from_physical(
-                self._physical_corpus(collection), collection, document_id
+        return found[0]
+
+    @log_call(logger=logger)
+    async def get_documents(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_ids: list[str],
+    ) -> list[Document | None]:
+        """ONE ``get`` on the private physical collection for every owner and
+        legacy id (missing ids are omitted by ChromaDB), then ONE on the corpus
+        collection for what is still unresolved (ADDENDUM-1 S2)."""
+        private = await self._resolve_private(user_context, collection, document_ids)
+        missing = [i for i in document_ids if i not in private]
+        corpus = (
+            await self._fetch_by_ids(self._physical_corpus(collection), missing)
+            if missing
+            else {}
+        )
+        out: list[Document | None] = []
+        for document_id in document_ids:
+            row = private.get(document_id) or corpus.get(document_id)
+            if row is None or not self._tier_authorized(row[1], user_context):
+                out.append(None)
+                continue
+            out.append(
+                Document(
+                    page_content=row[0],
+                    metadata={**row[1], "collection": collection},
+                )
             )
-        if doc is None:
-            return None
-        if not self._tier_authorized(doc.metadata, user_context):
-            return None
-        return doc
+        return out
+
+    @log_call(logger=logger)
+    async def drop_legacy_documents(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_ids: list[str],
+    ) -> int:
+        """Copy-forward step 3 (ADDENDUM-1 S2): ONE ``get`` then ONE ``delete`` of
+        the bare ids whose metadata ``user_id`` is the caller's and whose tier is
+        private. Another user's chunk at the same bare id, or a corpus-tier row,
+        is never touched."""
+        rows = await self._fetch_by_ids(self._physical(collection), document_ids)
+        doomed = [
+            cid
+            for cid, (_, meta) in rows.items()
+            if meta.get("user_id") == user_context.user_id
+            and meta.get("tier") != "corpus"
+        ]
+        if not doomed:
+            return 0
+        col = await self._client.get_or_create_collection(
+            name=self._physical(collection), embedding_function=None
+        )
+        await col.delete(ids=doomed)
+        return len(doomed)
 
 
 class UserScopedSemanticService(SemanticService):
@@ -1063,6 +1187,30 @@ class UserScopedSemanticService(SemanticService):
     ) -> Document | None:
         del user_context
         return await self._inner.get_document(self._bound_user, collection, document_id)
+
+    @log_call(logger=logger)
+    async def get_documents(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_ids: list[str],
+    ) -> list[Document | None]:
+        del user_context
+        return await self._inner.get_documents(
+            self._bound_user, collection, document_ids
+        )
+
+    @log_call(logger=logger)
+    async def drop_legacy_documents(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_ids: list[str],
+    ) -> int:
+        del user_context
+        return await self._inner.drop_legacy_documents(
+            self._bound_user, collection, document_ids
+        )
 
 
 class MockSemanticService(SemanticService):

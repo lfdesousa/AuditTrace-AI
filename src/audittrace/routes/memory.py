@@ -95,6 +95,7 @@ from audittrace.routes.memory_promote import (
 )
 from audittrace.routes.memory_semantic_writes import (
     concurrent_write_409,
+    drop_copied_forward_chunk,
     require_visible_row_or_404,
     semantic_write_errors_as_http,
 )
@@ -111,6 +112,8 @@ from audittrace.services.memory_keys import (
     ConcurrentManifestWriteError,
     LogicalKeyTooLongError,
     check_logical,
+    logical_id,
+    private_physical_id,
     semantic_logical_key,
 )
 from audittrace.services.memory_manifest import (
@@ -231,6 +234,15 @@ def _doc_id(collection: str, source: str, chunk_idx: int) -> str:
     """Generate a deterministic document ID."""
     raw = f"{collection}:{source}:{chunk_idx}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _chroma_ids(user: UserContext, tier: str, ids: list[str]) -> list[str]:
+    """The ChromaDB ids a fold writes for the LOGICAL chunk *ids* (LC-9 WP3):
+    ``{owner}__{id}`` for a private-tier write, unchanged for corpus. The one
+    place the two fold sinks (markdown and PDF) derive a physical id."""
+    if tier == "corpus":
+        return list(ids)
+    return [private_physical_id(user, i) for i in ids]
 
 
 # WU-1 (SPEC-2026-09-17-memory-retrieval-and-learning-loop-telemetry, closes
@@ -1136,7 +1148,13 @@ async def _index_md_objects(
                     _semantic_key(col_name, doc_id),
                     requested_tier=tier,
                 )
-        await _upsert_in_batches(collection, ids, chunks, metadatas)
+        # LC-9 WP3 (R4 / ADDENDUM-1 S5): the ChromaDB id of a PRIVATE chunk is
+        # ``{owner}__{hash}``, derived from ``user`` (the token), always
+        # prepended. The authorize_write check above and the manifest keys
+        # below keep the LOGICAL ``ids``. Corpus ids are unchanged.
+        await _upsert_in_batches(
+            collection, _chroma_ids(user, tier, ids), chunks, metadatas
+        )
         total += len(chunks)
         # ADR-059 WU-1c — thread the manifest write (see this function's
         # docstring + the memory_md_manifest module docstring). Runs after
@@ -1532,6 +1550,7 @@ async def index_memory(
                     dry_run=dry_run,
                     outcomes=object_outcomes,
                     caller_can_write_shared=col_caller_can_write_shared,
+                    tier=tier,
                 )
                 chunk_count += await _index_pdf_objects(
                     collection,
@@ -1549,6 +1568,7 @@ async def index_memory(
                     dry_run=dry_run,
                     outcomes=object_outcomes,
                     caller_can_write_shared=col_caller_can_write_shared,
+                    tier=tier,
                 )
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
@@ -2486,6 +2506,7 @@ async def create_semantic(
             )
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
+    await drop_copied_forward_chunk(service, user, collection, document_id, copied_from)
     await _emit_write_audits(
         user=user,
         layer="semantic",
@@ -2643,11 +2664,15 @@ async def _merge_semantic_with_chroma(
             logger.warning("ChromaDB get failed for collection %s: %s", col_name, exc)
             continue
         for i, doc_id in enumerate(ids):
-            key = _semantic_key(col_name, doc_id)
+            meta = metas[i] if i < len(metas) and metas[i] else {}
+            # LC-9 WP3 (ADDENDUM-1 C3 #8 / R4): a private chunk's ChromaDB id is
+            # ``{owner}__{id}``; the row is listed under its LOGICAL id so it
+            # dedups against its own manifest row (one item per document).
+            owner = meta.get("user_id") if meta.get("tier") == "private" else None
+            key = _semantic_key(col_name, logical_id(doc_id, owner))
             if key in known_keys:
                 continue
             content = docs[i] if i < len(docs) else ""
-            meta = metas[i] if i < len(metas) and metas[i] else {}
             # ADR-062 Phase B (§3 hole 2) — close the raw-Chroma enumeration
             # hole: skip a discovered row the caller does not own and that
             # isn't corpus-tier. See the function docstring.
@@ -2880,12 +2905,12 @@ async def _gather_whole_document(
         return [document_id], [doc]
     chunk_ids: list[str] = []
     chunk_docs: list[Any] = []
-    for chunk_id in _iter_document_chunk_ids(collection, title):
-        candidate = (
-            doc
-            if chunk_id == document_id
-            else await service.get_document(user, collection, chunk_id)
-        )
+    # LC-9 WP3 (ADDENDUM-1 S2): the whole sequence is resolved with ONE batched
+    # read (owner ids and the caller's legacy ids together; missing ids are
+    # omitted), not one ``get_document`` per chunk.
+    sequence = _iter_document_chunk_ids(collection, title)
+    fetched = await service.get_documents(user, collection, sequence)
+    for chunk_id, candidate in zip(sequence, fetched, strict=True):
         if candidate is None:
             break
         chunk_ids.append(chunk_id)
@@ -3111,6 +3136,7 @@ async def update_semantic(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
+    await drop_copied_forward_chunk(service, user, collection, document_id, copied_from)
     await _emit_write_audits(
         user=user,
         layer="semantic",

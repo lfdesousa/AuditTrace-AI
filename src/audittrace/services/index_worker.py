@@ -171,6 +171,8 @@ async def default_indexer(envelope: IndexRequestEnvelope, settings: Settings) ->
         # on metadata fields, same "preserve tier/owner on legitimate
         # re-index" contract as an authorized human caller gets.
         caller_can_write_shared=True,
+        # The worker drains the SHARED bucket only (above): corpus ids stay bare.
+        tier="corpus",
     )
     return bool(outcomes) and outcomes[-1]
 

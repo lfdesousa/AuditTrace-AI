@@ -583,7 +583,14 @@ class TestSoftDeleteTombstoneFiltersRecall:
     ) -> None:
         """LC-9: a pre-LC-9 (legacy, bare-key) private row's tombstone is
         still honoured -- the candidates cover BOTH storage shapes."""
-        await service.upsert(user_context, "decisions", "doc-legacy", "legacy body")
+        # A pre-LC-9 chunk: a BARE ChromaDB id with the owner in the metadata
+        # (``upsert`` now writes ``{owner}__{id}``, so seed the raw row).
+        raw = await service._client.get_or_create_collection(name="decisions_v2")
+        await raw.upsert(
+            ids=["doc-legacy"],
+            documents=["legacy body"],
+            metadatas=[{"user_id": user_context.user_id, "tier": "private"}],
+        )
         manifest._rows[("semantic", "decisions/doc-legacy")] = {
             "id": "legacy-1",
             "layer": "semantic",
@@ -1419,7 +1426,8 @@ class TestUpsertStampsFromContextUnconditionally:
         private_col = await service._client.get_or_create_collection(
             name="decisions_v2"
         )
-        assert (await private_col.get(ids=["forge-tier"]))["ids"] == ["forge-tier"]
+        physical_id = f"{user_context.user_id}__forge-tier"  # LC-9 WP3 id space
+        assert (await private_col.get(ids=[physical_id]))["ids"] == [physical_id]
 
     async def test_forged_metadata_tier_corpus_is_unreadable_by_a_stranger(
         self, service, user_context
@@ -1494,6 +1502,18 @@ class TestGetDocumentClosesHole:
         alice_like = replace(user_context, user_id=owner, is_admin=False, scopes=())
         await service.upsert(alice_like, "decisions", "priv-doc", "alice's secret")
 
+    async def _seed_legacy(self, service, owner: str) -> None:
+        """A pre-LC-9 chunk: BARE id, owner in the metadata. LC-9 WP3 moved new
+        private chunks to ``{owner}__{id}``, which only the owner can address;
+        the admin override and the ``_tier_authorized`` neuter cases are about
+        the bare-id (legacy) path."""
+        raw = await service._client.get_or_create_collection(name="decisions_v2")
+        await raw.upsert(
+            ids=["priv-doc"],
+            documents=["alice's secret"],
+            metadatas=[{"user_id": owner, "tier": "private"}],
+        )
+
     async def test_owner_can_read_own_private_doc(self, service, user_context):
         await self._seed_private(service, user_context, "user-alice")
         alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
@@ -1510,7 +1530,7 @@ class TestGetDocumentClosesHole:
         assert doc is None
 
     async def test_admin_bypasses_ownership_check(self, service, user_context):
-        await self._seed_private(service, user_context, "user-alice")
+        await self._seed_legacy(service, "user-alice")
         # user_context fixture is the admin sentinel.
         doc = await service.get_document(user_context, "decisions", "priv-doc")
         assert doc is not None
@@ -1529,7 +1549,7 @@ class TestGetDocumentClosesHole:
         """Prove the ownership check is load-bearing: neutering
         `_tier_authorized` to always return True must resurrect the
         cross-user leak this hole-closure fixes."""
-        await self._seed_private(service, user_context, "user-alice")
+        await self._seed_legacy(service, "user-alice")
         monkeypatch.setattr(
             ChromaSemanticService,
             "_tier_authorized",
@@ -1586,8 +1606,13 @@ class TestDeleteDocumentClosesHole:
         assert await service.get_document(alice, "decisions", "priv-doc") is not None
 
     async def test_admin_can_delete_any_users_private_doc(self, service, user_context):
-        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
-        await service.upsert(alice, "decisions", "priv-doc", "secret")
+        # A pre-LC-9 chunk (bare id): see TestGetDocumentClosesHole._seed_legacy.
+        raw = await service._client.get_or_create_collection(name="decisions_v2")
+        await raw.upsert(
+            ids=["priv-doc"],
+            documents=["secret"],
+            metadatas=[{"user_id": "user-alice", "tier": "private"}],
+        )
         # user_context fixture is the admin sentinel.
         assert (
             await service.delete_document(user_context, "decisions", "priv-doc") is True
@@ -1603,8 +1628,12 @@ class TestDeleteDocumentClosesHole:
     async def test_falsifiability_neuter_tier_authorized_allows_cross_user_delete(
         self, service, user_context, monkeypatch
     ):
-        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
-        await service.upsert(alice, "decisions", "priv-doc", "secret")
+        raw = await service._client.get_or_create_collection(name="decisions_v2")
+        await raw.upsert(
+            ids=["priv-doc"],
+            documents=["secret"],
+            metadatas=[{"user_id": "user-alice", "tier": "private"}],
+        )
         monkeypatch.setattr(
             ChromaSemanticService,
             "_tier_authorized",

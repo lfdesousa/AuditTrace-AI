@@ -28,6 +28,7 @@ site; removing this context manager from a site (or making the mapper return
 from __future__ import annotations
 
 import contextlib
+import logging
 from collections.abc import Iterator
 from typing import Any
 
@@ -38,6 +39,8 @@ from audittrace.services.memory_keys import (
     ConcurrentManifestWriteError,
     LogicalKeyTooLongError,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def concurrent_write_409(exc: ConcurrentManifestWriteError) -> HTTPException:
@@ -74,4 +77,35 @@ async def require_visible_row_or_404(
                 "semantic doc has no manifest row: "
                 f"no manifest row for layer='semantic' key={key!r}"
             ),
+        )
+
+
+async def drop_copied_forward_chunk(
+    service: Any,
+    user: UserContext,
+    collection: str,
+    document_id: str,
+    copied_from: str | None,
+) -> None:
+    """Copy-forward step 3 (LC-9 WP3, ADDENDUM-1 S2): after the manifest has
+    tombstoned the caller's own legacy row (*copied_from* names it), delete the
+    caller's legacy ChromaDB chunk at the bare *document_id*.
+
+    Runs AFTER the manifest transaction, so a failure here never undoes it: the
+    legacy chunk is already hidden from recall by the tombstone (reader #5), and
+    the owner-keyed chunk written in step 1 answers every read. The failure is
+    logged and the write still succeeds; the owner check inside
+    ``drop_legacy_documents`` means another user's chunk at that bare id is never
+    deleted. A no-op when nothing was copied forward."""
+    if not copied_from:
+        return
+    try:
+        await service.drop_legacy_documents(user, collection, [document_id])
+    except Exception:
+        logger.warning(
+            "copy-forward step 3 failed collection=%s document_id=%s; the legacy "
+            "chunk stays hidden by its tombstone",
+            collection,
+            document_id,
+            exc_info=True,
         )
