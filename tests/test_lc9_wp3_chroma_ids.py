@@ -18,6 +18,27 @@ RT -> class map (spec ``2026-10-26-SPEC-lc9-cross-user-private-row-isolation``
 * dual lookup         ``TestLegacyChunkDualLookup`` (owner id, then the caller's OWN legacy id)
 * S2 step 3           ``TestCopyForwardDropsLegacyChunk``
 
+Doubles declared (EVERY one this module uses; nothing else is faked):
+
+* ``audittrace.services.semantic.embed_via_nomic`` and
+  ``audittrace.routes.memory.embed_via_nomic`` are replaced by one ``AsyncMock``
+  returning fixed 3-d vectors (no embedding server runs).
+* ``audittrace.auth.get_settings``, ``audittrace.auth._get_jwks_keys`` and
+  ``audittrace.auth._decode_jwt_with_allowed_issuers`` are patched by ``_Auth``
+  so a request carries a valid JWT for the chosen ``sub`` and scope string (the
+  repo's JWT-patch pattern); the route, the dependency chain and the scope
+  checks run for real.
+* ``audittrace.routes.memory._get_minio_client`` is a ``MagicMock`` (the upload
+  and promote tests) or a ``MagicMock`` whose ``get_object`` returns the file
+  bytes (``_fake_minio``, the fold tests); no object store runs.
+* The ChromaDB client is the in-repo ``MockChromaDBFactory`` client, driven by
+  the REAL ``ChromaSemanticService``. The real engine is exercised in
+  ``test_lc9_wp3_real_chroma.py``.
+* The manifest is ``MockMemoryManifestService`` (the container default) or the
+  real ``MemoryManifestService`` over ``InMemoryPostgresFactory`` (aiosqlite).
+* the ``registries`` fixture re-imports the tool modules so the tool registries are fresh;
+  the tools themselves are the real handlers.
+
 Neuters (each ALONE, restored with ``git checkout``) are listed in the build
 record's RT -> test -> neuter map.
 """
