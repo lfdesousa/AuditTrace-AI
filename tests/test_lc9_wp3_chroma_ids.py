@@ -1206,12 +1206,18 @@ class TestD1hRead:
             assert r.status_code == 404, doc
             assert "DIRECT-P" not in r.text and "PROMOTED-AGAIN" not in r.text
 
-    def test_a_stamped_bare_row_is_not_served_as_legacy(self, rig: Rig) -> None:
-        """A's new-form ``p.md`` sits at ``user-a__p.md``; B's logical id
-        ``user-a__p.md`` has no row of B's, and A's stamped row must not answer
-        it (neuter: accept the stamped bare row)."""
+    def test_a_stamped_bare_row_never_answers_another_logical_id(
+        self, rig: Rig
+    ) -> None:
+        """A has ONLY the new-form ``p.md`` (stored ``user-a__p.md``). A's read of
+        logical ``user-a__p.md`` must not be answered by that stamped row (it
+        is some other logical id's row): 404, and ``None`` from the service.
+        Neuter: the stamp condition off in ``_resolve_private``."""
         assert rig.create(A, "p.md", "DIRECT-P").status_code == 200
-        assert _read(rig, B, f"{A}__p.md") is None
+        r = rig.get(A, f"{A}__p.md")
+        assert r.status_code == 404 and "DIRECT-P" not in r.text
+        assert _read(rig, A, f"{A}__p.md") is None
+        assert rig.get(A, "p.md").json()["content"] == "DIRECT-P"
 
 
 class TestD1iStampForgery:
