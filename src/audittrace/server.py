@@ -771,6 +771,18 @@ def create_app() -> FastAPI:
         version=_resolve_version(),
         openapi_tags=OPENAPI_TAGS,
         lifespan=lifespan,
+        # WP-1: FastAPI 0.162 ships native OTel (tracing/metrics/logs/operation
+        # spans). Ours is the contrib FastAPIInstrumentor behind
+        # attach_instrumentor + install_trace_context_policy (TRACEPARENT-TRUST);
+        # native telemetry stays OFF (whole-config equality, pinned by
+        # tests/test_fastapi_native_telemetry_off.py).
+        telemetry={
+            "tracing": False,
+            "metrics": False,
+            "logs": False,
+            "operation_spans": False,
+            "auto_configure": False,
+        },
     )
 
     # CORS — required by the minimalist webui (ADR-042 reference impl)

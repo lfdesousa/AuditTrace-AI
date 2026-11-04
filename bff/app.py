@@ -224,6 +224,15 @@ def create_app() -> FastAPI:
             "byte-identical."
         ),
         lifespan=lifespan,
+        # WP-1: native FastAPI telemetry OFF (equality pin; see
+        # tests/test_fastapi_native_telemetry_off.py).
+        telemetry={
+            "tracing": False,
+            "metrics": False,
+            "logs": False,
+            "operation_spans": False,
+            "auto_configure": False,
+        },
     )
 
     @app.get("/health")

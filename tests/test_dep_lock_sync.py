@@ -232,10 +232,10 @@ def test_the_guard_flags_a_package_whose_hashes_were_stripped_n3(rel: str) -> No
 def test_the_guard_flags_a_lock_only_version_change_n4() -> None:
     inp = _mutated(
         "requirements-dev.txt",
-        lambda t: t.replace("\nfastapi==0.146.0 ", "\nfastapi==0.145.0 ", 1),
+        lambda t: t.replace("\nfastapi==0.162.0 ", "\nfastapi==0.161.0 ", 1),
     )
     assert any(
-        "fastapi pinned 0.146.0 but the lock has 0.145.0" in v
+        "fastapi pinned 0.162.0 but the lock has 0.161.0" in v
         for v in all_violations(inp)
     )
 

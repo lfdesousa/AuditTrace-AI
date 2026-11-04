@@ -139,7 +139,7 @@ SANCTIONED: frozenset[tuple[str, str]] = SANCTIONED_STATEMENTS | ALLOWED_CONFIGU
 # Chokepoint scripts: byte-identical to their pin, or RED until the pin is updated on purpose.
 HASH_PINNED: dict[str, str] = {
     "scripts/install-locked.sh": "2e6ceb154ee09f21f952920eefc7cc29a27a2209b3f1a2da34a4536e8bd47e1c",
-    "scripts/lock.sh": "d24954bd611d3908fddf33250a6a0307fb6263ab1721ff41d476737fd430fe93",
+    "scripts/lock.sh": "ffcf78c5a1f95cf0d9652344a557cf531e33c28aad58f4345184814bfc2e5d3e",
 }
 
 # Undecodable files that are expected: 4 kinds (.der, .meta, .pdf; the .tgz are pinned below).

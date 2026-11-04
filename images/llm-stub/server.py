@@ -22,7 +22,19 @@ from typing import Any
 
 from fastapi import FastAPI
 
-app = FastAPI(title="audittrace-llm-stub")
+# WP-1: native FastAPI telemetry OFF (equality pin; see
+# tests/test_fastapi_native_telemetry_off.py). Literal on purpose: the stub image
+# does not import the audittrace package.
+app = FastAPI(
+    title="audittrace-llm-stub",
+    telemetry={
+        "tracing": False,
+        "metrics": False,
+        "logs": False,
+        "operation_spans": False,
+        "auto_configure": False,
+    },
+)
 
 # nomic-embed-text-v1.5 dimensionality (matches
 # config.py::memory_embedding_dim). Deterministic non-zero vector so
