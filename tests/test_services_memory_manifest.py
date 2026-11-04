@@ -12,6 +12,8 @@ integration tests through the in-memory PostgresFactory.
 
 from __future__ import annotations
 
+import contextlib
+import threading
 import time
 
 import pytest
@@ -20,6 +22,7 @@ from sqlalchemy import update
 
 from audittrace.db.models import MemoryItem
 from audittrace.identity import UserContext
+from audittrace.services import memory_manifest as mm_module
 from audittrace.services.memory_manifest import (
     IndexStatusSummary,
     ManifestAuthorizationError,
@@ -1931,3 +1934,125 @@ class TestPostgresUpsertPdfMetadata:
         assert e.created_by_user_id == "alice"
         assert e.title == "Main paper"  # preserved by upsert path
         assert e.page_count == 46  # populated by upsert
+
+
+class TestListForLayerOffLoopPostgres:
+    """GP4-CI r2 (review r1 F1, F2, F5): the REAL ``MemoryManifestService``
+    (not the Mock) runs its O(rows) materialise + owner-or-corpus filter OFF
+    the event-loop thread, with the caller's identity carried across the hop,
+    and only AFTER the DB session has closed."""
+
+    async def _seed(self, m: MemoryManifestService) -> None:
+        # alice: 2 private + 1 corpus; bob: 1 private + 1 corpus.
+        await m.record_create(
+            "semantic", "decisions/a-priv-1", None, 1, "alice", tier="private"
+        )
+        await m.record_create(
+            "semantic", "decisions/a-priv-2", None, 1, "alice", tier="private"
+        )
+        await m.record_create(
+            "semantic", "decisions/a-corp", None, 1, "alice", tier="corpus"
+        )
+        await m.record_create(
+            "semantic", "decisions/b-priv", None, 1, "bob", tier="private"
+        )
+        await m.record_create(
+            "semantic", "decisions/b-corp", None, 1, "bob", tier="corpus"
+        )
+
+    async def test_materialise_runs_off_the_loop_thread(
+        self, pg_manifest, monkeypatch
+    ) -> None:
+        """NEUTER (review N3): inline ``asyncio.to_thread(_rows_to_entries,
+        ...)`` in ``MemoryManifestService.list_for_layer`` -> the recorded
+        thread id equals the loop thread -> RED."""
+        await self._seed(pg_manifest)
+        seen: list[int] = []
+        orig = mm_module._rows_to_entries
+
+        def spy(rows, caller):
+            seen.append(threading.get_ident())
+            return orig(rows, caller)
+
+        monkeypatch.setattr(mm_module, "_rows_to_entries", spy)
+        got = await pg_manifest.list_for_layer("semantic")
+        assert len(got) == 5
+        assert seen and all(tid != threading.get_ident() for tid in seen)
+
+    async def test_caller_identity_crosses_the_hop_hides_other_private_rows(
+        self, pg_manifest, monkeypatch
+    ) -> None:
+        """NEUTER (review N8): pass ``None`` instead of ``caller`` to the
+        worker -> bob's private row leaks to alice (unfiltered cross-tenant
+        list) -> RED. Also asserts the worker received the caller object."""
+        await self._seed(pg_manifest)
+        callers: list[object] = []
+        orig = mm_module._rows_to_entries
+
+        def spy(rows, caller):
+            callers.append(caller)
+            return orig(rows, caller)
+
+        monkeypatch.setattr(mm_module, "_rows_to_entries", spy)
+        alice = _user("alice")
+        got = await pg_manifest.list_for_layer("semantic", caller=alice)
+        keys = {e.key for e in got}
+        assert keys == {
+            "decisions/a-priv-1",
+            "decisions/a-priv-2",
+            "decisions/a-corp",
+            "decisions/b-corp",
+        }
+        assert "decisions/b-priv" not in keys  # bob's private row is hidden
+        assert callers == [alice]
+        bob_keys = {
+            e.key
+            for e in await pg_manifest.list_for_layer("semantic", caller=_user("bob"))
+        }
+        assert bob_keys == {
+            "decisions/b-priv",
+            "decisions/b-corp",
+            "decisions/a-corp",
+        }
+        # admin and caller=None stay UNFILTERED (documented contract).
+        admin = await pg_manifest.list_for_layer(
+            "semantic", caller=_user("root", is_admin=True)
+        )
+        assert len(admin) == 5
+        assert len(await pg_manifest.list_for_layer("semantic")) == 5
+
+    async def test_hop_happens_after_the_db_session_closed(
+        self, pg_manifest, monkeypatch
+    ) -> None:
+        """F5: the pooled connection is not held while waiting for a worker.
+        Wraps the session factory to count open sessions; the worker records
+        that count. NEUTER: move the ``to_thread`` back inside ``async with
+        self._session_factory()`` -> count is 1 -> RED. The worker also reads
+        the (detached) rows, proving the detached read is safe."""
+        await self._seed(pg_manifest)
+        inner = pg_manifest._session_factory
+        state = {"open": 0, "opened": 0}
+
+        @contextlib.asynccontextmanager
+        async def tracked():
+            async with inner() as session:
+                state["open"] += 1
+                state["opened"] += 1
+                try:
+                    yield session
+                finally:
+                    state["open"] -= 1
+
+        monkeypatch.setattr(pg_manifest, "_session_factory", tracked)
+        open_at_hop: list[int] = []
+        orig = mm_module._rows_to_entries
+
+        def spy(rows, caller):
+            open_at_hop.append(state["open"])
+            return orig(rows, caller)
+
+        monkeypatch.setattr(mm_module, "_rows_to_entries", spy)
+        got = await pg_manifest.list_for_layer("semantic", caller=_user("alice"))
+        assert len(got) == 4
+        assert state["opened"] == 1  # the query really went through the wrapper
+        assert open_at_hop == [0]

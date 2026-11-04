@@ -1391,17 +1391,23 @@ def _build_gp4_app_and_manifest(monkeypatch):
 @pytest.mark.asyncio
 async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_env):
     """Through the real public route (``httpx.ASGITransport`` — the whole
-    FastAPI stack, no ``kubectl exec``, no mocked serializer): a
-    thread-based watchdog (``_LoopWatchdog`` — RE-REVIEW 2026-10-14 R1,
-    not an asyncio-task ticker, which fails to observe a SYNCHRONOUS
-    blocking call: see N35 below) observing the SAME loop as the
-    request must never see a gap wider than 1.0s (the liveness kill
-    sits at ~60s; this is liveness-facing, not a tight micro-bound —
-    ratified ADDENDUM A1 §6), and must record enough ticks to make that
-    measurement meaningful at all (``_max_gap_fail_closed`` — an empty
-    or too-sparse tick list is itself a failure, never silently 0.0).
-    A phase-free companion check sums the CPU time spent INSIDE
-    ``render_payload`` during the request and requires it stay <= 0.05s.
+    FastAPI stack, no ``kubectl exec``, no mocked serializer).
+
+    GP4-CI r2 (operator rule 2026-11-03: no test passes or fails on a
+    wall-clock duration): the liveness property is proven STRUCTURALLY.
+    Every O(rows) pure-Python unit behind ``GET /memory/semantic`` (the
+    manifest materialise + owner filter, ``to_dict``, the dedup key set,
+    the corpus-gate/dedupe/group/sort/paginate tail) must execute on a
+    worker thread, never on the event-loop thread — a thread-identity spy,
+    on the Mock manifest here and on the REAL ``MemoryManifestService``
+    (aiosqlite) through the SAME route below. NEUTER: inline any
+    ``asyncio.to_thread`` hop onto the loop thread -> its recorded thread
+    id equals the loop thread -> RED, deterministically.
+
+    The thread-based watchdog (``_LoopWatchdog``) still observes the
+    request and still fails closed on a too-sparse tick COUNT
+    (``_max_gap_fail_closed`` — a count, not a duration), but ``max_gap``
+    and the ``render_payload`` CPU time are RECORDED (printed) only.
     Positive control: >= 2 ``list_for_layer`` seam spans are exported,
     each carrying the truncation suffix and the redaction marker, with no
     raw fragment of the token anywhere."""
@@ -1454,6 +1460,26 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
 
     monkeypatch.setattr(lc, "render_payload", _spying_render_payload)
 
+    # Deterministic off-loop proof (GP4-CI r2): record the thread each CPU
+    # unit runs on. ``loop_tid`` is this (the event-loop) thread.
+    from audittrace.routes import memory as routes_memory
+
+    loop_tid = threading.get_ident()
+    unit_threads: dict[str, set[int]] = {}
+
+    def _spy(owner, attr, label):
+        orig = getattr(owner, attr)
+
+        def wrapper(*a, **k):
+            unit_threads.setdefault(label, set()).add(threading.get_ident())
+            return orig(*a, **k)
+
+        monkeypatch.setattr(owner, attr, wrapper)
+
+    for _name in ("entries_to_dicts", "entry_keys", "semantic_list_view"):
+        _spy(routes_memory, _name, _name)
+    _spy(manifest, "_list_entries_sync", "mock_list_entries_sync")
+
     transport = httpx.ASGITransport(app=app)
     loop = asyncio.get_running_loop()
     watchdog = _LoopWatchdog(loop)
@@ -1478,14 +1504,25 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
 
     assert resp.status_code == 200, resp.text
 
+    # RECORDED, not asserted (operator rule: no wall-clock pass/fail).
+    # ``_max_gap_fail_closed`` still raises on a too-sparse tick COUNT.
     max_gap = _max_gap_fail_closed(ticks)
-    assert max_gap <= 1.0, f"event loop stalled for {max_gap:.3f}s during the request"
-
     summed_render_cpu = sum(render_payload_cpu_seconds)
-    assert summed_render_cpu <= 0.05, (
-        f"render_payload summed CPU time {summed_render_cpu:.4f}s exceeds "
-        f"the 0.05s bound (phase-free companion to the watchdog-gap check)"
+    print(
+        f"\nG-P4 RECORDED max_gap={max_gap:.4f}s ticks={len(ticks)} "
+        f"render_payload_cpu={summed_render_cpu:.4f}s"
     )
+
+    assert set(unit_threads) == {
+        "entries_to_dicts",
+        "entry_keys",
+        "semantic_list_view",
+        "mock_list_entries_sync",
+    }, unit_threads
+    for _label, _tids in unit_threads.items():
+        assert loop_tid not in _tids, (
+            f"{_label} ran on the event-loop thread (GP4-CI: must be off-loop)"
+        )
 
     seam_spans = [
         s for s in exporter.get_finished_spans() if "list_for_layer" in s.name
@@ -1535,6 +1572,55 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
         f"(gap_fixed - gap_floor = {max_gap - gap_floor:.4f}s)  "
         f"ticks={len(ticks)} floor_ticks={len(floor_ticks)}"
     )
+
+    # Same route, REAL ``MemoryManifestService`` (aiosqlite): the production
+    # hop ``_rows_to_entries`` runs off the loop thread too (review r1 F1).
+    from audittrace.db.models import MemoryItem
+    from audittrace.db.postgres import InMemoryPostgresFactory
+    from audittrace.services import memory_manifest as mm_module
+    from audittrace.services.memory_manifest import MemoryManifestService
+
+    factory = InMemoryPostgresFactory()
+    await factory.create_schema()
+    async with factory.get_session_factory()() as session:
+        session.add_all(
+            MemoryItem(
+                id=f"real-{i:04d}",
+                layer="semantic",
+                key=f"decisions/real-{i:04d}",
+                created_at_ms=1000 + i,
+                modified_at_ms=1000 + i,
+                created_by_user_id="stall-test-user",
+                modified_by_user_id="stall-test-user",
+                tier="corpus",
+            )
+            for i in range(40)
+        )
+        await session.commit()
+    from audittrace import dependencies as deps_mod
+
+    deps_mod.container._instances["memory_manifest"] = MemoryManifestService(
+        session_factory=factory.get_session_factory()
+    )
+    real_tids: list[int] = []
+    orig_rows_to_entries = mm_module._rows_to_entries
+
+    def _spy_rows(rows, caller):
+        real_tids.append(threading.get_ident())
+        return orig_rows_to_entries(rows, caller)
+
+    monkeypatch.setattr(mm_module, "_rows_to_entries", _spy_rows)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c2:
+        real_resp = await c2.get(
+            "/memory/semantic",
+            params={"collection": "decisions", "limit": 25},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert real_resp.status_code == 200, real_resp.text
+    assert real_resp.json()["total"] > 0
+    assert real_tids, "the real list_for_layer hop never ran"
+    assert loop_tid not in real_tids, "real list_for_layer ran on the loop thread"
+    deps_mod.container._instances["memory_manifest"] = manifest
 
     telemetry._reset_for_tests()
     telemetry.init_telemetry(
