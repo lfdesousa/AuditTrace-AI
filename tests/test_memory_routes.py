@@ -2008,6 +2008,8 @@ class TestIndexPrivateTier:
     @staticmethod
     def _mock_chroma() -> tuple[MagicMock, AsyncMock]:
         mock_collection = AsyncMock()
+        # LC-9 ADDENDUM-5 D1: the private-tier pre-check reads the target ids
+        mock_collection.get = AsyncMock(return_value={"ids": [], "metadatas": []})
         mock_chroma = MagicMock()
         mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
         mock_chroma.delete_collection = AsyncMock()
@@ -8709,6 +8711,8 @@ class TestPdfIndexOrchestratorEdgePaths:
         fake_pymupdf.open.return_value = fake_doc
 
         mock_collection = AsyncMock()
+        # LC-9 ADDENDUM-5 D1: the private-tier pre-check reads the target ids
+        mock_collection.get = AsyncMock(return_value={"ids": [], "metadatas": []})
         mock_manifest = MagicMock()
         mock_manifest.upsert_pdf_metadata = AsyncMock()
         mock_manifest.get = AsyncMock(return_value=None)

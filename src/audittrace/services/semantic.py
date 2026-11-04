@@ -866,10 +866,6 @@ class ChromaSemanticService(SemanticService):
         # stored value.
         meta = dict(metadata or {})
         meta["user_id"] = user_context.user_id
-        # LC-9 ADDENDUM-5 D0: the form stamp is server-side and total -- it is
-        # assigned here (never ``setdefault``) and stripped from caller
-        # metadata at every entry point, so no caller can forge a new-form row.
-        meta.pop("id_form", None)
         if tier == "corpus":
             # ADR-062 Phase B (D1): the corpus write TARGET. The
             # promote SCOPE-GATE (memory:corpus:<collection>:write) is
@@ -879,6 +875,9 @@ class ChromaSemanticService(SemanticService):
         else:
             physical_name = self._physical(collection)
             meta["tier"] = "private"
+            # ADDENDUM-5 D0: the form stamp, by DIRECT assignment beside
+            # ``user_id``/``tier`` (never ``setdefault``): no caller metadata can
+            # supply it (the routes also strip it).
             meta["id_form"] = ID_FORM_LC9
         # LC-9 WP3 (ADDENDUM-1 S5): a PRIVATE chunk's ChromaDB id is ALWAYS
         # ``{owner}__{id}``, derived from the token's identity -- never

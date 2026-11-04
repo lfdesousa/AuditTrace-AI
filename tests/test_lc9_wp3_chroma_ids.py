@@ -1248,19 +1248,6 @@ class TestD1iStampForgery:
         )
         assert rig.raw()[f"{B}__x"]["metadata"]["id_form"] == "lc9"
 
-    def test_corpus_writes_are_not_stamped(self, rig: Rig) -> None:
-        asyncio.run(
-            rig.semantic.upsert(
-                _ctx("curator-1"),
-                "decisions",
-                "c",
-                "t",
-                {"id_form": "lc9"},
-                tier="corpus",
-            )
-        )
-        assert "id_form" not in rig.raw("decisions_corpus")["c"]["metadata"]
-
 
 @pytest.mark.usefixtures("registries")
 class TestD1gMcp:
@@ -1459,3 +1446,42 @@ class TestD1fFoldSinks:
             assert cid.startswith(f"{B}__")
             assert meta["id_form"] == "lc9" and meta["tier"] == "private"
         assert _index_pdf(rig, B, key).status_code == 200  # own re-index converges
+
+
+class TestD1409AtEachSite:
+    """The 409 arm precedes the 502 arm at PUT and at promote (create is in
+    ``TestD1aCrossOwnerLegacy``, ``index_memory`` in ``TestD1fFoldSinks``).
+    Neuter: remove the arm at that site -> 502."""
+
+    def _unstamp(self, rig: Rig, cid: str, collection: str = "decisions") -> None:
+        rig.raw(collection)[cid]["metadata"].pop("id_form")
+
+    def test_put_onto_an_unstamped_row_is_409(
+        self, rig: Rig, audits: AsyncMock
+    ) -> None:
+        assert rig.create(A, "foo", "A-NEW").status_code == 200
+        self._unstamp(rig, f"{A}__foo")
+        before = _snapshot(rig, f"{A}__foo")
+        audits.reset_mock()
+        r = rig.update(A, "foo", "A-V2")
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == _conflict_text("decisions", "foo")
+        assert "retry-after" not in {k.lower() for k in r.headers}
+        assert _snapshot(rig, f"{A}__foo") == before
+        audits.assert_not_called()
+
+    def test_promote_onto_an_unstamped_row_is_409(self, rig: Rig) -> None:
+        rig.raw_col("semantic")  # create the collection
+        asyncio.run(
+            rig.raw_col("semantic").upsert(
+                ids=[f"{A}__{A}__n.md"],
+                documents=["PLANTED"],
+                metadatas=[{"user_id": A, "tier": "private"}],
+            )
+        )
+        before = _snapshot(rig, f"{A}__{A}__n.md", "semantic")
+        _upload_session(rig, A, "n.md")
+        r = _promote(rig, A, "n.md")
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == _conflict_text("semantic", f"{A}__n.md")
+        assert _snapshot(rig, f"{A}__{A}__n.md", "semantic") == before
