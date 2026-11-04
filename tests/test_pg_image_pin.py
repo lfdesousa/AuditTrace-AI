@@ -56,19 +56,26 @@ _PRUNE_DIRS = {
 _REGISTRY_RX = re.compile(
     r"^(?:index\.docker\.io|registry-1\.docker\.io|docker\.io)/", re.IGNORECASE
 )
-#: A candidate image token: an optional path of segments, then a repository
-#: whose LAST segment is exactly ``postgres``, then ``:<tag>`` or
-#: ``@sha256:<digest>``. The lookbehind stops a match starting inside a word
-#: (``audittrace-postgres``), after ``@`` (a DSN host) or after ``.``/``-``.
+#: A candidate image token (DENY-BY-DEFAULT, r4): an optional path of segments,
+#: then a repository whose LAST segment is ``postgres`` (any case), then ANY
+#: Docker-grammar tag ``:[\w][\w.\-]{0,127}`` and/or ANY ``@sha256:`` digest. No
+#: tag family is enumerated: whether the reference is acceptable is decided
+#: only by equality with the pin in :func:`find_foreign_images`. The tag is
+#: possessive so the engine cannot backtrack to a shorter tag to dodge the
+#: lookaheads. ``(?![\w.\-]*:)`` keeps ``postgres:5432:5432``-style host:port
+#: strings out; ``(?!@)`` keeps ``postgres:password@host`` credentials out. The
+#: lookbehind stops a match starting inside a word (``audittrace-postgres``),
+#: after ``@`` (a DSN host), ``/`` (``scheme://postgres:pw@``) or ``.``/``-``.
 #: Whether the repository IS the official image is decided by
 #: :func:`normalise_repo`, not by this pattern.
 _IMAGE_RX = re.compile(
     r"(?<![\w@/.\-])(?P<repo>(?:[\w.\-]+/)*postgres)"
     r"(?:"
-    r":(?P<tag>\d+(?:\.\d+)*(?:-[\w.]+)?|latest|alpine[\w.\-]*|bookworm[\w.\-]*)"
-    r"(?![\w.\-]*:)"
-    r"|@(?P<digest>sha256:[0-9a-f]+)"
-    r")"
+    r":(?P<tag>\w[\w.\-]{0,127}+)(?:@(?P<tagdigest>sha256:\w+))?"
+    r"(?![\w.\-]*:)(?!@)"
+    r"|@(?P<digest>sha256:\w+)"
+    r")",
+    re.IGNORECASE,
 )
 #: An untagged (implicit ``:latest``) image, only where it IS an image
 #: reference: a compose/workflow ``image:`` value or a Dockerfile ``FROM``.
@@ -98,11 +105,11 @@ def expand_param_defaults(text: str) -> str:
 
 
 def normalise_repo(repo: str) -> str:
-    """``index.docker.io/library/postgres`` -> ``postgres``; any other
+    """``index.docker.io/library/postgres`` -> ``postgres`` (lower-cased); any other
     namespace (``bitnami/postgres``, ``team/postgres``, ``ghcr.io/x/postgres``)
     is returned unchanged, so it never equals the official ``postgres``."""
-    repo = _REGISTRY_RX.sub("", repo)
-    return repo[len("library/") :] if repo.lower().startswith("library/") else repo
+    repo = _REGISTRY_RX.sub("", repo).lower()
+    return repo[len("library/") :] if repo.startswith("library/") else repo
 
 
 def _is_port(tag: str) -> bool:
@@ -153,7 +160,14 @@ def find_foreign_images(text: str, pin: str) -> list[str]:
         tag = m.group("tag")
         if tag is not None and _is_port(tag):
             continue
-        ref = "postgres" + m.group(0)[len(m.group("repo")) :]
+        # a trailing dot is sentence punctuation, never part of a real tag
+        ref = "postgres" + (f":{tag.rstrip('.')}" if tag else "")
+        digest = m.group("tagdigest") or m.group("digest")
+        if digest:
+            # RULING (r4): the pin carries no digest policy, so ANY digest
+            # form -- bare or behind a tag, the pinned tag included -- is not
+            # the pin and is RED.
+            ref += "@" + digest
         if ref != pin:
             out.append(ref)
     out.extend(
@@ -323,6 +337,35 @@ def test_makefile_resolves_the_pin_with_a_stripped_path(tmp_path: Path) -> None:
         ),
         ("image: &pg postgres:" + "16", ["postgres:16"]),
         ("image: ${PG_IMAGE:-postgres}", ["postgres"]),
+        # r4 deny-by-default: ANY tag / digest that is not the pin is RED
+        ("image: postgres:trixie", ["postgres:trixie"]),
+        ("image: postgres:bullseye", ["postgres:bullseye"]),
+        ("image: docker.io/library/postgres:bookworm", ["postgres:bookworm"]),
+        ("image: postgres:18-trixie", ["postgres:18-trixie"]),
+        ("image: POSTGRES:" + "16", ["postgres:16"]),
+        ("image: postgres:some_new.tag-9", ["postgres:some_new.tag-9"]),
+        ("image: postgres:" + "x" * 128, ["postgres:" + "x" * 128]),
+        ("see postgres:" + "16.", ["postgres:16"]),
+        ("image: " + PG_TEST_IMAGE + "-x", [PG_TEST_IMAGE + "-x"]),
+        (
+            "image: ${PG_IMAGE:-docker.io/library/postgres:trixie}",
+            ["postgres:trixie"],
+        ),
+        # RULING: the pin has no digest policy, so a digest on the pinned tag
+        # (any registry spelling) is NOT the pin and is RED.
+        (
+            PG_TEST_IMAGE + "@sha256:" + "cd34" * 16,
+            [f"{PG_TEST_IMAGE}@sha256:" + "cd34" * 16],
+        ),
+        (
+            "docker.io/library/" + PG_TEST_IMAGE + "@sha256:" + "cd34" * 16,
+            [f"{PG_TEST_IMAGE}@sha256:" + "cd34" * 16],
+        ),
+        (
+            "postgres:trixie@sha256:" + "cd34" * 16,
+            ["postgres:trixie@sha256:" + "cd34" * 16],
+        ),
+        ("postgres@sha256:" + "CD34" * 16, ["postgres@sha256:" + "CD34" * 16]),
         # the pin in any canonical spelling is fine
         ("docker.io/library/" + PG_TEST_IMAGE, []),
         ("library/" + PG_TEST_IMAGE, []),
@@ -358,6 +401,15 @@ def test_scanner_has_no_false_positives_on_prose_users_hosts_or_urls() -> None:
         "image: registry.example.com/team/postgres:" + "16\n"
         'USERS = ["postgres", "audittrace"]\n'
         'argv = ["psql", "-U", "postgres"]\n'
+        "postgres:5432\n"
+        "ports: postgres:5432:5432\n"
+        "postgresql://u:p@host:5432/db\n"
+        "postgresql+asyncpg://postgres:secret@postgres:5432/audit\n"
+        "postgres:secret@db.internal/audit\n"
+        "postgres_exporter --web.listen-address=:9187\n"
+        "image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0\n"
+        "docker.io/library/" + PG_TEST_IMAGE + "\n"
+        "POSTGRES_PASSWORD: postgres\n"
     )
     assert find_foreign_images(ok, PG_TEST_IMAGE) == []
 
