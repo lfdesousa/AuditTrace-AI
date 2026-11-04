@@ -615,3 +615,88 @@ class TestInvalidSubIsRefused:
         r = rig.create("bad__sub", "x", "t")
         assert r.status_code == 403
         assert rig.raw() == {}
+
+
+# ── B1: the admin exception is gone (operator ruling, strict) ──────────────
+
+ADMIN = BASE + " audittrace:admin"
+ADMIN_SUB = "admin-1"
+
+
+class TestAdminDoesNotReachPrivateRows:
+    """An admin GET / hard delete by A's logical OR physical id is exactly 404 and
+    leaks nothing; A reads back unchanged. Neuter: restore ``is_admin`` in
+    ``_tier_authorized`` -> the physical-id GET is 200 with A's text -> RED."""
+
+    def _a_has_x(self, rig: Rig) -> None:
+        assert rig.create(A, "x", "A-SECRET").status_code == 200
+
+    def _owner_readback(self, rig: Rig) -> None:
+        r = rig.get(A, "x")
+        assert r.status_code == 200 and r.json()["content"] == "A-SECRET"
+        assert r.json()["metadata"]["user_id"] == A
+
+    def test_admin_get_by_physical_id_is_404(self, rig: Rig) -> None:
+        self._a_has_x(rig)
+        r = rig.call("GET", f"/memory/semantic/decisions/{A}__x", ADMIN_SUB, ADMIN)
+        assert r.status_code == 404
+        assert "A-SECRET" not in r.text
+        self._owner_readback(rig)
+
+    def test_admin_get_by_logical_id_is_404(self, rig: Rig) -> None:
+        self._a_has_x(rig)
+        r = rig.call("GET", "/memory/semantic/decisions/x", ADMIN_SUB, ADMIN)
+        assert r.status_code == 404 and "A-SECRET" not in r.text
+        self._owner_readback(rig)
+
+    def test_admin_get_of_a_legacy_row_is_404(self, rig: Rig) -> None:
+        rig.seed_legacy("old", A, "A-LEGACY-SECRET")
+        r = rig.call("GET", "/memory/semantic/decisions/old", ADMIN_SUB, ADMIN)
+        assert r.status_code == 404 and "A-LEGACY-SECRET" not in r.text
+        assert rig.get(A, "old").json()["content"] == "A-LEGACY-SECRET"
+
+    def test_admin_service_hard_delete_by_physical_id_is_false(self, rig: Rig) -> None:
+        self._a_has_x(rig)
+        admin = UserContext(
+            user_id=ADMIN_SUB,
+            username=ADMIN_SUB,
+            agent_type="t",
+            scopes=("audittrace:admin",),
+            is_admin=True,
+        )
+        assert (
+            asyncio.run(rig.semantic.delete_document(admin, "decisions", f"{A}__x"))
+            is False
+        )
+        assert set(rig.raw()) == {f"{A}__x"}
+        self._owner_readback(rig)
+
+
+# ── B6: a foreign legacy row never aborts the caller's own hard delete ─────
+
+
+class TestHardDeleteSkipsForeignLegacyRow:
+    """B owns ``x`` (stored ``user-b__x``); A has a legacy chunk at the bare id
+    ``x``. B's hard delete removes B's chunk and leaves A's untouched. Neuter:
+    ``return False`` on the foreign legacy row (the r1 shape) -> B's chunk
+    survives -> RED."""
+
+    def test_service_level(self, rig: Rig) -> None:
+        rig.seed_raw_chunk("x", A, "A-legacy")
+        asyncio.run(
+            rig.semantic.upsert(_ctx(B), "decisions", "x", "B-new", {}, tier="private")
+        )
+        assert asyncio.run(rig.semantic.delete_document(_ctx(B), "decisions", "x"))
+        assert set(rig.raw()) == {"x"}
+        assert rig.raw()["x"]["metadata"]["user_id"] == A
+
+    def test_route_level_admin_hard_delete_of_own_doc(self, rig: Rig) -> None:
+        rig.seed_raw_chunk("x", A, "A-legacy")
+        assert rig.create(ADMIN_SUB, "x", "admin-body").status_code == 200
+        assert set(rig.raw()) == {"x", f"{ADMIN_SUB}__x"}
+        r = rig.call(
+            "DELETE", "/memory/semantic/decisions/x?hard=true", ADMIN_SUB, ADMIN
+        )
+        assert r.status_code == 200, r.text
+        assert set(rig.raw()) == {"x"}
+        assert rig.get(A, "x").json()["content"] == "A-legacy"

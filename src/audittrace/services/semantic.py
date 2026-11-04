@@ -384,16 +384,15 @@ class ChromaSemanticService(SemanticService):
 
     @staticmethod
     def _tier_authorized(meta: dict[str, Any], user_context: UserContext) -> bool:
-        """ADR-062 Phase B §3 ownership predicate — shared by
+        """ADR-062 Phase B §3 ownership predicate -- shared by
         ``get_document`` and ``delete_document`` (the two formerly-
-        unfiltered reads/writes-by-id). A non-admin caller is authorized
-        for a document iff they own it (``metadata["user_id"] ==
-        caller``) OR the document is corpus-tier
-        (``metadata["tier"] == "corpus"``, deliberately unfiltered — D1).
-        Admins are always authorized, mirroring ``search()``/
-        ``search_page()``, which never filter for admin callers."""
-        if user_context.is_admin:
-            return True
+        unfiltered reads/writes-by-id). A caller is authorized for a document
+        iff they own it (``metadata["user_id"] == caller``) OR the document is
+        corpus-tier (``metadata["tier"] == "corpus"``, deliberately
+        unfiltered -- D1). There is NO admin exception for a private row (LC-9,
+        operator ruling "strict", ADDENDUM-1 S2/R3): an admin reaches another
+        user's private chunk by id neither to read nor to delete it. Admin
+        reads through ``search()``/``search_page()`` are a separate path."""
         return (
             meta.get("user_id") == user_context.user_id or meta.get("tier") == "corpus"
         )
@@ -935,8 +934,8 @@ class ChromaSemanticService(SemanticService):
     ) -> dict[str, tuple[str, dict[str, Any]]]:
         """Dual lookup for many ids with ONE ``get``: for each logical id the
         caller's owner-prefixed id first, then the bare (legacy) id when
-        ``_tier_authorized`` admits it (the caller's own, a corpus-tier row, or
-        the existing ADR-062 admin read -- see the build record, STOP item 1). Returns ``{logical id: (text, meta)}``."""
+        ``_tier_authorized`` admits it (the caller's own row or a corpus-tier
+        row; no admin exception). Returns ``{logical id: (text, meta)}``."""
         owner_ids = {i: self._owner_id(user_context, i) for i in document_ids}
         wanted = [oid for oid in owner_ids.values() if oid is not None]
         rows = await self._fetch_by_ids(
@@ -979,9 +978,12 @@ class ChromaSemanticService(SemanticService):
         if owner_id is not None and owner_id in rows:
             if rows[owner_id][1].get("user_id") == user_context.user_id:
                 doomed.append(owner_id)
-        if document_id in rows:
-            if not self._tier_authorized(rows[document_id][1], user_context):
-                return False
+        # A bare-id row that is not the caller's (and not corpus-tier) is
+        # SKIPPED, never a reason to abort: it must not stop the caller's own
+        # owner-id row from being deleted (review B6).
+        if document_id in rows and self._tier_authorized(
+            rows[document_id][1], user_context
+        ):
             doomed.append(document_id)
         if doomed:
             col = await self._client.get_or_create_collection(
