@@ -158,3 +158,20 @@ async def test_drop_legacy_only_removes_the_callers_bare_chunk(env: Any) -> None
     assert left[0] is not None
     assert await svc.get_documents(_ctx(A), coll, ["mine"]) == [None]
     assert await svc.drop_legacy_documents(_ctx(A), coll, ["mine"]) == 0
+
+
+async def test_a_row_at_the_callers_prefix_but_another_owner_is_not_returned(
+    env: Any,
+) -> None:
+    """An id at B's prefix whose metadata names another owner is inconsistent
+    data: it is never served to B. Neuter: drop the owner check on the owner-id
+    row AND the final ownership check -> RED."""
+    svc, client, coll = env
+    private = await client.get_or_create_collection(f"{coll}_v2")
+    await private.upsert(
+        ids=[f"{B}__x"],
+        documents=["misplaced"],
+        embeddings=[[0.1, 0.2, 0.3]],
+        metadatas=[{"user_id": A, "tier": "private"}],
+    )
+    assert await svc.get_documents(_ctx(B), coll, ["x"]) == [None]
