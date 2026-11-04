@@ -722,3 +722,193 @@ class TestRt11LegacyPromotedListedOnce:
         assert rig.create(A, "plain", "plain").status_code == 200
         ids = sorted(i["key"].rsplit("/", 1)[-1] for i in rig.chunk_items(A))
         assert ids == sorted([f"{A}__old.md", f"{A}__new.md", "plain"])
+
+
+# ── B4: each guard has a test that turns it RED ALONE ──────────────────────
+# (neuter -> test: R10a/R10b/R11a/R16/R20/R24/R25 service level; R18 promote;
+#  R19 MCP; R22/R23 the user-scoped wrapper. Each neuter is a single edit.)
+
+
+def _scoped(rig: Rig, bound_sub: str) -> Any:
+    from audittrace.services.semantic import UserScopedSemanticService
+
+    return UserScopedSemanticService(rig.semantic, _ctx(bound_sub))
+
+
+def _corpus_row(rig: Rig, doc: str, text: str, meta: dict[str, Any]) -> None:
+    asyncio.run(
+        rig.raw_col("decisions_corpus").upsert(
+            ids=[doc], documents=[text], metadatas=[meta]
+        )
+    )
+
+
+def _read(rig: Rig, sub: str, doc: str) -> Any:
+    return asyncio.run(rig.semantic.get_documents(_ctx(sub), "decisions", [doc]))[0]
+
+
+class TestEachDualLookupHalfAlone:
+    def test_r10a_foreign_legacy_row_does_not_shadow_the_corpus_doc(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the legacy-branch ownership check removed (the final check
+        left in place) -> B gets ``None`` instead of the corpus document."""
+        rig.seed_raw_chunk("shared", A, "A-legacy-private")
+        _corpus_row(rig, "shared", "CORPUS", {"tier": "corpus", "user_id": "curator"})
+        got = _read(rig, B, "shared")
+        assert got is not None and got.page_content == "CORPUS"
+
+    def test_r10b_foreign_private_row_in_the_corpus_collection_is_not_served(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the FINAL ownership check removed (the lookup check left in
+        place) -> a private-tier row planted in the corpus collection is served."""
+        _corpus_row(rig, "z", "A-in-corpus-col", {"tier": "private", "user_id": A})
+        assert _read(rig, B, "z") is None
+        got = _read(rig, A, "z")
+        assert got is not None and got.page_content == "A-in-corpus-col"
+
+    def test_r11a_a_misplaced_row_at_the_callers_prefix_does_not_shadow(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the owned-row metadata check removed (the final check left
+        in place) -> the misplaced ``user-b__foo`` owned by A shadows B's own
+        legacy ``foo``."""
+        rig.seed_raw_chunk(f"{B}__foo", A, "A-legacy-misplaced")
+        rig.seed_raw_chunk("foo", B, "B-own-legacy")
+        got = _read(rig, B, "foo")
+        assert got is not None and got.page_content == "B-own-legacy"
+
+
+class TestStepThreeTierCheck:
+    def test_r16_a_corpus_tier_row_owned_by_the_caller_is_not_dropped(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: ``tier != "corpus"`` removed from ``drop_legacy_documents``."""
+        asyncio.run(
+            rig.raw_col().upsert(
+                ids=["c"],
+                documents=["curated"],
+                metadatas=[{"user_id": A, "tier": "corpus"}],
+            )
+        )
+        assert (
+            asyncio.run(rig.semantic.drop_legacy_documents(_ctx(A), "decisions", ["c"]))
+            == 0
+        )
+        assert "c" in rig.raw()
+
+
+class TestHardDeleteGuards:
+    def test_r20_a_misplaced_row_at_the_callers_prefix_is_not_deleted(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the owner check on the caller-prefix row removed."""
+        rig.seed_raw_chunk(f"{B}__x", A, "A-misplaced")
+        assert (
+            asyncio.run(rig.semantic.delete_document(_ctx(B), "decisions", "x"))
+            is False
+        )
+        assert f"{B}__x" in rig.raw()
+
+    def test_r25_a_foreign_private_row_in_the_corpus_collection_is_not_deleted(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the corpus-collection authorisation removed."""
+        _corpus_row(rig, "z", "A-in-corpus-col", {"tier": "private", "user_id": A})
+        assert (
+            asyncio.run(rig.semantic.delete_document(_ctx(B), "decisions", "z"))
+            is False
+        )
+        assert "z" in rig.raw("decisions_corpus")
+
+    def test_r24_a_sub_that_cannot_own_a_private_id_reads_and_deletes_cleanly(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: ``_owner_id`` stops swallowing ``InvalidPrivateSubjectError``
+        -> the read and the delete RAISE for such a caller."""
+        _corpus_row(rig, "pub", "CORPUS", {"tier": "corpus", "user_id": "curator"})
+        bad = _ctx("bad__sub")
+        got = asyncio.run(rig.semantic.get_documents(bad, "decisions", ["pub", "nope"]))
+        assert got[0] is not None and got[0].page_content == "CORPUS" and got[1] is None
+        assert (
+            asyncio.run(rig.semantic.delete_document(bad, "decisions", "nope")) is False
+        )
+
+
+class TestUserScopedWrapperBindsTheCaller:
+    def test_r22_get_documents_uses_the_bound_identity(self, rig: Rig) -> None:
+        """Neuter: the wrapper forwards the per-call ``user_context``."""
+        assert rig.create(A, "x", "A-body").status_code == 200
+        scoped = _scoped(rig, B)  # bound to B; the per-call argument claims A
+        got = asyncio.run(scoped.get_documents(_ctx(A), "decisions", ["x"]))
+        assert got == [None]
+        own = asyncio.run(_scoped(rig, A).get_documents(_ctx(B), "decisions", ["x"]))
+        assert own[0] is not None and own[0].page_content == "A-body"
+
+    def test_r23_drop_legacy_documents_uses_the_bound_identity(self, rig: Rig) -> None:
+        """Neuter: the wrapper forwards the per-call ``user_context``."""
+        rig.seed_raw_chunk("x", A, "A-legacy")
+        scoped = _scoped(rig, B)
+        assert (
+            asyncio.run(scoped.drop_legacy_documents(_ctx(A), "decisions", ["x"])) == 0
+        )
+        assert "x" in rig.raw()
+        assert (
+            asyncio.run(
+                _scoped(rig, A).drop_legacy_documents(_ctx(B), "decisions", ["x"])
+            )
+            == 1
+        )
+
+
+class TestStepThreeAtPromoteAndMcp:
+    def _upload(self, rig: Rig, sub: str, name: str) -> None:
+        with (
+            _Auth(sub, "memory:session:write"),
+            patch("audittrace.routes.memory._get_minio_client", MagicMock()),
+        ):
+            r = rig.client.post(
+                "/memory/upload",
+                params={"layer": "session"},
+                files={"file": (name, b"scratch", "text/plain")},
+                headers={"Authorization": "Bearer t"},
+            )
+        assert r.status_code == 200, r.text
+
+    def test_r18_promote_over_own_legacy_drops_the_legacy_chunk(self, rig: Rig) -> None:
+        """Neuter: the step-3 call removed from ``_promote_to_semantic``. The
+        legacy promoted chunk sits at the bare id ``user-a__n.md``; the promote
+        writes ``user-a__user-a__n.md`` and must drop the legacy one."""
+        rig.seed_legacy_row(f"{A}__n.md", A, collection="semantic")
+        rig.seed_raw_chunk(f"{A}__n.md", A, "legacy", collection="semantic")
+        self._upload(rig, A, "n.md")
+        with _Auth(A, "memory:semantic:write memory:session:write"):
+            r = rig.client.post(
+                "/memory/promote",
+                json={"filename": "n.md", "target_layer": "semantic"},
+                headers={"Authorization": "Bearer t"},
+            )
+        assert r.status_code == 200, r.text
+        assert set(rig.raw("semantic")) == {f"{A}__{A}__n.md"}
+
+
+@pytest.mark.usefixtures("registries")
+class TestStepThreeAtMcp:
+    def test_r19_mcp_write_over_own_legacy_drops_the_legacy_chunk(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the step-3 call removed from ``_write_semantic_document``."""
+        rig.seed_legacy("dec-1", A, "legacy")
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "write_decision",
+                "arguments": {"document_id": "dec-1", "text": "new"},
+            },
+        }
+        r = rig.call("POST", "/mcp", A, "memory:decisions:write", json=body)
+        assert r.status_code == 200 and r.json()["result"]["isError"] is False
+        assert set(rig.raw()) == {f"{A}__dec-1"}
