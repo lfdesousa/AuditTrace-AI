@@ -56,37 +56,26 @@ _PRUNE_DIRS = {
 _REGISTRY_RX = re.compile(
     r"^(?:index\.docker\.io|registry-1\.docker\.io|docker\.io)/", re.IGNORECASE
 )
-#: What may follow ``postgres:<tag>@`` and still be an IMAGE reference rather
-#: than a credential (r5): (a) a digest grammar ``algo:<32+ hex>``, (b) a ``${``
-#: expansion, bare or after an algorithm (``@sha256:${D}``), (c) nothing (end of
-#: token). Anything else after the ``@`` (``db.internal``, ``host:5432``) is a
-#: DSN credential and stays excluded.
-_AT_IMAGE_TAIL = (
-    r"(?:[A-Za-z][A-Za-z0-9+._\-]*:(?:[0-9a-fA-F]{32,}|\$\{)"
-    r"|\$\{"
-    r"|(?:[\s'\"`,;)\]}<>]|\Z))"
-)
-#: A candidate image token (DENY-BY-DEFAULT, r4/r5): an optional path of
+#: A candidate image token (DENY-BY-DEFAULT, r4/r6): an optional path of
 #: segments, then a repository whose LAST segment is ``postgres`` (any case),
 #: then ANY Docker-grammar tag ``:[\w][\w.\-]{0,127}`` and/or ANY ``@sha256:``
 #: digest. No tag family is enumerated: whether the reference is acceptable is
 #: decided only by equality with the pin in :func:`find_foreign_images`. The
 #: tag is possessive so the engine cannot backtrack to a shorter tag to dodge
-#: the lookaheads. ``(?![\w.\-]*:)`` keeps ``postgres:5432:5432``-style
-#: host:port strings out. The credentials exclusion is ``(?!@)`` NARROWED (r5):
-#: an ``@`` that is followed by :data:`_AT_IMAGE_TAIL` is captured as ``tail``
-#: (the reference is then never the pin -- see :func:`find_foreign_images`);
-#: any other ``@`` (``postgres:password@host``) is a credential and excluded.
-#: The lookbehind stops a match starting inside a word
-#: (``audittrace-postgres``), after ``@`` (a DSN host), ``/``
-#: (``scheme://postgres:pw@${HOST}`` is therefore a DSN, never a candidate) or
-#: ``.``/``-``. Whether the repository IS the official image is decided by
-#: :func:`normalise_repo`, not by this pattern.
+#: the lookahead. ``(?![\w.\-]*:)`` keeps ``postgres:5432:5432``-style
+#: host:port strings out.
+#: RULING (r6, flipped): an ``@`` after ``postgres:<tag>`` NEVER excludes the
+#: reference, whatever follows it (it is captured as ``at`` and kept on the
+#: reference, so it can never equal the pin). The ONLY exclusion is a DSN: the
+#: lookbehind refuses a match that starts after a word char, ``@`` (a DSN
+#: host), ``/`` (so ``scheme://postgres:pw@${HOST}`` is a DSN, never a
+#: candidate) or ``.``/``-``. Whether the repository IS the official image is
+#: decided by :func:`normalise_repo`, not by this pattern.
 _IMAGE_RX = re.compile(
     r"(?<![\w@/.\-])(?P<repo>(?:[\w.\-]+/)*postgres)"
     r"(?:"
     r":(?P<tag>\w[\w.\-]{0,127}+)(?:@(?P<tagdigest>sha256:\w+))?"
-    r"(?![\w.\-]*:)(?P<tail>@(?=" + _AT_IMAGE_TAIL + r"))?(?!@)"
+    r"(?![\w.\-]*:)(?P<at>@)?"
     r"|@(?P<digest>sha256:\w+)"
     r")",
     re.IGNORECASE,
@@ -182,10 +171,10 @@ def find_foreign_images(text: str, pin: str) -> list[str]:
             # form -- bare or behind a tag, the pinned tag included -- is not
             # the pin and is RED.
             ref += "@" + digest
-        if m.group("tail"):
-            # RULING (r5): a non-credential ``@`` after the tag (digest
-            # grammar, ``${`` expansion or nothing) is an image reference
-            # that is never the pin, whatever tag precedes it.
+        if m.group("at"):
+            # RULING (r6): an ``@`` after the tag is never an exclusion (only a
+            # ``scheme://`` DSN is, via the lookbehind); the reference keeps
+            # the ``@`` so it is never the pin, whatever follows it.
             ref += "@"
         if ref != pin:
             out.append(ref)
@@ -396,12 +385,29 @@ def test_makefile_resolves_the_pin_with_a_stripped_path(tmp_path: Path) -> None:
         ("image: " + PG_TEST_IMAGE + "@sha512:" + "ab" * 64, [PG_TEST_IMAGE + "@"]),
         ("image: " + PG_TEST_IMAGE + "@", [PG_TEST_IMAGE + "@"]),
         ("image: postgres:16@SHA256:${PG_DIGEST}", ["postgres:16@"]),
-        # RULING on ``postgres:pw@${HOST}``: ambiguous with ``@${DIGEST}``, so
-        # deny-by-default makes it RED -- UNLESS it is clearly a DSN, i.e. the
-        # token follows ``://`` (the lookbehind), which stays GREEN.
+        # r6 (flipped rule): after ``postgres:<tag>@`` the reference is ALWAYS
+        # a candidate, whatever follows -- unbraced/paren/escaped expansions,
+        # other algorithms, template and format tails, credentials.
+        ("postgres:16@$PG_DIGEST", ["postgres:16@"]),
+        ("postgres:16@$(PG_DIGEST)", ["postgres:16@"]),
+        ("postgres:16@$${PG_DIGEST}", ["postgres:16@"]),
+        ("postgres:16@sha256:$PG_DIGEST", ["postgres:16@"]),
+        ("postgres:16@sha256:$(PG_DIGEST)", ["postgres:16@"]),
+        ("postgres:16@sha384:" + "ab" * 48, ["postgres:16@"]),
+        ("postgres:16@{{ d }}", ["postgres:16@"]),
+        ("postgres:16@%s", ["postgres:16@"]),
+        ("postgres:pw@$HOST", ["postgres:pw@"]),
         ("postgres:pw@${HOST}", ["postgres:pw@"]),
+        # DECISION (operator, 2026-11-04, LC-9 r6 flipped rule): a bare
+        # ``postgres:secret@db.internal`` (no ``scheme://``) is now RED.
+        ("postgres:secret@db.internal", ["postgres:secret@"]),
+        ("postgres:secret@host:5432/audit", ["postgres:secret@"]),
+        # the ONLY exclusion: a DSN (``://`` precedes it), whatever the tail
         ("postgres://postgres:pw@${HOST}/db", []),
+        ("postgres://u:p@$HOST/db", []),
+        ("postgresql://postgres:pw@$(HOST)/db", []),
         ("postgresql+asyncpg://postgres:pw@${HOST}:5432/db", []),
+        ("postgresql+asyncpg://postgres:secret@postgres:5432", []),
         # the pin in any canonical spelling is fine
         ("docker.io/library/" + PG_TEST_IMAGE, []),
         ("library/" + PG_TEST_IMAGE, []),
@@ -441,8 +447,6 @@ def test_scanner_has_no_false_positives_on_prose_users_hosts_or_urls() -> None:
         "ports: postgres:5432:5432\n"
         "postgresql://u:p@host:5432/db\n"
         "postgresql+asyncpg://postgres:secret@postgres:5432/audit\n"
-        "postgres:secret@db.internal/audit\n"
-        "postgres:secret@host:5432/audit\n"
         "postgres://postgres:pw@${HOST}/audit\n"
         "postgres_exporter --web.listen-address=:9187\n"
         "image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0\n"
