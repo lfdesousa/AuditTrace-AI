@@ -353,8 +353,9 @@ class TestValidScopeWritesDocumentAndAudit:
         assert docs[0].metadata.get("tier") == "private"
 
         manifest = test_container._instances["memory_manifest"]
-        assert ("semantic", "decisions/adr-100") in manifest._rows
-        row = manifest._rows[("semantic", "decisions/adr-100")]
+        # LC-9: a private row is stored under its owner's prefix.
+        assert ("semantic", "curator-2/decisions/adr-100") in manifest._rows
+        row = manifest._rows[("semantic", "curator-2/decisions/adr-100")]
         assert row["created_by_user_id"] == "curator-2"
         assert row["tier"] == "private"
 
@@ -412,7 +413,7 @@ class TestValidScopeWritesDocumentAndAudit:
         assert docs[0].metadata.get("tier") == "private"
 
         manifest = test_container._instances["memory_manifest"]
-        assert ("semantic", "skills/skill-1") in manifest._rows
+        assert ("semantic", "curator-6/skills/skill-1") in manifest._rows
 
 
 class TestMcpWriteNoBypassOfCorpusGuard:
@@ -594,7 +595,7 @@ class TestCallerSuppliedFieldsIgnored:
         assert docs[0].metadata.get("user_id") != "mallory"
 
         manifest = test_container._instances["memory_manifest"]
-        row = manifest._rows[("semantic", "decisions/adr-200")]
+        row = manifest._rows[("semantic", "real-writer/decisions/adr-200")]
         assert row["created_by_user_id"] == "real-writer"
         assert row["tier"] == "private"
 

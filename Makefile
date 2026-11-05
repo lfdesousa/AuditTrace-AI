@@ -4,6 +4,12 @@
        token-guard sync-dashboards check-dashboard-drift check-retention-drift integration \
        release-bump-files release release-cut
 
+# LC-9 TEST-PG-PARITY-18 -- the ONE Postgres image for test/CI (prod parity,
+# PG 18.3). Single definition: scripts/ci/pg_image.mk, `include`d (no external
+# tool, so it resolves with a stripped PATH); `-include` is NOT used, a missing
+# file is a hard error.
+include scripts/ci/pg_image.mk
+
 # SPEC #441 — the obs-stack (ADR-028, external docker-compose project) is a
 # sibling checkout, not part of this repo. Its Grafana file-provider dir is a
 # synced mirror of the chart's canonical dashboard set; the path is
@@ -108,7 +114,7 @@ test: ## Run all tests with per-file coverage gate (scripts/ci/run-tests.sh owns
 	@.venv/bin/python -m scripts.neuter.runner hold-shared -- bash scripts/ci/run-tests.sh
 
 test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgres (NEVER production)
-	# Runs tests/test_rls_isolation.py against a throwaway postgres:16
+	# Runs tests/test_rls_isolation.py against a throwaway $(PG_TEST_IMAGE)
 	# container on localhost:15432. CRITICALLY: does NOT port-forward the
 	# k3s production Postgres — the test file includes a positive test
 	# (test_alice_cannot_insert_as_bob) that deliberately provokes an RLS
@@ -122,7 +128,7 @@ test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgre
 	  -e POSTGRES_PASSWORD=test \
 	  -e POSTGRES_DB=audittrace \
 	  -p 15432:5432 \
-	  postgres:16 -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null
+	  $(PG_TEST_IMAGE) -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null
 	@echo "⏳ Waiting for Postgres to accept connections ..."
 	@for i in 1 2 3 4 5 6 7 8; do \
 	  docker exec audittrace-test-pg pg_isready -U postgres >/dev/null 2>&1 && break ; \

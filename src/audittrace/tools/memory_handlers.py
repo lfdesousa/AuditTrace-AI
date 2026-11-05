@@ -315,8 +315,9 @@ def _recall_identity_fields(metadata: dict[str, Any]) -> dict[str, Any]:
     answer — not just its text — and a reconstruction query can fetch that
     passage back:
 
-    - ``id`` — the ChromaDB ``chunk_id`` (== the ``document_id`` supplied at
-      upsert) when the match came from the vector store. All three vector
+    - ``id`` — the ChromaDB ``chunk_id`` when the match came from the vector
+      store (== the ``document_id`` supplied at upsert for a corpus chunk; for a
+      PRIVATE chunk the owner-prefixed ``{owner}__{document_id}``, LC-9 WP3). All three vector
       recall tools carry a chunk id: ``recall_semantic`` and — since #383 —
       ``recall_decisions`` / ``recall_skills``, which now query the ChromaDB
       ``decisions`` / ``skills`` collections too. When a match carries no chunk

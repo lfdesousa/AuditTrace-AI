@@ -542,7 +542,9 @@ class TestSoftDeleteTombstoneFiltersRecall:
         await self._seed(service, manifest, user_context)
         assert len(await service.search(user_context, "body", k=4)) == 1
 
-        await manifest.record_delete("semantic", "decisions/doc-tomb", "someone")
+        await manifest.record_delete(
+            "semantic", "decisions/doc-tomb", user_context.user_id
+        )
         assert await service.search(user_context, "body", k=4) == []
 
     async def test_search_page_excludes_soft_deleted(
@@ -552,7 +554,9 @@ class TestSoftDeleteTombstoneFiltersRecall:
         page = await service.search_page(user_context, "body", k=4)
         assert page.total == 1
 
-        await manifest.record_delete("semantic", "decisions/doc-tomb", "someone")
+        await manifest.record_delete(
+            "semantic", "decisions/doc-tomb", user_context.user_id
+        )
         page = await service.search_page(user_context, "body", k=4)
         assert page.matches == []
         assert page.total == 0
@@ -561,7 +565,9 @@ class TestSoftDeleteTombstoneFiltersRecall:
         self, service, manifest, user_context
     ) -> None:
         await self._seed(service, manifest, user_context)
-        await manifest.record_delete("semantic", "decisions/doc-tomb", "someone")
+        await manifest.record_delete(
+            "semantic", "decisions/doc-tomb", user_context.user_id
+        )
         assert await service.search(user_context, "body", k=4) == []
 
         # Re-create: manifest revives (record_create clears deleted_at_ms)
@@ -571,6 +577,48 @@ class TestSoftDeleteTombstoneFiltersRecall:
         results = await service.search(user_context, "body", k=4)
         assert len(results) == 1
         assert results[0].page_content == "body v2 revived"
+
+    async def test_legacy_bare_key_tombstone_still_filters(
+        self, service, manifest, user_context
+    ) -> None:
+        """LC-9: a pre-LC-9 (legacy, bare-key) private row's tombstone is
+        still honoured -- the candidates cover BOTH storage shapes."""
+        # A pre-LC-9 chunk: a BARE ChromaDB id with the owner in the metadata
+        # (``upsert`` now writes ``{owner}__{id}``, so seed the raw row).
+        raw = await service._client.get_or_create_collection(name="decisions_v2")
+        await raw.upsert(
+            ids=["doc-legacy"],
+            documents=["legacy body"],
+            metadatas=[{"user_id": user_context.user_id, "tier": "private"}],
+        )
+        manifest._rows[("semantic", "decisions/doc-legacy")] = {
+            "id": "legacy-1",
+            "layer": "semantic",
+            "key": "decisions/doc-legacy",
+            "title": None,
+            "size_bytes": 1,
+            "created_at_ms": 1,
+            "modified_at_ms": 1,
+            "created_by_user_id": user_context.user_id,
+            "modified_by_user_id": user_context.user_id,
+            "deleted_at_ms": 2,
+            "deleted_by_user_id": user_context.user_id,
+            "tier": "private",
+        }
+        assert await service.search(user_context, "legacy", k=4) == []
+
+    async def test_another_users_tombstone_does_not_hide_my_document(
+        self, service, manifest, user_context
+    ) -> None:
+        """LC-9: B's tombstone of B's OWN ``doc-tomb`` (stored at
+        ``user-b/decisions/doc-tomb``) never hides A's document of the same
+        id (A's candidates are built from A's owner)."""
+        await self._seed(service, manifest, user_context)
+        await manifest.record_create(
+            "semantic", "decisions/doc-tomb", "B", 1, "someone-else"
+        )
+        await manifest.record_delete("semantic", "decisions/doc-tomb", "someone-else")
+        assert len(await service.search(user_context, "body", k=4)) == 1
 
     async def test_no_manifest_wired_is_a_no_op(self, user_context) -> None:
         """Backward compatibility: a service constructed without
@@ -1378,7 +1426,8 @@ class TestUpsertStampsFromContextUnconditionally:
         private_col = await service._client.get_or_create_collection(
             name="decisions_v2"
         )
-        assert (await private_col.get(ids=["forge-tier"]))["ids"] == ["forge-tier"]
+        physical_id = f"{user_context.user_id}__forge-tier"  # LC-9 WP3 id space
+        assert (await private_col.get(ids=[physical_id]))["ids"] == [physical_id]
 
     async def test_forged_metadata_tier_corpus_is_unreadable_by_a_stranger(
         self, service, user_context
@@ -1453,6 +1502,18 @@ class TestGetDocumentClosesHole:
         alice_like = replace(user_context, user_id=owner, is_admin=False, scopes=())
         await service.upsert(alice_like, "decisions", "priv-doc", "alice's secret")
 
+    async def _seed_legacy(self, service, owner: str) -> None:
+        """A pre-LC-9 chunk: BARE id, owner in the metadata. LC-9 WP3 moved new
+        private chunks to ``{owner}__{id}``, which only the owner can address;
+        the admin override and the ``_tier_authorized`` neuter cases are about
+        the bare-id (legacy) path."""
+        raw = await service._client.get_or_create_collection(name="decisions_v2")
+        await raw.upsert(
+            ids=["priv-doc"],
+            documents=["alice's secret"],
+            metadatas=[{"user_id": owner, "tier": "private"}],
+        )
+
     async def test_owner_can_read_own_private_doc(self, service, user_context):
         await self._seed_private(service, user_context, "user-alice")
         alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
@@ -1468,11 +1529,35 @@ class TestGetDocumentClosesHole:
         doc = await service.get_document(bob, "decisions", "priv-doc")
         assert doc is None
 
-    async def test_admin_bypasses_ownership_check(self, service, user_context):
-        await self._seed_private(service, user_context, "user-alice")
+    async def test_admin_does_not_reach_a_legacy_private_doc(
+        self, service, user_context
+    ):
+        """LC-9 (operator ruling, strict): no admin exception for a private row.
+        Exact denial for the admin, an owner read-back, and no leak."""
+        await self._seed_legacy(service, "user-alice")
         # user_context fixture is the admin sentinel.
-        doc = await service.get_document(user_context, "decisions", "priv-doc")
-        assert doc is not None
+        assert user_context.is_admin is True
+        assert await service.get_document(user_context, "decisions", "priv-doc") is None
+        assert await service.get_documents(user_context, "decisions", ["priv-doc"]) == [
+            None
+        ]
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        doc = await service.get_document(alice, "decisions", "priv-doc")
+        assert doc is not None and doc.page_content == "alice's secret"
+        assert doc.metadata["user_id"] == "user-alice"
+
+    async def test_admin_does_not_reach_a_new_form_private_doc_by_its_physical_id(
+        self, service, user_context
+    ):
+        """The new-form id ``user-alice__priv-doc`` is no back door for an admin
+        (it used to be served through the legacy branch)."""
+        await self._seed_private(service, user_context, "user-alice")
+        physical = "user-alice__priv-doc"
+        assert await service.get_document(user_context, "decisions", physical) is None
+        assert await service.get_document(user_context, "decisions", "priv-doc") is None
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        doc = await service.get_document(alice, "decisions", "priv-doc")
+        assert doc is not None and doc.page_content == "alice's secret"
 
     async def test_corpus_doc_readable_by_any_non_admin(self, service, user_context):
         await service.upsert(
@@ -1485,22 +1570,46 @@ class TestGetDocumentClosesHole:
     async def test_falsifiability_neuter_tier_authorized_leaks_cross_user(
         self, service, user_context, monkeypatch
     ):
-        """Prove the ownership check is load-bearing: neutering
-        `_tier_authorized` to always return True must resurrect the
-        cross-user leak this hole-closure fixes."""
-        await self._seed_private(service, user_context, "user-alice")
+        """Prove the ownership check is load-bearing: the real predicate denies
+        bob exactly (``None``, no leak, alice still reads her own); neutering
+        `_tier_authorized` to always return True resurrects the leak."""
+        await self._seed_legacy(service, "user-alice")
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        assert await service.get_document(bob, "decisions", "priv-doc") is None
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        assert (
+            await service.get_document(alice, "decisions", "priv-doc")
+        ).page_content == "alice's secret"
         monkeypatch.setattr(
             ChromaSemanticService,
             "_tier_authorized",
             staticmethod(lambda meta, uc: True),
         )
-        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
         doc = await service.get_document(bob, "decisions", "priv-doc")
         assert doc is not None, (
             "neutering _tier_authorized should resurrect the cross-user "
             "leak — if this assertion fails, the check wasn't actually "
             "load-bearing"
         )
+
+    async def test_restoring_the_admin_bypass_would_leak(
+        self, service, user_context, monkeypatch
+    ):
+        """Neuter for the operator ruling: an ``is_admin`` exception in the
+        predicate turns the admin denial above into a leak."""
+        await self._seed_legacy(service, "user-alice")
+        monkeypatch.setattr(
+            ChromaSemanticService,
+            "_tier_authorized",
+            staticmethod(
+                lambda meta, uc: (
+                    uc.is_admin
+                    or meta.get("user_id") == uc.user_id
+                    or meta.get("tier") == "corpus"
+                )
+            ),
+        )
+        assert await service.get_document(user_context, "decisions", "priv-doc")
 
     async def test_get_document_checks_corpus_when_absent_from_private(
         self, service, user_context
@@ -1544,13 +1653,61 @@ class TestDeleteDocumentClosesHole:
         # Still there — the delete must not have gone through.
         assert await service.get_document(alice, "decisions", "priv-doc") is not None
 
-    async def test_admin_can_delete_any_users_private_doc(self, service, user_context):
+    async def test_admin_cannot_delete_another_users_private_doc(
+        self, service, user_context
+    ):
+        """LC-9 (operator ruling, strict): exact denial (``False``), the chunk
+        survives, and its owner still reads it back."""
+        # A pre-LC-9 chunk (bare id): see TestGetDocumentClosesHole._seed_legacy.
+        raw = await service._client.get_or_create_collection(name="decisions_v2")
+        await raw.upsert(
+            ids=["priv-doc"],
+            documents=["secret"],
+            metadatas=[{"user_id": "user-alice", "tier": "private"}],
+        )
+        # user_context fixture is the admin sentinel.
+        assert user_context.is_admin is True
+        assert (
+            await service.delete_document(user_context, "decisions", "priv-doc")
+            is False
+        )
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        doc = await service.get_document(alice, "decisions", "priv-doc")
+        assert doc is not None and doc.page_content == "secret"
+
+    async def test_admin_cannot_delete_a_new_form_doc_by_its_physical_id(
+        self, service, user_context
+    ):
         alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
         await service.upsert(alice, "decisions", "priv-doc", "secret")
-        # user_context fixture is the admin sentinel.
         assert (
-            await service.delete_document(user_context, "decisions", "priv-doc") is True
+            await service.delete_document(
+                user_context, "decisions", "user-alice__priv-doc"
+            )
+            is False
         )
+        doc = await service.get_document(alice, "decisions", "priv-doc")
+        assert doc is not None and doc.page_content == "secret"
+
+    async def test_a_foreign_legacy_row_does_not_stop_the_callers_own_delete(
+        self, service, user_context
+    ):
+        """Review B6: bob owns ``priv-doc`` (stored ``user-bob__priv-doc``) and
+        alice has a legacy row at the bare id. Bob's hard delete removes bob's
+        chunk and leaves alice's untouched (it used to abort with ``False``)."""
+        raw = await service._client.get_or_create_collection(name="decisions_v2")
+        await raw.upsert(
+            ids=["priv-doc"],
+            documents=["alice legacy"],
+            metadatas=[{"user_id": "user-alice", "tier": "private"}],
+        )
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        await service.upsert(bob, "decisions", "priv-doc", "bob body")
+        assert await service.delete_document(bob, "decisions", "priv-doc") is True
+        assert await service.get_document(bob, "decisions", "priv-doc") is None
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        doc = await service.get_document(alice, "decisions", "priv-doc")
+        assert doc is not None and doc.page_content == "alice legacy"
 
     async def test_any_non_admin_can_delete_corpus_doc(self, service, user_context):
         await service.upsert(
@@ -1562,14 +1719,24 @@ class TestDeleteDocumentClosesHole:
     async def test_falsifiability_neuter_tier_authorized_allows_cross_user_delete(
         self, service, user_context, monkeypatch
     ):
+        raw = await service._client.get_or_create_collection(name="decisions_v2")
+        await raw.upsert(
+            ids=["priv-doc"],
+            documents=["secret"],
+            metadatas=[{"user_id": "user-alice", "tier": "private"}],
+        )
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        # the real predicate: exact denial, and the chunk survives
+        assert await service.delete_document(bob, "decisions", "priv-doc") is False
         alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
-        await service.upsert(alice, "decisions", "priv-doc", "secret")
+        assert (
+            await service.get_document(alice, "decisions", "priv-doc")
+        ).page_content == "secret"
         monkeypatch.setattr(
             ChromaSemanticService,
             "_tier_authorized",
             staticmethod(lambda meta, uc: True),
         )
-        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
         deleted = await service.delete_document(bob, "decisions", "priv-doc")
         assert deleted is True, (
             "neutering _tier_authorized should allow the cross-user delete "

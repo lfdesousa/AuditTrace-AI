@@ -410,7 +410,7 @@ class _RollbackSplitProbe:
     with no code change to production. The independent reviewer
     measured this with the same ~15-line technique and reproduced the
     predicted pairs `(1, 'idle', 0)` (shape 1) and `(0, 'idle in
-    transaction (aborted)', 1)` (shape 3) on real ``postgres:16``."""
+    transaction (aborted)', 1)` (shape 3) on real ``postgres:18.3``."""
 
     def __init__(
         self, harness: Any, admin: Any, monkeypatch: pytest.MonkeyPatch
@@ -703,7 +703,7 @@ class TestShapeOneFlushRefusal:
                 "event after the method's own explicit rollback"
             )
             assert excinfo.value.failure_class == _audit.FAILURE_CLASS_ACL_DENIED_POLICY
-            # B5 — pinned on the EMITTED row: measured on real postgres:16,
+            # B5 — pinned on the EMITTED row: measured on real postgres:18.3,
             # the RLS refusal's SQLSTATE is insufficient_privilege (42501),
             # matching spec §5.6's "SQLSTATE when present" rule — never
             # type(exc).__name__ ("ProgrammingError").

@@ -37,6 +37,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from audittrace.identity import UserContext
+
 # ── auth helpers ─────────────────────────────────────────────────────────────
 
 
@@ -657,7 +659,16 @@ class TestPromoteTitleField:
         assert response.status_code == 200
         key = response.json()["key"]
 
-        entry = asyncio.run(get_memory_manifest_service().get("episodic", key))
+        alice = UserContext(
+            user_id="alice",
+            username="alice",
+            agent_type="test",
+            scopes=(),
+            is_admin=False,
+        )
+        entry = asyncio.run(
+            get_memory_manifest_service().resolve_read("episodic", key, alice)
+        )
         assert entry is not None
         assert entry.title == "My Custom Title"
 

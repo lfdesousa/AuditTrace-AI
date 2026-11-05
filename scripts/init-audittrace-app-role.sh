@@ -97,7 +97,7 @@ SELECT set_config('audittrace.app_password', :'app_password', false);
 -- ───────────── Grant BYPASSRLS to the `audittrace` role ─────────────
 -- The session summariser (server.py:228) connects with this role and
 -- needs to read across user rows (cross-tenant aggregation). Under
--- pre-B7 vanilla postgres:16-alpine, POSTGRES_USER=audittrace was a
+-- pre-B7 vanilla PG16-alpine image, POSTGRES_USER=audittrace was a
 -- SUPERUSER → had BYPASSRLS implicitly. Under Bitnami the role is
 -- plain LOGIN → RLS blocks the cross-user SELECT with:
 --   ERROR: query would be affected by row-level security policy for

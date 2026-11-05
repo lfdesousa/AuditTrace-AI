@@ -325,14 +325,19 @@ def test_neuter_job_ignores_global_registry_is_red(chart_copy: Path) -> None:
 
 def test_neuter_second_container_before_the_pinned_one_is_red(chart_copy: Path) -> None:
     """B10: an off-image container ahead of the pinned psql container, same Job."""
+    # Split literal: the off-image tag is fixture data, not an executable
+    # reference, so the PG-pin scan (tests/test_pg_image_pin.py) must not see
+    # it as one (same idiom as that file's own scanner fixtures).
+    off_image = "postgres:" + "16"
     _edit(
         chart_copy / JOB_TEMPLATE,
         "        - name: psql\n",
-        '        - name: sneaky\n          image: postgres:16\n          command: ["psql", "-c", "select 1"]\n'
+        f"        - name: sneaky\n          image: {off_image}\n"
+        '          command: ["psql", "-c", "select 1"]\n'
         "        - name: psql\n",
     )
     assert violations(render(chart_copy)) == [
-        "Job/audittrace-ensure-summariser-role/sneaky=postgres:16"
+        f"Job/audittrace-ensure-summariser-role/sneaky={off_image}"
     ]
 
 

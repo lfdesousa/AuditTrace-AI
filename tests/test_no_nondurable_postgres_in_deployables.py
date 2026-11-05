@@ -1,7 +1,7 @@
 """Guard: the harness's non-durable Postgres flags (SPEC v3 §8) must never
 reach the chart, compose, or deploy/release tooling.
 
-A test-only, throwaway ``postgres:16`` container running with ``fsync=off``,
+A test-only, throwaway ``postgres:18.3`` container running with ``fsync=off``,
 ``synchronous_commit=off``, ``full_page_writes=off`` is fine for a neuter
 pool -- crash durability doesn't matter for a container that lives seconds
 and is force-removed. The SAME flags on a real deployment would risk silent
@@ -9,7 +9,7 @@ data loss on a crash.
 
 Review round 2 should-fix: enumerating spellings loses (a review-1 fix
 already had to add ``f``/``n`` after ``fsync = of`` / ``fal`` were found to
-pass while ``postgres:16`` itself reports ``off`` for both). Postgres's OWN
+pass while ``postgres:18.3`` itself reports ``off`` for both). Postgres's OWN
 boolean-parsing rule is not an enumeration -- it accepts ``1``/``0`` or ANY
 UNAMBIGUOUS PREFIX of ``on``/``off``/``true``/``false``/``yes``/``no``
 (case-insensitively), and rejects a prefix that is ambiguous between the
@@ -173,7 +173,7 @@ def test_positive_control_regex_matches_the_test_fixture_itself():
 def test_parser_accepts_every_unambiguous_prefix_and_full_spelling():
     """Review round 2 should-fix, the reviewer's exact escape: ``fsync = of``
     and ``fsync = fal`` (unambiguous PREFIXES of ``off``/``false``, which
-    ``postgres:16`` itself parses identically to the full spelling) must be
+    ``postgres:18.3`` itself parses identically to the full spelling) must be
     caught -- an enumeration of only the full words misses every prefix a
     real ``postgresql.conf`` accepts."""
     for key in ("fsync", "synchronous_commit", "full_page_writes"):

@@ -308,6 +308,7 @@ else
     --cov=scripts.integration_gate \
     --cov-report=term-missing \
     --cov-report=xml \
+    --cov-report=json:coverage.json \
     --cov-report=html:htmlcov \
     --cov-fail-under=90 \
     --junit-xml="$JUNIT_PATH"

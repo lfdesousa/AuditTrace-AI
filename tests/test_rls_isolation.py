@@ -96,7 +96,7 @@ def _resolve_test_postgres_url() -> str | None:
     if env_url:
         return env_url
 
-    # No explicit DSN → bring up a throwaway postgres:16 container (setup),
+    # No explicit DSN → bring up a throwaway postgres:18.3 container (setup),
     # torn down at session end (teardown). Returns None when Docker is
     # unavailable so the suite degrades to skip, never to a false failure
     # against whatever happens to be squatting on :15432.

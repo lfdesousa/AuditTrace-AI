@@ -2043,7 +2043,7 @@ class TestCorpusStatusTenancy374:
         )
         manifest.set_index_state(
             "semantic",
-            "decisions/alice-private.pdf",
+            "user-alice/decisions/alice-private.pdf",  # LC-9: owner-keyed storage key
             index_failed_at_ms=1,
             index_failure_code="pdf_corrupted_structure",
         )

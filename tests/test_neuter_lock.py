@@ -68,16 +68,24 @@ def test_open_existing_lock_file_never_creates(tmp_path):
     assert not path.exists()
 
 
-def test_open_existing_lock_file_unreadable_returns_none_not_raise(tmp_path):
+def test_open_existing_lock_file_unreadable_returns_none_not_raise(
+    tmp_path, monkeypatch, caplog
+):
+    """SF-E: an unreadable lock file yields ``None`` + a warning, never a
+    raise. uid-independent (LC-9 gate fix C2 round 2, F3): the OS refusal is
+    INJECTED (``os.open`` raises ``PermissionError``) instead of relying on
+    mode bits, which root ignores -- so no skip is ever needed. Neuter:
+    re-raise the ``OSError`` in ``open_existing_lock_file`` -> RED."""
     path = tmp_path / "unreadable.lock"
     path.touch()
-    path.chmod(0o000)
-    try:
-        if os.geteuid() == 0:
-            pytest.skip("root ignores file permission bits")
+
+    def _refuse(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(lockmod.os, "open", _refuse)
+    with caplog.at_level("WARNING", logger=lockmod.logger.name):
         assert lockmod.open_existing_lock_file(path) is None
-    finally:
-        path.chmod(0o644)
+    assert "unreadable" in caplog.text
 
 
 def test_try_flock_exclusive_then_shared_blocks(tmp_path):
@@ -250,3 +258,50 @@ def test_assert_lock_held_raises_when_nobody_holds_the_lock(tmp_path):
         lockmod.try_flock(fd, fcntl.LOCK_EX)
     finally:
         os.close(fd)
+
+
+def _record_probe_fds(monkeypatch) -> list[int]:
+    """Wrap ``lockmod.open_lock_file`` so the test sees every fd the
+    chokepoint probe opens."""
+    recorded: list[int] = []
+    real_open = lockmod.open_lock_file
+
+    def _recording_open(path):
+        fd = real_open(path)
+        recorded.append(fd)
+        return fd
+
+    monkeypatch.setattr(lockmod, "open_lock_file", _recording_open)
+    return recorded
+
+
+def _assert_fd_closed(fd: int) -> None:
+    with pytest.raises(OSError):  # EBADF: the descriptor no longer exists
+        os.fstat(fd)
+
+
+def test_assert_lock_held_closes_probe_fd_on_both_paths(tmp_path, monkeypatch):
+    """LC-9 gate fix C2 round 2, F2: ``assert_lock_held`` opens a fresh probe
+    fd on every call (``pool.py`` calls the chokepoint repeatedly) and must
+    close it on BOTH exits -- the held path (returns) and the not-held path
+    (raises). Neuter: drop the ``os.close`` (the ``stack.callback``) -> RED
+    on both halves."""
+    path = tmp_path / "pool.lock"
+    holder = lockmod.open_lock_file(path)  # opened BEFORE recording starts
+    recorded = _record_probe_fds(monkeypatch)
+
+    # held path: another open file description holds LOCK_EX -> returns
+    try:
+        lockmod.try_flock(holder, fcntl.LOCK_EX)
+        lockmod.assert_lock_held(path)
+        assert len(recorded) == 1
+        _assert_fd_closed(recorded[0])
+    finally:
+        os.close(holder)
+
+    # not-held path: nobody holds it -> raises
+    recorded.clear()
+    with pytest.raises(RuntimeError, match="is not held"):
+        lockmod.assert_lock_held(path)
+    assert len(recorded) == 1
+    _assert_fd_closed(recorded[0])

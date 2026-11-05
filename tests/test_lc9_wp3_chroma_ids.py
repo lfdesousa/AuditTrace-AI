@@ -1,0 +1,1543 @@
+"""LC-9 WP3 -- the ChromaDB side of cross-user private-row isolation.
+
+Everything goes through the REAL HTTP routes (``TestClient(create_app())``, two
+subs through the repo's JWT-patch pattern, the REAL ``ChromaSemanticService`` on
+the in-repo fake ChromaDB client) and runs the manifest half on BOTH backends
+(the Mock twin and ``MemoryManifestService`` over aiosqlite).
+
+RT -> class map (spec ``2026-10-26-SPEC-lc9-cross-user-private-row-isolation``
++ ADDENDUM-1 C3/C4/S2/S5 + brief ``2026-11-04-BRIEF-lc9-wp3-chroma-dispatch``):
+
+* RT-1 content half   ``TestRt1ContentHalf``      (A reads OWN text after B wrote the same id)
+* RT-7                ``TestRt7FoldSameFilename``  (two subs fold the same ``x.md``)
+* RT-8                ``TestRt8McpSameDocumentId`` (MCP ``write_decision``, two subs)
+* RT-11               ``TestRt11OneItemPerDocument`` (new, legacy, promoted: one item each)
+* RT-19               ``TestRt19SoftDeleteExcludesRecall`` (C3 reader #5)
+* RT-23               ``TestRt23AlwaysPrepend``    (``foo`` and ``user-a__foo`` are two docs)
+* batched read        ``TestBatchedWholeDocumentRead`` (ONE ``get`` for N chunks)
+* dual lookup         ``TestLegacyChunkDualLookup`` (owner id, then the caller's OWN legacy id)
+* S2 step 3           ``TestCopyForwardDropsLegacyChunk``
+
+Doubles declared (EVERY one this module uses; nothing else is faked):
+
+* ``audittrace.services.semantic.embed_via_nomic`` and
+  ``audittrace.routes.memory.embed_via_nomic`` are replaced by one ``AsyncMock``
+  returning fixed 3-d vectors (no embedding server runs).
+* ``audittrace.auth.get_settings``, ``audittrace.auth._get_jwks_keys`` and
+  ``audittrace.auth._decode_jwt_with_allowed_issuers`` are patched by ``_Auth``
+  so a request carries a valid JWT for the chosen ``sub`` and scope string (the
+  repo's JWT-patch pattern); the route, the dependency chain and the scope
+  checks run for real.
+* ``audittrace.routes.memory._get_minio_client`` is a ``MagicMock`` (the upload
+  and promote tests) or a ``MagicMock`` whose ``get_object`` returns the file
+  bytes (``_fake_minio``, the fold tests); no object store runs.
+* ``emit_memory_audit_event`` (routes.memory, routes.memory_promote and
+  tools.mcp_write_handlers) is an ``AsyncMock`` in the ``audits`` fixture, so a
+  test can assert that a refused write emitted no audit row.
+* ``pymupdf`` is NOT doubled: the PDF tests parse a real one-page PDF made in
+  the test.
+* The ChromaDB client is the in-repo ``MockChromaDBFactory`` client, driven by
+  the REAL ``ChromaSemanticService``. The real engine is exercised in
+  ``test_lc9_wp3_real_chroma.py``.
+* The manifest is ``MockMemoryManifestService`` (the container default) or the
+  real ``MemoryManifestService`` over ``InMemoryPostgresFactory`` (aiosqlite).
+* the ``registries`` fixture re-imports the tool modules so the tool registries are fresh;
+  the tools themselves are the real handlers.
+
+Neuters (each ALONE, restored with ``git checkout``) are listed in the build
+record's RT -> test -> neuter map.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+import uuid
+from collections.abc import Iterator
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+from audittrace import dependencies
+from audittrace.db.models import MemoryItem
+from audittrace.identity import UserContext
+from audittrace.routes.memory import _chunk_text, _doc_id
+from audittrace.services.memory_manifest import MemoryManifestService
+
+A, B = "user-a", "user-b"
+BACKENDS = ("mock", "sql")
+BASE = "memory:semantic:write memory:semantic:read"
+FOLD = (
+    "memory:episodic:write memory:episodic:read memory:semantic:read "
+    "memory:semantic:write"
+)
+
+
+class _Auth:
+    """Three patches bundled: a valid JWT for *sub* holding *scope*."""
+
+    def __init__(self, sub: str, scope: str) -> None:
+        self.sub, self.scope = sub, scope
+
+    def __enter__(self) -> _Auth:
+        self._patches = [
+            patch("audittrace.auth.get_settings"),
+            patch("audittrace.auth._get_jwks_keys"),
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers"),
+        ]
+        settings, jwks, decode = (p.__enter__() for p in self._patches)
+        settings.return_value = MagicMock(auth_enabled=True, auth_required=True)
+        jwks.return_value = ["fake-key"]
+        decode.return_value = {"sub": self.sub, "scope": self.scope}
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        for p in reversed(self._patches):
+            p.__exit__(*exc)
+
+
+def _ctx(sub: str) -> UserContext:
+    return UserContext(
+        user_id=sub, username=sub, agent_type="test", scopes=(), is_admin=False
+    )
+
+
+class Rig:
+    """A TestClient plus the manifest, the real semantic service and the raw
+    fake ChromaDB client behind it."""
+
+    def __init__(self, client: TestClient, container: Any, kind: str, chroma: Any):
+        self.client, self.kind, self.chroma = client, kind, chroma
+        self.manifest = container._instances["memory_manifest"]
+        self.semantic = container._instances["semantic"]
+
+    def call(
+        self, method: str, url: str, sub: str, scope: str = BASE, **kw: Any
+    ) -> Any:
+        with _Auth(sub, scope):
+            return self.client.request(
+                method, url, headers={"Authorization": "Bearer t"}, **kw
+            )
+
+    def create(
+        self,
+        sub: str,
+        doc: str,
+        text: str = "body",
+        *,
+        collection: str = "decisions",
+        extra_meta: dict[str, Any] | None = None,
+    ) -> Any:
+        body: dict[str, Any] = {
+            "collection": collection,
+            "document_id": doc,
+            "text": text,
+        }
+        if extra_meta:
+            body["metadata"] = extra_meta
+        return self.call("POST", "/memory/semantic", sub, json=body)
+
+    def update(
+        self, sub: str, doc: str, text: str = "upd", *, collection: str = "decisions"
+    ) -> Any:
+        return self.call(
+            "PUT", f"/memory/semantic/{collection}/{doc}", sub, json={"text": text}
+        )
+
+    def delete(self, sub: str, doc: str, *, collection: str = "decisions") -> Any:
+        return self.call("DELETE", f"/memory/semantic/{collection}/{doc}", sub)
+
+    def get(
+        self, sub: str, doc: str, *, collection: str = "decisions", whole: bool = False
+    ) -> Any:
+        url = f"/memory/semantic/{collection}/{doc}"
+        params = {"whole_document": "true"} if whole else None
+        return self.call("GET", url, sub, params=params)
+
+    def chunk_items(self, sub: str, collection: str = "decisions") -> list[Any]:
+        r = self.call(
+            "GET",
+            "/memory/semantic",
+            sub,
+            params={"collection": collection, "granularity": "chunk"},
+        )
+        assert r.status_code == 200, r.text
+        return list(r.json()["items"])
+
+    def raw(self, collection: str = "decisions") -> dict[str, dict[str, Any]]:
+        """Every raw ChromaDB row of the private physical collection by id."""
+        col = asyncio.run(
+            self.chroma.get_or_create_collection(
+                name=f"{collection}_v2", embedding_function=None
+            )
+        )
+        return {r["id"]: r for r in col.data}
+
+    def raw_col(self, collection: str = "decisions") -> Any:
+        return asyncio.run(
+            self.chroma.get_or_create_collection(
+                name=f"{collection}_v2", embedding_function=None
+            )
+        )
+
+    def rows(self) -> dict[str, Any]:
+        """Every semantic manifest row (tombstones included) by STORED key."""
+        entries = asyncio.run(
+            self.manifest.list_for_layer("semantic", include_deleted=True)
+        )
+        return {e.storage_key: e for e in entries}
+
+    def seed_raw_chunk(
+        self, bare_id: str, owner: str, text: str, collection: str = "decisions"
+    ) -> None:
+        """A pre-LC-9 ChromaDB chunk: a BARE id, owner in the metadata."""
+        col = self.raw_col(collection)
+        asyncio.run(
+            col.upsert(
+                ids=[bare_id],
+                documents=[text],
+                metadatas=[{"user_id": owner, "tier": "private"}],
+            )
+        )
+
+    def seed_legacy_row(
+        self, doc: str, owner: str, *, collection: str = "decisions"
+    ) -> None:
+        """A pre-LC-9 bare-key private MANIFEST row (no Chroma chunk)."""
+        key = f"{collection}/{doc}"
+        now = int(time.time() * 1000) - 5000
+        cols = dict(
+            layer="semantic",
+            key=key,
+            title="legacy",
+            size_bytes=3,
+            created_at_ms=now,
+            modified_at_ms=now,
+            created_by_user_id=owner,
+            modified_by_user_id=owner,
+            tier="private",
+        )
+        if self.kind == "mock":
+            self.manifest._rows[("semantic", key)] = {
+                "id": str(uuid.uuid4()),
+                **cols,
+                "deleted_at_ms": None,
+                "deleted_by_user_id": None,
+            }
+            return
+
+        async def _add() -> None:
+            async with self.manifest._session_factory() as s:
+                s.add(MemoryItem(**cols))
+                await s.commit()
+
+        asyncio.run(_add())
+
+    def seed_legacy(self, doc: str, owner: str, text: str = "legacy body") -> None:
+        """Legacy manifest row AND legacy Chroma chunk, both at the bare key."""
+        self.seed_legacy_row(doc, owner)
+        self.seed_raw_chunk(doc, owner, text)
+
+
+@pytest.fixture(params=BACKENDS)
+def rig(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Rig]:
+    from audittrace.db.factory import MockChromaDBFactory
+    from audittrace.services.semantic import ChromaSemanticService
+
+    embed = AsyncMock(side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts])
+    monkeypatch.setattr("audittrace.services.semantic.embed_via_nomic", embed)
+    monkeypatch.setattr("audittrace.routes.memory.embed_via_nomic", embed)
+    previous = dependencies.container
+    container = dependencies.create_test_container()
+    if request.param == "sql":
+        from audittrace.db.postgres import InMemoryPostgresFactory
+
+        container._instances["memory_manifest"] = MemoryManifestService(
+            InMemoryPostgresFactory().get_session_factory()
+        )
+    client = asyncio.run(MockChromaDBFactory().get_client())
+    container._instances["chromadb"] = client
+    container._instances["semantic"] = ChromaSemanticService(
+        client=client,
+        default_collections=["decisions", "skills", "semantic"],
+        manifest=container._instances["memory_manifest"],
+    )
+    dependencies.container = container
+    from audittrace.server import create_app
+
+    with TestClient(create_app()) as c:
+        yield Rig(c, container, request.param, client)
+    dependencies.container = previous
+
+
+def _fake_minio(contents: dict[str, bytes]) -> MagicMock:
+    def get_object(_bucket: str, key: str) -> MagicMock:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read.return_value = contents[key]
+        return response
+
+    fake = MagicMock()
+    fake.get_object.side_effect = get_object
+    return fake
+
+
+def fold(rig: Rig, sub: str, filename: str, content: bytes) -> None:
+    """Real ``POST /memory/upload`` -> ``POST /memory/index`` for *sub*."""
+    with patch("audittrace.routes.memory._get_minio_client", return_value=MagicMock()):
+        up = rig.call(
+            "POST",
+            "/memory/upload",
+            sub,
+            FOLD,
+            params={"layer": "episodic", "filename": filename},
+            files={"file": (filename, content, "text/markdown")},
+        )
+    assert up.status_code == 200, up.text
+    key = up.json()["key"]
+    with patch(
+        "audittrace.routes.memory._get_minio_client",
+        return_value=_fake_minio({key: content}),
+    ):
+        ix = rig.call(
+            "POST",
+            "/memory/index",
+            sub,
+            FOLD,
+            params={"file": key, "collections": "decisions"},
+        )
+    assert ix.status_code == 200, ix.text
+
+
+def _body(tag: str, entries: int = 220) -> str:
+    """A multi-chunk document whose every line names *tag* and its index."""
+    text = "".join(f"[{tag}-{i:05d}]\n" for i in range(entries))
+    assert len(_chunk_text(text)) > 1
+    return text
+
+
+@pytest.fixture
+def registries() -> Iterator[None]:
+    """Re-register the memory tools and the MCP write tools for this test."""
+    import importlib
+
+    import audittrace.tools.memory_handlers as mh
+    from audittrace.tools import mcp_write_handlers as wh
+    from audittrace.tools import reset_registry_for_tests
+    from audittrace.tools.mcp_write_registry import (
+        reset_mcp_write_registry_for_tests,
+    )
+
+    reset_registry_for_tests()
+    importlib.reload(mh)
+    reset_mcp_write_registry_for_tests()
+    importlib.reload(wh)
+    yield
+    reset_registry_for_tests()
+    reset_mcp_write_registry_for_tests()
+
+
+# ── RT-1 content half ───────────────────────────────────────────────────────
+
+
+class TestRt1ContentHalf:
+    """A reads its OWN text after B wrote the same ``document_id``. Neuter:
+    ``private_physical_id`` returns the bare id -> one shared Chroma row -> RED."""
+
+    def test_a_reads_own_text_after_b_writes_the_same_id(self, rig: Rig) -> None:
+        assert rig.create(A, "x", "A-body").status_code == 200
+        assert rig.create(B, "x", "B-body").status_code == 200
+        ga, gb = rig.get(A, "x"), rig.get(B, "x")
+        assert ga.status_code == gb.status_code == 200
+        assert ga.json()["content"] == "A-body"
+        assert gb.json()["content"] == "B-body"
+        assert ga.json()["metadata"]["user_id"] == A
+
+    def test_two_chroma_rows_each_owner_prefixed(self, rig: Rig) -> None:
+        rig.create(A, "x", "A-body")
+        rig.create(B, "x", "B-body")
+        raw = rig.raw()
+        assert set(raw) == {f"{A}__x", f"{B}__x"}
+        for cid, row in raw.items():
+            assert cid.startswith(row["metadata"]["user_id"] + "__")  # the R4 pin
+
+    def test_an_update_by_a_never_touches_b(self, rig: Rig) -> None:
+        rig.create(A, "x", "A-body")
+        rig.create(B, "x", "B-body")
+        assert rig.update(A, "x", "A-v2").status_code == 200
+        assert rig.get(B, "x").json()["content"] == "B-body"
+        assert rig.get(A, "x").json()["content"] == "A-v2"
+
+    def test_b_cannot_read_a_by_a_known_physical_id(self, rig: Rig) -> None:
+        rig.create(A, "x", "A-body")
+        assert rig.get(B, f"{A}__x").status_code == 404
+
+
+# ── RT-23 ───────────────────────────────────────────────────────────────────
+
+
+class TestRt23AlwaysPrepend:
+    """``foo`` and ``user-a__foo`` stay TWO documents (ADDENDUM-1 S5). Neuter:
+    an idempotent own-prefix rule -> one Chroma row -> RED."""
+
+    def test_foo_and_prefixed_foo_are_two_docs(self, rig: Rig) -> None:
+        assert rig.create(A, "foo", "plain").status_code == 200
+        assert rig.create(A, f"{A}__foo", "prefixed").status_code == 200
+        assert set(rig.raw()) == {f"{A}__foo", f"{A}__{A}__foo"}
+        assert rig.get(A, "foo").json()["content"] == "plain"
+        assert rig.get(A, f"{A}__foo").json()["content"] == "prefixed"
+
+
+# ── RT-8 ────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.usefixtures("registries")
+class TestRt8McpSameDocumentId:
+    """The MCP ``write_decision`` tool, two subs, one ``document_id``: disjoint.
+    Neuter: ``private_physical_id`` returns the bare id -> RED."""
+
+    def _write(self, rig: Rig, sub: str, doc: str, text: str) -> Any:
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "write_decision",
+                "arguments": {"document_id": doc, "text": text},
+            },
+        }
+        return rig.call("POST", "/mcp", sub, "memory:decisions:write", json=body)
+
+    def test_two_subs_same_document_id_are_disjoint(self, rig: Rig) -> None:
+        for sub, text in ((A, "A-mcp"), (B, "B-mcp")):
+            r = self._write(rig, sub, "dec-1", text)
+            assert r.status_code == 200 and r.json()["result"]["isError"] is False
+        assert set(rig.raw()) == {f"{A}__dec-1", f"{B}__dec-1"}
+        assert rig.get(A, "dec-1").json()["content"] == "A-mcp"
+        assert rig.get(B, "dec-1").json()["content"] == "B-mcp"
+
+
+# ── RT-7 + the batched whole-document read ─────────────────────────────────
+
+
+class TestRt7FoldSameFilename:
+    """Two subs upload+index the SAME ``x.md`` to ``decisions``; each reads its
+    OWN chunks whole-document. Neuter: the fold writes bare ids -> the second
+    fold overwrites the first (and A's chunks vanish) -> RED."""
+
+    def test_each_sub_reads_its_own_whole_document(self, rig: Rig) -> None:
+        a_text, b_text = _body("A"), _body("B")
+        fold(rig, A, "x.md", a_text.encode())
+        fold(rig, B, "x.md", b_text.encode())
+        first = _doc_id("decisions", "x.md", 0)
+        ra, rb = rig.get(A, first, whole=True), rig.get(B, first, whole=True)
+        assert ra.status_code == rb.status_code == 200, (ra.text, rb.text)
+        assert ra.json()["content"] == a_text
+        assert rb.json()["content"] == b_text
+        assert ra.json()["chunk_count"] == rb.json()["chunk_count"] > 1
+
+    def test_chroma_holds_two_owner_prefixed_copies(self, rig: Rig) -> None:
+        fold(rig, A, "x.md", _body("A").encode())
+        fold(rig, B, "x.md", _body("B").encode())
+        raw = rig.raw()
+        assert raw
+        for cid, row in raw.items():
+            assert cid.startswith(row["metadata"]["user_id"] + "__")
+        assert {r["metadata"]["user_id"] for r in raw.values()} == {A, B}
+
+
+class TestBatchedWholeDocumentRead:
+    """ONE ``get`` for the whole chunk sequence, not one per chunk (ADDENDUM-1
+    S2: ``get(ids=[owner..., legacy...])``, missing ids omitted). Neuter: loop
+    ``get_document`` per chunk -> hundreds of calls -> RED."""
+
+    def test_whole_document_read_is_one_get_per_physical_collection(
+        self, rig: Rig
+    ) -> None:
+        text = _body("A")
+        fold(rig, A, "x.md", text.encode())
+        first = _doc_id("decisions", "x.md", 0)
+        private, corpus = rig.raw_col(), rig.raw_col("decisions_corpus")
+        counts = {"private": 0, "corpus": 0}
+        real_p, real_c = private.get, corpus.get
+
+        async def count_p(*a: Any, **kw: Any) -> Any:
+            counts["private"] += 1 if kw.get("ids") is not None else 0
+            return await real_p(*a, **kw)
+
+        async def count_c(*a: Any, **kw: Any) -> Any:
+            counts["corpus"] += 1 if kw.get("ids") is not None else 0
+            return await real_c(*a, **kw)
+
+        with (
+            patch.object(private, "get", count_p),
+            patch.object(corpus, "get", count_c),
+        ):
+            r = rig.get(A, first, whole=True)
+        assert r.status_code == 200 and r.json()["content"] == text
+        # 1 id-probe to resolve the requested chunk + 1 batched sequence read
+        assert counts["private"] <= 2, counts
+        assert counts["corpus"] <= 2, counts
+
+    def test_a_legacy_whole_document_is_read_for_its_owner_only(self, rig: Rig) -> None:
+        """Pre-LC-9 chunks (bare ids, owner in metadata) still read whole for
+        their OWNER; B reading the same ids gets nothing."""
+        text = _body("L")
+        chunks = _chunk_text(text)
+        col = rig.raw_col()
+        ids = [_doc_id("decisions", "old.md", i) for i in range(len(chunks))]
+        asyncio.run(
+            col.upsert(
+                ids=ids,
+                documents=chunks,
+                metadatas=[
+                    {"user_id": A, "tier": "private", "source": "old.md"} for _ in ids
+                ],
+            )
+        )
+        r = rig.get(A, ids[0], whole=True)
+        assert r.status_code == 200 and r.json()["content"] == text
+        assert rig.get(B, ids[0], whole=True).status_code == 404
+
+
+# ── RT-11 ───────────────────────────────────────────────────────────────────
+
+
+class TestRt11OneItemPerDocument:
+    """A's chunk list shows exactly ONE item per document: a new one (owner-keyed
+    row + prefixed chunk), a legacy one (bare row + bare chunk) and a promoted
+    one (``{sub}__file`` id). Neuter: a discovered row keeps the PHYSICAL id in
+    its key -> the manifest row and its own chunk list twice -> RED."""
+
+    def test_new_legacy_and_promoted_each_listed_once(self, rig: Rig) -> None:
+        assert rig.create(A, "new-1", "new body").status_code == 200
+        rig.seed_legacy("legacy-1", A)
+        assert rig.create(A, f"{A}__promoted.md", "promoted body").status_code == 200
+        keys = sorted(i["key"].rsplit("/", 1)[-1] for i in rig.chunk_items(A))
+        # the dedup identity is the trailing id: one per document, never twice
+        assert keys == sorted(["new-1", "legacy-1", f"{A}__promoted.md"])
+
+    def test_a_discovered_row_carries_the_logical_id(self, rig: Rig) -> None:
+        """A chunk with no manifest row is discovered from Chroma; its key
+        shows the LOGICAL id, not ``user-a__...``."""
+        asyncio.run(
+            rig.semantic.upsert(
+                _ctx(A), "decisions", "orphan-1", "t", {}, tier="private"
+            )
+        )
+        items = [i for i in rig.chunk_items(A) if i["discovered"]]
+        assert [i["key"].rsplit("/", 1)[-1] for i in items] == ["orphan-1"]
+
+    def test_other_users_chunk_is_not_listed(self, rig: Rig) -> None:
+        rig.create(B, "b-only", "b")
+        assert rig.chunk_items(A) == []
+
+
+# ── RT-19 ───────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.usefixtures("registries")
+class TestRt19SoftDeleteExcludesRecall:
+    """A soft-deleted NEW-form private chunk never surfaces in recall (MCP
+    ``recall_semantic``). Neuter: ``_tombstone_candidates`` tries only the
+    legacy bare key -> the owner-keyed tombstone is missed -> RED."""
+
+    def _recall(self, rig: Rig, sub: str) -> list[str]:
+        from audittrace.tools import get_tool_by_name
+
+        tool = get_tool_by_name("recall_semantic")
+        assert tool is not None
+        out = asyncio.run(tool.handler(_ctx(sub), {"query": "body", "k": 20}))
+        return [m["snippet"] for m in out["matches"]]
+
+    def test_soft_deleted_chunk_is_excluded_from_its_owners_recall(
+        self, rig: Rig
+    ) -> None:
+        rig.create(A, "x", "A-body")
+        assert "A-body" in self._recall(rig, A)
+        assert rig.delete(A, "x").status_code == 200
+        assert "A-body" not in self._recall(rig, A)
+
+    def test_a_delete_does_not_hide_b_same_named_chunk(self, rig: Rig) -> None:
+        rig.create(A, "x", "A-body")
+        rig.create(B, "x", "B-body")
+        assert rig.delete(A, "x").status_code == 200
+        assert self._recall(rig, B) == ["B-body"]
+        assert self._recall(rig, A) == []
+
+    def test_legacy_tombstone_still_excludes_a_legacy_chunk(self, rig: Rig) -> None:
+        rig.seed_legacy("old", A, "legacy-body")
+        assert "legacy-body" in self._recall(rig, A)
+        assert rig.delete(A, "old").status_code == 200
+        assert "legacy-body" not in self._recall(rig, A)
+
+
+# ── dual lookup (reads + hard delete) ──────────────────────────────────────
+
+
+class TestLegacyChunkDualLookup:
+    """Owner id first, then the caller's OWN legacy bare id (R3). Neuter:
+    accept any legacy owner -> B reads A's legacy chunk -> RED."""
+
+    def test_owner_reads_own_legacy_chunk(self, rig: Rig) -> None:
+        rig.seed_legacy("x", A, "A-legacy")
+        r = rig.get(A, "x")
+        assert r.status_code == 200 and r.json()["content"] == "A-legacy"
+
+    def test_other_user_gets_404_for_a_legacy_chunk(self, rig: Rig) -> None:
+        rig.seed_legacy("x", A, "A-legacy")
+        assert rig.get(B, "x").status_code == 404
+
+    def test_owner_id_wins_over_the_legacy_id(self, rig: Rig) -> None:
+        rig.seed_legacy("x", A, "A-legacy")
+        asyncio.run(
+            rig.semantic.upsert(_ctx(A), "decisions", "x", "A-new", {}, tier="private")
+        )
+        assert rig.get(A, "x").json()["content"] == "A-new"
+
+    def test_hard_delete_removes_only_the_callers_chunk(self, rig: Rig) -> None:
+        rig.create(A, "x", "A-body")
+        rig.create(B, "x", "B-body")
+        admin = "memory:semantic:write audittrace:admin"
+        r = rig.call("DELETE", "/memory/semantic/decisions/x?hard=true", A, admin)
+        assert r.status_code == 200, r.text
+        assert set(rig.raw()) == {f"{B}__x"}
+
+    def test_hard_delete_never_removes_another_users_legacy_chunk(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_raw_chunk("x", B, "B-legacy")
+        deleted = asyncio.run(rig.semantic.delete_document(_ctx(A), "decisions", "x"))
+        assert deleted is False
+        assert "x" in rig.raw()
+
+
+# ── S2 step 3 ───────────────────────────────────────────────────────────────
+
+
+class TestCopyForwardDropsLegacyChunk:
+    """After the manifest copy-forward the caller's OWN legacy chunk is deleted
+    (one batched delete; ADDENDUM-1 S2 step 3). Neuter: skip the owner check ->
+    another user's chunk at the same bare id is deleted -> RED."""
+
+    def test_put_over_own_legacy_leaves_only_the_prefixed_chunk(self, rig: Rig) -> None:
+        rig.seed_legacy("x", A, "A-legacy")
+        assert rig.update(A, "x", "A-new").status_code == 200
+        assert set(rig.raw()) == {f"{A}__x"}
+        assert rig.get(A, "x").json()["content"] == "A-new"
+
+    def test_create_over_own_legacy_leaves_only_the_prefixed_chunk(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_legacy("x", A, "A-legacy")
+        assert rig.create(A, "x", "A-new").status_code == 200
+        assert set(rig.raw()) == {f"{A}__x"}
+
+    def test_another_users_chunk_at_the_bare_id_survives(self, rig: Rig) -> None:
+        rig.seed_legacy_row("x", A)
+        rig.seed_raw_chunk("x", B, "B-legacy")
+        assert rig.update(A, "x", "A-new").status_code == 200
+        raw = rig.raw()
+        assert set(raw) == {"x", f"{A}__x"}
+        assert raw["x"]["metadata"]["user_id"] == B
+
+    def test_a_plain_new_write_drops_nothing(self, rig: Rig) -> None:
+        rig.seed_raw_chunk("x", B, "B-legacy")
+        assert rig.create(A, "x", "A-body").status_code == 200
+        assert set(rig.raw()) == {"x", f"{A}__x"}
+
+
+# ── invalid subs fail closed ───────────────────────────────────────────────
+
+
+class TestInvalidSubIsRefused:
+    def test_a_sub_that_breaks_the_prefix_rule_is_403_not_500(self, rig: Rig) -> None:
+        r = rig.create("bad__sub", "x", "t")
+        assert r.status_code == 403
+        assert rig.raw() == {}
+
+
+# ── B1: the admin exception is gone (operator ruling, strict) ──────────────
+
+ADMIN = BASE + " audittrace:admin"
+ADMIN_SUB = "admin-1"
+
+
+class TestAdminDoesNotReachPrivateRows:
+    """An admin GET / hard delete by A's logical OR physical id is exactly 404 and
+    leaks nothing; A reads back unchanged. Neuter: restore ``is_admin`` in
+    ``_tier_authorized`` -> the physical-id GET is 200 with A's text -> RED."""
+
+    def _a_has_x(self, rig: Rig) -> None:
+        assert rig.create(A, "x", "A-SECRET").status_code == 200
+
+    def _owner_readback(self, rig: Rig) -> None:
+        r = rig.get(A, "x")
+        assert r.status_code == 200 and r.json()["content"] == "A-SECRET"
+        assert r.json()["metadata"]["user_id"] == A
+
+    def test_admin_get_by_physical_id_is_404(self, rig: Rig) -> None:
+        self._a_has_x(rig)
+        r = rig.call("GET", f"/memory/semantic/decisions/{A}__x", ADMIN_SUB, ADMIN)
+        assert r.status_code == 404
+        assert "A-SECRET" not in r.text
+        self._owner_readback(rig)
+
+    def test_admin_get_by_logical_id_is_404(self, rig: Rig) -> None:
+        self._a_has_x(rig)
+        r = rig.call("GET", "/memory/semantic/decisions/x", ADMIN_SUB, ADMIN)
+        assert r.status_code == 404 and "A-SECRET" not in r.text
+        self._owner_readback(rig)
+
+    def test_admin_get_of_a_legacy_row_is_404(self, rig: Rig) -> None:
+        rig.seed_legacy("old", A, "A-LEGACY-SECRET")
+        r = rig.call("GET", "/memory/semantic/decisions/old", ADMIN_SUB, ADMIN)
+        assert r.status_code == 404 and "A-LEGACY-SECRET" not in r.text
+        assert rig.get(A, "old").json()["content"] == "A-LEGACY-SECRET"
+
+    def test_admin_service_hard_delete_by_physical_id_is_false(self, rig: Rig) -> None:
+        self._a_has_x(rig)
+        admin = UserContext(
+            user_id=ADMIN_SUB,
+            username=ADMIN_SUB,
+            agent_type="t",
+            scopes=("audittrace:admin",),
+            is_admin=True,
+        )
+        assert (
+            asyncio.run(rig.semantic.delete_document(admin, "decisions", f"{A}__x"))
+            is False
+        )
+        assert set(rig.raw()) == {f"{A}__x"}
+        self._owner_readback(rig)
+
+
+# ── B6: a foreign legacy row never aborts the caller's own hard delete ─────
+
+
+class TestHardDeleteSkipsForeignLegacyRow:
+    """B owns ``x`` (stored ``user-b__x``); A has a legacy chunk at the bare id
+    ``x``. B's hard delete removes B's chunk and leaves A's untouched. Neuter:
+    ``return False`` on the foreign legacy row (the r1 shape) -> B's chunk
+    survives -> RED."""
+
+    def test_service_level(self, rig: Rig) -> None:
+        rig.seed_raw_chunk("x", A, "A-legacy")
+        asyncio.run(
+            rig.semantic.upsert(_ctx(B), "decisions", "x", "B-new", {}, tier="private")
+        )
+        assert asyncio.run(rig.semantic.delete_document(_ctx(B), "decisions", "x"))
+        assert set(rig.raw()) == {"x"}
+        assert rig.raw()["x"]["metadata"]["user_id"] == A
+
+    def test_route_level_admin_hard_delete_of_own_doc(self, rig: Rig) -> None:
+        rig.seed_raw_chunk("x", A, "A-legacy")
+        assert rig.create(ADMIN_SUB, "x", "admin-body").status_code == 200
+        assert set(rig.raw()) == {"x", f"{ADMIN_SUB}__x"}
+        r = rig.call(
+            "DELETE", "/memory/semantic/decisions/x?hard=true", ADMIN_SUB, ADMIN
+        )
+        assert r.status_code == 200, r.text
+        assert set(rig.raw()) == {"x"}
+        assert rig.get(A, "x").json()["content"] == "A-legacy"
+
+
+# ── B2: RT-11 for the LEGACY promoted shape ────────────────────────────────
+
+
+class TestRt11LegacyPromotedListedOnce:
+    """A pre-LC-9 promoted document (bare manifest row ``decisions/user-a__p.md``
+    + bare chunk ``user-a__p.md``) lists exactly once. Neuter: ``logical_id``
+    strips the owner prefix from the legacy bare id with no check against the
+    manifest -> ``decisions_v2/p.md`` lists beside the manifest row -> RED."""
+
+    def test_legacy_promoted_row_is_listed_once(self, rig: Rig) -> None:
+        rig.seed_legacy(f"{A}__p.md", A, "promoted-legacy")
+        keys = [i["key"] for i in rig.chunk_items(A)]
+        assert [k.rsplit("/", 1)[-1] for k in keys] == [f"{A}__p.md"], keys
+
+    def test_all_three_promoted_shapes_beside_each_other(self, rig: Rig) -> None:
+        rig.seed_legacy(f"{A}__old.md", A)
+        assert rig.create(A, f"{A}__new.md", "new-form promoted").status_code == 200
+        assert rig.create(A, "plain", "plain").status_code == 200
+        ids = sorted(i["key"].rsplit("/", 1)[-1] for i in rig.chunk_items(A))
+        assert ids == sorted([f"{A}__old.md", f"{A}__new.md", "plain"])
+
+
+# ── B4: each guard has a test that turns it RED ALONE ──────────────────────
+# (neuter -> test: R10a/R10b/R11a/R16/R20/R24/R25 service level; R18 promote;
+#  R19 MCP; R22/R23 the user-scoped wrapper. Each neuter is a single edit.)
+
+
+def _scoped(rig: Rig, bound_sub: str) -> Any:
+    from audittrace.services.semantic import UserScopedSemanticService
+
+    return UserScopedSemanticService(rig.semantic, _ctx(bound_sub))
+
+
+def _corpus_row(rig: Rig, doc: str, text: str, meta: dict[str, Any]) -> None:
+    asyncio.run(
+        rig.raw_col("decisions_corpus").upsert(
+            ids=[doc], documents=[text], metadatas=[meta]
+        )
+    )
+
+
+def _read(rig: Rig, sub: str, doc: str) -> Any:
+    return asyncio.run(rig.semantic.get_documents(_ctx(sub), "decisions", [doc]))[0]
+
+
+class TestEachDualLookupHalfAlone:
+    def test_r10a_foreign_legacy_row_does_not_shadow_the_corpus_doc(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the legacy-branch ownership check removed (the final check
+        left in place) -> B gets ``None`` instead of the corpus document."""
+        rig.seed_raw_chunk("shared", A, "A-legacy-private")
+        _corpus_row(rig, "shared", "CORPUS", {"tier": "corpus", "user_id": "curator"})
+        got = _read(rig, B, "shared")
+        assert got is not None and got.page_content == "CORPUS"
+
+    def test_r10b_foreign_private_row_in_the_corpus_collection_is_not_served(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the FINAL ownership check removed (the lookup check left in
+        place) -> a private-tier row planted in the corpus collection is served."""
+        _corpus_row(rig, "z", "A-in-corpus-col", {"tier": "private", "user_id": A})
+        assert _read(rig, B, "z") is None
+        got = _read(rig, A, "z")
+        assert got is not None and got.page_content == "A-in-corpus-col"
+
+    def test_r11a_a_misplaced_row_at_the_callers_prefix_does_not_shadow(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the owned-row metadata check removed (the final check left
+        in place) -> the misplaced ``user-b__foo`` owned by A shadows B's own
+        legacy ``foo``."""
+        rig.seed_raw_chunk(f"{B}__foo", A, "A-legacy-misplaced")
+        rig.seed_raw_chunk("foo", B, "B-own-legacy")
+        got = _read(rig, B, "foo")
+        assert got is not None and got.page_content == "B-own-legacy"
+
+
+class TestStepThreeTierCheck:
+    def test_r16_a_corpus_tier_row_owned_by_the_caller_is_not_dropped(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: ``tier != "corpus"`` removed from ``drop_legacy_documents``."""
+        asyncio.run(
+            rig.raw_col().upsert(
+                ids=["c"],
+                documents=["curated"],
+                metadatas=[{"user_id": A, "tier": "corpus"}],
+            )
+        )
+        assert (
+            asyncio.run(rig.semantic.drop_legacy_documents(_ctx(A), "decisions", ["c"]))
+            == 0
+        )
+        assert "c" in rig.raw()
+
+
+class TestHardDeleteGuards:
+    def test_r20_a_misplaced_row_at_the_callers_prefix_is_not_deleted(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the owner check on the caller-prefix row removed."""
+        rig.seed_raw_chunk(f"{B}__x", A, "A-misplaced")
+        assert (
+            asyncio.run(rig.semantic.delete_document(_ctx(B), "decisions", "x"))
+            is False
+        )
+        assert f"{B}__x" in rig.raw()
+
+    def test_r25_a_foreign_private_row_in_the_corpus_collection_is_not_deleted(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the corpus-collection authorisation removed."""
+        _corpus_row(rig, "z", "A-in-corpus-col", {"tier": "private", "user_id": A})
+        assert (
+            asyncio.run(rig.semantic.delete_document(_ctx(B), "decisions", "z"))
+            is False
+        )
+        assert "z" in rig.raw("decisions_corpus")
+
+    def test_r24_a_sub_that_cannot_own_a_private_id_reads_and_deletes_cleanly(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: ``_owner_id`` stops swallowing ``InvalidPrivateSubjectError``
+        -> the read and the delete RAISE for such a caller."""
+        _corpus_row(rig, "pub", "CORPUS", {"tier": "corpus", "user_id": "curator"})
+        bad = _ctx("bad__sub")
+        got = asyncio.run(rig.semantic.get_documents(bad, "decisions", ["pub", "nope"]))
+        assert got[0] is not None and got[0].page_content == "CORPUS" and got[1] is None
+        assert (
+            asyncio.run(rig.semantic.delete_document(bad, "decisions", "nope")) is False
+        )
+
+
+class TestUserScopedWrapperBindsTheCaller:
+    def test_r22_get_documents_uses_the_bound_identity(self, rig: Rig) -> None:
+        """Neuter: the wrapper forwards the per-call ``user_context``."""
+        assert rig.create(A, "x", "A-body").status_code == 200
+        scoped = _scoped(rig, B)  # bound to B; the per-call argument claims A
+        got = asyncio.run(scoped.get_documents(_ctx(A), "decisions", ["x"]))
+        assert got == [None]
+        own = asyncio.run(_scoped(rig, A).get_documents(_ctx(B), "decisions", ["x"]))
+        assert own[0] is not None and own[0].page_content == "A-body"
+
+    def test_r23_drop_legacy_documents_uses_the_bound_identity(self, rig: Rig) -> None:
+        """Neuter: the wrapper forwards the per-call ``user_context``."""
+        rig.seed_raw_chunk("x", A, "A-legacy")
+        scoped = _scoped(rig, B)
+        assert (
+            asyncio.run(scoped.drop_legacy_documents(_ctx(A), "decisions", ["x"])) == 0
+        )
+        assert "x" in rig.raw()
+        assert (
+            asyncio.run(
+                _scoped(rig, A).drop_legacy_documents(_ctx(B), "decisions", ["x"])
+            )
+            == 1
+        )
+
+
+class TestStepThreeAtPromoteAndMcp:
+    def _upload(self, rig: Rig, sub: str, name: str) -> None:
+        with (
+            _Auth(sub, "memory:session:write"),
+            patch("audittrace.routes.memory._get_minio_client", MagicMock()),
+        ):
+            r = rig.client.post(
+                "/memory/upload",
+                params={"layer": "session"},
+                files={"file": (name, b"scratch", "text/plain")},
+                headers={"Authorization": "Bearer t"},
+            )
+        assert r.status_code == 200, r.text
+
+    def test_r18_promote_over_own_legacy_drops_the_legacy_chunk(self, rig: Rig) -> None:
+        """Neuter: the step-3 call removed from ``_promote_to_semantic``. The
+        legacy promoted chunk sits at the bare id ``user-a__n.md``; the promote
+        writes ``user-a__user-a__n.md`` and must drop the legacy one."""
+        rig.seed_legacy_row(f"{A}__n.md", A, collection="semantic")
+        rig.seed_raw_chunk(f"{A}__n.md", A, "legacy", collection="semantic")
+        self._upload(rig, A, "n.md")
+        with _Auth(A, "memory:semantic:write memory:session:write"):
+            r = rig.client.post(
+                "/memory/promote",
+                json={"filename": "n.md", "target_layer": "semantic"},
+                headers={"Authorization": "Bearer t"},
+            )
+        assert r.status_code == 200, r.text
+        assert set(rig.raw("semantic")) == {f"{A}__{A}__n.md"}
+
+
+@pytest.mark.usefixtures("registries")
+class TestStepThreeAtMcp:
+    def test_r19_mcp_write_over_own_legacy_drops_the_legacy_chunk(
+        self, rig: Rig
+    ) -> None:
+        """Neuter: the step-3 call removed from ``_write_semantic_document``."""
+        rig.seed_legacy("dec-1", A, "legacy")
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "write_decision",
+                "arguments": {"document_id": "dec-1", "text": "new"},
+            },
+        }
+        r = rig.call("POST", "/mcp", A, "memory:decisions:write", json=body)
+        assert r.status_code == 200 and r.json()["result"]["isError"] is False
+        assert set(rig.raw()) == {f"{A}__dec-1"}
+
+
+# ── ADDENDUM-5 (B3): the D0 stamp and the total D1 collision rule ──────────
+# Every test below runs the REAL ``ChromaSemanticService`` over the Chroma
+# double (condition C2); mock/sql name only the MANIFEST backend.
+
+from audittrace.services.memory_keys import tier_conflict_message  # noqa: E402
+
+
+@pytest.fixture
+def audits() -> Iterator[AsyncMock]:
+    """Capture every audit event the routes emit (memory + promote + MCP)."""
+    mock = AsyncMock()
+    with (
+        patch("audittrace.routes.memory.emit_memory_audit_event", mock),
+        patch("audittrace.routes.memory_promote.emit_memory_audit_event", mock),
+        patch("audittrace.tools.mcp_write_handlers.emit_memory_audit_event", mock),
+    ):
+        yield mock
+
+
+def _conflict_text(collection: str, doc: str) -> str:
+    return tier_conflict_message("semantic", f"{collection}/{doc}")
+
+
+def _snapshot(rig: Rig, cid: str, collection: str = "decisions") -> dict[str, Any]:
+    row = rig.raw(collection)[cid]
+    return {"document": row["document"], "metadata": dict(row["metadata"])}
+
+
+def _upload_session(rig: Rig, sub: str, name: str) -> None:
+    with (
+        _Auth(sub, "memory:session:write"),
+        patch("audittrace.routes.memory._get_minio_client", MagicMock()),
+    ):
+        r = rig.client.post(
+            "/memory/upload",
+            params={"layer": "session"},
+            files={"file": (name, b"scratch", "text/plain")},
+            headers={"Authorization": "Bearer t"},
+        )
+    assert r.status_code == 200, r.text
+
+
+def _promote(rig: Rig, sub: str, name: str) -> Any:
+    with _Auth(sub, "memory:semantic:write memory:session:write"):
+        return rig.client.post(
+            "/memory/promote",
+            json={"filename": name, "target_layer": "semantic"},
+            headers={"Authorization": "Bearer t"},
+        )
+
+
+class TestD1aCrossOwnerLegacy:
+    """AC-D1a. A owns legacy bare ``user-b__foo`` (unstamped). B writes ``foo``.
+    Neuters: drop the pre-check at ``upsert``; drop the 409 arm (-> 502); reuse
+    ``concurrent_write_409`` (Retry-After); another text or 403."""
+
+    def _seed(self, rig: Rig) -> dict[str, Any]:
+        rig.seed_legacy(f"{B}__foo", A, "A-LEGACY")
+        return _snapshot(rig, f"{B}__foo")
+
+    def test_b_post_is_exactly_409_with_the_one_text(
+        self, rig: Rig, audits: AsyncMock
+    ) -> None:
+        before = self._seed(rig)
+        audits.reset_mock()
+        r = rig.create(B, "foo", "B-NEW")
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == _conflict_text("decisions", "foo")
+        assert "retry-after" not in {k.lower() for k in r.headers}
+        assert A not in r.text and "A-LEGACY" not in r.text
+        # nothing of B exists: no chunk, no manifest row, no audit row
+        assert _snapshot(rig, f"{B}__foo") == before
+        assert set(rig.raw()) == {f"{B}__foo"}
+        assert set(rig.rows()) == {f"decisions/{B}__foo"}
+        audits.assert_not_called()
+        assert rig.get(B, "foo").status_code == 404
+        assert rig.chunk_items(B) == []
+
+    def test_a_reads_back_unchanged(self, rig: Rig) -> None:
+        self._seed(rig)
+        assert rig.create(B, "foo", "B-NEW").status_code == 409
+        r = rig.get(A, f"{B}__foo")
+        assert r.status_code == 200 and r.json()["content"] == "A-LEGACY"
+
+    def test_b_put_is_404_before_any_write(self, rig: Rig) -> None:
+        before = self._seed(rig)
+        assert rig.update(B, "foo", "B-NEW").status_code == 404
+        assert _snapshot(rig, f"{B}__foo") == before
+
+
+class TestD1bSameOwnerLegacyPromoted:
+    """AC-D1b. A owns legacy promoted ``user-a__p.md`` (unstamped, bare manifest
+    key). Neuters: drop the pre-check (A's write overwrites it); drop the
+    stamp condition at step 3 (the later re-promote deletes the NEW ``p.md``)."""
+
+    COLL = "semantic"
+
+    def _seed(self, rig: Rig) -> None:
+        rig.seed_legacy_row(f"{A}__p.md", A, collection=self.COLL)
+        rig.seed_raw_chunk(f"{A}__p.md", A, "PROMOTED-LEGACY", collection=self.COLL)
+
+    def _ids(self, rig: Rig) -> list[str]:
+        return sorted(
+            i["key"].rsplit("/", 1)[-1]
+            for i in rig.chunk_items(A, collection=self.COLL)
+        )
+
+    def test_i_a_write_of_p_md_is_409_and_the_legacy_row_stays(self, rig: Rig) -> None:
+        self._seed(rig)
+        before = _snapshot(rig, f"{A}__p.md", self.COLL)
+        r = rig.create(A, "p.md", "DIRECT-P", collection=self.COLL)
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == _conflict_text(self.COLL, "p.md")
+        assert "retry-after" not in {k.lower() for k in r.headers}
+        assert _snapshot(rig, f"{A}__p.md", self.COLL) == before
+        got = rig.get(A, f"{A}__p.md", collection=self.COLL)
+        assert got.status_code == 200 and got.json()["content"] == "PROMOTED-LEGACY"
+        assert self._ids(rig) == [f"{A}__p.md"]
+
+    def test_ii_iii_repromote_converts_it_then_p_md_is_writable(self, rig: Rig) -> None:
+        self._seed(rig)
+        _upload_session(rig, A, "p.md")
+        assert _promote(rig, A, "p.md").status_code == 200
+        raw = rig.raw(self.COLL)
+        assert set(raw) == {f"{A}__{A}__p.md"}  # step 3 removed the bare row
+        assert raw[f"{A}__{A}__p.md"]["metadata"]["id_form"] == "lc9"
+        assert (
+            rig.create(A, "p.md", "DIRECT-P", collection=self.COLL).status_code == 200
+        )
+        assert self._ids(rig) == sorted(["p.md", f"{A}__p.md"])
+        assert rig.get(A, "p.md", collection=self.COLL).json()["content"] == "DIRECT-P"
+
+
+class TestD1cForeignRowAtTheCollidingId:
+    """AC-D1c. #8 and step 3 given a foreign row at the colliding id: ignored,
+    the caller's operation succeeds, the foreign row is unchanged and its OWNER
+    still reads it. Neuters: ``new_form_owner`` at #8 / the stamp condition at
+    step 3 replaced by the old ``user_id``-based rule."""
+
+    def test_8_a_foreign_unstamped_chunk_lists_under_its_own_bare_id(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_legacy(f"{A}__x", B, "B-LEGACY")  # B's legacy chunk, A-looking id
+        keys = [i["key"].rsplit("/", 1)[-1] for i in rig.chunk_items(B)]
+        assert keys == [f"{A}__x"]
+        assert rig.chunk_items(A) == []
+
+    def test_step3_skips_a_foreign_row_and_the_owner_still_reads_it(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_legacy_row("x", A)
+        rig.seed_raw_chunk("x", B, "B-LEGACY")
+        before = _snapshot(rig, "x")
+        assert rig.update(A, "x", "A-NEW").status_code == 200
+        assert _snapshot(rig, "x") == before
+        assert rig.get(B, "x").json()["content"] == "B-LEGACY"
+
+    def test_step3_does_not_delete_the_callers_own_stamped_row(self, rig: Rig) -> None:
+        """A's NEW-form ``x`` sits at ``user-a__x``; a copy-forward of a legacy
+        row whose bare id is ``user-a__x`` must not delete it."""
+        assert rig.create(A, "x", "A-NEW").status_code == 200
+        dropped = asyncio.run(
+            rig.semantic.drop_legacy_documents(_ctx(A), "decisions", [f"{A}__x"])
+        )
+        assert dropped == 0 and f"{A}__x" in rig.raw()
+
+
+class TestD1dCorpusRowInThePrivateCollection:
+    """AC-D1d. A ``tier == corpus`` row at ``user-b__k`` INSIDE ``decisions_v2``:
+    B's private write is 409 and the row is byte-equal; it still answers a corpus
+    read. Neuter: drop the pre-check -> the corpus row is overwritten."""
+
+    def test_409_row_unchanged_and_still_readable(self, rig: Rig) -> None:
+        asyncio.run(
+            rig.raw_col().upsert(
+                ids=[f"{B}__k"],
+                documents=["CORPUS-ROW"],
+                metadatas=[{"tier": "corpus", "user_id": "curator"}],
+            )
+        )
+        before = _snapshot(rig, f"{B}__k")
+        r = rig.create(B, "k", "B-NEW")
+        assert r.status_code == 409 and r.json()["detail"] == _conflict_text(
+            "decisions", "k"
+        )
+        assert _snapshot(rig, f"{B}__k") == before
+        got = _read(rig, B, f"{B}__k")
+        assert got is not None and got.page_content == "CORPUS-ROW"
+
+
+class TestD1eHardDelete:
+    """AC-D1e. (a) a foreign bare row is skipped; (b) logical ``user-a__p.md`` and
+    logical ``p.md`` stay separate. Neuters: abort on the foreign bare row;
+    accept ``user_id == U`` alone for the bare row."""
+
+    def test_a_foreign_bare_row_never_aborts_the_callers_delete(self, rig: Rig) -> None:
+        rig.seed_raw_chunk("x", A, "A-legacy")
+        assert rig.create(ADMIN_SUB, "x", "admin-body").status_code == 200
+        before = _snapshot(rig, "x")
+        r = rig.call(
+            "DELETE", "/memory/semantic/decisions/x?hard=true", ADMIN_SUB, ADMIN
+        )
+        assert r.status_code == 200, r.text
+        assert set(rig.raw()) == {"x"} and _snapshot(rig, "x") == before
+        assert rig.get(A, "x").json()["content"] == "A-legacy"
+
+    def test_b_logical_user_a_p_md_deletes_only_its_own_row(self, rig: Rig) -> None:
+        assert rig.create(A, "p.md", "DIRECT-P").status_code == 200
+        assert rig.create(A, f"{A}__p.md", "PROMOTED-AGAIN").status_code == 200
+        r = rig.call(
+            "DELETE",
+            f"/memory/semantic/decisions/{A}__p.md?hard=true",
+            A,
+            ADMIN,
+        )
+        assert r.status_code == 200, r.text
+        assert set(rig.raw()) == {f"{A}__p.md"}  # the new-form p.md survives
+        assert rig.get(A, "p.md").json()["content"] == "DIRECT-P"
+
+
+class TestD1hRead:
+    """AC-D1h. Both rows present: logical ``user-a__p.md`` is the PROMOTED row,
+    never the new-form ``p.md``. Neuter: ``_resolve_private`` accepts
+    ``user_id == U`` alone for the bare row."""
+
+    def _both(self, rig: Rig) -> None:
+        assert rig.create(A, "p.md", "DIRECT-P").status_code == 200
+        assert rig.create(A, f"{A}__p.md", "PROMOTED-AGAIN").status_code == 200
+
+    def test_a_gets_the_promoted_content_for_the_prefixed_logical_id(
+        self, rig: Rig
+    ) -> None:
+        self._both(rig)
+        assert rig.get(A, f"{A}__p.md").json()["content"] == "PROMOTED-AGAIN"
+        assert rig.get(A, "p.md").json()["content"] == "DIRECT-P"
+        got = asyncio.run(
+            rig.semantic.get_documents(_ctx(A), "decisions", ["p.md", f"{A}__p.md"])
+        )
+        assert [g.page_content for g in got if g] == ["DIRECT-P", "PROMOTED-AGAIN"]
+
+    def test_b_gets_404_for_all_three_ids_without_a_leak(self, rig: Rig) -> None:
+        self._both(rig)
+        for doc in ("p.md", f"{A}__p.md", f"{A}__{A}__p.md"):
+            r = rig.get(B, doc)
+            assert r.status_code == 404, doc
+            assert "DIRECT-P" not in r.text and "PROMOTED-AGAIN" not in r.text
+
+    def test_a_stamped_bare_row_never_answers_another_logical_id(
+        self, rig: Rig
+    ) -> None:
+        """A has ONLY the new-form ``p.md`` (stored ``user-a__p.md``). A's read of
+        logical ``user-a__p.md`` must not be answered by that stamped row (it
+        is some other logical id's row): 404, and ``None`` from the service.
+        Neuter: the stamp condition off in ``_resolve_private``."""
+        assert rig.create(A, "p.md", "DIRECT-P").status_code == 200
+        r = rig.get(A, f"{A}__p.md")
+        assert r.status_code == 404 and "DIRECT-P" not in r.text
+        assert _read(rig, A, f"{A}__p.md") is None
+        assert rig.get(A, "p.md").json()["content"] == "DIRECT-P"
+
+
+class TestD1iStampForgery:
+    """AC-D1i. A caller-supplied ``id_form`` never lands. Neuters: ``setdefault``
+    in ``upsert`` (with the strip also gone); drop it from each sanitizer set."""
+
+    def test_rest_forged_stamp_is_overwritten(self, rig: Rig) -> None:
+        r = rig.create(B, "x", "t", extra_meta={"id_form": "zzz"})
+        assert r.status_code == 200, r.text
+        assert rig.raw()[f"{B}__x"]["metadata"]["id_form"] == "lc9"
+        assert rig.get(B, "x").status_code == 200
+
+    def test_a_forged_stamp_on_a_legacy_shaped_write_cannot_claim_the_id(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_legacy(f"{B}__foo", A, "A-LEGACY")
+        r = rig.create(B, "foo", "t", extra_meta={"id_form": "lc9", "user_id": A})
+        assert r.status_code == 409
+
+    def test_sanitizers_drop_the_key(self) -> None:
+        from audittrace.routes.memory import _sanitize_semantic_metadata
+        from audittrace.tools.mcp_write_handlers import _sanitize_metadata
+
+        assert _sanitize_semantic_metadata({"id_form": "x", "k": 1}) == {"k": 1}
+        assert _sanitize_metadata({"id_form": "x", "k": 1}) == {"k": 1}
+
+    def test_service_overwrites_a_stamp_in_the_metadata_argument(
+        self, rig: Rig
+    ) -> None:
+        asyncio.run(
+            rig.semantic.upsert(
+                _ctx(B), "decisions", "x", "t", {"id_form": "zzz"}, tier="private"
+            )
+        )
+        assert rig.raw()[f"{B}__x"]["metadata"]["id_form"] == "lc9"
+
+
+@pytest.mark.usefixtures("registries")
+class TestD1gMcp:
+    """AC-D1g. MCP ``write_decision`` onto A's legacy ``user-b__foo``. Neuters: let
+    the error reach ``except Exception`` (``<Class>: write failed``); forged
+    ``id_form`` in MCP metadata is dropped."""
+
+    def _call(
+        self, rig: Rig, sub: str, doc: str, extra: dict[str, Any] | None = None
+    ) -> Any:
+        args: dict[str, Any] = {"document_id": doc, "text": "B-MCP"}
+        args.update(extra or {})
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "write_decision", "arguments": args},
+        }
+        return rig.call("POST", "/mcp", sub, "memory:decisions:write", json=body)
+
+    def test_tool_result_is_the_one_text_and_a_is_untouched(
+        self, rig: Rig, audits: AsyncMock
+    ) -> None:
+        rig.seed_legacy(f"{B}__foo", A, "A-LEGACY")
+        before = _snapshot(rig, f"{B}__foo")
+        audits.reset_mock()
+        r = self._call(rig, B, "foo")
+        assert r.status_code == 200, r.text
+        result = r.json()["result"]
+        assert result["isError"] is True
+        assert _conflict_text("decisions", "foo") in result["content"][0]["text"]
+        assert "write failed" not in result["content"][0]["text"]
+        assert _snapshot(rig, f"{B}__foo") == before
+        assert set(rig.rows()) == {f"decisions/{B}__foo"}
+        audits.assert_not_called()
+        assert rig.get(A, f"{B}__foo").json()["content"] == "A-LEGACY"
+
+    def test_forged_stamp_in_mcp_metadata_is_dropped(self, rig: Rig) -> None:
+        r = self._call(rig, B, "x", {"metadata": {"id_form": "zzz"}})
+        assert r.status_code == 200 and r.json()["result"]["isError"] is False
+        assert rig.raw()[f"{B}__x"]["metadata"]["id_form"] == "lc9"
+
+
+class TestD1jOneTombstoneCandidate:
+    """AC-D1j / #5. One candidate per row, decided by the row's stamp. Neuters:
+    both candidates for a stamped row; ``user_id``/``tier`` as the owner."""
+
+    def _recall(self, rig: Rig, sub: str) -> list[str]:
+        from audittrace.tools import get_tool_by_name
+
+        tool = get_tool_by_name("recall_semantic")
+        assert tool is not None
+        out = asyncio.run(tool.handler(_ctx(sub), {"query": "body", "k": 20}))
+        return [m["snippet"] for m in out["matches"]]
+
+    @pytest.fixture(autouse=True)
+    def _reg(self, registries: None) -> None:
+        return None
+
+    def test_a_tombstone_on_the_legacy_key_does_not_hide_a_stamped_chunk(
+        self, rig: Rig
+    ) -> None:
+        assert rig.create(A, "p.md", "body-new").status_code == 200
+        rig.seed_legacy_row(f"{A}__p.md", A)
+        # tombstone the legacy promoted manifest row (bare key decisions/user-a__p.md)
+        assert rig.delete(A, f"{A}__p.md").status_code == 200
+        assert "body-new" in self._recall(rig, A)
+
+    def test_a_tombstone_on_the_owner_key_hides_the_stamped_chunk(
+        self, rig: Rig
+    ) -> None:
+        assert rig.create(A, "p.md", "body-new").status_code == 200
+        assert rig.delete(A, "p.md").status_code == 200
+        assert "body-new" not in self._recall(rig, A)
+
+    def test_an_unstamped_chunk_is_filtered_by_its_bare_key_tombstone(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_legacy(f"{A}__p.md", A, "body-legacy")
+        assert "body-legacy" in self._recall(rig, A)
+        assert rig.delete(A, f"{A}__p.md").status_code == 200
+        assert "body-legacy" not in self._recall(rig, A)
+
+    def test_a_foreign_owners_tombstone_does_not_hide_a_row_by_id_alone(
+        self, rig: Rig
+    ) -> None:
+        """A's new-form ``x`` is tombstoned; B's legacy chunk at the id
+        ``user-a__x`` (owner B) is still B's recall result."""
+        assert rig.create(A, "x", "body-a").status_code == 200
+        assert rig.delete(A, "x").status_code == 200
+        rig.seed_legacy(f"{A}__x", B, "body-b")
+        assert "body-b" in self._recall(rig, B)
+
+
+# ── AC-D1f: the two fold sinks ─────────────────────────────────────────────
+
+
+def _pdf_bytes() -> bytes:
+    import pymupdf
+
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 72), "LC-9 fold probe. " * 12)
+    out = bytes(doc.tobytes())
+    doc.close()
+    return out
+
+
+def _index_pdf(rig: Rig, sub: str, key: str) -> Any:
+    with patch(
+        "audittrace.routes.memory._get_minio_client",
+        return_value=_fake_minio({key: _pdf_bytes()}),
+    ):
+        return rig.call(
+            "POST",
+            "/memory/index",
+            sub,
+            FOLD,
+            params={"file": key, "collections": "ai_research_papers"},
+        )
+
+
+class TestD1fFoldSinks:
+    """AC-D1f. Markdown and PDF folds onto a planted unstamped ``user-b__{hex16}``
+    owned by A: exactly 409, the planted row byte-equal, nothing of B's file
+    under ``user-b__``. Neuters: drop the call at the markdown / PDF sink; let the
+    PDF ``except Exception`` classify it; drop the 409 arm at ``index_memory``;
+    omit ``tier`` from PDF chunks (the control)."""
+
+    def test_markdown_fold_onto_a_planted_row_is_409(self, rig: Rig) -> None:
+        hex16 = _doc_id("decisions", "x.md", 0)
+        rig.seed_raw_chunk(f"{B}__{hex16}", A, "A-PLANTED")
+        before = _snapshot(rig, f"{B}__{hex16}")
+        with patch(
+            "audittrace.routes.memory._get_minio_client", return_value=MagicMock()
+        ):
+            up = rig.call(
+                "POST",
+                "/memory/upload",
+                B,
+                FOLD,
+                params={"layer": "episodic", "filename": "x.md"},
+                files={"file": ("x.md", b"B-CHUNK", "text/markdown")},
+            )
+        key = up.json()["key"]
+        with patch(
+            "audittrace.routes.memory._get_minio_client",
+            return_value=_fake_minio({key: b"B-CHUNK"}),
+        ):
+            r = rig.call(
+                "POST",
+                "/memory/index",
+                B,
+                FOLD,
+                params={"file": key, "collections": "decisions"},
+            )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == _conflict_text("decisions", hex16)
+        assert "retry-after" not in {k.lower() for k in r.headers}
+        assert A not in r.text and "A-PLANTED" not in r.text
+        assert set(rig.raw()) == {f"{B}__{hex16}"}
+        assert _snapshot(rig, f"{B}__{hex16}") == before
+        got = rig.get(A, f"{B}__{hex16}")
+        assert got.status_code == 200 and got.json()["content"] == "A-PLANTED"
+
+    def test_markdown_control_stamps_every_chunk(self, rig: Rig) -> None:
+        fold(rig, B, "ok.md", _body("B").encode())
+        raw = rig.raw()
+        assert raw and all(r["metadata"]["id_form"] == "lc9" for r in raw.values())
+        assert all(r["metadata"]["tier"] == "private" for r in raw.values())
+
+    def test_pdf_fold_onto_a_planted_row_is_409(self, rig: Rig) -> None:
+        key = f"{B}/episodic/p.pdf"
+        hex16 = _doc_id("ai_research_papers", f"{key}:p1", 0)
+        rig.seed_raw_chunk(
+            f"{B}__{hex16}", A, "A-PLANTED", collection="ai_research_papers"
+        )
+        before = _snapshot(rig, f"{B}__{hex16}", "ai_research_papers")
+        r = _index_pdf(rig, B, key)
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == _conflict_text("ai_research_papers", hex16)
+        assert A not in r.text and "A-PLANTED" not in r.text
+        assert set(rig.raw("ai_research_papers")) == {f"{B}__{hex16}"}
+        assert _snapshot(rig, f"{B}__{hex16}", "ai_research_papers") == before
+
+    def test_pdf_control_unplanted_is_200_and_chunks_are_stamped(
+        self, rig: Rig
+    ) -> None:
+        """Also the neuter target for ``tier`` omitted: B's OWN second index of
+        its stamped chunks must not be refused."""
+        key = f"{B}/episodic/p.pdf"
+        assert _index_pdf(rig, B, key).status_code == 200
+        raw = rig.raw("ai_research_papers")
+        assert raw
+        for cid, row in raw.items():
+            meta = row["metadata"]
+            assert cid.startswith(f"{B}__")
+            assert meta["id_form"] == "lc9" and meta["tier"] == "private"
+        assert _index_pdf(rig, B, key).status_code == 200  # own re-index converges
+
+
+class TestD1409AtEachSite:
+    """The 409 arm precedes the 502 arm at PUT and at promote (create is in
+    ``TestD1aCrossOwnerLegacy``, ``index_memory`` in ``TestD1fFoldSinks``).
+    Neuter: remove the arm at that site -> 502."""
+
+    def _unstamp(self, rig: Rig, cid: str, collection: str = "decisions") -> None:
+        rig.raw(collection)[cid]["metadata"].pop("id_form")
+
+    def test_put_onto_an_unstamped_row_is_409(
+        self, rig: Rig, audits: AsyncMock
+    ) -> None:
+        assert rig.create(A, "foo", "A-NEW").status_code == 200
+        self._unstamp(rig, f"{A}__foo")
+        before = _snapshot(rig, f"{A}__foo")
+        audits.reset_mock()
+        r = rig.update(A, "foo", "A-V2")
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == _conflict_text("decisions", "foo")
+        assert "retry-after" not in {k.lower() for k in r.headers}
+        assert _snapshot(rig, f"{A}__foo") == before
+        audits.assert_not_called()
+
+    def test_promote_onto_an_unstamped_row_is_409(self, rig: Rig) -> None:
+        rig.raw_col("semantic")  # create the collection
+        asyncio.run(
+            rig.raw_col("semantic").upsert(
+                ids=[f"{A}__{A}__n.md"],
+                documents=["PLANTED"],
+                metadatas=[{"user_id": A, "tier": "private"}],
+            )
+        )
+        before = _snapshot(rig, f"{A}__{A}__n.md", "semantic")
+        _upload_session(rig, A, "n.md")
+        r = _promote(rig, A, "n.md")
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == _conflict_text("semantic", f"{A}__n.md")
+        assert _snapshot(rig, f"{A}__{A}__n.md", "semantic") == before
+
+
+# ── Round 3 (review R2-1, V9): the owner-prefixed branch has its own cases ──
+
+
+class TestOwnedRowStampReachable:
+    """A legacy promoted document (bare manifest row ``decisions/user-a__p.md`` +
+    UNSTAMPED chunk ``user-a__p.md``) sits at the physical id that logical ``p.md``
+    would own. It must answer ONLY its own logical id ``user-a__p.md``.
+    Neuter (V7): the owner-prefixed branch of ``_resolve_private`` accepts
+    ``user_id == U`` alone -> logical ``p.md`` is answered by the legacy row."""
+
+    def test_the_short_logical_id_is_404_and_the_promoted_id_reads_back(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_legacy(f"{A}__p.md", A, "PROMOTED-LEGACY")
+        r = rig.get(A, "p.md")
+        assert r.status_code == 404, r.text
+        assert "PROMOTED-LEGACY" not in r.text
+        back = rig.get(A, f"{A}__p.md")
+        assert back.status_code == 200
+        assert back.json()["content"] == "PROMOTED-LEGACY"
+
+    def test_service_level_batched_read_answers_only_the_promoted_id(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_legacy(f"{A}__p.md", A, "PROMOTED-LEGACY")
+        got = asyncio.run(
+            rig.semantic.get_documents(_ctx(A), "decisions", ["p.md", f"{A}__p.md"])
+        )
+        assert got[0] is None
+        assert got[1] is not None and got[1].page_content == "PROMOTED-LEGACY"
+
+
+class TestHardDeleteOwnerRowStamp:
+    """Neuter (V9): the owner-row stamp check in ``delete_document`` accepts
+    ``user_id == U`` alone -> A's hard delete of logical ``p.md`` removes A's
+    legacy promoted chunk ``user-a__p.md`` (a different logical document)."""
+
+    def test_deleting_p_md_never_removes_the_legacy_promoted_chunk(
+        self, rig: Rig
+    ) -> None:
+        rig.seed_legacy(f"{A}__p.md", A, "PROMOTED-LEGACY")
+        before = _snapshot(rig, f"{A}__p.md")
+        assert (
+            asyncio.run(rig.semantic.delete_document(_ctx(A), "decisions", "p.md"))
+            is False
+        )
+        assert _snapshot(rig, f"{A}__p.md") == before
+        assert rig.get(A, f"{A}__p.md").json()["content"] == "PROMOTED-LEGACY"

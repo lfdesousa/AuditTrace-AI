@@ -1,4 +1,4 @@
-"""Shared throwaway-``postgres:16`` scaffolding for the RLS proof suites
+"""Shared throwaway-``postgres:18.3`` scaffolding for the RLS proof suites
 (SPEC v3 §8: ``tests/test_acl_ownership_rls.py``, ``test_console_store_rls_postgres.py``,
 ``test_rls_isolation.py``).
 
@@ -22,6 +22,8 @@ import time
 from collections.abc import Mapping
 
 from sqlalchemy import create_engine, text
+
+from scripts.ci.pg_image import PG_TEST_IMAGE
 
 #: SPEC v3 §8 -- crash-durability only. Kept as one named tuple of flags so
 #: every ephemeral-Postgres caller in this repo uses the identical set (the
@@ -56,7 +58,7 @@ def run_label_args(environ: Mapping[str, str] | None = None) -> list[str]:
 
 
 def start_ephemeral_postgres(name_prefix: str, password: str, db: str) -> str | None:
-    """Spin a throwaway, non-durable ``postgres:16`` container.
+    """Spin a throwaway, non-durable ``postgres:18.3`` container.
 
     Returns the ``postgresql+psycopg2://`` DSN, or ``None`` (caller should
     skip) when Docker is unavailable. The container is ``--rm`` AND
@@ -87,7 +89,7 @@ def start_ephemeral_postgres(name_prefix: str, password: str, db: str) -> str | 
                 f"POSTGRES_DB={db}",
                 "-p",
                 f"{port}:5432",
-                "postgres:16",
+                PG_TEST_IMAGE,
                 *NONDURABLE_FLAGS,
             ],
             check=True,

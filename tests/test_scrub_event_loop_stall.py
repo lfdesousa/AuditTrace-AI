@@ -291,9 +291,14 @@ def test_g_p1b_neuter_ignore_supplied_index_zero_probes(monkeypatch):
 # ═══════════════════════════ G-P2 — leaf-count counter ═════════════════════
 
 
+# 34 leaves/entry x (4 + 2) = 204 before LC-9. LC-9 adds the ``storage_key``
+# field to ManifestEntry (ADDENDUM-1 C3 reader #1), so 35 leaves/entry x 6 = 210.
+_GP2_SCRUB_CALL_BOUND = 210
+
+
 def test_g_p2_scrub_text_call_count_bounded_by_emitted_size(monkeypatch):
     """At 10000 entries x a 4000-char registered secret, ``scrub_text`` is
-    called AT MOST 204 times (34 leaves/entry x (4 + 2) entries worth of
+    called AT MOST ``_GP2_SCRUB_CALL_BOUND`` times (35 leaves/entry x (4 + 2) entries worth of
     budget headroom, spec fact F4) — not once per leaf across all 10000
     entries."""
     secret = _make_secret(4000)
@@ -311,7 +316,9 @@ def test_g_p2_scrub_text_call_count_bounded_by_emitted_size(monkeypatch):
 
     lc._serialize_for_span(entries)
 
-    assert calls["n"] <= 204, f"expected <= 204 scrub_text calls, got {calls['n']}"
+    assert calls["n"] <= _GP2_SCRUB_CALL_BOUND, (
+        f"expected <= {_GP2_SCRUB_CALL_BOUND} scrub_text calls, got {calls['n']}"
+    )
 
 
 def test_g_p2_neuter_remove_exhaustion_check_reddens(monkeypatch):
@@ -335,7 +342,7 @@ def test_g_p2_neuter_remove_exhaustion_check_reddens(monkeypatch):
 
     lc._serialize_for_span(entries)
 
-    assert calls["n"] > 204, (
+    assert calls["n"] > _GP2_SCRUB_CALL_BOUND, (
         "NEUTER SANITY: disabling the exhaustion check must blow the "
         f"leaf-count bound open; got {calls['n']}"
     )
