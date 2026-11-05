@@ -58,7 +58,9 @@ from audittrace.routes.memory_pdf.redactions import (
 )
 from audittrace.routes.memory_pdf.signature import _pdf_signature_status
 from audittrace.routes.memory_pdf.toc import _build_toc_index
+from audittrace.services.memory_keys import ID_FORM_LC9, ChromaIdConflictError
 from audittrace.services.memory_manifest import authorize_write
+from audittrace.services.semantic import ChromaSemanticService
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,7 @@ async def _index_pdf_objects(
     dry_run: bool = False,
     outcomes: list[bool] | None = None,
     caller_can_write_shared: bool = False,
+    tier: str = "private",
 ) -> int:
     """Stream-index ``.pdf`` files into *collection*, per-page.
 
@@ -104,6 +107,10 @@ async def _index_pdf_objects(
     page_count, signature_status, ocr_coverage_pct, attachment_count,
     form_field_count, the structured ``extraction_warnings`` list,
     and document_sha256 (plus the tier-C ADR-056 fields).
+
+    *tier* (LC-9 WP3) -- ``"private"`` (the fail-closed default) stores each
+    chunk at the owner-prefixed id ``{user.user_id}__{hash}``; ``"corpus"``
+    keeps the bare hash id (a shared document has no single owner).
 
     *outcomes* (#430 v3) — when supplied, every object in *objects*
     appends exactly one ``bool``: ``True`` once the document reaches
@@ -144,6 +151,7 @@ async def _index_pdf_objects(
     # cost essentially nothing after the first call (Python module
     # cache).
     from audittrace.routes.memory import (
+        _chroma_ids,
         _chunk_text,
         _doc_id,
         _read_minio_object,
@@ -658,8 +666,26 @@ async def _index_pdf_objects(
                     for md in metadatas:
                         if md.get("toc_section") is None:
                             md.pop("toc_section", None)
+                        # LC-9 ADDENDUM-5 D0: every chunk carries its tier
+                        # (absent before: without it a private chunk would read
+                        # as LEGACY) and a private one carries the form stamp.
+                        md["tier"] = tier
+                        if tier != "corpus":
+                            md["id_form"] = ID_FORM_LC9
                     if not dry_run:
-                        await _upsert_in_batches(collection, ids, chunks, metadatas)
+                        if tier != "corpus":
+                            # ADDENDUM-5 D1: refuse the page if a target id
+                            # holds a row this caller does not own as a
+                            # new-form row; re-raised below, never classified
+                            # as a PDF extraction failure.
+                            await ChromaSemanticService.check_private_targets(
+                                collection, user, col_name, ids
+                            )
+                        # LC-9 WP3: a private-tier chunk is stored at
+                        # ``{owner}__{hash}`` (always prepended, ADDENDUM-1 S5).
+                        await _upsert_in_batches(
+                            collection, _chroma_ids(user, tier, ids), chunks, metadatas
+                        )
                         total += len(chunks)
                     # Tier-C #23 — chunks_written_doc reflects what
                     # *would* have been written, so dry-run response
@@ -696,6 +722,13 @@ async def _index_pdf_objects(
                 caller_can_write_shared=caller_can_write_shared,
             )
             _record_outcome(True)
+        except ChromaIdConflictError:
+            # ADDENDUM-5 D1: a state conflict at the physical id, not an
+            # extraction failure. Pages before the refused one were written
+            # under the caller's own stamped ids and no manifest row is flushed
+            # for this file (residual, build record). ``index_memory`` maps it
+            # to 409.
+            raise
         except Exception as exc:
             # Tier-C item #16 — classify pymupdf raises into closed-set
             # codes. Falls through to ``pdf_corrupted_structure`` for

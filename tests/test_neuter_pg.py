@@ -104,7 +104,7 @@ def test_wait_ready_times_out_on_an_unreachable_dsn():
 
 @requires_docker
 def test_real_container_lifecycle_settings_and_catalog():
-    """Real ``postgres:16`` end-to-end: start (non-fake), SHOW read-back,
+    """Real ``postgres:18.3`` end-to-end: start (non-fake), SHOW read-back,
     catalog snapshot, stop -- the code path the self-proofs' ``fake=True``
     seam stands in for.
 
@@ -193,6 +193,25 @@ def test_start_container_real_with_tmpfs():
     try:
         settings = read_settings(handle)
         assert_nondurable(settings)  # does not raise
+        # Non-vacuity (LC-9 r1 F3): PGDATA, read back from the RUNNING
+        # container, must itself sit on a tmpfs mount. A tmpfs mounted
+        # elsewhere, or no --tmpfs at all, leaves PGDATA on an on-disk
+        # (anonymous-volume / overlay) filesystem and must go RED.
+        fstype = subprocess.run(
+            [
+                "docker",
+                "exec",
+                handle.name,
+                "sh",
+                "-c",
+                'df -T "$PGDATA" | tail -n 1 | tr -s " " | cut -d" " -f2',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        ).stdout.strip()
+        assert fstype == "tmpfs", f"PGDATA is on {fstype!r}, not tmpfs"
     finally:
         stop_container(handle)
 

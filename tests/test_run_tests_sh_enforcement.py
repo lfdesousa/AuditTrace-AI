@@ -72,6 +72,25 @@ def _write_exec(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def _coverage_writer_source(report: dict[str, tuple[int, int]]) -> str:
+    """Python source a fake pytest runs to leave the two artefacts the real
+    one leaves: coverage.json (the gate's input) and `.coverage` (the raw
+    measurement the completeness guard reads)."""
+    return (
+        "import json, coverage\n"
+        f"report = {report!r}\n"
+        "files = {n: {'summary': {'num_statements': s, 'covered_lines': c}}\n"
+        "         for n, (s, c) in report.items()}\n"
+        "json.dump({'files': files}, open('coverage.json', 'w'))\n"
+        "data = coverage.CoverageData('.coverage')\n"
+        "data.add_lines({n: list(range(1, s + 1)) for n, (s, c) in report.items()})\n"
+        "data.write()\n"
+    )
+
+
+PASSING_REPORT = {"src/audittrace/example.py": (10, 10)}
+
+
 def _fake_pytest(
     bin_dir: Path,
     *,
@@ -79,20 +98,21 @@ def _fake_pytest(
     junit_testcase: str = '<testcase classname="fake" name="test_fake" time="0.0"/>',
     junit_skipped_attr: str = "0",
     record_argv_to: Path | None = None,
-    write_coverage_xml: str | None = None,
+    coverage_report: dict[str, tuple[int, int]] | None = None,
 ) -> Path:
     """Stands in for the real `pytest` binary resolve_tool() finds on
     PATH. `body` is extra shell to run before writing the junit.xml
     (`junit_testcase`/`junit_skipped_attr` control its content, so a
-    caller can simulate a skipped test) and optionally a coverage.xml
-    (`write_coverage_xml`), then exits 0 — a test suite that "passed"
+    caller can simulate a skipped test) and optionally a coverage.json plus the
+    matching raw `.coverage` data (`coverage_report`: file -> (statements,
+    covered lines)), then exits 0 — a test suite that "passed"
     while doing whatever `body` says (e.g. leaking to a real cluster
     tool, or reporting a skip / a low-coverage file)."""
     tool = bin_dir / "pytest"
     record_line = f'echo "$@" > "{record_argv_to}"\n' if record_argv_to else ""
     coverage_line = (
-        f"cat > coverage.xml <<COVXML\n{write_coverage_xml}\nCOVXML\n"
-        if write_coverage_xml
+        f"python - <<'COVPY'\n{_coverage_writer_source(coverage_report)}\nCOVPY\n"
+        if coverage_report
         else ""
     )
     _write_exec(
@@ -423,8 +443,8 @@ def test_helm_rule_case_table_through_bash_shim_list_rows_only(tmp_path_factory)
 
 def test_a2_9_zero_skip_gate_fires_on_full_run(tmp_path: Path):
     """S20 (round-2 Required #4, re-REJECTed in round 3): the fake pytest
-    must ALSO write a PASSING coverage.xml, so that ONLY the skip gate can
-    fail here — otherwise `check-per-file-coverage.py`'s own "coverage.xml
+    must ALSO write a PASSING coverage.json, so that ONLY the skip gate can
+    fail here — otherwise `check-per-file-coverage.py`'s own "coverage.json
     not found" abort (which also happens to contain the substring "skip"
     in the script's unconditional banner echo) makes this pass for the
     wrong reason. The assertion matches the skip-check script's OWN
@@ -433,15 +453,11 @@ def test_a2_9_zero_skip_gate_fires_on_full_run(tmp_path: Path):
     root = _scratch_script_root(tmp_path)
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
-    passing_coverage_xml = (
-        '<?xml version="1.0" ?>\n'
-        '<coverage line-rate="1.0" branch-rate="1.0"><packages/></coverage>'
-    )
     _fake_pytest(
         bin_dir,
         junit_testcase='<testcase classname="fake" name="test_fake" time="0.0"><skipped/></testcase>',
         junit_skipped_attr="1",
-        write_coverage_xml=passing_coverage_xml,
+        coverage_report=PASSING_REPORT,
     )
     _fake_python_passthrough(bin_dir)
     _fake_real_helm(bin_dir)
@@ -450,7 +466,7 @@ def test_a2_9_zero_skip_gate_fires_on_full_run(tmp_path: Path):
 
     assert result.returncode != 0, result.stdout + result.stderr
     combined = result.stdout + result.stderr
-    assert "coverage.xml not found" not in combined, (
+    assert "coverage.json not found" not in combined, (
         "the per-file gate must not be what failed here"
     )
     assert "skipped testcase(s)" in combined
@@ -479,17 +495,7 @@ def test_a2_9_per_file_coverage_gate_fires(tmp_path: Path):
     root = _scratch_script_root(tmp_path)
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
-    low_coverage_xml = (
-        '<?xml version="1.0" ?>\n'
-        '<coverage line-rate="0.5" branch-rate="0.5">\n'
-        '<packages><package name="src">\n'
-        '<classes><class filename="src/audittrace/example.py" line-rate="0.5" branch-rate="0.5">\n'
-        '<lines><line number="1" hits="1"/><line number="2" hits="0"/></lines>\n'
-        "</class></classes>\n"
-        "</package></packages>\n"
-        "</coverage>"
-    )
-    _fake_pytest(bin_dir, write_coverage_xml=low_coverage_xml)
+    _fake_pytest(bin_dir, coverage_report={"src/audittrace/example.py": (2, 1)})
     _fake_python_passthrough(bin_dir)
     _fake_real_helm(bin_dir)
 
@@ -507,13 +513,7 @@ def test_a2_9_pytest_argument_set_matches_golden(tmp_path: Path):
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
     argv_dump = tmp_path / "argv.txt"
-    passing_coverage_xml = (
-        '<?xml version="1.0" ?>\n'
-        '<coverage line-rate="1.0" branch-rate="1.0"><packages/></coverage>'
-    )
-    _fake_pytest(
-        bin_dir, record_argv_to=argv_dump, write_coverage_xml=passing_coverage_xml
-    )
+    _fake_pytest(bin_dir, record_argv_to=argv_dump, coverage_report=PASSING_REPORT)
     _fake_python_passthrough(bin_dir)
     _fake_real_helm(bin_dir)
 
@@ -539,6 +539,7 @@ def test_a2_9_pytest_argument_set_matches_golden(tmp_path: Path):
         "--cov=scripts.integration_gate",
         "--cov-report=term-missing",
         "--cov-report=xml",
+        "--cov-report=json:coverage.json",
         "--cov-report=html:htmlcov",
         "--cov-fail-under=90",
         "--junit-xml=junit.xml",
@@ -877,16 +878,12 @@ def test_a_pytest_that_ignores_sigterm_is_killed_after_the_grace_period(tmp_path
 def test_g5_runs_after_pytest_on_the_full_path_too(tmp_path: Path):
     """B1: `make test` and CI use full mode, not --subset. The fake suite leaves the
     lock violated; the full-mode post-pytest G5 must refuse BEFORE the zero-skip and
-    coverage checks (a passing coverage.xml is supplied so only G5 can fail the run).
+    coverage checks (a passing coverage.json is supplied so only G5 can fail the run).
     Neuter: delete ONLY the full-mode `check_environments post` -> exit 0, RED."""
-    passing_xml = (
-        '<?xml version="1.0" ?>\n'
-        '<coverage line-rate="1.0" branch-rate="1.0"><packages/></coverage>'
-    )
     root, bin_dir = _fakes(
         tmp_path,
         body="sed -i 's/^fastapi==0.146.0 /fastapi==0.141.1 /' requirements-dev.txt",
-        write_coverage_xml=passing_xml,
+        coverage_report=PASSING_REPORT,
     )
     result = _run_script(root, bin_dir, subset=False)
 

@@ -16,6 +16,7 @@ timestamp column (``created_at_ms`` / ``modified_at_ms`` /
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Iterable, Sequence
@@ -24,36 +25,100 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import Row, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.db.models import MemoryItem
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
+from audittrace.services.memory_keys import (
+    ConcurrentManifestWriteError as ConcurrentManifestWriteError,
+)
+from audittrace.services.memory_keys import (
+    CrossOwnerWriteError as CrossOwnerWriteError,
+)
+from audittrace.services.memory_keys import (
+    InvalidPrivateSubjectError as InvalidPrivateSubjectError,
+)
+from audittrace.services.memory_keys import (
+    LogicalKeyTooLongError as LogicalKeyTooLongError,
+)
+from audittrace.services.memory_keys import (
+    ManifestAuthorizationError as ManifestAuthorizationError,
+)
+from audittrace.services.memory_keys import (
+    Resolution,
+    RowFacts,
+    logical_key,
+    physical_key,
+    resolve_read,
+    resolve_write,
+    tier_conflict_message,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _facts(row: MemoryItem | None) -> RowFacts | None:
+    """The resolver's backend-neutral view of an ORM row."""
+    if row is None:
+        return None
+    return RowFacts(
+        key=row.key,
+        tier=row.tier,
+        created_by_user_id=row.created_by_user_id,
+        deleted_at_ms=row.deleted_at_ms,
+    )
+
+
+def _entry_facts(entry: ManifestEntry | None) -> RowFacts | None:
+    """The resolver's view of a ``get()`` result (``authorize_write`` reads
+    through the public ``get`` so any manifest double keeps working)."""
+    if entry is None:
+        return None
+    return RowFacts(
+        key=entry.storage_key or entry.key,
+        tier=entry.tier,
+        created_by_user_id=entry.created_by_user_id,
+        deleted_at_ms=entry.deleted_at_ms,
+    )
+
+
+def _is_unique_violation(exc: IntegrityError) -> bool:
+    """``True`` iff *exc* is a ``UNIQUE`` violation (Postgres SQLSTATE
+    ``23505``; SQLite's ``UNIQUE constraint failed`` text). A CHECK or NOT
+    NULL violation is NOT one: it stays a hard error (fail-closed)."""
+    orig = exc.orig
+    state = (
+        getattr(orig, "sqlstate", None)
+        or getattr(orig, "pgcode", None)
+        or getattr(getattr(orig, "__cause__", None), "sqlstate", None)
+    )
+    if state is not None:
+        return str(state) == "23505"
+    return "UNIQUE constraint failed" in str(orig)
+
+
+async def _commit_or_conflict(session: AsyncSession, layer: str, key: str) -> None:
+    """Commit; turn losing the ``UNIQUE (layer, key)`` race into the
+    retryable :class:`ConcurrentManifestWriteError` (LC-9 WP1 advisory A2:
+    two simultaneous copy-forwards of one owner's legacy row used to
+    surface as an IntegrityError -> 500). Any other IntegrityError (the 034
+    CHECK included) propagates unchanged."""
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        if _is_unique_violation(exc):
+            raise ConcurrentManifestWriteError(
+                f"concurrent write to layer={layer!r} key={key!r}; retry"
+            ) from exc
+        raise
 
 
 def _now_ms() -> int:
     """Current Unix epoch in milliseconds UTC. Matches `Date.now()` in JS."""
     return int(time.time() * 1000)
-
-
-class ManifestAuthorizationError(PermissionError):
-    """Raised by ``record_create``/``record_update`` when a caller writes
-    over an EXISTING **corpus**-tier manifest row without the shared-write
-    authorization that row requires (SPEC security-memory-manifest-tier-
-    authz, 2026-08-30 — the M3-WU-D2-2 reviewer's cross-user corpus-hijack/
-    hide finding).
-
-    ``record_create``/``record_update`` are the shared manifest choke for
-    every writer (the REST ``/memory/{episodic,procedural,semantic}``
-    routes, the ``.md`` fold path via ``memory_md_manifest._flush_md_manifest``,
-    and the ``mcp_write`` tools) — raising HERE, not only at the route
-    layer, means no caller can reach an unauthorized corpus overwrite by a
-    path that forgets to duplicate the route-level scope check. Routes
-    MUST map this to HTTP 403 (never let it fall through to a generic 500)
-    — see ``routes/memory.py``'s create/update handlers.
-    """
 
 
 def _tier_write_unauthorized(existing_tier: str, caller_can_write_shared: bool) -> bool:
@@ -70,6 +135,18 @@ def _tier_write_unauthorized(existing_tier: str, caller_can_write_shared: bool) 
     edit.
     """
     return existing_tier == "corpus" and not caller_can_write_shared
+
+
+def _pdf_private_row_foreign(
+    existing_tier: str, existing_owner: str, caller_user_id: str
+) -> bool:
+    """``True`` iff a PDF-metadata refresh would touch ANOTHER user's
+    **private**-tier row (LC-9 WP1 review advisory A1). Neither the shared-
+    write authorization nor an admin/curator role overrides it (ADR-062
+    curators are not private-data admins, operator row O-3): before this
+    guard a foreign legacy bare private row was refused only by the
+    Postgres CHECK (034), never by the service."""
+    return existing_tier == "private" and existing_owner != caller_user_id
 
 
 def _pdf_metadata_write_unauthorized(
@@ -162,13 +239,22 @@ class ManifestEntry:
     # manifest writer) reading the same value it always implicitly
     # meant before this column existed.
     tier: str = "corpus"
+    # ── LC-9 — the STORED key. ``key`` is the LOGICAL key (the owner prefix
+    # of a private row is stripped once, here, by ``logical_key``); callers
+    # that must address the row itself use ``storage_key``. Not serialised.
+    storage_key: str = ""
 
     @classmethod
     def from_row(cls, row: MemoryItem | Row[Any]) -> ManifestEntry:
+        """THE single stored -> logical conversion point (LC-9 ADDENDUM-1 C3,
+        reader #1); the Mock twin's ``_to_entry`` applies the same
+        :func:`logical_key`. *row* is an ORM ``MemoryItem`` or a plain-column
+        ``Row`` from ``list_for_layer`` (``_MANIFEST_COLUMNS``)."""
         return cls(
             id=row.id,
             layer=row.layer,
-            key=row.key,
+            key=logical_key(row.key, tier=row.tier, owner=row.created_by_user_id),
+            storage_key=row.key,
             title=row.title,
             size_bytes=row.size_bytes,
             created_at_ms=row.created_at_ms,
@@ -285,6 +371,15 @@ async def authorize_write(
     (see ``memory_md_manifest.py``/``memory_pdf/manifest.py``, which no
     longer do).
 
+    **LC-9 (cross-user private-row isolation).** The target is resolved by
+    the shared pure resolver (:func:`~audittrace.services.memory_keys.resolve_write`)
+    over the (at most two) rows the write can touch: the caller's owner key
+    ``{user}/{key}`` and the bare key. Another user's private row can never
+    enter the decision, so a private write is always the caller's own space;
+    a corpus write over ANY private row, and a foreign row at the caller's own
+    target, raise :class:`CrossOwnerWriteError` (403) HERE, before any
+    content write. ``key`` is the LOGICAL key.
+
     ``requested_tier`` is the tier the WRITE is targeting (``"private"``
     by default; ``"corpus"`` when the caller explicitly promotes, or when
     a fold/index path resolved the destination to the shared prefix) —
@@ -334,8 +429,24 @@ async def authorize_write(
             f"target layer={layer!r} key={key!r}"
         )
 
-    existing = await manifest.get(layer, key)
-    if existing is None:
+    # LC-9: decide through the shared pure resolver BEFORE any content write.
+    # It raises CrossOwnerWriteError (-> 403) for a corpus write over any
+    # private row and for a foreign row at the private target. The caller's
+    # logical key never reaches another user's private row (their rows live
+    # under their own owner prefix), so nothing is written before the 403.
+    owner = user.user_id
+    target_key = physical_key(owner, key) if requested_tier == "private" else key
+    target = (
+        _entry_facts(await manifest.get(layer, target_key))
+        if target_key != key
+        else None
+    )
+    bare = _entry_facts(await manifest.get(layer, key))
+    resolution = resolve_write(
+        layer, key, owner, requested_tier, target=target, bare=bare
+    )
+    existing = resolution.row
+    if existing is None or resolution.kind != "corpus":
         return
     if (
         owner_exempt
@@ -383,10 +494,20 @@ class IndexStatusSummary:
     matched: list[MatchedUnindexed]
 
 
-# The manifest columns ``list_for_layer`` selects: exactly the
+# ``ManifestEntry`` fields that are NOT ``memory_items`` columns: LC-9's
+# ``storage_key`` is derived by ``from_row`` from the ``key`` column (which
+# ``from_row`` turns into the LOGICAL key). Named explicitly so any other
+# non-column field still fails loudly at import (``getattr`` below).
+_DERIVED_ENTRY_FIELDS = frozenset({"storage_key"})
+
+# The manifest columns ``list_for_layer`` selects: exactly the column-backed
 # ``ManifestEntry`` fields, so the query returns plain ``Row`` tuples and no
 # session-bound ORM instance (#364: nothing may outlive its session).
-_MANIFEST_COLUMNS = tuple(getattr(MemoryItem, f.name) for f in fields(ManifestEntry))
+_MANIFEST_COLUMNS = tuple(
+    getattr(MemoryItem, f.name)
+    for f in fields(ManifestEntry)
+    if f.name not in _DERIVED_ENTRY_FIELDS
+)
 
 
 def _rows_to_entries(
@@ -418,6 +539,72 @@ class MemoryManifestService:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
+    async def _fetch_rows(
+        self, session: AsyncSession, layer: str, keys: Iterable[str]
+    ) -> dict[str, MemoryItem]:
+        """Rows of ``layer`` stored at any of *keys*, by stored key."""
+        rows = (
+            (
+                await session.execute(
+                    select(MemoryItem).where(
+                        MemoryItem.layer == layer, MemoryItem.key.in_(list(keys))
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return {r.key: r for r in rows}
+
+    async def _resolve_write_in(
+        self,
+        session: AsyncSession,
+        layer: str,
+        logical: str,
+        owner: str,
+        tier: str,
+    ) -> tuple[Resolution, dict[str, MemoryItem]]:
+        """Fetch the (at most two) rows a write touches and decide. The
+        target key is derived BEFORE the fetch so an invalid sub or an
+        over-long key is refused with no query."""
+        target_key = physical_key(owner, logical) if tier == "private" else logical
+        rows = await self._fetch_rows(session, layer, {target_key, logical})
+        res = resolve_write(
+            layer,
+            logical,
+            owner,
+            tier,
+            target=_facts(rows.get(target_key)) if target_key != logical else None,
+            bare=_facts(rows.get(logical)),
+        )
+        return res, rows
+
+    @log_call(logger=logger)
+    async def resolve_read(
+        self, layer: str, logical_key: str, user: UserContext
+    ) -> ManifestEntry | None:
+        """Dual-lookup read (LC-9 R3): the caller's owner key, then the
+        caller's OWN legacy bare row, then a corpus row. ``None`` for
+        everything else -- another user's private row is indistinguishable
+        from an absent one."""
+        _validate_layer(layer)
+        async with self._session_factory() as session:
+            row = await self._read_row(session, layer, logical_key, user.user_id)
+            return ManifestEntry.from_row(row) if row is not None else None
+
+    async def _read_row(
+        self, session: AsyncSession, layer: str, logical: str, owner: str
+    ) -> MemoryItem | None:
+        # The owner key is only computed when the sub is a valid prefix: a
+        # read never raises on a malformed sub, it just cannot see an owner key.
+        keys = {logical}
+        with contextlib.suppress(InvalidPrivateSubjectError, LogicalKeyTooLongError):
+            keys.add(physical_key(owner, logical))
+        rows = await self._fetch_rows(session, layer, keys)
+        target = rows.get(f"{owner}/{logical}")
+        res = resolve_read(owner, target=_facts(target), bare=_facts(rows.get(logical)))
+        return rows.get(res.row.key) if res is not None and res.row else None
+
     @log_call(logger=logger)
     async def record_create(
         self,
@@ -430,85 +617,44 @@ class MemoryManifestService:
         *,
         caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
-        """Insert a new manifest row, OR un-soft-delete + bump
-        timestamps if a row with the same (layer, key) already exists
-        (e.g. an operator deletes ADR-007 then recreates with the same
-        key).
+        """Insert a manifest row for *key* (a LOGICAL key), OR revive/overwrite
+        the caller's own row.
 
-        ``tier`` (ADR-062 Phase B, WU-B4/WU-B5) defaults ``"private"`` —
-        D2's "new writes default private" policy lives here as much as
-        at the route layer, so any future call site that forgets to
-        pass ``tier`` explicitly still lands on the fail-closed
-        (least-shared) side rather than silently defaulting to
-        ``"corpus"``. Recreating an existing row (revive-after-delete or
-        overwrite) also re-stamps ``tier`` to the caller's requested
-        value — same as ``title``/``size_bytes`` on that branch — but
-        ONLY when authorized (see ``caller_can_write_shared`` below).
+        LC-9: a private row is stored at ``{user_id}/{key}`` (``user_id`` MUST
+        be the token's ``sub``); a corpus row at the bare key. The resolver
+        decides what the write touches: the caller's own row (``own``) is
+        updated, the caller's OWN legacy bare row (``legacy_own``) is
+        copied forward (new owner-keyed row, ``created_at_ms`` preserved, the
+        legacy row tombstoned by its owner, ONE transaction), and a bare
+        corpus row is subject to the corpus guard (``caller_can_write_shared``,
+        fail-closed ``False``) but is NEVER re-stamped: a private write
+        creates its own row beside it. A corpus write over any private row,
+        and any other cross-owner shape, raises
+        :class:`CrossOwnerWriteError` (the silent tier re-stamp of the
+        pre-LC-9 ``existing.tier = tier`` branch is gone).
 
-        ``caller_can_write_shared`` (SPEC security-memory-manifest-tier-
-        authz, 2026-08-30) — ``True`` iff the caller holds
-        ``memory:corpus:<layer>:write`` (or ``audittrace:admin``/admin)
-        for this write, computed by the route from the token's scopes.
-        Defaults ``False`` — FAIL-CLOSED, so a caller of this SERVICE
-        method (not just the route) that forgets to pass it lands on the
-        least-privileged side, same discipline as the ``tier`` default.
-
-        Fixes the cross-user corpus-hijack/hide vulnerability the M3-WU-
-        D2-2 reviewer surfaced: before this guard, an EXISTING row's
-        lookup was ``(layer, key)`` only — no tier/ownership check — so
-        a caller holding just the base ``memory:<layer>:write`` scope
-        could POST a create at a shared **corpus**-tier item's key and
-        silently demote it to their own private tier + re-own it,
-        hiding it from everyone else. Now: if the EXISTING row is
-        corpus-tier and the caller is not authorized for shared writes,
-        this raises :class:`ManifestAuthorizationError` — no tier
-        change, no title/content overwrite, no re-authorship. An
-        authorized caller (or a write landing on an existing PRIVATE
-        row) keeps working exactly as before; an unauthorized write
-        that reaches an existing PRIVATE row still updates
-        title/size/``modified_by_user_id`` (unaffected — private-tier
-        cross-owner collisions are a separate, already-flagged follow-
-        up, see ``routes/memory.py::_manifest_visible``'s docstring) but
-        its ``tier`` field is left untouched rather than blindly set to
-        whatever the caller requested, so an unauthorized promote-to-
-        corpus can never silently land via this defense-in-depth path
-        either. ``created_by_user_id`` is never reassigned (unchanged
-        behavior — always was owner-preserving on this branch).
-
-        Returns the resulting entry.
+        ``tier`` defaults ``"private"`` (ADR-062 Phase B D2: new writes
+        default to the least-shared side). Returns the entry with the
+        LOGICAL key.
         """
         _validate_layer(layer)
         now = _now_ms()
         async with self._session_factory() as session:
-            existing = (
-                await session.execute(
-                    select(MemoryItem).filter_by(layer=layer, key=key)
+            res, rows = await self._resolve_write_in(session, layer, key, user_id, tier)
+            existing = rows[res.row.key] if res.row is not None else None
+            if res.kind == "corpus" and _tier_write_unauthorized(
+                "corpus", caller_can_write_shared
+            ):
+                raise ManifestAuthorizationError(
+                    f"caller lacks shared-write authorization to overwrite "
+                    f"existing corpus-tier manifest row layer={layer!r} "
+                    f"key={key!r}"
                 )
-            ).scalar_one_or_none()
-            if existing is None:
-                row = MemoryItem(
-                    layer=layer,
-                    key=key,
-                    title=title,
-                    size_bytes=size_bytes,
-                    created_at_ms=now,
-                    modified_at_ms=now,
-                    created_by_user_id=user_id,
-                    modified_by_user_id=user_id,
-                    tier=tier,
-                )
-                session.add(row)
-            else:
-                if _tier_write_unauthorized(existing.tier, caller_can_write_shared):
-                    raise ManifestAuthorizationError(
-                        f"caller lacks shared-write authorization to overwrite "
-                        f"existing corpus-tier manifest row layer={layer!r} "
-                        f"key={key!r}"
-                    )
-                # Recreating after a soft-delete (or overwriting an
-                # existing live entry — caller should usually call
-                # `record_update` for the latter; this path is
-                # idempotent either way).
+            row: MemoryItem
+            if existing is not None and (res.kind == "own" or tier == "corpus"):
+                # Recreating after a soft-delete (or overwriting an existing
+                # live entry; callers usually use `record_update` for the
+                # latter, this path is idempotent either way).
                 if existing.deleted_at_ms is not None:
                     existing.deleted_at_ms = None
                     existing.deleted_by_user_id = None
@@ -516,10 +662,28 @@ class MemoryManifestService:
                 existing.size_bytes = size_bytes
                 existing.modified_at_ms = now
                 existing.modified_by_user_id = user_id
-                if caller_can_write_shared:
-                    existing.tier = tier
                 row = existing
-            await session.commit()
+            else:
+                created = now
+                if res.kind == "legacy_own" and existing is not None:
+                    # copy-forward: keep the audit history continuous, tombstone
+                    # the legacy row by its owner, same transaction.
+                    created = existing.created_at_ms
+                    existing.deleted_at_ms = now
+                    existing.deleted_by_user_id = user_id
+                row = MemoryItem(
+                    layer=layer,
+                    key=res.storage_key,
+                    title=title,
+                    size_bytes=size_bytes,
+                    created_at_ms=created,
+                    modified_at_ms=now,
+                    created_by_user_id=user_id,
+                    modified_by_user_id=user_id,
+                    tier=tier,
+                )
+                session.add(row)
+            await _commit_or_conflict(session, layer, key)
             await session.refresh(row)
             return ManifestEntry.from_row(row)
 
@@ -536,32 +700,23 @@ class MemoryManifestService:
     ) -> ManifestEntry:
         """Bump ``modified_at_ms`` + ``modified_by_user_id`` on the row.
 
-        ``title`` is updated only if non-None (PUT semantics — empty
-        string clears it). Raises ``LookupError`` if no row exists for
-        ``(layer, key)``. Raises ``RuntimeError`` if the row is
-        soft-deleted (caller should ``record_create`` to revive
-        rather than update a deleted row).
+        *key* is a LOGICAL key; the row is found by the dual-lookup order
+        (the caller's owner key, the caller's OWN legacy bare row, then a
+        corpus row). Another user's private row is never reachable: it is
+        ``LookupError``, same as an absent row. An update of the caller's
+        own LEGACY row copy-forwards it (see :meth:`record_create`).
 
-        ``caller_can_write_shared`` (SPEC security-memory-manifest-tier-
-        authz, 2026-08-30) — same fail-closed (default ``False``)
-        shared-write authorization ``record_create`` takes. Raises
-        :class:`ManifestAuthorizationError` — BEFORE any field is
-        touched — when the row is corpus-tier and the caller lacks it:
-        this closes the same vulnerability class as ``record_create``'s
-        guard for the update path, where an unauthorized caller could
-        previously overwrite a shared corpus row's ``title`` and
-        re-stamp ``modified_by_user_id`` to themselves with no
-        ownership/tier check at all. ``record_update`` never touches
-        ``tier`` (unchanged — it never did), so authorized callers see
-        no behavior change.
+        ``title`` is updated only if non-None (PUT semantics). Raises
+        ``LookupError`` if no row exists, ``RuntimeError`` if the row is
+        soft-deleted (the caller should ``record_create`` to revive), and
+        :class:`ManifestAuthorizationError` -- BEFORE any field is touched --
+        when the row is corpus-tier and ``caller_can_write_shared`` (SPEC
+        security-memory-manifest-tier-authz, fail-closed ``False``) is not
+        held. ``tier`` is never touched.
         """
         _validate_layer(layer)
         async with self._session_factory() as session:
-            row = (
-                await session.execute(
-                    select(MemoryItem).filter_by(layer=layer, key=key)
-                )
-            ).scalar_one_or_none()
+            row = await self._read_row(session, layer, key, user_id)
             if row is None:
                 raise LookupError(f"no manifest row for layer={layer!r} key={key!r}")
             if row.deleted_at_ms is not None:
@@ -575,12 +730,31 @@ class MemoryManifestService:
                     f"existing corpus-tier manifest row layer={layer!r} "
                     f"key={key!r}"
                 )
-            if title is not None:
-                row.title = title
-            row.size_bytes = size_bytes
-            row.modified_at_ms = _now_ms()
-            row.modified_by_user_id = user_id
-            await session.commit()
+            now = _now_ms()
+            if row.tier == "private" and row.key == key:
+                # The caller's own LEGACY bare row: copy forward.
+                new_row = MemoryItem(
+                    layer=layer,
+                    key=physical_key(user_id, key),
+                    title=title if title is not None else row.title,
+                    size_bytes=size_bytes,
+                    created_at_ms=row.created_at_ms,
+                    modified_at_ms=now,
+                    created_by_user_id=user_id,
+                    modified_by_user_id=user_id,
+                    tier="private",
+                )
+                row.deleted_at_ms = now
+                row.deleted_by_user_id = user_id
+                session.add(new_row)
+                row = new_row
+            else:
+                if title is not None:
+                    row.title = title
+                row.size_bytes = size_bytes
+                row.modified_at_ms = now
+                row.modified_by_user_id = user_id
+            await _commit_or_conflict(session, layer, key)
             await session.refresh(row)
             return ManifestEntry.from_row(row)
 
@@ -594,33 +768,21 @@ class MemoryManifestService:
         caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         """Soft-delete: set ``deleted_at_ms`` + ``deleted_by_user_id``.
-        Idempotent — calling on an already-deleted row is a no-op
+        Idempotent -- calling on an already-deleted row is a no-op
         that returns the existing entry. Raises ``LookupError`` if
-        the row does not exist at all.
+        the row does not exist (including: it is another user's private
+        row, which the caller can never address).
 
-        ``caller_can_write_shared`` (SPEC security-memory-manifest-tier-
-        authz, 2026-08-30) — the SAME fail-closed (default ``False``)
-        shared-write authorization ``record_create``/``record_update``/
-        ``upsert_pdf_metadata`` take. This is the LAST of the four
-        manifest mutation methods to gain it — the M3-WU-D2-2 reviewer's
-        second REJECT: a caller holding only base ``memory:<layer>:write``
-        could soft-delete (tombstone -> hidden from recall) an existing
-        **corpus**-tier row it doesn't own, stamping
-        ``deleted_by_user_id`` as itself with no ownership/tier check at
-        all. Raises :class:`ManifestAuthorizationError` — BEFORE touching
-        any field — when the row is corpus-tier and the caller lacks
-        authorization; a caller deleting their own PRIVATE-tier item is
-        unaffected. Idempotent-no-op path (already deleted) is likewise
-        gated: an unauthorized caller must not be able to confirm/observe
-        a corpus row's deleted state via a no-op call either.
+        *key* is a LOGICAL key, resolved by the dual-lookup order of
+        :meth:`record_update`. ``caller_can_write_shared`` (SPEC security-
+        memory-manifest-tier-authz) is the same fail-closed corpus guard: it
+        raises :class:`ManifestAuthorizationError` BEFORE touching any field
+        for a corpus-tier row, and gates the idempotent no-op path too (an
+        unauthorized caller must not observe a corpus row's deleted state).
         """
         _validate_layer(layer)
         async with self._session_factory() as session:
-            row = (
-                await session.execute(
-                    select(MemoryItem).filter_by(layer=layer, key=key)
-                )
-            ).scalar_one_or_none()
+            row = await self._read_row(session, layer, key, user_id)
             if row is None:
                 raise LookupError(f"no manifest row for layer={layer!r} key={key!r}")
             if _tier_write_unauthorized(row.tier, caller_can_write_shared):
@@ -760,6 +922,8 @@ class MemoryManifestService:
                 )
                 session.add(row)
             else:
+                if _pdf_private_row_foreign(row.tier, row.created_by_user_id, user_id):
+                    raise CrossOwnerWriteError(tier_conflict_message(layer, key))
                 if _pdf_metadata_write_unauthorized(
                     row.tier, row.created_by_user_id, user_id, caller_can_write_shared
                 ):
@@ -907,7 +1071,9 @@ class MemoryManifestService:
                 )
                 matched = [
                     MatchedUnindexed(
-                        key=row.key,
+                        key=logical_key(
+                            row.key, tier=row.tier, owner=row.created_by_user_id
+                        ),
                         state=(
                             "dead_lettered"
                             if row.index_failed_at_ms is not None
@@ -992,7 +1158,12 @@ class MockMemoryManifestService(MemoryManifestService):
         return ManifestEntry(
             id=row["id"],
             layer=row["layer"],
-            key=row["key"],
+            key=logical_key(
+                row["key"],
+                tier=row.get("tier", "corpus"),
+                owner=row.get("created_by_user_id"),
+            ),
+            storage_key=row["key"],
             title=row.get("title"),
             size_bytes=row.get("size_bytes"),
             created_at_ms=row["created_at_ms"],
@@ -1018,6 +1189,50 @@ class MockMemoryManifestService(MemoryManifestService):
             tier=row.get("tier", "corpus"),
         )
 
+    def _mock_facts(self, layer: str, key: str) -> RowFacts | None:
+        row = self._rows.get((layer, key))
+        if row is None:
+            return None
+        return RowFacts(
+            key=key,
+            tier=row.get("tier", "corpus"),
+            created_by_user_id=row["created_by_user_id"],
+            deleted_at_ms=row.get("deleted_at_ms"),
+        )
+
+    def _mock_resolve_write(
+        self, layer: str, logical: str, owner: str, tier: str
+    ) -> Resolution:
+        """Same inputs, same pure decision as the Postgres twin."""
+        target_key = physical_key(owner, logical) if tier == "private" else logical
+        return resolve_write(
+            layer,
+            logical,
+            owner,
+            tier,
+            target=self._mock_facts(layer, target_key)
+            if target_key != logical
+            else None,
+            bare=self._mock_facts(layer, logical),
+        )
+
+    def _mock_read_row(
+        self, layer: str, logical: str, owner: str
+    ) -> dict[str, Any] | None:
+        res = resolve_read(
+            owner,
+            target=self._mock_facts(layer, f"{owner}/{logical}"),
+            bare=self._mock_facts(layer, logical),
+        )
+        return self._rows[(layer, res.row.key)] if res is not None and res.row else None
+
+    async def resolve_read(
+        self, layer: str, logical_key: str, user: UserContext
+    ) -> ManifestEntry | None:
+        _validate_layer(layer)
+        row = self._mock_read_row(layer, logical_key, user.user_id)
+        return self._to_entry(row) if row is not None else None
+
     async def record_create(
         self,
         layer: str,
@@ -1031,44 +1246,48 @@ class MockMemoryManifestService(MemoryManifestService):
     ) -> ManifestEntry:
         _validate_layer(layer)
         now = _now_ms()
-        existing = self._rows.get((layer, key))
-        if existing is None:
-            import uuid
-
-            existing = {
-                "id": str(uuid.uuid4()),
-                "layer": layer,
-                "key": key,
-                "title": title,
-                "size_bytes": size_bytes,
-                "created_at_ms": now,
-                "modified_at_ms": now,
-                "created_by_user_id": user_id,
-                "modified_by_user_id": user_id,
-                "deleted_at_ms": None,
-                "deleted_by_user_id": None,
-                "tier": tier,
-            }
-            self._rows[(layer, key)] = existing
-        else:
-            if _tier_write_unauthorized(
-                existing.get("tier", "corpus"), caller_can_write_shared
-            ):
-                raise ManifestAuthorizationError(
-                    f"caller lacks shared-write authorization to overwrite "
-                    f"existing corpus-tier manifest row layer={layer!r} "
-                    f"key={key!r}"
-                )
+        res = self._mock_resolve_write(layer, key, user_id, tier)
+        existing = self._rows[(layer, res.row.key)] if res.row is not None else None
+        if res.kind == "corpus" and _tier_write_unauthorized(
+            "corpus", caller_can_write_shared
+        ):
+            raise ManifestAuthorizationError(
+                f"caller lacks shared-write authorization to overwrite "
+                f"existing corpus-tier manifest row layer={layer!r} "
+                f"key={key!r}"
+            )
+        if existing is not None and (res.kind == "own" or tier == "corpus"):
             existing["title"] = title
             existing["size_bytes"] = size_bytes
             existing["modified_at_ms"] = now
             existing["modified_by_user_id"] = user_id
-            if caller_can_write_shared:
-                existing["tier"] = tier
             if existing.get("deleted_at_ms") is not None:
                 existing["deleted_at_ms"] = None
                 existing["deleted_by_user_id"] = None
-        return self._to_entry(existing)
+            return self._to_entry(existing)
+        import uuid
+
+        created = now
+        if res.kind == "legacy_own" and existing is not None:
+            created = existing["created_at_ms"]
+            existing["deleted_at_ms"] = now
+            existing["deleted_by_user_id"] = user_id
+        new_row: dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "layer": layer,
+            "key": res.storage_key,
+            "title": title,
+            "size_bytes": size_bytes,
+            "created_at_ms": created,
+            "modified_at_ms": now,
+            "created_by_user_id": user_id,
+            "modified_by_user_id": user_id,
+            "deleted_at_ms": None,
+            "deleted_by_user_id": None,
+            "tier": tier,
+        }
+        self._rows[(layer, res.storage_key)] = new_row
+        return self._to_entry(new_row)
 
     async def record_update(
         self,
@@ -1081,7 +1300,7 @@ class MockMemoryManifestService(MemoryManifestService):
         caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         _validate_layer(layer)
-        existing = self._rows.get((layer, key))
+        existing = self._mock_read_row(layer, key, user_id)
         if existing is None:
             raise LookupError(f"no manifest row for layer={layer!r} key={key!r}")
         if existing.get("deleted_at_ms") is not None:
@@ -1089,18 +1308,41 @@ class MockMemoryManifestService(MemoryManifestService):
                 f"manifest row for layer={layer!r} key={key!r} is "
                 f"soft-deleted; use record_create to revive"
             )
-        if _tier_write_unauthorized(
-            existing.get("tier", "corpus"), caller_can_write_shared
-        ):
+        tier = existing.get("tier", "corpus")
+        if _tier_write_unauthorized(tier, caller_can_write_shared):
             raise ManifestAuthorizationError(
                 f"caller lacks shared-write authorization to overwrite "
                 f"existing corpus-tier manifest row layer={layer!r} "
                 f"key={key!r}"
             )
+        now = _now_ms()
+        if tier == "private" and existing["key"] == key:
+            # The caller's own LEGACY bare row: copy forward.
+            import uuid
+
+            new_key = physical_key(user_id, key)
+            new_row: dict[str, Any] = {
+                "id": str(uuid.uuid4()),
+                "layer": layer,
+                "key": new_key,
+                "title": title if title is not None else existing.get("title"),
+                "size_bytes": size_bytes,
+                "created_at_ms": existing["created_at_ms"],
+                "modified_at_ms": now,
+                "created_by_user_id": user_id,
+                "modified_by_user_id": user_id,
+                "deleted_at_ms": None,
+                "deleted_by_user_id": None,
+                "tier": "private",
+            }
+            existing["deleted_at_ms"] = now
+            existing["deleted_by_user_id"] = user_id
+            self._rows[(layer, new_key)] = new_row
+            return self._to_entry(new_row)
         if title is not None:
             existing["title"] = title
         existing["size_bytes"] = size_bytes
-        existing["modified_at_ms"] = _now_ms()
+        existing["modified_at_ms"] = now
         existing["modified_by_user_id"] = user_id
         return self._to_entry(existing)
 
@@ -1113,7 +1355,7 @@ class MockMemoryManifestService(MemoryManifestService):
         caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         _validate_layer(layer)
-        existing = self._rows.get((layer, key))
+        existing = self._mock_read_row(layer, key, user_id)
         if existing is None:
             raise LookupError(f"no manifest row for layer={layer!r} key={key!r}")
         if _tier_write_unauthorized(
@@ -1231,7 +1473,11 @@ class MockMemoryManifestService(MemoryManifestService):
                 if any(token in h for token in lowered_tokens for h in haystacks):
                     matched.append(
                         MatchedUnindexed(
-                            key=r["key"],
+                            key=logical_key(
+                                r["key"],
+                                tier=r.get("tier", "corpus"),
+                                owner=r.get("created_by_user_id"),
+                            ),
                             state=(
                                 "dead_lettered"
                                 if r.get("index_failed_at_ms") is not None
@@ -1314,6 +1560,12 @@ class MockMemoryManifestService(MemoryManifestService):
             }
             self._rows[(layer, key)] = existing
         else:
+            if _pdf_private_row_foreign(
+                existing.get("tier", "corpus"),
+                existing.get("created_by_user_id", ""),
+                user_id,
+            ):
+                raise CrossOwnerWriteError(tier_conflict_message(layer, key))
             if _pdf_metadata_write_unauthorized(
                 existing.get("tier", "corpus"),
                 existing.get("created_by_user_id", ""),

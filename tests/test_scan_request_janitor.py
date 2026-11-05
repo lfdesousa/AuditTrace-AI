@@ -69,7 +69,8 @@ async def _seed_md_manifest_fold(factory, *, key: str, age_seconds: int) -> str:
     async with factory() as session:
         row = (
             await session.execute(
-                select(MemoryItem).filter_by(layer="episodic", key=key)
+                # LC-9: a private CRUD row is stored under its owner's prefix.
+                select(MemoryItem).filter_by(layer="episodic", key=f"alice/{key}")
             )
         ).scalar_one()
         row.created_at_ms = int(time.time() * 1000) - (age_seconds * 1000)

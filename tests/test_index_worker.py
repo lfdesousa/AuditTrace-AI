@@ -395,7 +395,11 @@ class TestDefaultIndexerRouting:
             manifest_service,
             outcomes=None,
             caller_can_write_shared=False,
+            tier="private",
         ):
+            # LC-9 WP3: the worker drains the SHARED bucket, so its chunks are
+            # corpus-tier (bare hash ids) -- never the fail-closed default.
+            assert tier == "corpus"
             assert collection is chroma_collection
             assert minio is minio_client
             assert bucket == "memory-shared"

@@ -305,15 +305,31 @@ def reset_registry_for_tests() -> None:
 # tool-call loop into chat.py to consume it.
 
 
-def _canonical_cache_id(session_id: str, tool_name: str, args: dict[str, Any]) -> str:
+def _canonical_cache_id(
+    user_id: str,
+    scopes: tuple[str, ...],
+    is_admin: bool,
+    session_id: str,
+    tool_name: str,
+    args: dict[str, Any],
+) -> str:
     """Build the deterministic cache id for a tool invocation.
 
-    Dict key ordering is irrelevant — the args dict is serialised with
+    The id covers the request context: the caller's identity, the caller's
+    scope set (as a sorted set: membership matters, order and duplicates do
+    not), the admin flag, the session, the tool and the arguments. The
+    fields are encoded as one JSON array, so a separator character inside
+    a field cannot alias two different tuples.
+
+    Dict key ordering in ``args`` is irrelevant — it is serialised with
     ``sort_keys=True`` so ``{"q": "x", "k": 4}`` and ``{"k": 4, "q": "x"}``
-    produce the same cache id. Session isolation is preserved by
-    including ``session_id`` in the hash input.
+    produce the same cache id.
     """
-    raw = f"{session_id}|{tool_name}|{json.dumps(args, sort_keys=True, default=str)}"
+    raw = json.dumps(
+        [user_id, sorted(set(scopes)), bool(is_admin), session_id, tool_name, args],
+        sort_keys=True,
+        default=str,
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -365,9 +381,25 @@ async def invoke_tool(
     from audittrace.tools.cache import get_tool_result_cache
 
     cache = get_tool_result_cache()
-    cache_id = _canonical_cache_id(session_id, tool.name, args)
+    # ONE predicate guards both the read and the write below. An empty
+    # identity cannot name a cache namespace, so the handler runs uncached.
+    use_cache = bool(user_context.user_id)
+    if not use_cache:
+        logger.warning("tool result cache bypassed: empty identity tool=%s", tool.name)
+    cache_id = (
+        _canonical_cache_id(
+            user_context.user_id,
+            user_context.scopes,
+            user_context.is_admin,
+            session_id,
+            tool.name,
+            args,
+        )
+        if use_cache
+        else ""
+    )
 
-    cached = cache.get(cache_id)
+    cached = cache.get(cache_id) if use_cache else None
     if cached is not None:
         logger.debug("tool result cache HIT tool=%s session=%s", tool.name, session_id)
         # M1 — emit cache-hit telemetry here (the handler never runs on hit).
@@ -398,6 +430,6 @@ async def invoke_tool(
     # Only cache success shapes. Error results look like {"error": "..."}
     # and must not be replayed — the next call might succeed against a
     # recovered layer.
-    if "error" not in result:
+    if use_cache and "error" not in result:
         cache.put(cache_id, result)
     return result, False

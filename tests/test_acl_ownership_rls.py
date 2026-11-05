@@ -2,7 +2,7 @@
 (``2026-09-18-SPEC-acl-wu2a-resource-ownership-verification.md``).
 
 Set-up mirrors ``tests/test_console_store_rls_postgres.py`` (itself
-mirroring ``tests/test_rls_isolation.py``): a throwaway ``postgres:16``
+mirroring ``tests/test_rls_isolation.py``): a throwaway ``postgres:18.3``
 container is brought UP at collection and torn DOWN at exit (or
 ``AUDITTRACE_TEST_POSTGRES_URL`` is used when set — the target is a
 parameter, never a hardcoded host), and every test connects through a
@@ -169,7 +169,7 @@ _SKIP_REASON = (
     "does not enforce RLS: this proof is REQUIRED, not optional, before the "
     "WU-2a ownership-tightening claim can be trusted. Set "
     "AUDITTRACE_TEST_POSTGRES_URL or make Docker available so a throwaway "
-    "postgres:16 can be started."
+    "postgres:18.3 can be started."
 )
 if _ADMIN_URL is None:
     warnings.warn(_SKIP_REASON, UserWarning, stacklevel=1)

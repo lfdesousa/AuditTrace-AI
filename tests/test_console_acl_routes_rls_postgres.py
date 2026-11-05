@@ -32,8 +32,9 @@ schema and asserts ``pg_policies`` / ``pg_class`` equal their
 before-image. Source-level neuters (dropping ``extra="forbid"`` etc.) are
 the build record's per-guard table, not tests here.
 
-**Version gap, disclosed:** this harness runs ``postgres:16``; the live
-cluster runs PostgreSQL 18.3.
+**Version parity (LC-9 TEST-PG-PARITY-18):** this harness runs the same
+PostgreSQL 18.3 the live cluster runs (``scripts/ci/pg_image.py``); the
+former 16-vs-18.3 gap is closed.
 
 **Limitations these tests prove OF, not controls:** N-6 (denial rows are
 RLS-scoped to the subject that caused them; no cross-subject auditor read

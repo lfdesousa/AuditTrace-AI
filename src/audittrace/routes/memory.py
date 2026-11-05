@@ -93,6 +93,13 @@ from audittrace.routes.memory_md_manifest import _flush_md_manifest
 from audittrace.routes.memory_promote import (
     promote_session_to_durable as _promote_session_to_durable,
 )
+from audittrace.routes.memory_semantic_writes import (
+    chroma_id_conflict_409,
+    concurrent_write_409,
+    drop_copied_forward_chunk,
+    require_visible_row_or_404,
+    semantic_write_errors_as_http,
+)
 from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.episodic import EpisodicService
 from audittrace.services.index_routing import collection_for_key
@@ -101,6 +108,17 @@ from audittrace.services.memory_audit import (
     MemoryOp,
     emit_memory_audit_event,
     schedule_read_audit,
+)
+from audittrace.services.memory_keys import (
+    ID_FORM_LC9,
+    ChromaIdConflictError,
+    ConcurrentManifestWriteError,
+    LogicalKeyTooLongError,
+    check_logical,
+    logical_id,
+    new_form_owner,
+    private_physical_id,
+    semantic_logical_key,
 )
 from audittrace.services.memory_manifest import (
     ManifestAuthorizationError,
@@ -112,6 +130,7 @@ from audittrace.services.recall_telemetry import (
     classify_recall_source_from_request,
     emit_recall_telemetry,
 )
+from audittrace.services.semantic import ChromaSemanticService
 from audittrace.services.session_memory import SessionMemoryService
 from audittrace.services.write_telemetry import emit_chunks_indexed, emit_memory_write
 
@@ -220,6 +239,15 @@ def _doc_id(collection: str, source: str, chunk_idx: int) -> str:
     """Generate a deterministic document ID."""
     raw = f"{collection}:{source}:{chunk_idx}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _chroma_ids(user: UserContext, tier: str, ids: list[str]) -> list[str]:
+    """The ChromaDB ids a fold writes for the LOGICAL chunk *ids* (LC-9 WP3):
+    ``{owner}__{id}`` for a private-tier write, unchanged for corpus. The one
+    place the two fold sinks (markdown and PDF) derive a physical id."""
+    if tier == "corpus":
+        return list(ids)
+    return [private_physical_id(user, i) for i in ids]
 
 
 # WU-1 (SPEC-2026-09-17-memory-retrieval-and-learning-loop-telemetry, closes
@@ -428,6 +456,65 @@ def _raise_manifest_authorization_as_403(
     return HTTPException(status_code=403, detail=str(exc))
 
 
+def _raise_concurrent_write_as_409(exc: ConcurrentManifestWriteError) -> HTTPException:
+    """A lost ``UNIQUE (layer, key)`` race is a retryable 409, never a 500
+    (LC-9 WP1 review A2); the body lives in ``memory_semantic_writes``."""
+    return concurrent_write_409(exc)
+
+
+async def _legacy_copy_forward_source(
+    manifest: Any, user: UserContext, layer: str, filename: str
+) -> str | None:
+    """The stored key of the caller's OWN live legacy bare-key private row
+    that the coming create/update of *filename* will copy forward, else
+    ``None`` (LC-9 WP2a, ADDENDUM-1 S2: the audit trail records the
+    copy-forward). Decided through ``resolve_read``: the caller's owner key
+    wins; the legacy row counts only when it is the caller's own, private and
+    live. Another user's row is invisible to ``resolve_read``, so it can
+    never be named here."""
+    prior: ManifestEntry | None = await manifest.resolve_read(layer, filename, user)
+    if (
+        prior is not None
+        and prior.tier == "private"
+        and prior.deleted_at_ms is None
+        and prior.created_by_user_id == user.user_id
+        and prior.storage_key == filename
+    ):
+        return prior.storage_key
+    return None
+
+
+async def _emit_write_audits(
+    *,
+    user: UserContext,
+    layer: str,
+    filename: str,
+    copied_from: str | None,
+    collection: str | None = None,
+) -> None:
+    """One ``_emit_write_audit`` per manifest mutation (ADDENDUM-1 S2): the
+    create/update row, and -- on a copy-forward -- the legacy tombstone.
+    The write carries ``copied_from``; the tombstone ``reason``. Both keys
+    are additive ``detail`` fields."""
+    await _emit_write_audit(
+        user=user,
+        op="write",
+        layer=layer,
+        collection=collection,
+        key=filename,
+        detail_extra={"copied_from": copied_from} if copied_from else None,
+    )
+    if copied_from:
+        await _emit_write_audit(
+            user=user,
+            op="delete",
+            layer=layer,
+            collection=collection,
+            key=filename,
+            detail_extra={"reason": "copy_forward"},
+        )
+
+
 def _resolve_requested_tier(payload: dict[str, Any] | None, promote: str | None) -> str:
     """Resolve the caller's requested write tier from an optional JSON
     body ``"tier"`` field and/or an optional ``?promote=`` query param
@@ -482,7 +569,7 @@ def _manifest_visible(entry: ManifestEntry, user: UserContext) -> bool:
     return entry.created_by_user_id == user.user_id or entry.tier == "corpus"
 
 
-_SEMANTIC_METADATA_SECURITY_KEYS = frozenset({"tier", "user_id"})
+_SEMANTIC_METADATA_SECURITY_KEYS = frozenset({"tier", "user_id", "id_form"})
 
 
 def _sanitize_semantic_metadata(metadata: Any) -> Any:
@@ -1066,7 +1153,23 @@ async def _index_md_objects(
                     _semantic_key(col_name, doc_id),
                     requested_tier=tier,
                 )
-        await _upsert_in_batches(collection, ids, chunks, metadatas)
+        # LC-9 WP3 (R4 / ADDENDUM-1 S5): the ChromaDB id of a PRIVATE chunk is
+        # ``{owner}__{hash}``, derived from ``user`` (the token), always
+        # prepended. The authorize_write check above and the manifest keys
+        # below keep the LOGICAL ``ids``. Corpus ids are unchanged.
+        if tier != "corpus":
+            # ADDENDUM-5 D0/D1: stamp the new-form rows, and refuse the whole
+            # file (nothing is written) if a target id holds a row this caller
+            # does not own as a new-form row. ``ChromaIdConflictError`` is not
+            # caught here: ``index_memory`` maps it to 409.
+            for m in metadatas:
+                m["id_form"] = ID_FORM_LC9
+            await ChromaSemanticService.check_private_targets(
+                collection, user, col_name, ids
+            )
+        await _upsert_in_batches(
+            collection, _chroma_ids(user, tier, ids), chunks, metadatas
+        )
         total += len(chunks)
         # ADR-059 WU-1c — thread the manifest write (see this function's
         # docstring + the memory_md_manifest module docstring). Runs after
@@ -1462,6 +1565,7 @@ async def index_memory(
                     dry_run=dry_run,
                     outcomes=object_outcomes,
                     caller_can_write_shared=col_caller_can_write_shared,
+                    tier=tier,
                 )
                 chunk_count += await _index_pdf_objects(
                     collection,
@@ -1479,9 +1583,16 @@ async def index_memory(
                     dry_run=dry_run,
                     outcomes=object_outcomes,
                     caller_can_write_shared=col_caller_can_write_shared,
+                    tier=tier,
                 )
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
+        except ChromaIdConflictError as exc:
+            # ADDENDUM-5 D1: a private target id is held by a row the caller
+            # does not own as a new-form row. Permanent, so 409 without
+            # Retry-After. A multi-file request may have indexed earlier files
+            # before this one was refused (advisory N2, build record).
+            raise chroma_id_conflict_409(exc) from exc
 
         results[col_name] = chunk_count
         total_chunks += chunk_count
@@ -1612,6 +1723,12 @@ def _validate_filename_or_400(filename: str, layer: str) -> None:
             status_code=400,
             detail="filename must not contain path separators or '..'",
         )
+    try:
+        check_logical(filename)
+    except LogicalKeyTooLongError as exc:
+        # LC-9 S1/S2: a 219+ char logical key cannot be stored under an
+        # owner prefix (String(255) column); a clean 400, never a 500.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _strip_known_key_prefixes(raw: str, layer: str, user_id: str) -> str:
@@ -1701,6 +1818,9 @@ async def create_episodic(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    copied_from = await _legacy_copy_forward_source(
+        manifest, user, "episodic", filename
+    )
     try:
         entry: ManifestEntry = await manifest.record_create(
             layer="episodic",
@@ -1711,11 +1831,15 @@ async def create_episodic(
             tier=tier,
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
+    except ConcurrentManifestWriteError as exc:
+        raise _raise_concurrent_write_as_409(exc) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
     # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
     # closed: see services/memory_audit.py module docstring).
-    await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
+    await _emit_write_audits(
+        user=user, layer="episodic", filename=filename, copied_from=copied_from
+    )
     return entry.to_dict()
 
 
@@ -1914,7 +2038,9 @@ async def read_episodic(
     doc = await service.read(user, filename)
     if doc is None:
         raise HTTPException(status_code=404, detail="ADR not found")
-    entry: ManifestEntry | None = await manifest.get("episodic", filename)
+    entry: ManifestEntry | None = await manifest.resolve_read(
+        "episodic", filename, user
+    )
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
@@ -1961,6 +2087,9 @@ async def update_episodic(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    copied_from = await _legacy_copy_forward_source(
+        manifest, user, "episodic", filename
+    )
     try:
         entry: ManifestEntry = await manifest.record_update(
             layer="episodic",
@@ -1970,6 +2099,8 @@ async def update_episodic(
             title=title,
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
+    except ConcurrentManifestWriteError as exc:
+        raise _raise_concurrent_write_as_409(exc) from exc
     except LookupError as exc:
         raise HTTPException(
             status_code=404, detail=f"ADR has no manifest row: {exc}"
@@ -1978,7 +2109,9 @@ async def update_episodic(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
+    await _emit_write_audits(
+        user=user, layer="episodic", filename=filename, copied_from=copied_from
+    )
     return entry.to_dict()
 
 
@@ -2093,6 +2226,9 @@ async def create_procedural(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    copied_from = await _legacy_copy_forward_source(
+        manifest, user, "procedural", filename
+    )
     try:
         entry: ManifestEntry = await manifest.record_create(
             layer="procedural",
@@ -2103,9 +2239,13 @@ async def create_procedural(
             tier=tier,
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
+    except ConcurrentManifestWriteError as exc:
+        raise _raise_concurrent_write_as_409(exc) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
+    await _emit_write_audits(
+        user=user, layer="procedural", filename=filename, copied_from=copied_from
+    )
     return entry.to_dict()
 
 
@@ -2173,7 +2313,9 @@ async def read_procedural(
     doc = await service.read(user, filename)
     if doc is None:
         raise HTTPException(status_code=404, detail="SKILL not found")
-    entry: ManifestEntry | None = await manifest.get("procedural", filename)
+    entry: ManifestEntry | None = await manifest.resolve_read(
+        "procedural", filename, user
+    )
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
@@ -2217,6 +2359,9 @@ async def update_procedural(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    copied_from = await _legacy_copy_forward_source(
+        manifest, user, "procedural", filename
+    )
     try:
         entry: ManifestEntry = await manifest.record_update(
             layer="procedural",
@@ -2226,6 +2371,8 @@ async def update_procedural(
             title=title,
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
+    except ConcurrentManifestWriteError as exc:
+        raise _raise_concurrent_write_as_409(exc) from exc
     except LookupError as exc:
         raise HTTPException(
             status_code=404, detail=f"SKILL has no manifest row: {exc}"
@@ -2234,7 +2381,9 @@ async def update_procedural(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
+    await _emit_write_audits(
+        user=user, layer="procedural", filename=filename, copied_from=copied_from
+    )
     return entry.to_dict()
 
 
@@ -2349,46 +2498,44 @@ async def create_semantic(
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
     # SPEC security-memory-write-authorization-choke (2026-08-30) — the
-    # PRE-WRITE choke, before the ChromaDB write below. Semantic already
-    # gated the "requested tier=corpus" case above via
-    # _require_corpus_scope; this ALSO covers overwriting an EXISTING
-    # corpus-tier row when the caller requested private (the exploit
-    # class three reviews found on the .md/PDF index paths — this route
-    # was never actually vulnerable to it, since service.upsert only
-    # targets the tier-specific physical collection, but the choke is
-    # applied uniformly per the ratified spec).
-    try:
-        await authorize_write(
-            manifest,
-            user,
-            "semantic",
-            _semantic_key(collection, document_id),
-            requested_tier=tier,
-        )
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    try:
-        await service.upsert(user, collection, document_id, text, metadata, tier=tier)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    try:
-        entry: ManifestEntry = await manifest.record_create(
-            layer="semantic",
-            key=_semantic_key(collection, document_id),
-            title=title,
-            size_bytes=len(text.encode("utf-8")),
-            user_id=user.user_id,
-            tier=tier,
-            caller_can_write_shared=_corpus_write_authorized(user, collection),
-        )
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audit(
+    # PRE-WRITE choke, before the ChromaDB write below (also covers
+    # overwriting an EXISTING corpus-tier row when the caller requested
+    # private). LC-9 WP2b: an over-long key is a 400 and a lost UNIQUE race a
+    # 409 (``semantic_write_errors_as_http``).
+    with semantic_write_errors_as_http():
+        key = semantic_logical_key(collection, document_id)
+        try:
+            await authorize_write(manifest, user, "semantic", key, requested_tier=tier)
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+        try:
+            await service.upsert(
+                user, collection, document_id, text, metadata, tier=tier
+            )
+        except ChromaIdConflictError as exc:
+            raise chroma_id_conflict_409(exc) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        copied_from = await _legacy_copy_forward_source(manifest, user, "semantic", key)
+        try:
+            entry: ManifestEntry = await manifest.record_create(
+                layer="semantic",
+                key=key,
+                title=title,
+                size_bytes=len(text.encode("utf-8")),
+                user_id=user.user_id,
+                tier=tier,
+                caller_can_write_shared=_corpus_write_authorized(user, collection),
+            )
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+    await drop_copied_forward_chunk(service, user, collection, document_id, copied_from)
+    await _emit_write_audits(
         user=user,
-        op="write",
         layer="semantic",
         collection=collection,
-        key=document_id,
+        filename=document_id,
+        copied_from=copied_from,
     )
     return entry.to_dict()
 
@@ -2540,11 +2687,17 @@ async def _merge_semantic_with_chroma(
             logger.warning("ChromaDB get failed for collection %s: %s", col_name, exc)
             continue
         for i, doc_id in enumerate(ids):
-            key = _semantic_key(col_name, doc_id)
+            meta = metas[i] if i < len(metas) and metas[i] else {}
+            # LC-9 WP3 (ADDENDUM-1 C3 #8, ADDENDUM-5 section 4): a NEW-form chunk
+            # (stamped ``id_form``) has the id ``{owner}__{id}`` and lists under
+            # its LOGICAL id, so it dedups against its own manifest row; a legacy
+            # chunk maps to its bare id, which is its legacy manifest key. The
+            # owner comes from the chunk's own metadata, never from the id.
+            owner = new_form_owner(meta)
+            key = _semantic_key(col_name, logical_id(doc_id, owner))
             if key in known_keys:
                 continue
             content = docs[i] if i < len(docs) else ""
-            meta = metas[i] if i < len(metas) and metas[i] else {}
             # ADR-062 Phase B (§3 hole 2) — close the raw-Chroma enumeration
             # hole: skip a discovered row the caller does not own and that
             # isn't corpus-tier. See the function docstring.
@@ -2777,12 +2930,12 @@ async def _gather_whole_document(
         return [document_id], [doc]
     chunk_ids: list[str] = []
     chunk_docs: list[Any] = []
-    for chunk_id in _iter_document_chunk_ids(collection, title):
-        candidate = (
-            doc
-            if chunk_id == document_id
-            else await service.get_document(user, collection, chunk_id)
-        )
+    # LC-9 WP3 (ADDENDUM-1 S2): the whole sequence is resolved with ONE batched
+    # read (owner ids and the caller's legacy ids together; missing ids are
+    # omitted), not one ``get_document`` per chunk.
+    sequence = _iter_document_chunk_ids(collection, title)
+    fetched = await service.get_documents(user, collection, sequence)
+    for chunk_id, candidate in zip(sequence, fetched, strict=True):
         if candidate is None:
             break
         chunk_ids.append(chunk_id)
@@ -2900,7 +3053,9 @@ async def read_semantic(
             service, user, collection, document_id, doc
         )
         front_matter = chunk_docs[0]
-        entry = await manifest.get("semantic", _semantic_key(collection, chunk_ids[0]))
+        entry = await manifest.resolve_read(
+            "semantic", _semantic_key(collection, chunk_ids[0]), user
+        )
         if entry is not None and not _manifest_visible(entry, user):
             entry = None
         schedule_read_audit(
@@ -2925,7 +3080,9 @@ async def read_semantic(
             "chunk_keys": [_semantic_key(collection, cid) for cid in chunk_ids],
         }
 
-    entry = await manifest.get("semantic", _semantic_key(collection, document_id))
+    entry = await manifest.resolve_read(
+        "semantic", _semantic_key(collection, document_id), user
+    )
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
@@ -2971,41 +3128,48 @@ async def update_semantic(
     title = payload.get("title")
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
-    key = _semantic_key(collection, document_id)
     # SPEC security-memory-write-authorization-choke (2026-08-30) — the
-    # PRE-WRITE choke, before the ChromaDB write below.
-    try:
-        await authorize_write(manifest, user, "semantic", key)
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    try:
-        await service.upsert(user, collection, document_id, text, metadata)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    try:
-        entry: ManifestEntry = await manifest.record_update(
-            layer="semantic",
-            key=key,
-            size_bytes=len(text.encode("utf-8")),
-            user_id=user.user_id,
-            title=title,
-            caller_can_write_shared=_corpus_write_authorized(user, collection),
-        )
-    except LookupError as exc:
-        raise HTTPException(
-            status_code=404,
-            detail=f"semantic doc has no manifest row: {exc}",
-        ) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audit(
+    # PRE-WRITE choke, before the ChromaDB write below. LC-9 WP2b: 400 / 409
+    # mapping and the copy-forward audit, as in ``create_semantic``.
+    with semantic_write_errors_as_http():
+        key = semantic_logical_key(collection, document_id)
+        try:
+            await authorize_write(manifest, user, "semantic", key)
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+        await require_visible_row_or_404(manifest, user, key)
+        try:
+            await service.upsert(user, collection, document_id, text, metadata)
+        except ChromaIdConflictError as exc:
+            raise chroma_id_conflict_409(exc) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        copied_from = await _legacy_copy_forward_source(manifest, user, "semantic", key)
+        try:
+            entry: ManifestEntry = await manifest.record_update(
+                layer="semantic",
+                key=key,
+                size_bytes=len(text.encode("utf-8")),
+                user_id=user.user_id,
+                title=title,
+                caller_can_write_shared=_corpus_write_authorized(user, collection),
+            )
+        except LookupError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"semantic doc has no manifest row: {exc}",
+            ) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+    await drop_copied_forward_chunk(service, user, collection, document_id, copied_from)
+    await _emit_write_audits(
         user=user,
-        op="write",
         layer="semantic",
         collection=collection,
-        key=document_id,
+        filename=document_id,
+        copied_from=copied_from,
     )
     return entry.to_dict()
 
@@ -3029,24 +3193,27 @@ async def delete_semantic(
         )
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
-    key = _semantic_key(collection, document_id)
     # SPEC security-memory-write-authorization-choke (2026-08-30) — the
-    # PRE-WRITE choke, before the soft-delete.
-    try:
-        await authorize_write(manifest, user, "semantic", key)
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    try:
-        entry: ManifestEntry = await manifest.record_delete(
-            "semantic",
-            key,
-            user.user_id,
-            caller_can_write_shared=_corpus_write_authorized(user, collection),
-        )
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
+    # PRE-WRITE choke, before the soft-delete. LC-9 WP2b: the 400 / 409
+    # mapping applies here too (``record_delete`` cannot lose the UNIQUE race
+    # today; the contract holds if a delete ever copies forward).
+    with semantic_write_errors_as_http():
+        key = semantic_logical_key(collection, document_id)
+        try:
+            await authorize_write(manifest, user, "semantic", key)
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
+        try:
+            entry: ManifestEntry = await manifest.record_delete(
+                "semantic",
+                key,
+                user.user_id,
+                caller_can_write_shared=_corpus_write_authorized(user, collection),
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete_document(user, collection, document_id)

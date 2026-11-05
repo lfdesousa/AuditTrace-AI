@@ -148,12 +148,22 @@ class TestAuthorizeWrite:
     async def test_existing_private_row_unaffected_by_guard(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        await manifest.record_create(
+        """LC-9 rewrite. This test used to pin the DEFECT: bob's write over
+        alice's private row was "allowed" because it landed ON alice's row
+        ("private-tier cross-owner collisions are a separate follow-up").
+        Now bob's resolved target is HIS OWN storage key, and alice's row is
+        unchanged afterwards. FALSIFIABLE: make ``physical_key`` return the
+        bare logical key and bob's create either overwrites alice's row or is
+        refused as foreign -- this test goes RED."""
+        alice_row = await manifest.record_create(
             "episodic", "own.md", "Mine", 10, "alice", tier="private"
         )
-        # bob has no scope at all — still allowed, since private-tier
-        # cross-owner collisions are a separate, already-flagged follow-up.
+        # bob has no scope at all -- still allowed: his write targets bob/own.md.
         await authorize_write(manifest, _user("bob"), "episodic", "own.md")
+        bob_row = await manifest.record_create("episodic", "own.md", "Bob", 1, "bob")
+        assert bob_row.storage_key == "bob/own.md"
+        assert bob_row.id != alice_row.id
+        assert await manifest.get("episodic", "alice/own.md") == alice_row
 
     async def test_owner_exempt_true_lets_owner_touch_own_corpus_row(
         self, manifest: MockMemoryManifestService
@@ -274,22 +284,26 @@ class TestRecordCreate:
         )
         assert again.tier == "corpus"
 
-    async def test_recreate_unauthorized_tier_change_preserves_tier(
+    async def test_corpus_write_never_restamps_the_callers_private_row(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        """Without ``caller_can_write_shared``, requesting ``tier="corpus"``
-        on an existing PRIVATE row does NOT promote it — the tier is
-        preserved (the write itself still succeeds; only the tier field
-        is protected) — defense-in-depth at the manifest choke, per the
-        SPEC's "only set existing.tier = tier when authorized" design."""
-        await manifest.record_create(
+        """LC-9: a private row is never re-stamped to corpus. A corpus write
+        by the same user lands on the BARE key (a distinct row); her private
+        row at ``alice/k.md`` stays private and untouched. (Pre-LC-9 this
+        test pinned the opposite: the private row was overwritten in place.)"""
+        priv = await manifest.record_create(
             "episodic", "k.md", None, 1, "alice", tier="private"
         )
         again = await manifest.record_create(
-            "episodic", "k.md", "still mine", 2, "alice", tier="corpus"
+            "episodic", "k.md", "corpus copy", 2, "alice", tier="corpus"
         )
-        assert again.tier == "private"
-        assert again.title == "still mine"
+        assert again.tier == "corpus"
+        assert again.id != priv.id
+        bare = await manifest.get("episodic", "k.md")
+        assert bare is not None and bare.tier == "corpus"
+        raw = await manifest.get("episodic", "alice/k.md")
+        assert raw is not None
+        assert raw.tier == "private" and raw.title is None and raw.id == priv.id
 
     # ── SPEC security-memory-manifest-tier-authz (2026-08-30) ────────────
     # The M3-WU-D2-2 reviewer's cross-user corpus-hijack/hide finding:
@@ -352,11 +366,11 @@ class TestRecordUpdate:
         e1 = await manifest.record_create("episodic", "k.md", "v1", 10, "alice")
         # Sleep just enough to guarantee a different millisecond.
         time.sleep(0.002)
-        e2 = await manifest.record_update("episodic", "k.md", 20, "bob", title="v2")
+        e2 = await manifest.record_update("episodic", "k.md", 20, "alice", title="v2")
         assert e2.created_at_ms == e1.created_at_ms
         assert e2.modified_at_ms > e1.modified_at_ms
         assert e2.created_by_user_id == "alice"
-        assert e2.modified_by_user_id == "bob"
+        assert e2.modified_by_user_id == "alice"
         assert e2.title == "v2"
         assert e2.size_bytes == 20
 
@@ -364,7 +378,7 @@ class TestRecordUpdate:
         self, manifest: MockMemoryManifestService
     ) -> None:
         await manifest.record_create("episodic", "k.md", "stays", 1, "alice")
-        e2 = await manifest.record_update("episodic", "k.md", 2, "bob", title=None)
+        e2 = await manifest.record_update("episodic", "k.md", 2, "alice", title=None)
         assert e2.title == "stays"
 
     async def test_update_missing_raises(
@@ -379,7 +393,7 @@ class TestRecordUpdate:
         await manifest.record_create("episodic", "k.md", None, 1, "alice")
         await manifest.record_delete("episodic", "k.md", "alice")
         with pytest.raises(RuntimeError, match="soft-deleted"):
-            await manifest.record_update("episodic", "k.md", 2, "bob")
+            await manifest.record_update("episodic", "k.md", 2, "alice")
 
     # ── SPEC security-memory-manifest-tier-authz (2026-08-30) ────────────
     # ``record_update`` had the SAME missing-authz shape as
@@ -432,19 +446,19 @@ class TestRecordDelete:
         self, manifest: MockMemoryManifestService
     ) -> None:
         await manifest.record_create("episodic", "k.md", None, 1, "alice")
-        d = await manifest.record_delete("episodic", "k.md", "bob")
+        d = await manifest.record_delete("episodic", "k.md", "alice")
         assert d.deleted_at_ms is not None
-        assert d.deleted_by_user_id == "bob"
+        assert d.deleted_by_user_id == "alice"
 
     async def test_delete_already_deleted_is_idempotent(
         self, manifest: MockMemoryManifestService
     ) -> None:
         await manifest.record_create("episodic", "k.md", None, 1, "alice")
-        d1 = await manifest.record_delete("episodic", "k.md", "bob")
-        d2 = await manifest.record_delete("episodic", "k.md", "cleo")
-        # Second call returns existing entry, doesn't update deleter.
+        d1 = await manifest.record_delete("episodic", "k.md", "alice")
+        d2 = await manifest.record_delete("episodic", "k.md", "alice")
+        # Second call returns existing entry, doesn't update the deleter.
         assert d2.deleted_at_ms == d1.deleted_at_ms
-        assert d2.deleted_by_user_id == "bob"
+        assert d2.deleted_by_user_id == "alice"
 
     async def test_delete_missing_raises(
         self, manifest: MockMemoryManifestService
@@ -774,7 +788,7 @@ class TestIndexStatusSummaryMock:
         )
         manifest.set_index_state(
             "semantic",
-            "decisions/bob-private.pdf",
+            "bob/decisions/bob-private.pdf",
             index_failed_at_ms=1,
             index_failure_code="pdf_corrupted_structure",
         )
@@ -1035,7 +1049,7 @@ class TestManifestEntryRoundTrip:
 
     async def test_immutable_via_get(self, manifest: MockMemoryManifestService) -> None:
         await manifest.record_create("episodic", "k.md", "t", 1, "u")
-        e1 = await manifest.get("episodic", "k.md")
+        e1 = await manifest.resolve_read("episodic", "k.md", _user("u"))
         assert e1 is not None
         # Updating doesn't mutate the previously-returned entry.
         await manifest.record_update("episodic", "k.md", 2, "u")
@@ -1052,15 +1066,19 @@ class TestGet:
         self, manifest: MockMemoryManifestService
     ) -> None:
         await manifest.record_create("episodic", "k.md", "t", 1, "u")
-        e = await manifest.get("episodic", "k.md")
+        e = await manifest.resolve_read("episodic", "k.md", _user("u"))
         assert e is not None and e.key == "k.md"
+        # LC-9: the raw `get` addresses the STORED key; the entry still
+        # reports the LOGICAL key.
+        raw = await manifest.get("episodic", "u/k.md")
+        assert raw is not None and raw.key == "k.md" and raw.storage_key == "u/k.md"
 
     async def test_returns_soft_deleted_too(
         self, manifest: MockMemoryManifestService
     ) -> None:
         await manifest.record_create("episodic", "k.md", None, 1, "u")
         await manifest.record_delete("episodic", "k.md", "u")
-        e = await manifest.get("episodic", "k.md")
+        e = await manifest.resolve_read("episodic", "k.md", _user("u"))
         assert e is not None
         assert e.deleted_at_ms is not None
 
@@ -1087,8 +1105,10 @@ class TestGetDeletedKeys:
     ) -> None:
         await manifest.record_create("semantic", "decisions/d1", None, 1, "u")
         await manifest.record_delete("semantic", "decisions/d1", "u")
-        assert await manifest.get_deleted_keys("semantic", ["decisions/d1"]) == {
-            "decisions/d1"
+        # LC-9: tombstones are keyed by STORED key; the caller passes the
+        # candidates of `deleted_key_candidates` (legacy bare + owner-keyed).
+        assert await manifest.get_deleted_keys("semantic", ["u/decisions/d1"]) == {
+            "u/decisions/d1"
         }
 
     async def test_only_the_requested_keys_are_checked(
@@ -1099,8 +1119,8 @@ class TestGetDeletedKeys:
         await manifest.record_create("semantic", "decisions/d2", None, 1, "u")
         await manifest.record_delete("semantic", "decisions/d2", "u")
         # d2 is soft-deleted too, but wasn't asked about — must not leak in.
-        assert await manifest.get_deleted_keys("semantic", ["decisions/d1"]) == {
-            "decisions/d1"
+        assert await manifest.get_deleted_keys("semantic", ["u/decisions/d1"]) == {
+            "u/decisions/d1"
         }
 
     async def test_other_layer_is_isolated(
@@ -1182,7 +1202,9 @@ class TestPostgresMemoryManifestService:
         e = await pg_manifest.record_create(
             "episodic", "ADR-001.md", "Title", 100, "user-alice"
         )
-        got = await pg_manifest.get("episodic", "ADR-001.md")
+        got = await pg_manifest.resolve_read(
+            "episodic", "ADR-001.md", _user("user-alice")
+        )
         assert got is not None
         assert got.id == e.id
         assert got.layer == "episodic"
@@ -1198,43 +1220,47 @@ class TestPostgresMemoryManifestService:
         await pg_manifest.record_create("procedural", "SKILL-x.md", None, 1, "alice")
         await pg_manifest.record_delete("procedural", "SKILL-x.md", "alice")
         # Pre-condition: row is soft-deleted
-        deleted = await pg_manifest.get("procedural", "SKILL-x.md")
+        deleted = await pg_manifest.resolve_read(
+            "procedural", "SKILL-x.md", _user("alice")
+        )
         assert deleted is not None and deleted.deleted_at_ms is not None
-        # Recreate
+        # Recreate (by the owner: bob's create would be bob's OWN new row)
         revived = await pg_manifest.record_create(
-            "procedural", "SKILL-x.md", "new", 2, "bob"
+            "procedural", "SKILL-x.md", "new", 2, "alice"
         )
         assert revived.deleted_at_ms is None
         assert revived.deleted_by_user_id is None
         assert revived.title == "new"
-        assert revived.modified_by_user_id == "bob"
+        assert revived.modified_by_user_id == "alice"
 
     async def test_recreate_overwrites_live_row(self, pg_manifest) -> None:
         e1 = await pg_manifest.record_create(
             "semantic", "decisions/d-1", "v1", 10, "alice"
         )
         e2 = await pg_manifest.record_create(
-            "semantic", "decisions/d-1", "v2", 20, "bob"
+            "semantic", "decisions/d-1", "v2", 20, "alice"
         )
         # Same row id (UNIQUE on (layer, key))
         assert e2.id == e1.id
         assert e2.title == "v2"
         assert e2.size_bytes == 20
-        assert e2.modified_by_user_id == "bob"
+        assert e2.modified_by_user_id == "alice"
 
     async def test_update_bumps_modified_only(self, pg_manifest) -> None:
         e1 = await pg_manifest.record_create("episodic", "k.md", "v1", 10, "alice")
         time.sleep(0.002)  # guarantee different ms
-        e2 = await pg_manifest.record_update("episodic", "k.md", 20, "bob", title="v2")
+        e2 = await pg_manifest.record_update(
+            "episodic", "k.md", 20, "alice", title="v2"
+        )
         assert e2.id == e1.id
         assert e2.created_at_ms == e1.created_at_ms
         assert e2.modified_at_ms > e1.modified_at_ms
-        assert e2.modified_by_user_id == "bob"
+        assert e2.modified_by_user_id == "alice"
         assert e2.title == "v2"
 
     async def test_update_title_none_preserves_existing(self, pg_manifest) -> None:
         await pg_manifest.record_create("episodic", "k.md", "stays", 1, "alice")
-        e2 = await pg_manifest.record_update("episodic", "k.md", 2, "bob", title=None)
+        e2 = await pg_manifest.record_update("episodic", "k.md", 2, "alice", title=None)
         assert e2.title == "stays"
 
     async def test_update_missing_raises(self, pg_manifest) -> None:
@@ -1245,7 +1271,7 @@ class TestPostgresMemoryManifestService:
         await pg_manifest.record_create("episodic", "k.md", None, 1, "alice")
         await pg_manifest.record_delete("episodic", "k.md", "alice")
         with pytest.raises(RuntimeError, match="soft-deleted"):
-            await pg_manifest.record_update("episodic", "k.md", 2, "bob")
+            await pg_manifest.record_update("episodic", "k.md", 2, "alice")
 
     # ── SPEC security-memory-manifest-tier-authz (2026-08-30) ────────────
     # Real Postgres-backed twin of the Mock guard tests above — proves the
@@ -1328,36 +1354,34 @@ class TestPostgresMemoryManifestService:
         assert updated.modified_by_user_id == "curator-2"
         assert updated.created_by_user_id == "curator"
 
-    async def test_unauthorized_create_over_private_row_preserves_tier(
-        self, pg_manifest
-    ) -> None:
-        """Defense-in-depth: an unauthorized create landing on an
-        existing PRIVATE row still writes (title/size/modified_by),
-        matching pre-fix behavior for the non-corpus case — but any
-        requested tier change is ignored rather than silently honored."""
+    async def test_corpus_write_never_restamps_a_private_row(self, pg_manifest) -> None:
+        """LC-9: another user's corpus-tier write never touches alice's
+        private row (it lives at ``alice/k-priv.md``); no title/owner/tier
+        change reaches it. (Pre-LC-9 bob overwrote it in place.)"""
         await pg_manifest.record_create(
             "episodic", "k-priv.md", "v1", 10, "alice", tier="private"
         )
-        again = await pg_manifest.record_create(
+        await pg_manifest.record_create(
             "episodic", "k-priv.md", "v2", 20, "bob", tier="corpus"
         )
-        assert again.title == "v2"
-        assert again.modified_by_user_id == "bob"
-        assert again.tier == "private"
+        raw = await pg_manifest.get("episodic", "alice/k-priv.md")
+        assert raw is not None
+        assert raw.title == "v1" and raw.modified_by_user_id == "alice"
+        assert raw.tier == "private"
 
     async def test_delete_sets_timestamp(self, pg_manifest) -> None:
         await pg_manifest.record_create("episodic", "k.md", None, 1, "alice")
-        d = await pg_manifest.record_delete("episodic", "k.md", "bob")
+        d = await pg_manifest.record_delete("episodic", "k.md", "alice")
         assert d.deleted_at_ms is not None
-        assert d.deleted_by_user_id == "bob"
+        assert d.deleted_by_user_id == "alice"
 
     async def test_delete_idempotent(self, pg_manifest) -> None:
         await pg_manifest.record_create("episodic", "k.md", None, 1, "alice")
-        d1 = await pg_manifest.record_delete("episodic", "k.md", "bob")
-        d2 = await pg_manifest.record_delete("episodic", "k.md", "cleo")
-        # Returns existing entry; doesn't update deleter (lossy bob-was-here)
+        d1 = await pg_manifest.record_delete("episodic", "k.md", "alice")
+        d2 = await pg_manifest.record_delete("episodic", "k.md", "alice")
+        # Returns existing entry; doesn't update the deleter
         assert d2.deleted_at_ms == d1.deleted_at_ms
-        assert d2.deleted_by_user_id == "bob"
+        assert d2.deleted_by_user_id == "alice"
 
     async def test_delete_missing_raises(self, pg_manifest) -> None:
         with pytest.raises(LookupError):
@@ -1455,9 +1479,10 @@ class TestPostgresMemoryManifestService:
         await pg_manifest.record_create("semantic", "decisions/gone", None, 1, "u")
         await pg_manifest.record_delete("semantic", "decisions/gone", "u")
         result = await pg_manifest.get_deleted_keys(
-            "semantic", ["decisions/live", "decisions/gone", "decisions/never-existed"]
+            "semantic",
+            ["u/decisions/live", "u/decisions/gone", "u/decisions/never-existed"],
         )
-        assert result == {"decisions/gone"}
+        assert result == {"u/decisions/gone"}
 
     async def test_get_deleted_keys_invalid_layer_raises(self, pg_manifest) -> None:
         with pytest.raises(ValueError):
@@ -1914,8 +1939,11 @@ class TestPostgresUpsertPdfMetadata:
         (record_create), THEN runs /memory/index which writes PDF
         metadata. The second call must update — not duplicate — the
         same row."""
+        # The PDF fold keys its row by the bare object key and defaults to
+        # tier=corpus (F-1); an existing corpus row at that key is the one it
+        # updates. (LC-9: a private CRUD row lives at ``{owner}/{key}``.)
         await pg_manifest.record_create(
-            "episodic", "main.pdf", "Main paper", 100, "alice"
+            "episodic", "main.pdf", "Main paper", 100, "alice", tier="corpus"
         )
         e = await pg_manifest.upsert_pdf_metadata(
             "episodic",
@@ -1929,6 +1957,7 @@ class TestPostgresUpsertPdfMetadata:
             form_field_count=0,
             extraction_warnings=[],
             document_sha256="d" * 64,
+            caller_can_write_shared=True,
         )
         # Same row — created_by stays as the original creator.
         assert e.created_by_user_id == "alice"

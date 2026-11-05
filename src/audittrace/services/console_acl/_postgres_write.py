@@ -117,7 +117,7 @@ claim is unproven until measured).** Spec §5.3 states the group-
 principal refusal is "classified by constraint name to
 ``acl_denied_principal_type``", naming
 ``ck_console_acl_entries_principal_type`` as the constraint. **Measured
-against real ``postgres:16`` (this build): migration 031 declares a
+against real PostgreSQL (first measured on 16, re-verified on 18.3 in LC-9): migration 031 declares a
 SECOND CHECK, ``ck_console_acl_entries_principal_model_matches_type``,
 whose three OR-branches exhaustively enumerate ONLY
 ``user``/``role``/``public`` — a ``principal_type`` outside that set
