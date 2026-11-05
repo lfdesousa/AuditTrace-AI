@@ -8,3 +8,6 @@
 # upstream; we never hand-edit it. See docs/reference/openai/README.md
 # and scripts/refresh-openai-spec.sh for provenance.
 docs/reference/openai/openapi.yaml:colleague-names:2257
+# 459 WU-2 golden fixture: `tokenizer_config_sha256` is a SHA-256 content hash of a
+# tokenizer config (64 hex chars), not a credential. Verified 2026-11-05.
+7e309b1a57021e28d1253cb7e806594cb85a5aae:tests/fixtures/decision/golden_record_refactor_93b659c.json:generic-api-key:1462
