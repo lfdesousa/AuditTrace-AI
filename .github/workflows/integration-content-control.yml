@@ -82,7 +82,7 @@ jobs:
         # (private packages). GITHUB_TOKEN has packages:read via the
         # workflow's `permissions` block (top of file) AND the
         # package's "Manage Actions access" allowlist includes this
-        # repo. Login here so the docker pull below authenticates.
+        # repo. Login here so the image loads below authenticate (skopeo reads this login).
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -149,11 +149,13 @@ jobs:
           echo "cc-chart images to load:"
           echo "$images"
           echo
+          # Fail closed: scripts/ci/kind-load-image.sh exits non-zero on
+          # any pull or load failure, so this step stops and names the
+          # image (no warning-and-continue into a helm --wait timeout).
+          skopeo --version
           for img in $images; do
-            echo "▶ pull + kind-load $img"
-            docker pull "$img" || { echo "::warning::failed to pull $img"; continue; }
-            kind load docker-image "$img" --name integration-cc || \
-              echo "::warning::failed to kind-load $img"
+            echo "▶ load $img"
+            scripts/ci/kind-load-image.sh "$img" integration-cc
           done
 
       - name: Pre-pull + kind-load every chart-rendered image
@@ -176,6 +178,8 @@ jobs:
           echo "Images to load:"
           echo "$images"
           echo
+          # Fail closed, see the cc-chart step above.
+          skopeo --version
           for img in $images; do
             # Skip locally-built images (already kind-loaded earlier).
             case "$img" in
@@ -184,10 +188,8 @@ jobs:
                 continue
                 ;;
             esac
-            echo "▶ pull + kind-load $img"
-            docker pull "$img" || { echo "::warning::failed to pull $img"; continue; }
-            kind load docker-image "$img" --name integration-cc || \
-              echo "::warning::failed to kind-load $img"
+            echo "▶ load $img"
+            scripts/ci/kind-load-image.sh "$img" integration-cc
           done
 
       - name: Helm install audittrace (chart)
