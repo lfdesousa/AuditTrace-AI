@@ -1,0 +1,53 @@
+meta {
+  name: PUT /memory/semantic/{collection}/{doc_id} — curator writes to a key owned by user A
+  type: http
+  seq: 8
+}
+
+put {
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{identityDocId}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "text": "Curator write attempt on a key owned by user A."
+  }
+}
+
+tests {
+  test("owner identifiers are configured", function() {
+    for (const name of ["identityUserASub", "identityUserAName"]) {
+      const v = bru.getEnvVar(name);
+      if (!v || v.startsWith("replace-with-")) {
+        throw new Error(name + " is empty or still a placeholder: set it before this run");
+      }
+    }
+  });
+  test("curator write answers exactly 404", function() {
+    expect(res.getStatus()).to.equal(404);
+  });
+  test("404 body carries no owner subject, username or text", function() {
+    const raw = JSON.stringify(res.getBody() || "");
+    expect(raw).to.not.contain("Identity check written by user A");
+    for (const name of ["identityUserASub", "identityUserAName"]) {
+      const v = bru.getEnvVar(name);
+      expect(raw).to.not.contain(v);
+    }
+  });
+}
+
+docs {
+  The operator token (curator) is not the owner of A's private row. The write
+  authorisation passes against the caller's own namespace and the visible-row
+  check then answers 404 (a 403 would mean a different path). Set
+  `identityUserASub` and `identityUserAName` to A's real values: the request
+  throws while either is empty or a `replace-with-...` placeholder. Run
+  08b-usera-read-after-curator-attempt next: the status alone does not prove
+  the row is untouched.
+}

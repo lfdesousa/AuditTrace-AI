@@ -1,0 +1,31 @@
+meta {
+  name: GET /memory/semantic/{collection}/{doc_id} — user A re-reads after the curator attempt
+  type: http
+  seq: 9
+}
+
+get {
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{identityDocId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{tokenUserA}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("A's text is still the original written by 01", function() {
+    const content = res.getBody().content;
+    expect(content).to.contain("Identity check written by user A.");
+    expect(content).to.not.contain("Curator write attempt");
+  });
+}
+
+docs {
+  Run after 08-curator-update-usera-key. The 404 status alone does not
+  prove the row was untouched; this read does.
+}

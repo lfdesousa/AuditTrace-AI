@@ -1,0 +1,36 @@
+meta {
+  name: GET /memory/semantic — user B lists (paged)
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/memory/semantic?include_deleted=false&collection={{exampleCollection}}&limit={{listLimit}}&offset={{listOffset}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{tokenUserB}}
+}
+
+query {
+  include_deleted: false
+  collection: {{exampleCollection}}
+  limit: {{listLimit}}
+  offset: {{listOffset}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("body has items + total", function() {
+    expect(res.getBody().items).to.be.an("array");
+    expect(res.getBody().total).to.be.a("number");
+  });
+}
+
+docs {
+  Caller-scoped list for identity B. Page with listLimit/listOffset.
+}

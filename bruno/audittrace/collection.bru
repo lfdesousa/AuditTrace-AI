@@ -19,4 +19,9 @@ script:pre-request {
   bridge("accessToken");
   bridge("refreshToken");
   bridge("assessmentToken");
+  // Named identities for the multi-user live run: written by
+  // `audittrace-login --env-key tokenUserA|tokenUserB` (the default
+  // accessToken pair stays the operator).
+  bridge("tokenUserA");
+  bridge("tokenUserB");
 }

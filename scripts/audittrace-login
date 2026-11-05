@@ -88,6 +88,9 @@ _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _REPO_ROOT="$(cd "$_SCRIPT_DIR/.." && pwd)"
 BRUNO_ENV_FILE="${AUDITTRACE_BRUNO_ENV:-$_REPO_ROOT/bruno/audittrace/.env}"
 SYNC_ENV="${AUDITTRACE_SYNC_ENV:-auto}"   # auto | 1 | 0
+# --env-key VAR (LC-9 S4): mirror the token into VAR ONLY, leaving the
+# accessToken / AUDITTRACE_TOKEN lines untouched. Empty = the default pair.
+ENV_KEY=""
 
 # Default OAuth2 scopes requested at login. The realm declares
 # `audittrace:admin` and the `memory:*:write` scopes as OPTIONAL on
@@ -166,6 +169,29 @@ persist_from_token_response() {
   '
 }
 
+# Temp files created next to an env file are removed on ANY exit (set -e abort,
+# error return, signal-driven exit). A successful mv leaves nothing to remove.
+_TMP_FILES=()
+cleanup_tmp() {
+  if [[ ${#_TMP_FILES[@]} -gt 0 ]]; then
+    rm -f "${_TMP_FILES[@]}"
+  fi
+}
+trap cleanup_tmp EXIT
+
+# Copy FILE to OUT without any `KEY=` line (anchored on the `=`, so a sibling
+# key that merely starts with KEY is kept). grep rc 1 (every line matched, so
+# nothing was kept) is a valid empty result; rc >= 2 is an I/O error and fails
+# closed so the caller never replaces the env file with a partial copy.
+copy_without_key() {
+  local file="$1" key="$2" out="$3" rc=0
+  grep -v -E "^[[:space:]]*${key}=" "$file" > "$out" || rc=$?
+  if [[ "$rc" -gt 1 ]]; then
+    log "error: cannot rewrite $file (grep rc=$rc) — left unchanged"
+    return 1
+  fi
+}
+
 # Upsert KEY=VALUE into an env file WITHOUT printing VALUE. Idempotent:
 # replaces an existing KEY= line in place, otherwise appends. Creates the
 # file mode 600 if missing. Leaves every other line untouched (so operator
@@ -177,15 +203,30 @@ upsert_env_var() {
   chmod 600 "$file" 2>/dev/null || true
   local tmp
   tmp="$(mktemp "${file}.XXXXXX")"
+  _TMP_FILES+=("$tmp")
   chmod 600 "$tmp"
-  # keep all lines except a prior assignment to KEY (|| true: grep exits 1
-  # on no match, which is fine under `set -e`)
+  # keep all lines except a prior assignment to KEY
   if [[ -s "$file" ]]; then
-    grep -v -E "^[[:space:]]*${key}=" "$file" > "$tmp" || true
+    copy_without_key "$file" "$key" "$tmp" || return 1
   fi
   printf '%s=%s\n' "$key" "$value" >> "$tmp"
   mv -f "$tmp" "$file"
   chmod 600 "$file"
+}
+
+# Remove KEY from an env file (all other lines untouched). No-op when the
+# file or the line is absent. Never prints a value.
+remove_env_var() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || { log "no env file at $file — nothing to unset"; return 0; }
+  local tmp
+  tmp="$(mktemp "${file}.XXXXXX")"
+  _TMP_FILES+=("$tmp")
+  chmod 600 "$tmp"
+  copy_without_key "$file" "$key" "$tmp" || return 1
+  mv -f "$tmp" "$file"
+  chmod 600 "$file"
+  log "removed ${key} from $file"
 }
 
 # Mirror the currently-saved access_token into the Bruno collection .env so
@@ -210,6 +251,12 @@ sync_bruno_env() {
   local token
   token="$(jq -r '.access_token // empty' "$TOKENS_FILE")"
   [[ -n "$token" ]] || return 0
+  if [[ -n "$ENV_KEY" ]]; then
+    # Named-variable mode: write VAR only; the default pair stays byte-equal.
+    upsert_env_var "$BRUNO_ENV_FILE" "$ENV_KEY" "$token"
+    log "🔗 synced access_token → $BRUNO_ENV_FILE (${ENV_KEY} only, mode 600, gitignored)"
+    return 0
+  fi
   upsert_env_var "$BRUNO_ENV_FILE" "accessToken" "$token"
   upsert_env_var "$BRUNO_ENV_FILE" "AUDITTRACE_TOKEN" "$token"
   log "🔗 synced access_token → $BRUNO_ENV_FILE (accessToken + AUDITTRACE_TOKEN, mode 600, gitignored)"
@@ -408,6 +455,7 @@ action_ensure() {
 # require a fresh login with `--scope` set.
 ACTION="login"
 SHOW_RAW="0"
+UNSET_ENV="0"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     login)          ACTION="login"; shift ;;
@@ -416,6 +464,15 @@ while [[ $# -gt 0 ]]; do
     --ensure)       ACTION="ensure"; shift ;;
     --sync-env)     ACTION="sync-env"; shift ;;
     --logout)       ACTION="logout"; shift ;;
+    --env-key)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --env-key requires a variable name (e.g. --env-key tokenUserB)" >&2
+        exit 64
+      fi
+      ENV_KEY="$2"
+      shift 2
+      ;;
+    --unset-env)    UNSET_ENV="1"; shift ;;
     --scope)
       if [[ $# -lt 2 ]]; then
         echo "error: --scope requires a value (e.g. --scope audittrace:admin)" >&2
@@ -439,6 +496,11 @@ Usage:
                                           collection .env for `bru run` — no browser needed;
                                           the "bru got a 401" recovery
   audittrace-login --logout              Delete the saved token pair
+  audittrace-login --env-key VAR [action] Mirror the token into VAR ONLY in the Bruno .env
+                                          (accessToken / AUDITTRACE_TOKEN untouched). Refresh =
+                                          the same call with the identity's AUDITTRACE_TOKENS_DIR.
+  audittrace-login --env-key VAR --unset-env
+                                          Remove the VAR line from the Bruno .env (no network)
 
 Environment overrides:
   KEYCLOAK_BASE            (default https://audittrace.local:30952 — k3s Istio Gateway)
@@ -465,7 +527,29 @@ EOF
   esac
 done
 
+if [[ -n "$ENV_KEY" ]]; then
+  # Fail closed: a valid shell-style name, and never the default pair.
+  if [[ ! "$ENV_KEY" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "error: --env-key '$ENV_KEY' is not a valid variable name" >&2
+    exit 64
+  fi
+  case "$ENV_KEY" in
+    accessToken|AUDITTRACE_TOKEN)
+      echo "error: --env-key may not target the default pair ($ENV_KEY)" >&2
+      exit 64
+      ;;
+  esac
+fi
+if [[ "$UNSET_ENV" == "1" ]]; then
+  if [[ -z "$ENV_KEY" ]]; then
+    echo "error: --unset-env requires --env-key VAR" >&2
+    exit 64
+  fi
+  ACTION="unset-env"
+fi
+
 case "$ACTION" in
+  unset-env) remove_env_var "$BRUNO_ENV_FILE" "$ENV_KEY" ;;
   login)    action_login ;;
   show)     action_show ;;
   ensure)   action_ensure ;;

@@ -10,6 +10,23 @@ post {
   auth: bearer
 }
 
+headers {
+  X-Session-Id: {{mcpSessionId}}
+}
+
+script:pre-request {
+  // One session id per run: a fresh value unless the caller pins one with
+  // --env-var mcpSessionId=... Repeated calls within a run share it (runtime
+  // variable), so a same-session check across two calls is meaningful and
+  // rows from earlier runs never share it.
+  if (!bru.getEnvVar("mcpSessionId") && !bru.getVar("mcpSessionId")) {
+    bru.setVar(
+      "mcpSessionId",
+      "run-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10)
+    );
+  }
+}
+
 auth:bearer {
   token: {{accessToken}}
 }
@@ -54,6 +71,13 @@ tests {
 }
 
 docs {
+  `X-Session-Id: {{mcpSessionId}}` pins the session id on the tool_calls
+  audit rows. Without the header MCP derives the session id from the
+  user id, so a same-session check across two calls would hold
+  trivially. The pre-request script generates one id per run (a runtime
+  variable shared by every call in the run); pin your own with
+  `--env-var mcpSessionId=...`.
+
   ADR-063 Phase 1 read tool, exercised through the MCP transport
   (`services.mcp_bridge.call_read_tool` → the SAME
   `ChromaSemanticService.search_page` the `/v1/chat/completions` tool

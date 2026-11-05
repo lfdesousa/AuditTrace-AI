@@ -132,3 +132,18 @@ For the M5 off-LAN rehearsal (HARD 2026-05-15) the recommended Bruno run order:
 7. `memory/episodic/01-list.bru` — confirm signature_status flipped correctly.
 8. `chat/02-chat-completions.bru` — exercise the augmented chat path.
 9. `audit/01-list-interactions.bru` — show the audit row appeared.
+
+## Multiple identities and paging
+
+`identities/` holds the requests for a run with two realm users (A and B, base
+memory write scopes) plus the operator as curator and audit reader. Mirror each
+user's token into its own variable (the operator keeps the default pair):
+
+    AUDITTRACE_TOKENS_DIR=<dir-of-user-a> scripts/audittrace-login --sync-env --env-key tokenUserA
+    AUDITTRACE_TOKENS_DIR=<dir-of-user-b> scripts/audittrace-login --sync-env --env-key tokenUserB
+    scripts/audittrace-login --env-key tokenUserA --unset-env     # remove the line afterwards
+
+`--env-key VAR` writes VAR only; `accessToken` / `AUDITTRACE_TOKEN` are left as
+they were. List requests take `listLimit` (default 100, max 500) and
+`listOffset` (default 0). `mcp/02-tools-call-read.bru` sends `X-Session-Id` (a fresh value per run, or
+`--env-var mcpSessionId=...`).

@@ -1,0 +1,28 @@
+meta {
+  name: GET /memory/semantic/{collection}/{doc_id} — user A reads own doc
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{identityDocId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{tokenUserA}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("content is user A's text", function() {
+    expect(res.getBody().content).to.contain("user A");
+  });
+}
+
+docs {
+  Each identity reads its OWN row under the shared logical key.
+}

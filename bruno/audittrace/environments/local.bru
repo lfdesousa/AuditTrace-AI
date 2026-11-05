@@ -22,12 +22,19 @@ vars {
   chatPrompt: What does the ratified decision on the memory mode say? Look it up in the decisions memory with your memory tools and cite the source decision.
   chatSessionId:
   expectSourcesTrailer: false
+  listLimit: 100
+  listOffset: 0
+  identityDocId: identity-check
+  identityUserASub: replace-with-user-a-sub
+  identityUserAName: replace-with-user-a-username
   inboundTraceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01
 }
 vars:secret [
   accessToken,
   refreshToken,
   assessmentToken,
+  tokenUserA,
+  tokenUserB,
   langfusePublicKey,
   langfuseSecretKey,
   deviceCode,
