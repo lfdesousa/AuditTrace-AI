@@ -56,11 +56,10 @@ def test_every_installed_instrumentor_is_compatible() -> None:
     )
 
 
-def test_positive_control_covers_the_six_product_families() -> None:
+def test_positive_control_covers_the_five_product_families() -> None:
     assert compat.src_instrumentor_classes() >= {
         "FastAPIInstrumentor",
         "HTTPXClientInstrumentor",
-        "LoggingInstrumentor",
         "RedisInstrumentor",
         "SQLAlchemyInstrumentor",
         "URLLib3Instrumentor",

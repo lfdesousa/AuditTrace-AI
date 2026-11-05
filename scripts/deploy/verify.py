@@ -13,11 +13,12 @@ the verdict. The deployer decides "it deployed"; this
 runner decides, separately and on evidence it gathered itself, "it works". FAIL
 blocks "done": *up* means complete AND working, not "helm exited 0".
 
-Eleven deploy-health probes — five CORE + four MESH-HEALTH (#384 WS2) + one
+Twelve deploy-health probes — five CORE + four MESH-HEALTH (#384 WS2) + one
 AUDIT-RELIABILITY (scan-DLQ depth, spec 2026-08-23) + one FIRST-PARTY-IMAGE
 (the BFF, D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-
-guard.md) — each PASS/FAIL/SKIPPED with captured evidence (failures-are-
-findings, every check declares the evidence it stands on):
+guard.md) + one LOG-CORRELATION (``log-trace-id``, LOG-TRACE-ID D7) — each
+PASS/FAIL/SKIPPED with captured evidence (failures-are-findings, every check
+declares the evidence it stands on):
 
 * **pods-ready**             — every expected app component has ≥1 Ready pod.
 * **digest-matches-published** — the LIVE memory-server pod digest == the intended
@@ -94,16 +95,18 @@ import argparse
 import json
 import logging
 import os
+import re
 import ssl
 import subprocess  # noqa: S404 - read-only kubectl/helm; fixed argv, no shell
 import sys
+import time
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from scripts.deploy import mesh, registry
 from scripts.deploy.frontdoor import (
@@ -324,12 +327,30 @@ E2E_TIMEOUT_ENV_VAR = "AUDITTRACE_VERIFY_E2E_TIMEOUT"
 # invariant), same posture as E2E_CHAT_TIMEOUT_DEFAULT above.
 SCAN_DLQ_DEFAULT_THRESHOLD = 10
 
-# The eleven probe identifiers — fixed order (determinism contract). The
+# The log-trace-id probe's Loki read (LOG-TRACE-ID D7 / ADDENDUM-1 C8). The
+# location is a target-shaped value, so it is configuration with a LAPTOP
+# default (portability invariant): ``--loki-url`` / ``AUDITTRACE_LOKI_URL``.
+# On a rig where it is unreachable the probe FAILS CLOSED (there is no skip
+# flag); a cloud Loki location is a separate operator decision.
+LOKI_URL_ENV_VAR = "AUDITTRACE_LOKI_URL"
+LOKI_URL_DEFAULT = "http://localhost:3100"
+# Loki ingests asynchronously (promtail batch + flush), so the line for the
+# interaction just created can trail it: poll a BOUNDED number of times,
+# ``LOKI_POLL_ATTEMPTS`` x ``LOKI_POLL_INTERVAL_S`` (= 60 s at most). Tests
+# replace ``_sleep`` and assert on attempt COUNTS, never on elapsed time.
+LOKI_POLL_ATTEMPTS = 12
+LOKI_POLL_INTERVAL_S = 5
+LOKI_LOOKBACK_S = 3600
+LOKI_QUERY_LIMIT = 100
+_TRACE_ID_SHAPE = re.compile(r"[0-9a-f]{32}")
+
+# The twelve probe identifiers — fixed order (determinism contract). The
 # four mesh-health probes are APPENDED so the core five keep their indices;
 # scan-dlq-depth is APPENDED after that (spec 2026-08-23); first-party-
 # images-match-published (D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-
-# stale-override-guard.md) is APPENDED last for the same reason — every
-# earlier index stays stable.
+# stale-override-guard.md) is APPENDED after that for the same reason;
+# log-trace-id (LOG-TRACE-ID D7) is APPENDED last — every earlier index stays
+# stable.
 PROBES = (
     "pods-ready",
     "digest-matches-published",
@@ -342,6 +363,7 @@ PROBES = (
     "no-unhealthy-upstream",
     "scan-dlq-depth",
     "first-party-images-match-published",
+    "log-trace-id",
 )
 
 # The BFF Deployment this probe reads — mirrors the chart's own naming
@@ -510,6 +532,9 @@ class VerifyConfig:
     # for the calibration rationale. Additive: default leaves every existing
     # caller's behaviour byte-for-byte unchanged.
     scan_dlq_threshold: int = SCAN_DLQ_DEFAULT_THRESHOLD
+    # The log-trace-id probe's Loki base URL - see LOKI_URL_DEFAULT. Additive:
+    # the laptop default leaves every existing caller's behaviour unchanged.
+    loki_url: str = LOKI_URL_DEFAULT
 
     def __post_init__(self) -> None:
         # Resolve None → the environment-dynamic default (env var > fallback).
@@ -798,12 +823,39 @@ def sanitized_finding(finding: mesh.Finding) -> dict[str, Any]:
 # ── the runner ────────────────────────────────────────────────────────────────
 
 
+def _sleep(
+    seconds: float,
+) -> None:  # pragma: no cover - thin time seam; replaced in tests
+    """Single sleep seam (the Loki poll); tests replace it, never wait."""
+    time.sleep(seconds)
+
+
+def _loki_values(body: Any) -> list[str]:
+    """The log lines of a Loki ``query_range`` ``streams`` answer (else ``[]``)."""
+    result = body.get("data", {}).get("result") if isinstance(body, dict) else None
+    lines: list[str] = []
+    for stream in result if isinstance(result, list) else []:
+        values = stream.get("values") if isinstance(stream, dict) else None
+        for entry in values if isinstance(values, list) else []:
+            if isinstance(entry, list) and len(entry) == 2:
+                lines.append(str(entry[1]))
+    return lines
+
+
+def _is_memory_read(line: str) -> bool:
+    """True when a structured log line is the ``memory.read`` recall line."""
+    return "memory.read" in line
+
+
 class VerifyRunner:
     """Runs the ten deploy-health probes and emits an independent PASS/FAIL verdict."""
 
     def __init__(self, cfg: VerifyConfig) -> None:
         self.cfg = cfg
         self.results: list[ProbeResult] = []
+        # The audit row's ``trace_id`` for the interaction recall-e2e created,
+        # handed to log-trace-id (None until recall-e2e reads a row carrying one).
+        self._recall_trace_id: str | None = None
 
     # -- independence, DERIVED (not self-attested) --
 
@@ -834,6 +886,8 @@ class VerifyRunner:
             "cluster-api:kubectl:bff-deployment",
             "cluster-api:kubectl:bff-pod-imageID",
             f"registry:{self.cfg.registry}:bff-published-digest",
+            # ── LOG-TRACE-ID D7: the log sink the audit row's id is joined to ──
+            f"loki:{self.cfg.loki_url}",
         ]
 
     @property
@@ -1244,6 +1298,8 @@ class VerifyRunner:
                 {"http_status": list_status},
             )
         interaction_id = interactions[0].get("id")
+        row_trace_id = interactions[0].get("trace_id")
+        self._recall_trace_id = row_trace_id if isinstance(row_trace_id, str) else None
         tc_status, tc_body = self._front_get(
             f"/interactions/{interaction_id}/tool-calls", token
         )
@@ -1669,6 +1725,102 @@ class VerifyRunner:
             {"published_digest": ref.digest, "live_digest": live},
         )
 
+    # -- probe 12: log-trace-id (LOG-TRACE-ID D7) --
+
+    def _loki_trace_lines(self, trace_id: str) -> tuple[int, list[str]]:
+        """Query Loki for the memory-server lines carrying ``trace_id``.
+
+        ``(http_status, lines)``; status ``0`` is the transport-failure sentinel
+        of :func:`_http_request`. ``trace_id`` is shape-checked by the caller
+        (32 lowercase hex), so it cannot alter the LogQL.
+        """
+        now_ns = time.time_ns()
+        query = (
+            f'{{container="{MEMORY_SERVER_CONTAINER}"}} | json | trace_id="{trace_id}"'
+        )
+        params = urlencode(
+            {
+                "query": query,
+                "start": now_ns - LOKI_LOOKBACK_S * 1_000_000_000,
+                "end": now_ns,
+                "limit": LOKI_QUERY_LIMIT,
+                "direction": "backward",
+            }
+        )
+        status, _h, body = _http_request(
+            "GET",
+            f"{self.cfg.loki_url.rstrip('/')}/loki/api/v1/query_range?{params}",
+            context=ssl_context(self.cfg.insecure),
+        )
+        return status, _loki_values(_parse_json(body))
+
+    def probe_log_trace_id(self) -> ProbeResult:
+        """The interaction recall-e2e just created is findable in Loki BY ITS
+        ``trace_id`` (LOG-TRACE-ID D7, the L4 regression layer).
+
+        Joins the audit row's ``trace_id`` (``/interactions``, read by
+        recall-e2e) to Loki ``{container="memory-server"} | json |
+        trace_id="<id>"`` and PASSES only with at least one line AND at least
+        one ``memory.read`` line among them (the recall path). Mandate-to-fail,
+        no skip flag: recall-e2e produced no row id, a malformed id, an
+        unsupported Loki URL scheme, Loki unreachable, an empty answer, or
+        lines without a ``memory.read`` all FAIL. Polls a bounded number of
+        times (:data:`LOKI_POLL_ATTEMPTS`) because Loki ingests asynchronously.
+        """
+        trace_id = self._recall_trace_id
+        if trace_id is None or not _TRACE_ID_SHAPE.fullmatch(trace_id):
+            return self._record(
+                PROBES[11],
+                FAIL,
+                "recall-e2e produced no interaction row with a 32-hex trace_id - "
+                "the log join cannot be certified",
+                {"trace_id": trace_id, "loki_url": self.cfg.loki_url},
+            )
+        if not self.cfg.loki_url.startswith(("http://", "https://")):
+            return self._record(
+                PROBES[11],
+                FAIL,
+                f"unsupported Loki URL scheme: {self.cfg.loki_url!r}",
+                {"trace_id": trace_id, "loki_url": self.cfg.loki_url},
+            )
+        status, lines = 0, []
+        for attempt in range(1, LOKI_POLL_ATTEMPTS + 1):
+            status, lines = self._loki_trace_lines(trace_id)
+            if status == 200 and any(_is_memory_read(ln) for ln in lines):
+                return self._record(
+                    PROBES[11],
+                    PASS,
+                    f"Loki returned {len(lines)} line(s) for trace_id {trace_id}, "
+                    "including a memory.read line",
+                    {
+                        "trace_id": trace_id,
+                        "loki_url": self.cfg.loki_url,
+                        "lines": len(lines),
+                        "memory_read_lines": sum(_is_memory_read(ln) for ln in lines),
+                        "attempts": attempt,
+                    },
+                )
+            if attempt < LOKI_POLL_ATTEMPTS:
+                _sleep(LOKI_POLL_INTERVAL_S)
+        reason = (
+            f"Loki unreachable or errored (HTTP {status})"
+            if status != 200
+            else f"Loki returned {len(lines)} line(s) for trace_id {trace_id} "
+            "but none is a memory.read line"
+        )
+        return self._record(
+            PROBES[11],
+            FAIL,
+            reason,
+            {
+                "trace_id": trace_id,
+                "loki_url": self.cfg.loki_url,
+                "http_status": status,
+                "lines": len(lines),
+                "attempts": LOKI_POLL_ATTEMPTS,
+            },
+        )
+
     # -- orchestration + verdict --
 
     @property
@@ -1703,6 +1855,9 @@ class VerifyRunner:
         self.probe_scan_dlq_depth()
         # ── first-party-images-match-published (D5) ──
         self.probe_first_party_images_match_published()
+        # ── log-trace-id (LOG-TRACE-ID D7): after recall-e2e, whose audit row
+        # supplies the id it joins to Loki ──
+        self.probe_log_trace_id()
         return self.write_report()
 
     def build_report(self) -> dict[str, Any]:
@@ -1774,6 +1929,15 @@ def _e2e_timeout_default() -> int:
         return E2E_CHAT_TIMEOUT_DEFAULT
 
 
+def _loki_url_default() -> str:
+    """``AUDITTRACE_LOKI_URL`` when set and non-empty, else the laptop default.
+
+    Read fresh on every call (like :func:`_e2e_timeout_default`) so tests can
+    monkeypatch ``os.environ``.
+    """
+    return os.environ.get(LOKI_URL_ENV_VAR) or LOKI_URL_DEFAULT
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m scripts.deploy.verify",
@@ -1838,6 +2002,16 @@ def build_parser() -> argparse.ArgumentParser:
             "via this flag."
         ),
     )
+    parser.add_argument(
+        "--loki-url",
+        default=_loki_url_default(),
+        help=(
+            "Loki base URL the log-trace-id probe queries (LOG-TRACE-ID D7). "
+            f"Default {LOKI_URL_DEFAULT} (the laptop observability stack), or "
+            f"the {LOKI_URL_ENV_VAR} env var. Unreachable -> the probe FAILS "
+            "(no skip flag; a cloud Loki location is a separate decision)."
+        ),
+    )
     parser.add_argument("--out-dir", type=Path, default=VerifyConfig.out_dir)
     return parser
 
@@ -1856,6 +2030,7 @@ def config_from_args(args: argparse.Namespace) -> VerifyConfig:
         e2e_timeout=args.e2e_timeout,
         skip_version_check=args.skip_version_check,
         scan_dlq_threshold=args.scan_dlq_threshold,
+        loki_url=args.loki_url,
     )
 
 

@@ -656,17 +656,57 @@ def test_record_logs_fail_at_error(tmp_path, monkeypatch, caplog):
 # ── probe 5: recall-e2e (PASS + FAIL) ────────────────────────────────────────
 
 
-def _recall_routes(tool_names=("recall_semantic",), interaction_id=42):
+LOG_TRACE_ID = "0af7651916cd43dd8448eb211c80319c"
+LOKI_QUERY_PATH = "/loki/api/v1/query_range"
+
+
+def _loki_answer(*lines):
+    """A Loki ``query_range`` ``streams`` answer carrying ``lines``."""
+    return {
+        "status": "success",
+        "data": {
+            "resultType": "streams",
+            "result": [
+                {
+                    "stream": {"container": "memory-server"},
+                    "values": [[str(1_000 + i), ln] for i, ln in enumerate(lines)],
+                }
+            ]
+            if lines
+            else [],
+        },
+    }
+
+
+MEMORY_READ_LINE = json.dumps(
+    {
+        "message": "memory.read | surface=tool collection=decisions",
+        "trace_id": LOG_TRACE_ID,
+    }
+)
+
+
+def _recall_routes(
+    tool_names=("recall_semantic",),
+    interaction_id=42,
+    trace_id=LOG_TRACE_ID,
+    loki=None,
+):
+    loki = (200, _loki_answer(MEMORY_READ_LINE)) if loki is None else loki
+    row = {"id": interaction_id}
+    if trace_id is not None:
+        row["trace_id"] = trace_id
     return {
         ("POST", "/v1/chat/completions"): (
             200,
             {"choices": [{"message": {"content": "hi"}}]},
         ),
-        ("GET", "/interactions"): (200, {"interactions": [{"id": interaction_id}]}),
+        ("GET", "/interactions"): (200, {"interactions": [row]}),
         ("GET", f"/interactions/{interaction_id}/tool-calls"): (
             200,
             {"tool_calls": [{"tool_name": n} for n in tool_names]},
         ),
+        ("GET", LOKI_QUERY_PATH): loki,
     }
 
 

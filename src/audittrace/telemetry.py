@@ -57,6 +57,26 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def current_trace_id_hex() -> str | None:
+    """Return the active OpenTelemetry trace id as 32-char lowercase hex.
+
+    The ONE trace-id derivation (LOG-TRACE-ID C7/S9; X-TRACE-ID D1): the log
+    ``TraceContextFilter`` reads it here and never formats ``ctx.trace_id``
+    itself. ``None`` when no span is active or its context is invalid (the
+    all-zero id is invalid by the W3C definition and is never returned), so
+    absent, null and NULL are one statement from one function.
+    """
+    try:
+        span = trace.get_current_span()
+        ctx = span.get_span_context() if span is not None else None
+        if ctx and ctx.is_valid:
+            return format(ctx.trace_id, "032x")
+    except Exception:  # pragma: no cover - defensive instrumentation read
+        return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # TRACEPARENT-TRUST: the server mints the trace identity of every request.
 #
@@ -650,23 +670,53 @@ def _init_langfuse_client(tracer_provider: TracerProvider | None = None) -> None
         logger.warning("Langfuse SDK init failed: %s", exc)
 
 
-def instrument_log_correlation(enabled: bool | None = None) -> None:
-    """Correlate log records with active spans (called by ``init_telemetry``).
+def _run_startup_log_correlation_self_test(tracer: Any) -> None:
+    """Fail closed if the stdout handler does not stamp the live trace id.
 
-    Its own function so tests drive exactly the product's call (TRACEPARENT-
-    TRUST AC7a) instead of a test-local ``LoggingInstrumentor`` invocation.
-    The attach goes through the SQLALCHEMY-SPANS chokepoint, so a declined
-    instrumentor is an ERROR + metric (and fatal under strict), not a
-    swallowed debug line.
+    LOG-TRACE-ID D4 (S-C1 pattern). Opens one span, runs a fresh
+    ``LogRecord`` through THE handler ``setup_logging()`` built (held by
+    identity in ``logging_config._STDOUT_HANDLER``, never the root handler
+    list, so pytest's capture handlers and alembic's ``fileConfig`` are
+    irrelevant) and raises ``RuntimeError`` unless the record carries the
+    span's own trace id. The expected value is read from the span (a
+    different source); the Filter is not checking itself.
+
+    When ``setup_logging()`` has not run in this process (``_STDOUT_HANDLER``
+    is ``None``: unit tests that call ``init_telemetry`` alone) it logs one
+    WARNING and returns. Production cannot reach that branch: ``lifespan``
+    calls ``setup_logging`` as a top-level statement before
+    ``init_telemetry`` (pinned by the AC18 test).
     """
-    from opentelemetry.instrumentation.logging import LoggingInstrumentor
+    from audittrace import logging_config
 
-    attach_instrumentor(
-        "LoggingInstrumentor",
-        LoggingInstrumentor(),
-        enabled=enabled,
-        set_logging_format=False,
+    handler = logging_config._STDOUT_HANDLER
+    if handler is None:
+        logger.warning("log-correlation self-test skipped: setup_logging() has not run")
+        return
+    if not any(
+        isinstance(f, logging_config.TraceContextFilter) for f in handler.filters
+    ):
+        raise RuntimeError(
+            "log-correlation self-test failed: the stdout handler carries no "
+            "TraceContextFilter; log lines would lose their trace_id"
+        )
+    record = logging.LogRecord(
+        name=__name__,
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg="log-correlation self-test",
+        args=(),
+        exc_info=None,
     )
+    with tracer.start_as_current_span("startup-log-correlation-self-test") as span:
+        expected = format(span.get_span_context().trace_id, "032x")
+        handler.filter(record)
+    if getattr(record, "trace_id", None) != expected:
+        raise RuntimeError(
+            "log-correlation self-test failed: the stdout handler did not stamp "
+            "the active span's trace_id on the record"
+        )
 
 
 def init_telemetry(
@@ -756,8 +806,6 @@ def init_telemetry(
             description="Count of errors raised by @log_call-decorated operations",
         )
 
-    instrument_log_correlation(enabled=tracing_enabled)
-
     if tracing_enabled and tracer_provider is not None:
         # Langfuse SECOND — our scrubber is already index 0 (S-C2).
         _init_langfuse_client(tracer_provider)
@@ -799,6 +847,10 @@ def init_telemetry(
         # S-C1(b) — fail closed if the assembled chain does not actually
         # redact a planted, registered secret end to end.
         _run_startup_scrub_self_test(tracer_provider)
+        # LOG-TRACE-ID D4 — fail closed if the stdout handler does not stamp
+        # the live span's trace id onto a record. Reuses ``_tracer`` (no new
+        # tracing-construction site: the G6e frozen enumeration stays equal).
+        _run_startup_log_correlation_self_test(_tracer)
         # S-C1(a) — read-only pin: the scrubber must still be index 0
         # after everything else has registered. No private-list WRITE
         # happens here (S-C2) — this only asserts what the public-API

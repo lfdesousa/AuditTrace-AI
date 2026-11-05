@@ -442,7 +442,9 @@ def test_every_attach_call_in_src_is_inside_the_chokepoint() -> None:
     assert sites, "the scanner found no attach call at all (vacuous)"
 
 
-def test_the_six_product_families_all_attach_through_the_chokepoint() -> None:
+def test_the_five_product_families_all_attach_through_the_chokepoint() -> None:
+    """LOG-TRACE-ID D3: ``LoggingInstrumentor`` is no longer attached (the
+    project-owned ``TraceContextFilter`` replaced it), so five families remain."""
     names: set[str] = set()
     for path in (SRC / "audittrace").rglob("*.py"):
         for node in ast.walk(ast.parse(path.read_text())):
@@ -459,7 +461,6 @@ def test_the_six_product_families_all_attach_through_the_chokepoint() -> None:
     assert names == {
         "FastAPIInstrumentor",
         "HTTPXClientInstrumentor",
-        "LoggingInstrumentor",
         "RedisInstrumentor",
         "SQLAlchemyInstrumentor",
         "URLLib3Instrumentor",
@@ -472,7 +473,7 @@ def _attach_instrumentor_sites(
     """(path, line, [source of every enclosing ``If`` test]) of each
     ``attach_instrumentor(...)`` CALL (not ``.instrument*``) under ``root``.
 
-    Same call predicate as ``test_the_six_product_families_...`` (C1 of the
+    Same call predicate as ``test_the_five_product_families_...`` (C1 of the
     WU-FU1 gate: ``attach_call_sites`` only sees ``.instrument*`` calls, which
     live inside the chokepoint, so it could never see a caller-side gate).
     """
@@ -503,7 +504,7 @@ def test_no_attach_site_is_gated_on_tracing_enabled() -> None:
     so no caller may wrap an attach in ``if ...tracing_enabled``. Enumerative by
     nature; G5/G6 are the behavioural pin."""
     sites = _attach_instrumentor_sites(SRC / "audittrace")
-    assert len(sites) == 6, sites  # one per family; also guards vacuity
+    assert len(sites) == 5, sites  # one per family; also guards vacuity
     gated = [s for s in sites if any("tracing_enabled" in t for t in s[2])]
     assert not gated, f"attach gated on tracing_enabled: {gated}"
 

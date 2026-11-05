@@ -32,9 +32,9 @@ identifying field.
 
 Structured ``memory.read`` INFO log line (WU-B) emits the same fields
 plus ``results_returned``, ``hit``, and ``cache``, and leverages the
-already-propagated ``user_id``/``trace_id``/``session_id`` (logs already
-carry these via the ``@log_call`` / context — this is the traceability
-invariant, NOT new PII in metrics).
+``user_id``/``trace_id``/``span_id`` stamped by ``TraceContextFilter``
+(``session_id`` once a route binds it) — the traceability invariant, NOT
+new PII in metrics.
 """
 
 from __future__ import annotations
@@ -124,8 +124,9 @@ def emit_recall_telemetry(
 
     # Structured log line (WU-B) — greppable in Loki, visible on laptop.
     # Fields: surface, collection, results_returned, hit, cache,
-    # best_match_distance. user_id/trace_id/session_id are already
-    # propagated via the logging-context machinery (no new PII in labels).
+    # best_match_distance. trace_id/span_id/user_id/session_id are stamped on
+    # this line by ``logging_config.TraceContextFilter`` on the stdout handler
+    # (LOG-TRACE-ID); session_id only where a route binds it. No PII in labels.
     logger.info(
         "memory.read | surface=%s collection=%s results_returned=%d "
         "hit=%s cache=%s best_match_distance=%s",

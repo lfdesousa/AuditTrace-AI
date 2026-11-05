@@ -35,13 +35,12 @@ neuter above by construction; ``test_ac3_pin_can_fail`` and
 ``test_ac6_pin_can_fail`` prove each pin is load-bearing by feeding it a
 divergent derivation / a rewritten inject (gate C5).
 
-The log half of AC7 (gate C6): the product calls
-``LoggingInstrumentor().instrument(set_logging_format=False)`` only, so on the
-contrib line in use its records carry NO ``otelTraceID`` (measured in Loki:
-500/500 request-scoped lines without ``trace_id``). AC7a therefore asserts the
-product configuration writes none of the caller's values into a log line;
-AC7b asserts, under ``inject_trace_context=True``, that the line carries the
-MINTED root id (forward protection for the log-trace-id unit).
+The log half of AC7 (gate C6): the contrib ``LoggingInstrumentor`` never stamped
+a ``trace_id`` (measured in Loki: 500/500 request-scoped lines without it) and
+was removed by LOG-TRACE-ID D3. The product's ``TraceContextFilter`` is the only
+correlator now. AC7a asserts the product configuration writes none of the
+caller's values into a log line; AC-ORD (which supersedes the old AC7b, per
+LOG-TRACE-ID ADDENDUM-1 C1) asserts the line carries the MINTED root id.
 """
 
 from __future__ import annotations
@@ -70,7 +69,6 @@ from opentelemetry.baggage.propagation import W3CBaggagePropagator
 from opentelemetry.context import Context
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from opentelemetry.instrumentation.urllib3 import URLLib3Instrumentor
 from opentelemetry.propagators.composite import CompositePropagator
 from opentelemetry.sdk.metrics import MeterProvider
@@ -695,36 +693,19 @@ def test_ac9_two_requests_with_the_same_inbound_id_get_distinct_server_ids(
 
 
 # ------------------------------------------------------------------- AC7 ----
-def _log_run(
-    headers: dict[str, str], *, inject_trace_context: bool | None
-) -> tuple[dict[str, Any], str, str]:
+def _log_run(headers: dict[str, str]) -> tuple[dict[str, Any], str, str]:
     """Run one request with the PRODUCT root handler capturing.
 
-    ``inject_trace_context=None`` -> the product's own instrumentation call
-    (``telemetry.instrument_log_correlation``). ``True`` -> a forward-protection
-    variant with trace injection on. Returns (probe line, whole captured text,
-    minted root id).
+    The product's own ``setup_logging()`` handler (with its ``TraceContextFilter``)
+    is the only correlator: LOG-TRACE-ID D3 removed ``instrument_log_correlation``
+    and the contrib ``LoggingInstrumentor``. Returns (probe line, whole captured
+    text, minted root id).
     """
     provider, exporter = _sdk_provider()
     harness = _Harness(provider, exporter)
-    inst = LoggingInstrumentor()
-    was = inst.is_instrumented_by_opentelemetry
-    if was:
-        inst.uninstrument()
-    if inject_trace_context is None:
-        telemetry.instrument_log_correlation()
-    else:
-        inst.instrument(
-            set_logging_format=False, inject_trace_context=inject_trace_context
-        )
-    try:
-        with _product_root_logging() as buf:
-            res = harness.run("GET", "/__m/ok", headers)
-            captured = buf.getvalue()
-    finally:
-        inst.uninstrument()
-        if was:
-            telemetry.instrument_log_correlation()
+    with _product_root_logging() as buf:
+        res = harness.run("GET", "/__m/ok", headers)
+        captured = buf.getvalue()
     probe = [ln for ln in captured.splitlines() if "measure.line" in ln]
     assert len(probe) == 1, captured  # positive control: the product path logged
     return json.loads(probe[0]), captured, _hex(_root(res).context.trace_id)
@@ -734,37 +715,29 @@ def test_ac7a_product_logging_path_writes_none_of_the_callers_values(
     sandbox: None,
 ) -> None:
     """AC7a (gate C6a, reviewer B1). Capture through the root handler that the
-    product's ``setup_logging()`` installs, with the product's own
-    ``telemetry.instrument_log_correlation()`` (the call ``init_telemetry``
-    makes). No captured line may contain the inbound trace id, tracestate or
-    baggage values.
+    product's ``setup_logging()`` installs. No captured line may contain the
+    inbound trace id, tracestate or baggage values.
 
-    This CAN fail, on the product path. Neuters (src patches, each alone, see
-    run_neuters.py): L1 default propagator + ``inject_trace_context=True`` in
-    ``instrument_log_correlation``; L2 default propagator + a
-    ``TraceContextFilter`` on the ``setup_logging`` handler (the LOG-TRACE-ID
-    D1/D2 mechanism); L3 policy intact + a handler Filter writing the caller's
-    stashed claim into ``record.trace_id``. Each turns this test RED.
+    This CAN fail, on the product path. Neuters (src patches, each alone): a
+    ``TraceContextFilter`` that stamps the caller's stashed claim into
+    ``record.trace_id`` turns this test RED.
     """
-    _, captured, _ = _log_run(
-        {"traceparent": _tp(), **INBOUND}, inject_trace_context=None
-    )
+    _, captured, _ = _log_run({"traceparent": _tp(), **INBOUND})
     for forbidden in (T, "evil", "injected", "k=v"):
         assert forbidden not in captured
 
 
-def test_ac7b_with_trace_injection_the_line_carries_the_minted_root(
+def test_ac_ord_the_log_line_carries_the_minted_root_not_the_inbound_id(
     sandbox: None,
 ) -> None:
-    """AC7b (forward protection for the log-trace-id unit). With trace injection
-    on, through the same product root handler, the line's ``trace_id`` is the
-    MINTED root.
+    """AC-ORD (LOG-TRACE-ID ADDENDUM-1 C1: supersedes TRACEPARENT-TRUST AC7b,
+    which asserted the same through a test-local ``LoggingInstrumentor`` with
+    ``inject_trace_context=True``). Through the product root handler the line's
+    ``trace_id`` is the MINTED root and never the inbound id.
 
-    Neuters: N1 -> the line carries T (RED).
+    Neuters: the Filter stamping the inbound claim -> the line carries T (RED).
     """
-    line, captured, root = _log_run(
-        {"traceparent": _tp(), **INBOUND}, inject_trace_context=True
-    )
+    line, captured, root = _log_run({"traceparent": _tp(), **INBOUND})
     assert line["trace_id"] == root != T
     for forbidden in ("evil", "injected", "k=v"):
         assert forbidden not in captured

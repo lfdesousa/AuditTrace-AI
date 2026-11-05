@@ -2879,7 +2879,6 @@ opentelemetry-api==1.45.1 \
     #   opentelemetry-instrumentation-asgi
     #   opentelemetry-instrumentation-fastapi
     #   opentelemetry-instrumentation-httpx
-    #   opentelemetry-instrumentation-logging
     #   opentelemetry-instrumentation-redis
     #   opentelemetry-instrumentation-sqlalchemy
     #   opentelemetry-instrumentation-urllib3
@@ -2933,7 +2932,6 @@ opentelemetry-instrumentation==0.66b1 \
     #   opentelemetry-instrumentation-asgi
     #   opentelemetry-instrumentation-fastapi
     #   opentelemetry-instrumentation-httpx
-    #   opentelemetry-instrumentation-logging
     #   opentelemetry-instrumentation-redis
     #   opentelemetry-instrumentation-sqlalchemy
     #   opentelemetry-instrumentation-urllib3
@@ -2952,12 +2950,6 @@ opentelemetry-instrumentation-fastapi==0.66b1 \
 opentelemetry-instrumentation-httpx==0.66b1 \
     --hash=sha256:0342a4002c6dbc6c4bf22cc7e698f50f5c8b77f63325c6f40c94ab87e016bf4d \
     --hash=sha256:5865a72c68098c85955a271ab8744b480a36e3ee492d35b8cadb93c7c4dbb618
-    # via
-    #   -c requirements.txt
-    #   audittrace-ai (pyproject.toml)
-opentelemetry-instrumentation-logging==0.66b1 \
-    --hash=sha256:2250240ecb1fce36939f64eafd988832338684564fb4c7b401c9b9af0ee11d46 \
-    --hash=sha256:f13761110c52eecae9d7debedb0f88b46acc248c20437e97c2a5b3a2b4f96a02
     # via
     #   -c requirements.txt
     #   audittrace-ai (pyproject.toml)
@@ -3007,7 +2999,6 @@ opentelemetry-semantic-conventions==0.66b1 \
     #   opentelemetry-instrumentation-asgi
     #   opentelemetry-instrumentation-fastapi
     #   opentelemetry-instrumentation-httpx
-    #   opentelemetry-instrumentation-logging
     #   opentelemetry-instrumentation-redis
     #   opentelemetry-instrumentation-sqlalchemy
     #   opentelemetry-instrumentation-urllib3
