@@ -135,6 +135,10 @@ _WORKLOAD_KINDS = frozenset(
 # all) — see :meth:`FirstPartyImagesMixin._live_row_digest`.
 _LONG_LIVED_SELECTOR_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet"})
 
+# A pod in one of these phases has finished and serves nothing; its imageID
+# is never part of the live set (2026-11-05, v1.30.1 leftover BFF pod).
+_FINISHED_POD_PHASES = frozenset({"Succeeded", "Failed"})
+
 
 def _parse_image_ref(image: str) -> tuple[str, str | None, str | None]:
     """Split a rendered ``repo[:tag][@sha256:hex]`` image string.
@@ -453,6 +457,8 @@ class FirstPartyImagesMixin:
         for pod in self._selector_pods(selector):
             metadata = pod.get("metadata") or {}
             if metadata.get("deletionTimestamp"):
+                continue
+            if (pod.get("status") or {}).get("phase") in _FINISHED_POD_PHASES:
                 continue
             if current_hash is not None:
                 labels = metadata.get("labels") or {}

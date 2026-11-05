@@ -715,6 +715,51 @@ def test_live_row_digest_unreadable_when_container_status_missing(
     assert rows[0]["live"] is None
 
 
+def test_live_row_digest_ignores_a_finished_leftover_pod(tmp_path, monkeypatch):
+    """2026-11-05 (v1.30.1): a Succeeded pod left over from the previous
+    ReplicaSet still carries the OLD imageID. On the fallback path (no
+    current ReplicaSet hash) it must not make the live set disagree; the
+    Running pod alone decides. Contrast: the same two pods both Running
+    disagree and stay unequal."""
+    manifest = _manifest_yaml(
+        _deployment_doc(
+            "audittrace-librechat-bff",
+            "bff",
+            "docker.io/lfds/audittrace-librechat-bff:1.29.1@sha256:bff-chart",
+        )
+    )
+
+    def _pod(phase, digest):
+        return {
+            "metadata": {"labels": {}},
+            "status": {
+                "phase": phase,
+                "containerStatuses": [
+                    {"name": "bff", "imageID": f"repo@sha256:{digest}"}
+                ],
+            },
+        }
+
+    def _rows(pods):
+        disp = _Dispatcher(
+            rules=[
+                ("helm get manifest", _proc(0, manifest)),
+                ("get deployment audittrace-librechat-bff -n", _proc(0, "")),
+                ("component=librechat-bff", _pods_json(pods)),
+            ]
+        )
+        r = _runner(tmp_path, monkeypatch, disp)
+        return r._first_party_image_rows(chart_values=_CHART_VALUES)
+
+    rows = _rows([_pod("Succeeded", "OLD"), _pod("Running", "bff-chart")])
+    assert rows[0]["live"] == "sha256:bff-chart"
+    assert rows[0]["equal"] is True
+
+    rows = _rows([_pod("Running", "OLD"), _pod("Running", "bff-chart")])
+    assert rows[0]["live"] is None
+    assert rows[0]["equal"] is False
+
+
 def test_rows_skips_doc_with_no_name_or_no_pod_spec(tmp_path, monkeypatch):
     """A workload-kind doc missing `metadata.name` or an unreadable pod
     spec contributes NO rows (never a crash)."""
