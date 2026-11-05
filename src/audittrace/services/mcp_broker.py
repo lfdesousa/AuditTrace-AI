@@ -58,6 +58,7 @@ from typing import Any
 import httpx
 import mcp.types as mcp_types
 
+from audittrace import telemetry
 from audittrace.config import get_settings
 from audittrace.identity import UserContext
 from audittrace.routes._memory_tool_loop import PendingToolCall
@@ -226,6 +227,7 @@ async def list_downstream_tools(
                     "method": "tools/list",
                     "params": {},
                 },
+                headers=telemetry.outbound_trace_headers(),
                 timeout=server.timeout_seconds,
             )
             resp.raise_for_status()
@@ -436,6 +438,7 @@ async def broker_tool_call(
                 "method": "tools/call",
                 "params": {"name": downstream_tool, "arguments": arguments},
             },
+            headers=telemetry.outbound_trace_headers(),
             timeout=server.timeout_seconds,
         )
         resp.raise_for_status()

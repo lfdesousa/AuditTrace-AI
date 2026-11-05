@@ -162,6 +162,23 @@ def install_trace_context_policy() -> None:
         propagate.set_global_textmap(ServerMintedTraceContext())
 
 
+def outbound_trace_headers() -> dict[str, str]:
+    """Headers an outbound call to a third party may carry (WP-11b, A3 = (a)).
+
+    ``{"traceparent": ...}`` built from the CURRENT server-minted span only, via
+    OTel's W3C propagator, which reads the span context itself: the trace id is
+    never formatted here, so :func:`current_trace_id_hex` stays the one
+    derivation (the test pins header id == that helper's id). The propagator
+    writes nothing for an absent or invalid span, so no header is sent rather
+    than a zero or caller-supplied id. ``tracestate`` and ``baggage`` are never
+    returned. An inbound ``traceparent`` is never an input: it only ever exists
+    as a span link (see ``ServerMintedTraceContext``).
+    """
+    carrier: dict[str, str] = {}
+    TraceContextTextMapPropagator().inject(carrier)
+    return {k: v for k, v in carrier.items() if k == "traceparent"}
+
+
 def inbound_trace_context_hook(span: Any, scope: Any) -> None:
     """``server_request_hook``: record the caller's claim as a link.
 
