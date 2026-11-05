@@ -66,6 +66,11 @@ from audittrace.tools import tools_visible_to
 
 _tracer = trace.get_tracer(__name__)
 
+# X-TRACE-ID D1: ONE trace-id derivation. This name is kept (call sites in
+# audit.py / mcp.py / the tests import it) as an ALIAS of the same object,
+# pinned by identity in tests/test_x_trace_id_header.py.
+_current_trace_id_hex = telemetry.current_trace_id_hex
+
 # Failure taxonomy (ADR-033 seed). Stored verbatim in
 # ``interactions.failure_class``. Kept as module-level constants rather than
 # an Enum so call sites read as plain strings and the value written to
@@ -500,24 +505,6 @@ async def _stream_upstream_with_keepalive_from_t0(
             with contextlib.suppress(asyncio.CancelledError):
                 await send_task
         raise
-
-
-def _current_trace_id_hex() -> str | None:
-    """Return the active OpenTelemetry trace_id as a 32-char hex string.
-
-    Returns ``None`` when no span is active or when the captured context is
-    invalid (e.g. tools-mode persist after the @_lf_observe decorator's span
-    has closed). Defensive try/except mirrors the pattern at
-    ``server.py:330``: instrumentation should never break the request path.
-    """
-    try:
-        span = trace.get_current_span()
-        ctx = span.get_span_context() if span is not None else None
-        if ctx and ctx.is_valid:
-            return format(ctx.trace_id, "032x")
-    except Exception:  # pragma: no cover - defensive instrumentation read
-        return None
-    return None
 
 
 async def _persist_interaction(

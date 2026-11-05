@@ -9,9 +9,10 @@ Every value here is SERVER-DERIVED:
   A disagreement is fail-closed (:class:`ConsoleStoreScopeError`) BEFORE any
   session opens. Never from a request body.
 * ``trace_id`` — the active OpenTelemetry span's trace id (32-hex), the same
-  derivation ``routes/chat.py::_current_trace_id_hex`` uses for
-  ``interactions.trace_id`` (EU AI Act Art 12 traceability, M5). ``None``
-  when no span is active (telemetry no-op on the laptop default).
+  derivation ``interactions.trace_id`` uses (EU AI Act Art 12 traceability,
+  M5): ``current_trace_id_hex`` below IS ``telemetry.current_trace_id_hex``
+  (X-TRACE-ID D1, one function, pinned by identity). ``None`` when no valid
+  span is active.
 * ``session_id`` — a request-scoped ContextVar bound by the request layer
   (``bind_session_id``); ``None`` when the request layer has not bound one.
   WU-A ships the stamp; wiring each console route's ``X-Session-Id`` header
@@ -28,11 +29,10 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 
-from opentelemetry import trace
-
 from audittrace.db import rls
 from audittrace.identity import UserContext
 from audittrace.services.console_store._errors import ConsoleStoreScopeError
+from audittrace.telemetry import current_trace_id_hex as current_trace_id_hex
 
 logger = logging.getLogger(__name__)
 
@@ -91,21 +91,6 @@ def bind_session_id(session_id: str | None) -> None:
 
 def current_session_id() -> str | None:
     return _current_session_id.get()
-
-
-def current_trace_id_hex() -> str | None:
-    """Return the active OpenTelemetry trace id as 32-char hex, or ``None``
-    when no valid span is active. Mirrors ``routes/chat.py::
-    _current_trace_id_hex`` so console rows correlate with ``interactions``
-    rows by the same key."""
-    try:
-        span = trace.get_current_span()
-        ctx = span.get_span_context() if span is not None else None
-        if ctx and ctx.is_valid:
-            return format(ctx.trace_id, "032x")
-    except Exception:  # pragma: no cover - defensive instrumentation read
-        return None
-    return None
 
 
 def resolve_user_sub(user_context: UserContext) -> str:
