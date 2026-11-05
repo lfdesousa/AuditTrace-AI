@@ -9,7 +9,8 @@ is added to the real app, nothing in the app is patched.
 
 Neuters (each alone, RED recorded in the build record): N1 / N2 / N3 -> AC6 RED;
 N4 / N4b (re-add the contrib instrumentor block) -> AC16 RED; binding
-``session_id`` in the request path -> the AC3b neuter test.
+``session_id`` in the request path -> the AC3b neuter test (AC3b is flipped by
+WP-6 SESSION-ID-BIND; its production half is ``test_session_id_bind_route.py``).
 """
 
 from __future__ import annotations
@@ -116,14 +117,18 @@ def test_ac6_the_request_line_carries_the_route_span_and_exported_server_trace_i
     assert SPAN_SHAPE.match(line["span_id"])
 
 
-def test_ac3b_a_production_request_line_carries_no_session_id_today(
+def test_ac3b_flipped_a_route_that_binds_nothing_still_has_no_session_id_key(
     real_route: tuple[_RealRoute, io.StringIO],
 ) -> None:
-    """AC3b (ADDENDUM-1 C2). No production route binds ``session_id`` yet
-    (SESSION-ID-BIND), so a real request line has NO ``session_id`` key.
+    """AC3b, FLIPPED by SESSION-ID-BIND (v1.31.0 WP-6). It used to read "no route
+    binds ``session_id`` today, so a real request line has no key" (ADDENDUM-1
+    C2). The production routes now bind (``tests/test_session_id_bind_route.py``
+    pins that, through the real chat and MCP routes); what stays true here is the
+    other half: the Filter never invents the key. This probe route binds nothing,
+    so its line has NO ``session_id``.
 
-    Neuter: bind in the request path (second test) -> the key appears, proving
-    this one reads production truth.
+    Neuter: bind in the request path (next test) -> the key appears, proving this
+    one reads the Filter's truth and not an absent field.
     """
     route, buf = real_route
     assert route.get() == 200

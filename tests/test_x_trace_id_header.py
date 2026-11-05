@@ -21,6 +21,8 @@ Neuters (each run ALONE, RED recorded in the build record):
   N6  the middleware keeps a pre-existing ``x-trace-id`` (first writer wins)
   N7  the middleware rewrites the other response headers / a body frame
   N9  ``memory_audit`` / ``console_store`` re-introduce a local copy
+  N-NB4 forward a route-set ``x-trace-id`` when there is no valid span
+  N-NB1 narrow the derivation matcher to the ``format(x, "032x")`` spelling
 """
 
 from __future__ import annotations
@@ -169,6 +171,47 @@ async def test_c2_a_pre_existing_header_is_replaced_case_insensitively(
     ]
 
 
+async def test_nb4_without_a_valid_span_a_route_set_header_is_stripped() -> None:
+    """WP-4 NB-4 (closed by WP-6), D4: with no valid span the header is ABSENT -
+    including a value a route set itself (any case, duplicated), because the
+    header may only ever carry a value the server minted. Every other header is
+    preserved in order and the body frame is untouched.
+
+    Neuter: restore the pre-WP-6 behaviour (forward the message untouched when the
+    helper reports ``None``) -> RED.
+    """
+    start = {
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [
+            (b"a", b"1"),
+            (b"X-Trace-Id", b"f" * 32),
+            (b"b", b"2"),
+            (b"x-trace-id", b"e" * 32),
+        ],
+    }
+    sent, _ = await _drive([start, dict(BODY)])
+    assert _headers(sent[0]) == [(b"a", b"1"), (b"b", b"2")]
+    assert sent[0]["status"] == 200
+    assert sent[1] == BODY
+
+
+async def test_nb4_the_strip_also_applies_when_the_helper_reports_none_in_a_span(
+    monkeypatch: pytest.MonkeyPatch, local_tracer: trace.Tracer
+) -> None:
+    """The decision lives in the one helper: when it says ``None`` the route-set
+    value goes even though a (here: valid) span is active."""
+    monkeypatch.setattr("audittrace.trace_id_header.current_trace_id_hex", lambda: None)
+    start = {
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"x-trace-id", b"f" * 32)],
+    }
+    with local_tracer.start_as_current_span("server"):
+        sent, _ = await _drive([start])
+    assert _headers(sent[0]) == []
+
+
 async def test_c2_a_start_message_without_a_headers_key_is_handled(
     local_tracer: trace.Tracer,
 ) -> None:
@@ -236,23 +279,99 @@ def _defs(path: str) -> set[str]:
     return {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
 
 
-def _format_trace_sites(path: str) -> list[int]:
-    """Lines where ``format(<x>.trace_id, "032x")`` appears in ``path``."""
+def _is_derivation_spec(node: ast.AST) -> bool:
+    """A string constant that formats an int as 32 zero-padded hex digits
+    (``"032x"``, ``"%032x"``, ``"{:032x}"``)."""
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "032x" in node.value
+    )
+
+
+def _derivation_sites_in(source: str) -> list[int]:
+    """Lines where ``source`` derives a W3C trace id by hand. Five spellings:
+
+    * ``format(x, "032x")``
+    * ``f"{x:032x}"``
+    * ``"%032x" % x``
+    * ``"{:032x}".format(x)``
+    * ``format_trace_id(x)`` / ``trace.format_trace_id(x)`` (OTel's own helper)
+
+    Docstrings and comments are never flagged: only call / format-spec / ``%``
+    syntax is (WP-4 NB-1, closed by WP-6).
+    """
     # index-gap: BS-003 (an expression pattern inside function bodies is not an
     # index node; stdlib ast is the instrument, and a different one from the index)
-    tree = ast.parse((SRC / path).read_text(encoding="utf-8"))
     out: list[int] = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "format"
-            and len(node.args) == 2
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value == "032x"
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Name)
+                and func.id == "format"
+                and len(node.args) == 2
+                and _is_derivation_spec(node.args[1])
+            ):
+                out.append(node.lineno)
+            elif (isinstance(func, ast.Name) and func.id == "format_trace_id") or (
+                isinstance(func, ast.Attribute) and func.attr == "format_trace_id"
+            ):
+                out.append(node.lineno)
+            elif (
+                isinstance(func, ast.Attribute)
+                and func.attr == "format"
+                and _is_derivation_spec(func.value)
+            ):
+                out.append(node.lineno)
+        elif isinstance(node, ast.FormattedValue) and node.format_spec is not None:
+            if any(_is_derivation_spec(v) for v in ast.walk(node.format_spec)):
+                out.append(node.lineno)
+        elif (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Mod)
+            and _is_derivation_spec(node.left)
         ):
             out.append(node.lineno)
     return out
+
+
+def _format_trace_sites(path: str) -> list[int]:
+    """Derivation sites in the ``src`` file at ``path`` (see
+    :func:`_derivation_sites_in`)."""
+    return _derivation_sites_in((SRC / path).read_text(encoding="utf-8"))
+
+
+_PLANTED_COPIES = {
+    "format_call": 'x = format(span.trace_id, "032x")\n',
+    "f_string": 'x = f"{span.trace_id:032x}"\n',
+    "percent_format": 'x = "%032x" % span.trace_id\n',
+    "str_format": 'x = "{:032x}".format(span.trace_id)\n',
+    "otel_helper": "from opentelemetry.trace import format_trace_id\nx = format_trace_id(t)\n",
+    "otel_helper_attr": "from opentelemetry import trace\nx = trace.format_trace_id(t)\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_PLANTED_COPIES))
+def test_nb1_the_matcher_catches_every_spelling_of_a_planted_copy(name: str) -> None:
+    """WP-4 NB-1 (closed by WP-6). Each spelling of a hand-rolled derivation, planted
+    in otherwise empty source, is found; a docstring or comment that merely MENTIONS
+    ``032x`` is not.
+
+    Neuter: narrow ``_derivation_sites_in`` back to the ``format(x, "032x")`` form ->
+    RED on the five other spellings. The same spellings planted in ``routes/chat.py``
+    also turn ``test_ac5_the_four_former_copies_...`` RED (recorded in the build record).
+    """
+    assert _derivation_sites_in(_PLANTED_COPIES[name]) != []
+
+
+def test_nb1_prose_that_mentions_the_format_is_not_a_derivation() -> None:
+    source = (
+        '"""Uses the 032x spelling: format(x, "032x") in prose."""\n'
+        '# also f"{x:032x}" in a comment\n'
+        "x = 1\n"
+    )
+    assert _derivation_sites_in(source) == []
 
 
 @pytest.mark.parametrize(

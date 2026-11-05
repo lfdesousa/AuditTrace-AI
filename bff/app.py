@@ -275,7 +275,12 @@ def create_app() -> FastAPI:
         content_type = request.headers.get("content-type", "application/json")
         try:
             return await proxy_chat_completions(
-                raw_body, content_type, minted_token, settings, http_client
+                raw_body,
+                content_type,
+                minted_token,
+                settings,
+                http_client,
+                session_id=request.headers.get("x-session-id"),
             )
         except ProxyError as exc:
             logger.error("orchestrator unreachable: %s", exc)

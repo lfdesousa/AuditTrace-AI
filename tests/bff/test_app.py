@@ -267,6 +267,45 @@ class TestHappyPath:
         assert backend.orchestrator_calls[0].read() == raw
 
 
+class TestSessionIdForward:
+    """LANGFUSE-WU-3 / SESSION-ID-BIND (v1.31.0 WP-6), through the real BFF app:
+    an inbound ``X-Session-Id`` reaches the orchestrator request; a request
+    without one adds no header.
+
+    Neuters (each alone): drop ``session_id=request.headers.get(...)`` in
+    ``bff/app.py`` -> the forward cell RED; drop the forward in ``bff/proxy.py`` ->
+    the forward cell RED.
+    """
+
+    def test_the_inbound_session_id_reaches_the_orchestrator(self, app_client) -> None:
+        client, backend = app_client
+        response = client.post(
+            "/v1/chat/completions",
+            content=b'{"model":"audittrace-chat","messages":[]}',
+            headers={
+                "Authorization": f"Bearer {make_token(sub='alice')}",
+                "Content-Type": "application/json",
+                "X-Session-Id": "librechat-conversation-7",
+            },
+        )
+        assert response.status_code == 200
+        assert backend.orchestrator_calls[0].headers.get_list("x-session-id") == [
+            "librechat-conversation-7"
+        ]
+
+    def test_no_inbound_session_id_means_no_header_upstream(self, app_client) -> None:
+        client, backend = app_client
+        client.post(
+            "/v1/chat/completions",
+            content=b'{"model":"audittrace-chat","messages":[]}',
+            headers={
+                "Authorization": f"Bearer {make_token(sub='alice')}",
+                "Content-Type": "application/json",
+            },
+        )
+        assert backend.orchestrator_calls[0].headers.get_list("x-session-id") == []
+
+
 class TestFailClosed:
     """The non-negotiable invariant: absent/invalid/expired token ⇒ 401,
     and the orchestrator is NEVER contacted — not "contacted with a

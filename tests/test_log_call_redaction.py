@@ -1341,11 +1341,16 @@ def _find_direct_input_value_writers() -> list[tuple[str, str]]:
 # (reviewed to confirm D7 alone covers it, or amended to call
 # render_payload itself) updates this tuple BY HAND, never
 # programmatically.
+#
+# v1.31.0 WP-6 (SESSION-ID-BIND): the ``chat.py`` entry was ``chat_completions``;
+# the route body moved VERBATIM into ``_chat_completions_impl`` (the public route
+# is now a thin wrapper that opens the request scope the session id is bound
+# into). Same writer, same code, same D7 coverage: the tuple follows the move.
 _FROZEN_DIRECT_INPUT_VALUE_WRITERS: tuple[tuple[str, str], ...] = (
     ("src/audittrace/routes/_memory_tool_loop.py", "_execute_memory_tool"),
     ("src/audittrace/routes/_memory_tool_loop.py", "run_memory_tool_loop"),
+    ("src/audittrace/routes/chat.py", "_chat_completions_impl"),
     ("src/audittrace/routes/chat.py", "_set_genai_request_attributes"),
-    ("src/audittrace/routes/chat.py", "chat_completions"),
 )
 
 

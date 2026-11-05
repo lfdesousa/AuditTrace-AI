@@ -14,9 +14,11 @@ Every value here is SERVER-DERIVED:
   (X-TRACE-ID D1, one function, pinned by identity). ``None`` when no valid
   span is active.
 * ``session_id`` — a request-scoped ContextVar bound by the request layer
-  (``bind_session_id``); ``None`` when the request layer has not bound one.
-  WU-A ships the stamp; wiring each console route's ``X-Session-Id`` header
-  into ``bind_session_id`` is the M5 retrofit vehicle.
+  (``bound_session_id``); ``None`` when the request layer has not bound one.
+  The two production request layers that resolve a session (``POST
+  /v1/chat/completions`` and ``POST /mcp`` ``tools/call``) bind it (v1.31.0
+  WP-6, SESSION-ID-BIND); wiring each console route's ``X-Session-Id``
+  header is the M5 retrofit vehicle.
 
 None of these functions accept a caller-supplied override — there is no
 parameter through which a body value could reach a stamped column.
@@ -24,9 +26,11 @@ parameter through which a body value could reach a stamped column.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
-from contextvars import ContextVar
+from collections.abc import Iterator
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 
 from audittrace.db import rls
@@ -83,10 +87,38 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def bind_session_id(session_id: str | None) -> None:
+def bind_session_id(session_id: str | None) -> Token[str | None]:
     """Bind (or clear, with ``None``) the request's ``session_id`` for M5
-    stamping. Called by the request layer, never by a domain."""
-    _current_session_id.set(session_id)
+    stamping and for the ``session_id`` field of every log line (the
+    ``TraceContextFilter`` reads it). Called by the request layer, never by a
+    domain.
+
+    Returns the :class:`~contextvars.Token` so the caller can restore the
+    PREVIOUS value with :func:`reset_session_id`; request code uses
+    :func:`bound_session_id` instead of pairing the two by hand.
+    """
+    return _current_session_id.set(session_id)
+
+
+def reset_session_id(token: Token[str | None]) -> None:
+    """Undo one :func:`bind_session_id` (restores the value it replaced)."""
+    _current_session_id.reset(token)
+
+
+@contextlib.contextmanager
+def bound_session_id(session_id: str | None) -> Iterator[None]:
+    """Bind ``session_id`` for the duration of the block and restore the
+    previous value on every exit path (SESSION-ID-BIND AC-6.3: nothing bleeds
+    into the next request served on the same task).
+
+    Falsifiable: drop the :func:`reset_session_id` call and
+    ``test_ac_6_3_*`` observes the id still bound after the block.
+    """
+    token = bind_session_id(session_id)
+    try:
+        yield
+    finally:
+        reset_session_id(token)
 
 
 def current_session_id() -> str | None:

@@ -181,3 +181,43 @@ class TestUnreachableOrchestrator:
             await proxy_chat_completions(
                 b"{}", "application/json", "t", _settings(), client
             )
+
+
+class TestSessionIdForward:
+    """LANGFUSE-WU-3 / SESSION-ID-BIND (v1.31.0 WP-6): the caller's ``X-Session-Id``
+    rides to the orchestrator; absent or blank adds nothing (additive only).
+
+    Neuters (each alone): drop the ``headers["X-Session-Id"]`` line in
+    ``bff/proxy.py`` -> the forward cell RED; drop the ``.strip()`` guard so a blank
+    value is forwarded -> the blank cell RED.
+    """
+
+    @staticmethod
+    async def _upstream_headers(session_id: str | None) -> httpx.Headers:
+        captured: dict[str, httpx.Headers] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["headers"] = request.headers
+            return httpx.Response(200, json={"ok": True})
+
+        response = await proxy_chat_completions(
+            b"{}",
+            "application/json",
+            "minted-token-abc",
+            _settings(),
+            _client(handler),
+            session_id=session_id,
+        )
+        await _collect(response)
+        return captured["headers"]
+
+    async def test_a_session_id_is_forwarded_trimmed(self) -> None:
+        headers = await self._upstream_headers("  agent-run-42  ")
+        assert headers.get_list("x-session-id") == ["agent-run-42"]
+
+    @pytest.mark.parametrize("value", [None, "", "   "], ids=["none", "empty", "blank"])
+    async def test_absent_or_blank_adds_no_header(self, value: str | None) -> None:
+        headers = await self._upstream_headers(value)
+        assert headers.get_list("x-session-id") == []
+        assert headers["authorization"] == "Bearer minted-token-abc"
+        assert headers["x-source"] == "librechat"

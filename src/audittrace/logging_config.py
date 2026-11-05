@@ -1015,8 +1015,8 @@ def _bound_session_id() -> str | None:
     """The session bound through the console-store ContextVar, lazily imported.
 
     Lazy because ``audittrace.services.console_store`` imports this module's
-    consumers; no route binds it today (SESSION-ID-BIND), so it is absent on
-    every production line until that unit lands.
+    consumers. ``POST /v1/chat/completions`` and ``POST /mcp`` ``tools/call``
+    bind it (SESSION-ID-BIND, v1.31.0 WP-6); on any other line it is absent.
     """
     try:
         from audittrace.services.console_store._context import current_session_id

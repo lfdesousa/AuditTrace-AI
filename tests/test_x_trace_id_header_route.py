@@ -118,6 +118,33 @@ def test_ac1_the_pre_existing_header_is_replaced_not_kept_nor_duplicated(
     assert PRESET_VALUE not in response.headers.get_list("x-trace-id")
 
 
+FORGED = "d" * 32
+
+
+def test_nb3_a_forged_inbound_x_trace_id_is_never_echoed(sdk: Harness) -> None:
+    """WP-4 NB-3 (closed by WP-6). A caller-supplied REQUEST ``X-Trace-Id`` is
+    ignored: the response header equals the exported SERVER span's id and differs
+    from the forged value, and the route itself saw the server's id.
+
+    Neuter: make the middleware echo the inbound ``x-trace-id`` request header
+    (read it from ``scope["headers"]``) -> RED.
+    """
+    case = Case(
+        "forged_inbound_x_trace_id",
+        "GET",
+        "/__x/json",
+        200,
+        headers={"X-Trace-Id": FORGED},
+        seen="json",
+    )
+    response, servers = _one_request(sdk, case)
+    values = response.headers.get_list("x-trace-id")
+    assert len(servers) == 1
+    assert values == servers
+    assert values[0] != FORGED
+    assert sdk.seen["json"] == values[0]
+
+
 def test_ac1_distinct_requests_get_distinct_ids(sdk: Harness) -> None:
     """The header is per-request, not a process constant.
 
@@ -132,21 +159,20 @@ def test_ac1_distinct_requests_get_distinct_ids(sdk: Harness) -> None:
 # ---------------------------------------------------------------------------
 # AC2: tracing disabled
 # ---------------------------------------------------------------------------
-_OFF_CASES = [c for c in CASES if c.name != "preset_header_replaced"]
-
-
-@pytest.mark.parametrize("case", _OFF_CASES, ids=[c.name for c in _OFF_CASES])
+@pytest.mark.parametrize("case", CASES, ids=IDS)
 def test_ac2_tracing_disabled_no_header_on_any_class(off: Harness, case: Case) -> None:
     """AC2 / D4. Proxy (non-recording) provider: the context is invalid, so the
     header is ABSENT on every class - including the 500 handler's response and
     the classes that carry an inbound ``traceparent`` (TRACEPARENT-TRUST keeps it
     as a link only, so it cannot make the context valid). Not all-zero.
 
-    ``preset_header_replaced`` is excluded: no span means the middleware owns
-    nothing, and a route that sets the header itself keeps its own value (no
-    production route does; stated, not pinned).
+    ``preset_header_replaced`` is INCLUDED since WP-6 (WP-4 NB-4): with no valid
+    span a route-set value is stripped too - the header only ever carries a value
+    the server minted (D4).
 
-    Neuters: N3 (all-zero when invalid) -> RED; N4 (hardcoded) -> RED.
+    Neuters: N3 (all-zero when invalid) -> RED; N4 (hardcoded) -> RED;
+    N-NB4 (forward a route-set value when the context is invalid) -> RED on
+    ``preset_header_replaced`` only.
     """
     response = off.request(case)
     assert response.status_code == case.status

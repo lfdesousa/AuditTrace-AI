@@ -20,7 +20,11 @@ Design (spec ``2026-10-17-SPEC-x-trace-id-header.md`` D2-D4, gate 5438c34e):
   time), so the current span is the request's server span.
 * Pre-existing ``x-trace-id`` header: REPLACED (gate C2). The invariant "the
   header equals this request's server span id" wins over "first writer wins".
-* Absent when the context is invalid (tracing disabled): never an all-zero id.
+* Absent when the context is invalid (tracing disabled): never an all-zero id,
+  and a route-set value is STRIPPED (D4: the header only ever carries a value
+  the server minted; v1.31.0 WP-6 closes WP-4 NB-4).
+* The inbound request's ``X-Trace-Id`` is never read (WP-4 NB-3, pinned by
+  ``test_nb3_a_forged_inbound_x_trace_id_is_never_echoed``).
 * The one response this middleware cannot see is the unhandled-exception 500:
   Starlette sends it from ``ServerErrorMiddleware``, outside user middleware.
   ``server.unhandled_exception_handler`` stamps its own response from the same
@@ -50,18 +54,25 @@ class TraceIdHeaderMiddleware:
         async def send_with_trace_id(message: Message) -> None:
             if message["type"] == "http.response.start":
                 trace_id = current_trace_id_hex()
+                headers = list(message.get("headers", ()))
+                kept = [
+                    (name, value)
+                    for name, value in headers
+                    if name.lower() != _TRACE_ID_HEADER_LOWER
+                ]
                 if trace_id is not None:
                     message = {
                         **message,
                         "headers": [
-                            *(
-                                (name, value)
-                                for name, value in message.get("headers", ())
-                                if name.lower() != _TRACE_ID_HEADER_LOWER
-                            ),
+                            *kept,
                             (_TRACE_ID_HEADER_LOWER, trace_id.encode("ascii")),
                         ],
                     }
+                elif len(kept) != len(headers):
+                    # D4: with no valid span the header is ABSENT. A value a
+                    # route set itself is a value the server did not mint, so
+                    # it is stripped, never forwarded (WP-4 NB-4).
+                    message = {**message, "headers": kept}
             await send(message)
 
         await self.app(scope, receive, send_with_trace_id)
