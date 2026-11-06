@@ -5,7 +5,9 @@ backfill script uses) returned ``{}`` for every ``HTTPError``, so the backfill
 recorded ``trace_id=None`` for every 403 although the server stamps
 ``X-Trace-Id`` on 403s (src/audittrace/trace_id_header.py).
 
-Declared test doubles: NONE of ``urlopen``. A real loopback ``http.server``
+Declared test doubles: ``test_http_error_response_is_closed_on_return`` wraps
+``urllib.request.urlopen`` in a pass-through SPY that calls the real function
+and records the HTTPError it raises (no behaviour change). Otherwise NONE of ``urlopen``. A real loopback ``http.server``
 stub (127.0.0.1, ephemeral port, started/stopped per test) answers with a fixed
 status, headers and body, so the real ``urllib`` HTTPError path is exercised.
 """
@@ -52,7 +54,7 @@ def _stub(status: int, headers: dict[str, str]) -> Iterator[str]:
     finally:
         server.shutdown()
         server.server_close()
-        thread.join()
+        thread.join(timeout=5)
 
 
 SEAMS: list[Callable[..., Any]] = [verify._http_request, memory._http_request]
@@ -101,3 +103,31 @@ def test_backfill_post_index_gets_trace_id_on_403() -> None:
     assert new_status is None
     assert trace_id == TRACE
     assert error == "forbidden"
+
+
+@pytest.mark.parametrize("seam", SEAMS, ids=["verify", "memory"])
+def test_http_error_response_is_closed_on_return(
+    seam: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Declared spy: pass-through wrapper over the REAL ``urlopen`` that records
+    the raised HTTPError; the error response must be closed once the seam returns
+    (guards the ``with exc:`` in ``_http_request``)."""
+    import urllib.request
+    from urllib.error import HTTPError
+
+    real = urllib.request.urlopen
+    seen: list[HTTPError] = []
+
+    def _spy(*a: Any, **k: Any) -> Any:
+        try:
+            return real(*a, **k)
+        except HTTPError as exc:
+            seen.append(exc)
+            raise
+
+    monkeypatch.setattr("urllib.request.urlopen", _spy)
+    with _stub(403, {"X-Trace-Id": TRACE}) as url:
+        status, _h, _b = seam("GET", f"{url}/x")
+    assert status == 403
+    assert len(seen) == 1
+    assert seen[0].fp is not None and seen[0].fp.closed is True
