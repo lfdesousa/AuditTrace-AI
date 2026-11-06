@@ -232,6 +232,23 @@ def test_policy_line_renders_in_both_vault_cells(cell: str) -> None:
     assert _covered(KV_PATH, _hcl_paths(_server_hcl(docs)))
 
 
+_LANGFUSE_READ = re.compile(
+    r'path "kv/data/audittrace/langfuse/\*"\s*\{\s*capabilities = \["read"\]\s*\}'
+)
+
+
+@pytest.mark.parametrize("cell", ["vault=true,flag=false", "vault=true,flag=true"])
+def test_policy_hcl_grants_exactly_read_on_the_langfuse_path(cell: str) -> None:
+    """The ``langfuse/*`` line grants exactly ``["read"]`` in both vault cells and
+    there is exactly one such block (mirrors tests/test_llama_chart_locks.py). A
+    ``["deny"]``, a missing capabilities line, a widened grant or a second
+    ``deny`` block would stop the Vault Agent reading the key pair at pass 2
+    (vault-agent-init fails, the pod never becomes Ready)."""
+    hcl = _server_hcl(_render(CELLS[cell])[1])
+    assert _LANGFUSE_READ.search(hcl), 'langfuse/* must grant exactly ["read"]'
+    assert len(re.findall(r'path "kv/data/audittrace/langfuse/', hcl)) == 1
+
+
 @pytest.mark.parametrize("cell", list(CELLS))
 def test_every_with_secret_path_has_a_policy_line(cell: str) -> None:
     """Falsifiability of the HCL line: a ``with secret`` block without its policy
