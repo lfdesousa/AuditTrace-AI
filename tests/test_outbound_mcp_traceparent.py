@@ -4,13 +4,15 @@ Outbound brokered MCP calls carry the SERVER-MINTED ``traceparent`` (the
 current server span's trace id), never an inbound, client-supplied one.
 TRACEPARENT-TRUST stays the only inbound path.
 
-Instrument: a real ``httpx.MockTransport`` behind the real
-``mcp_broker.broker_tool_call`` / ``list_downstream_tools`` (declared: the
-transport is a mock, so nothing here depends on the HTTPX instrumentor being
-attached; the loopback + instrumentor path is covered by
-``tests/test_traceparent_trust.py`` AC6 ``broker``). The server span is built the
-way the ASGI middleware builds it: ``propagate.extract`` with the process-global
-textmap, then a span started on that context.
+UNIT cells only. These are NOT the AC-11b.1 cells: the ratified instrument
+(ADDENDUM-3 S1/S2: POST /mcp, real loopback server, no MockTransport) lives in
+``tests/test_outbound_mcp_traceparent_loopback.py``. Here a declared
+``httpx.MockTransport`` sits behind ``mcp_broker.broker_tool_call`` /
+``list_downstream_tools``. The server span is started on a context extracted
+from the forged headers but that context is NOT attached, so the inbound span
+context is never in the current context here; a helper that forwards the
+inbound context is therefore invisible to these cells (it is caught by the
+loopback file).
 
 Neuters (each run alone, restored, tree hash checked):
   N-11b.1  forward the inbound header verbatim (broker posts ``headers`` taken
@@ -89,6 +91,16 @@ def default_policy() -> Iterator[None]:
         propagate.set_global_textmap(saved)
 
 
+@pytest.fixture
+def tracer() -> Iterator[trace.Tracer]:
+    """A per-test provider, shut down on teardown."""
+    provider = TracerProvider()
+    try:
+        yield provider.get_tracer("test")
+    finally:
+        provider.shutdown()
+
+
 def _capture() -> tuple[list[httpx.Request], httpx.AsyncClient]:
     seen: list[httpx.Request] = []
 
@@ -126,10 +138,9 @@ def _tid(traceparent: str) -> str:
     return traceparent.split("-")[1]
 
 
-async def _call_inside_server_span() -> tuple[str, httpx.Request]:
+async def _call_inside_server_span(tracer: trace.Tracer) -> tuple[str, httpx.Request]:
     """Run one brokered call inside a server span minted from a forged inbound."""
     seen, client = _capture()
-    tracer = TracerProvider().get_tracer("test")
     async with client:
         with tracer.start_as_current_span(
             "POST /mcp", context=_inbound_context(), kind=trace.SpanKind.SERVER
@@ -149,10 +160,10 @@ async def _call_inside_server_span() -> tuple[str, httpx.Request]:
 
 @pytest.mark.asyncio
 async def test_tools_call_carries_the_server_minted_traceparent_not_the_forged_one(
-    minted_policy: None,
+    minted_policy: None, tracer: trace.Tracer
 ) -> None:
-    """AC-11b.1 (tools/call). Outbound id == server span id, and is not R."""
-    server_tid, request = await _call_inside_server_span()
+    """Unit cell (tools/call). Outbound id == server span id, and is not R."""
+    server_tid, request = await _call_inside_server_span(tracer)
     tp = request.headers["traceparent"]
     assert _tid(tp) == server_tid
     assert _tid(tp) != FORGED_TRACE_ID
@@ -163,11 +174,10 @@ async def test_tools_call_carries_the_server_minted_traceparent_not_the_forged_o
 
 @pytest.mark.asyncio
 async def test_tools_list_carries_the_server_minted_traceparent_not_the_forged_one(
-    minted_policy: None,
+    minted_policy: None, tracer: trace.Tracer
 ) -> None:
-    """AC-11b.1 (tools/list, the other egress site of the broker)."""
+    """Unit cell (tools/list, the other egress site of the broker)."""
     seen, client = _capture()
-    tracer = TracerProvider().get_tracer("test")
     async with client:
         with tracer.start_as_current_span(
             "POST /mcp", context=_inbound_context(), kind=trace.SpanKind.SERVER
@@ -186,12 +196,12 @@ async def test_tools_list_carries_the_server_minted_traceparent_not_the_forged_o
 
 @pytest.mark.asyncio
 async def test_without_the_policy_the_outbound_id_is_the_inbound_one(
-    default_policy: None,
+    default_policy: None, tracer: trace.Tracer
 ) -> None:
     """N-11b.2 recreated as a cell: with the parent-adopting default textmap the
     forged id DOES leave the process, so the assertions above are sensitive to
     ``install_trace_context_policy()`` being removed."""
-    server_tid, request = await _call_inside_server_span()
+    server_tid, request = await _call_inside_server_span(tracer)
     assert server_tid == FORGED_TRACE_ID
     assert _tid(request.headers["traceparent"]) == FORGED_TRACE_ID
 
@@ -214,9 +224,8 @@ async def test_no_valid_span_means_no_traceparent_header(minted_policy: None) ->
 
 
 def test_helper_returns_only_traceparent_and_matches_the_single_derivation(
-    minted_policy: None,
+    minted_policy: None, tracer: trace.Tracer
 ) -> None:
-    tracer = TracerProvider().get_tracer("test")
     with tracer.start_as_current_span("s"):
         headers = telemetry.outbound_trace_headers()
         assert list(headers) == ["traceparent"]
