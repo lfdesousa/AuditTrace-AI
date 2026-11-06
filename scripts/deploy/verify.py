@@ -928,8 +928,11 @@ class VerifyRunner:
         return items if isinstance(items, list) else []
 
     def _live_memory_server_digest(self) -> str | None:
+        # Running pods only: a Succeeded/Failed leftover from a rollout keeps
+        # its old imageID and served nothing (cf. _live_bff_digest).
         jsonpath = (
-            '{.items[*].status.containerStatuses[?(@.name=="'
+            '{.items[?(@.status.phase=="Running")]'
+            '.status.containerStatuses[?(@.name=="'
             + MEMORY_SERVER_CONTAINER
             + '")].imageID}'
         )
@@ -1628,9 +1631,7 @@ class VerifyRunner:
         probe FAIL on a correct release."""
         jsonpath = (
             '{.items[?(@.status.phase=="Running")]'
-            '.status.containerStatuses[?(@.name=="'
-            + BFF_CONTAINER
-            + '")].imageID}'
+            '.status.containerStatuses[?(@.name=="' + BFF_CONTAINER + '")].imageID}'
         )
         proc = _run(
             [

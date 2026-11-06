@@ -479,6 +479,54 @@ def test_live_digest_none_when_no_sha(tmp_path, monkeypatch):
     assert VerifyRunner(_cfg(tmp_path))._live_memory_server_digest() is None
 
 
+_RUNNING_FILTER = '{.items[?(@.status.phase=="Running")]'
+
+
+def _memserver_kubectl(pods):
+    """Fake kubectl honouring the Running-phase jsonpath filter: with the
+    filter only Running pods' imageIDs are printed, without it all pods'."""
+    seen = []
+
+    def _run_stub(cmd):
+        seen.append(cmd)
+        query = next(a for a in cmd if a.startswith("jsonpath="))
+        only_running = _RUNNING_FILTER in query
+        return _proc(
+            0,
+            " ".join(
+                f"repo@sha256:{digest}"
+                for phase, digest in pods
+                if phase == "Running" or not only_running
+            ),
+        )
+
+    return _run_stub, seen
+
+
+def test_live_memory_server_digest_ignores_a_finished_leftover_pod(
+    tmp_path, monkeypatch
+):
+    """2026-11-06: a Succeeded memory-server pod left over from a rollout
+    carries an older imageID. Only Running pods are read, so the serving
+    pod's digest is returned and the digest check passes on a correct
+    release."""
+    stub, seen = _memserver_kubectl([("Succeeded", "old"), ("Running", "serving")])
+    monkeypatch.setattr(verify, "_run", stub)
+    assert VerifyRunner(_cfg(tmp_path))._live_memory_server_digest() == (
+        "sha256:serving"
+    )
+    (cmd,) = seen
+    assert any(a.startswith("jsonpath=" + _RUNNING_FILTER) for a in cmd)
+
+
+def test_live_memory_server_digest_none_when_no_pod_is_running(tmp_path, monkeypatch):
+    """Fail-closed: only finished pods -> nothing readable -> None, never a
+    digest taken from a finished pod."""
+    stub, _ = _memserver_kubectl([("Succeeded", "old"), ("Failed", "older")])
+    monkeypatch.setattr(verify, "_run", stub)
+    assert VerifyRunner(_cfg(tmp_path))._live_memory_server_digest() is None
+
+
 # ── probe 3: no-drift (PASS + FAIL) ──────────────────────────────────────────
 
 
