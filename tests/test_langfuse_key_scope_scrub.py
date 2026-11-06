@@ -8,7 +8,9 @@ removes it on the OTLP/Tempo path only.
   in a fresh interpreter) with Langfuse enabled; the OTLP exporter is replaced by
   an in-memory exporter AT THE SCRUBBER'S ``inner`` seam; >= 3 spans are driven;
   no span / event / resource / scope attribute value in the Tempo chain matches
-  ``[ps]k-lf-<uuid>``.
+  ``[ps]k-lf-<uuid>``. One span is the real ``@log_call`` span of
+  ``auth.require_user`` (bypass mode, minimal Starlette ``Request``), asserted
+  present in the exported set and scrubbed (ADDENDUM-2 B1).
 * AC-13.L (Langfuse positive): a real ``LangfuseSpanProcessor`` attached to the
   same provider receives the same spans with ``scope.attributes["public_key"] ==
   PK``.
@@ -17,7 +19,8 @@ Neuters (each alone, recorded RED): N-13.1 remove the scrubber wrap -> AC-13.T;
 N-13.2 drop the scope attribute from the tracer -> AC-13.L.
 
 Mocks declared: the OTLP exporter class (replaced by ``InMemorySpanExporter``);
-the Langfuse HTTP endpoint is a closed loopback port (nothing listens). Keys are
+the Langfuse HTTP endpoint is a closed loopback port (nothing listens); the
+``Request`` is a hand-built ASGI scope (no server, no JWT: bypass mode). Keys are
 built at runtime (S1): nothing key-shaped is committed. The child prints counts
 only, never a key.
 """
@@ -69,14 +72,18 @@ provider.add_span_processor(LangfuseSpanProcessor(
     public_key=os.environ["WP13_PK"], secret_key=os.environ["WP13_SK"],
     base_url="http://127.0.0.1:9", span_exporter=lf_inner))
 
-from audittrace.logging_config import log_call
-@log_call()
-def _op():
-    return 1
-_op()
+# ADDENDUM-2 B1: drive the REAL @log_call span of auth.require_user (bypass mode,
+# AUDITTRACE_AUTH_REQUIRED unset -> false) with a minimal real Starlette Request.
+import asyncio
+from starlette.requests import Request
+from audittrace.auth import require_user
 for n in ("wp13-a", "wp13-b"):
     with telemetry._tracer.start_as_current_span(n):
         pass
+provider.force_flush()
+before = {s.context.span_id for s in tempo_inner.get_finished_spans()}
+request = Request({"type": "http", "method": "GET", "path": "/", "headers": [(b"user-agent", b"wp13-child")]})
+ctx = asyncio.run(require_user(request, None))
 provider.force_flush()
 
 KEY = re.compile(r"[ps]k-lf-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-")
@@ -92,10 +99,14 @@ def values(span):
 
 tempo = tempo_inner.get_finished_spans()
 lf = lf_inner.get_finished_spans()
+ru = [s for s in tempo if s.context.span_id not in before]
 print("RESULT " + json.dumps({
     "tempo_spans": len(tempo),
     "tempo_langfuse_sdk_spans": sum(1 for s in tempo if s.instrumentation_scope.name == "langfuse-sdk"),
     "tempo_key_hits": sum(1 for s in tempo for v in values(s) if KEY.search(v)),
+    "require_user_returned_ctx": ctx is not None and type(ctx).__name__ == "UserContext",
+    "require_user_spans": sum(1 for s in ru if "require_user" in s.name),
+    "require_user_key_hits": sum(1 for s in ru for v in values(s) if KEY.search(v)),
     "lf_spans": len(lf),
     "lf_scope_pk_matches": sum(1 for s in lf if (s.instrumentation_scope.attributes or {}).get("public_key") == os.environ["WP13_PK"]),
     "tracer_scope_has_pk": any((s.instrumentation_scope.attributes or {}).get("public_key") == os.environ["WP13_PK"] for s in lf),
@@ -146,6 +157,11 @@ def test_ac_13_t_no_key_shaped_value_in_the_tempo_chain() -> None:
     assert r["tempo_spans"] >= 3
     assert r["tempo_langfuse_sdk_spans"] >= 3
     assert r["tempo_key_hits"] == 0
+    # ADDENDUM-2 B1: the real request-path span (auth.require_user) is among the
+    # exported spans, and it is scrubbed
+    assert r["require_user_returned_ctx"] is True
+    assert r["require_user_spans"] >= 1
+    assert r["require_user_key_hits"] == 0
 
 
 def test_ac_13_l_langfuse_processor_still_receives_the_scope_attribute() -> None:

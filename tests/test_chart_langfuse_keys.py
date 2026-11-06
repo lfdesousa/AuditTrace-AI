@@ -125,6 +125,26 @@ def _server_hcl(docs: Iterable[dict[str, Any]]) -> str:
     return str(cm["data"]["audittrace-server.hcl"])
 
 
+_HCL_PATH = re.compile(r'^\s*path\s+"([^"]+)"\s*\{', re.MULTILINE)
+_WITH_SECRET = re.compile(r'with secret "([^"]+)"')
+
+
+def _hcl_paths(hcl: str) -> list[str]:
+    """The ``path "..."`` entries of a rendered Vault policy (HCL)."""
+    return _HCL_PATH.findall(hcl)
+
+
+def _covered(secret_path: str, policy_paths: Iterable[str]) -> bool:
+    """Vault policy semantics, minimal: an exact match, or a policy path ending in
+    ``*`` whose prefix (the path minus the ``*``) the secret path starts with."""
+    for pol in policy_paths:
+        if pol == secret_path:
+            return True
+        if pol.endswith("*") and secret_path.startswith(pol[:-1]):
+            return True
+    return False
+
+
 F, T = "false", "true"
 
 
@@ -188,16 +208,36 @@ def test_four_cells_render_the_measured_shape(cell: str, from_vault: bool) -> No
     assert "FASTAPI_OTEL_AUTO_CONFIGURE" not in stdout
 
 
+def test_hcl_parser_finds_the_existing_policy_paths() -> None:
+    """Positive control: the parser is not vacuous -- it finds the chart's real
+    policy paths, the Langfuse one among them, and the coverage predicate is
+    exact on the cases that matter (a wrong prefix is NOT covered)."""
+    _, docs = _render(CELLS["vault=true,flag=false"])
+    paths = _hcl_paths(_server_hcl(docs))
+    assert len(paths) >= 3, paths
+    assert KV_PATH.replace("/keys", "/*") in paths
+    assert _covered(KV_PATH, paths)
+    assert _covered("kv/data/a/b", ["kv/data/a/b"])  # exact
+    assert _covered("kv/data/a/b", ["kv/data/a/*"])  # prefix glob
+    assert not _covered(
+        "kv/data/audittrace/langfuse/keys", ["kv/data/audittrace-x/langfuse/*"]
+    )
+    assert not _covered("kv/data/a/b", ["kv/data/a/c"])  # near-miss exact
+    assert not _covered("kv/data/a/b", [])
+
+
 @pytest.mark.parametrize("cell", ["vault=true,flag=false", "vault=true,flag=true"])
 def test_policy_line_renders_in_both_vault_cells(cell: str) -> None:
     _, docs = _render(CELLS[cell])
-    assert "/langfuse/*" in _server_hcl(docs)
+    assert _covered(KV_PATH, _hcl_paths(_server_hcl(docs)))
 
 
 @pytest.mark.parametrize("cell", list(CELLS))
 def test_every_with_secret_path_has_a_policy_line(cell: str) -> None:
     """Falsifiability of the HCL line: a ``with secret`` block without its policy
-    path would be refused by Vault at pass 2 (the agent cannot read it)."""
+    path would be refused by Vault at pass 2 (the agent cannot read it). Checked
+    against the PARSED ``path "..."`` entries (exact or ``*``-prefix), so a policy
+    line under a wrong mount/prefix is not covered (reviewer neuter R-4)."""
     _, docs = _render(CELLS[cell])
     if not cell.startswith("vault=true"):
         # vault=false renders no policies ConfigMap at all
@@ -206,10 +246,11 @@ def test_every_with_secret_path_has_a_policy_line(cell: str) -> None:
         ]
         return
     template = _env_template(_memory_server(docs))
-    hcl = _server_hcl(docs)
-    for path in re.findall(r'with secret "(kv/data/audittrace/[^"]+)"', template):
-        prefix = path.removeprefix("kv/data/audittrace/").split("/")[0]
-        assert f"/{prefix}/*" in hcl, f"no policy line for {path}"
+    policy_paths = _hcl_paths(_server_hcl(docs))
+    secret_paths = _WITH_SECRET.findall(template)
+    assert (KV_PATH in secret_paths) == cell.endswith("flag=true")
+    for path in secret_paths:
+        assert _covered(path, policy_paths), f"no policy line for {path}"
 
 
 @pytest.mark.parametrize("cell", list(CELLS))
@@ -287,11 +328,16 @@ def test_flag_defaults_to_false_and_values_carry_no_key() -> None:
 
 def test_setup_vault_seeds_the_path_the_template_reads() -> None:
     script = (REPO_ROOT / "scripts" / "setup-vault.sh").read_text()
-    assert (
-        "seed_kv langfuse/keys public_key=langfuse-public-key.txt "
-        "secret_key=langfuse-secret-key.txt"
-    ) in script
-    assert KV_PATH.replace("kv/data/", "kv/") == "kv/audittrace/langfuse/keys"
+    seeded = re.findall(r"^seed_kv (\S+) ", script, re.MULTILINE)
+    assert "langfuse/keys" in seeded, seeded
+    # the template reads KV v2 data path kv/data/audittrace/<p>; the seed writes
+    # kv/audittrace/<p> (mount kv, KV v2 inserts /data/)
+    assert f"kv/data/audittrace/{seeded[seeded.index('langfuse/keys')]}" == KV_PATH
+    line = next(
+        ln for ln in script.splitlines() if ln.startswith("seed_kv langfuse/keys ")
+    )
+    assert "public_key=langfuse-public-key.txt" in line
+    assert "secret_key=langfuse-secret-key.txt" in line
 
 
 def test_airplane_script_reads_keys_from_env_or_private_file() -> None:
