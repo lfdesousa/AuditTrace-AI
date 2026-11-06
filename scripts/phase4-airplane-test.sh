@@ -105,8 +105,18 @@ pass "chat 200 + OpenAI shape"
 # ── 7. trace lands in Langfuse ───────────────────────────────────────
 step "7. trace in Langfuse (wait 6s for export flush)"
 sleep 6
-LF_PK="pk-lf-b3fb3a7e-b447-41c3-941e-c798ac006c58"
-LF_SK="sk-lf-507779bd-f2b9-4bd2-9e05-71361840c1ba"
+# Langfuse keys are never committed (WP-13): read them from the environment, else
+# from the private secrets dir (the same files scripts/setup-vault.sh seeds).
+LF_SECRETS_DIR="${SECRETS_DIR:-$HOME/work/audittrace-private/secrets}"
+LF_PK="${LANGFUSE_PUBLIC_KEY:-}"
+LF_SK="${LANGFUSE_SECRET_KEY:-}"
+if [[ -z "$LF_PK" && -f "$LF_SECRETS_DIR/langfuse-public-key.txt" ]]; then
+  LF_PK="$(tr -d '[:space:]' < "$LF_SECRETS_DIR/langfuse-public-key.txt")"
+fi
+if [[ -z "$LF_SK" && -f "$LF_SECRETS_DIR/langfuse-secret-key.txt" ]]; then
+  LF_SK="$(tr -d '[:space:]' < "$LF_SECRETS_DIR/langfuse-secret-key.txt")"
+fi
+[[ -n "$LF_PK" && -n "$LF_SK" ]] || fail "Langfuse keys not available: set LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY or place langfuse-{public,secret}-key.txt under $LF_SECRETS_DIR"
 # find traces within last 2 minutes with our user
 hits=$(/usr/bin/curl -sf -u "$LF_PK:$LF_SK" "http://localhost:3000/api/public/traces?userId=0b0cdd4d-04c3-428f-ab9d-37b47429c381&limit=5" \
   | python3 -c "

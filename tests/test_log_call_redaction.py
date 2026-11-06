@@ -2756,7 +2756,8 @@ def test_g8c_processor_and_exporter_construction_sites_frozen():
             if name == "Langfuse":
                 langfuse_constructions += 1
     assert add_span_processor_calls >= 1
-    assert span_exporter_constructions == 1  # OTLPSpanExporter
+    # OTLPSpanExporter + its Tempo-path ScopeScrubbingSpanExporter wrap (WP-13)
+    assert span_exporter_constructions == 2
     assert span_processor_constructions >= 2  # OTLP batch + self-test probe
     assert langfuse_constructions == 1
 
@@ -2825,6 +2826,8 @@ _FROZEN_TRACING_CONSTRUCTION_SITES: tuple[tuple[str, str, str], ...] = (
     ),
     ("src/audittrace/telemetry.py", "_run_startup_scrub_self_test", "get_tracer"),
     ("src/audittrace/telemetry.py", "init_telemetry", "OTLPSpanExporter"),
+    # WP-13: the Tempo-path scrubber wrapped around the OTLP exporter.
+    ("src/audittrace/telemetry.py", "init_telemetry", "ScopeScrubbingSpanExporter"),
     ("src/audittrace/telemetry.py", "init_telemetry", "TracerProvider"),
     ("src/audittrace/telemetry.py", "init_telemetry", "add_span_processor"),
     ("src/audittrace/telemetry.py", "init_telemetry", "add_span_processor"),

@@ -51,6 +51,12 @@ data:
     path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/llm/*" {
       capabilities = ["read"]
     }
+    # WP-13 -- the Langfuse key pair. Rendered UNCONDITIONALLY (like llm/* above):
+    # scripts/setup-vault.sh writes the policy BETWEEN the two deploy passes, so
+    # it must exist when pass 2 turns the `with secret` block on.
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/langfuse/*" {
+      capabilities = ["read"]
+    }
 
   keycloak.hcl: |
     # Keycloak reads its admin password + the postgres app-user creds

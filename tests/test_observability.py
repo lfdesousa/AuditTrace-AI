@@ -371,7 +371,11 @@ def test_init_telemetry_installs_own_provider_when_global_lacks_processor_api(
             getattr(p, "span_exporter", None)
             for p in provider._active_span_processor._span_processors
         ]
-        assert span_exporter_mock.return_value in exporters
+        # WP-13: the OTLP exporter sits inside the Tempo-path scope scrubber.
+        from audittrace.telemetry_scope_scrub import ScopeScrubbingSpanExporter
+
+        wrappers = [e for e in exporters if isinstance(e, ScopeScrubbingSpanExporter)]
+        assert [w.inner for w in wrappers] == [span_exporter_mock.return_value]
         span_exporter_mock.assert_called_once_with(
             endpoint="http://otel.test/v1/traces"
         )

@@ -50,6 +50,7 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 
 from audittrace.instrumentation import attach_instrumentor as attach_instrumentor
 from audittrace.instrumentation import flush_pending_outcomes
+from audittrace.telemetry_scope_scrub import ScopeScrubbingSpanExporter
 
 if TYPE_CHECKING:
     from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
@@ -838,8 +839,14 @@ def init_telemetry(
                     if not otlp_endpoint.endswith("/v1/traces")
                     else otlp_endpoint
                 )
+                # WP-13: Tempo path only -- the Langfuse routing attribute on
+                # the tracer scope never leaves the process via OTLP.
                 tracer_provider.add_span_processor(
-                    BatchSpanProcessor(OTLPSpanExporter(endpoint=traces_endpoint))
+                    BatchSpanProcessor(
+                        ScopeScrubbingSpanExporter(
+                            OTLPSpanExporter(endpoint=traces_endpoint)
+                        )
+                    )
                 )
                 logger.info("OTel tracing exporter -> %s", otlp_endpoint)
             except Exception as e:  # pragma: no cover

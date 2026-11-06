@@ -1,0 +1,7 @@
+# WP-13 -- one-key overlay: deliver the Langfuse key pair through the Vault Agent
+# template (kv/audittrace/langfuse/keys); the two env entries leave the
+# Deployment spec. Pass 2 only, AFTER scripts/setup-vault.sh seeded the path and
+# `vault kv metadata get kv/audittrace/langfuse/keys` returned it.
+memoryServer:
+  langfuseKeys:
+    vaultSecret: true

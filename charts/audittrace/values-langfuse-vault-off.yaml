@@ -1,0 +1,7 @@
+# WP-13 -- one-key overlay: deliver the Langfuse key pair through the k8s Secret
+# (memoryServer.langfuseKeys.secretName), not Vault. Pass 1 and the rollback of
+# pass 2. Explicit false because --reset-then-reuse-values keeps a stored `true`.
+# The kv path stays seeded; nothing is deleted.
+memoryServer:
+  langfuseKeys:
+    vaultSecret: false
