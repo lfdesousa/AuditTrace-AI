@@ -2315,6 +2315,27 @@ def test_live_bff_digest_agrees_when_all_pods_match(tmp_path, monkeypatch):
     assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() == "sha256:same"
 
 
+def test_live_bff_digest_reads_only_running_pods(tmp_path, monkeypatch):
+    """2026-11-05 (v1.30.1): a Succeeded leftover BFF pod from the previous
+    ReplicaSet made the all-pods-agree set disagree and the probe FAIL on a
+    correct release. The kubectl query itself selects only Running pods
+    (proven live: the unfiltered query returned the leftover's old digest
+    beside the serving one; the filtered query returned only the serving
+    one)."""
+    seen = []
+
+    def _run_stub(cmd):
+        seen.append(cmd)
+        return _proc(0, "repo@sha256:serving")
+
+    monkeypatch.setattr(verify, "_run", _run_stub)
+    assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() == "sha256:serving"
+    (cmd,) = seen
+    query = next(a for a in cmd if a.startswith("jsonpath="))
+    assert query.startswith('jsonpath={.items[?(@.status.phase=="Running")]')
+    assert "BFF_CONTAINER" not in query and '@.name=="bff"' in query
+
+
 def test_resolve_accepts_bff_repo_path_byte_identical_default_call(
     tmp_path, monkeypatch
 ):

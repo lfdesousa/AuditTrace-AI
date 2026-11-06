@@ -1620,9 +1620,15 @@ class VerifyRunner:
         stale, used to PASS on the first (possibly stale) one; now any
         disagreement is ``None`` (unreadable), mirroring the deploy
         runner's own S1 all-pods-agree rule
-        (``scripts.deploy.runner.images._live_row_digest``)."""
+        (``scripts.deploy.runner.images._live_row_digest``).
+
+        Only pods in phase ``Running`` are read (2026-11-05, v1.30.1 verify):
+        a ``Succeeded``/``Failed`` pod left over from an older ReplicaSet
+        serves nothing, yet its old imageID made the set disagree and the
+        probe FAIL on a correct release."""
         jsonpath = (
-            '{.items[*].status.containerStatuses[?(@.name=="'
+            '{.items[?(@.status.phase=="Running")]'
+            '.status.containerStatuses[?(@.name=="'
             + BFF_CONTAINER
             + '")].imageID}'
         )
