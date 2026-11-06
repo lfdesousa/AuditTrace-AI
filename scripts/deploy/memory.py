@@ -176,7 +176,16 @@ def _http_request(  # pragma: no cover - thin urllib egress boundary; monkeypatc
             payload = response.read()
         return status, resp_headers, payload
     except HTTPError as exc:
-        return exc.code, {}, exc.read()
+        # Keep the error response's headers (lowercased, like the 2xx path): the
+        # server stamps X-Trace-Id on 403s and callers need it (L20). ``with exc``
+        # closes the error response deterministically.
+        with exc:
+            err_headers = (
+                {k.lower(): v for k, v in exc.headers.items()}
+                if exc.headers is not None
+                else {}
+            )
+            return exc.code, err_headers, exc.read()
     except OSError:
         # URLError (an OSError), a bare TimeoutError/socket.timeout on a read
         # timeout, or any ConnectionError — one sentinel for the whole class.
