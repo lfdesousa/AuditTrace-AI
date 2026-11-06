@@ -2,7 +2,7 @@
 # Exact pins (DEP-LOCK-AT C1): installs run --no-build-isolation against the
 # hashed copies in the locks, so these are documentation + the isolated-build
 # fallback; tests/test_dep_lock_sync.py asserts they equal requirements-build.in.
-requires = ["setuptools==84.0.0", "wheel==0.48.0"]
+requires = ["setuptools==84.1.0", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
