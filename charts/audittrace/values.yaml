@@ -29,9 +29,9 @@
 #      (Vault via External Secrets Operator, SOPS, Sealed Secrets, or CSI
 #      Secrets Store driver). Roadmap Phase 1.1 will ship first-class Vault
 #      integration (ADR-040 candidate, target 2026-05-16).
-#   3. Review `memoryServer.env.AUDITTRACE_LANGFUSE_PUBLIC_KEY` and the
-#      matching secret key — the dev defaults point at the local Langfuse
-#      instance; production must re-issue keys per tenant.
+#   3. Provide the Langfuse key pair through `memoryServer.langfuseKeys`
+#      (an operator-created Secret, or Vault) — the chart carries no
+#      Langfuse key; production must issue keys per tenant.
 #
 # This notice exists because regulated-industry security reviewers flag
 # credentials in git-history within 90 seconds of opening the repo.
@@ -66,6 +66,22 @@ memoryServer:
   # in the window between the two passes.
   llmApiKey:
     enabled: false
+  # WP-13 -- the Langfuse key pair is never a chart value. One flag, two
+  # delivery paths (both render nothing key-shaped):
+  #   vaultSecret=false (default): the two env entries are valueFrom.secretKeyRef
+  #     on the operator-created Secret `secretName` (data keys `public_key` and
+  #     `secret_key`). Rendered only while memoryServer.env.
+  #     AUDITTRACE_LANGFUSE_ENABLED is not "false" (the Kind smoke runs with
+  #     Langfuse off and has no such Secret).
+  #   vaultSecret=true (needs vault.enabled=true): the Vault Agent template reads
+  #     kv/audittrace/langfuse/keys and exports both variables; the env entries
+  #     are absent from the Deployment spec. Two-pass order: pass 1 (false) ships
+  #     the policy line, the operator seeds the path with scripts/setup-vault.sh;
+  #     pass 2 flips it via values-langfuse-vault-on.yaml. Rollback = the matching
+  #     -off overlay (explicit false: --reset-then-reuse-values keeps a stored true).
+  langfuseKeys:
+    vaultSecret: false
+    secretName: audittrace-langfuse
   # Production default = 3 (HA, one per AZ via topologySpreadConstraints in the
   # deployment template). Single-node dev / laptop k3s + CI override with
   # `--set memoryServer.replicaCount=1` (ScheduleAnyway makes 3-on-1-node safe).
@@ -240,8 +256,13 @@ memoryServer:
     # deployment.yaml using global.hostNodeIP + observability.external.
     # langfusePort so it resolves correctly on any network. Do not add
     # it here.
-    AUDITTRACE_LANGFUSE_PUBLIC_KEY: "pk-lf-b3fb3a7e-b447-41c3-941e-c798ac006c58"
-    AUDITTRACE_LANGFUSE_SECRET_KEY: "sk-lf-507779bd-f2b9-4bd2-9e05-71361840c1ba"
+    # AUDITTRACE_LANGFUSE_PUBLIC_KEY / AUDITTRACE_LANGFUSE_SECRET_KEY are NOT
+    # values: they are never committed. The Deployment template renders them
+    # as valueFrom.secretKeyRef on the operator-created Secret named by
+    # memoryServer.langfuseKeys.secretName (vault.enabled=false, or
+    # vault.enabled=true with langfuseKeys.vaultSecret=false), or delivers them
+    # through the Vault Agent template (vault.enabled=true and
+    # langfuseKeys.vaultSecret=true). See memoryServer.langfuseKeys below.
     AUDITTRACE_SUMMARIZER_ENABLED: "true"
     AUDITTRACE_SUMMARIZER_MODEL: "mistral-7b-summarizer"
     AUDITTRACE_SUMMARIZER_IDLE_MINUTES: "15"

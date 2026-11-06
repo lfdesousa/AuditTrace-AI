@@ -932,3 +932,52 @@ class TestAgentsLearningFleetSourcePanels:
             "fleet-only stat panel must expose its denominator (#446 low-n polish), "
             f"got legends: {legend_formats}"
         )
+
+
+# LOG-TRACE-ID D8 / AC14 / A5 — the logs dashboard carries the "request-scoped
+# lines missing trace_id" stat panel. It is the LogQL twin of the runtime
+# metric: the share of ``memory.read`` lines (the recall path) with no
+# ``trace_id`` over 24 h.
+LOGS_FILE = "audittrace-logs.json"
+
+
+class TestLogsDashboardMissingTraceIdPanel:
+    def _panel(self) -> dict:
+        panels = [
+            p
+            for p in _load(LOGS_FILE).get("panels", [])
+            if "missing trace_id" in p.get("title", "")
+        ]
+        assert len(panels) == 1, (
+            f"{LOGS_FILE} must carry exactly one 'missing trace_id' panel "
+            f"(LOG-TRACE-ID D8); found {len(panels)}"
+        )
+        return panels[0]
+
+    def test_panel_is_a_stat_with_an_instant_query(self) -> None:
+        """AC14. A 24 h share must be an INSTANT query (a range query renders
+        one point per step - ``feedback_dashboard_render_check_and_instant_tables``).
+
+        Neuter N10: drop ``instant`` -> RED.
+        """
+        panel = self._panel()
+        assert panel.get("type") == "stat"
+        targets = panel.get("targets", [])
+        assert targets, "panel has no target (vacuous)"
+        for tgt in targets:
+            assert tgt.get("instant") is True
+
+    def test_panel_expression_is_numerator_over_denominator_on_memory_read(
+        self,
+    ) -> None:
+        exprs = _all_target_exprs({"panels": [self._panel()]})
+        assert exprs == [
+            'sum(count_over_time({container="memory-server"} |= "memory.read" '
+            '| json | trace_id="" [24h])) / '
+            'sum(count_over_time({container="memory-server"} |= "memory.read" [24h]))'
+        ]
+
+    def test_panel_description_states_the_pre_deploy_reading(self) -> None:
+        """A5. Reads ~100 % until the first deploy that carries LOG-TRACE-ID."""
+        desc = self._panel().get("description", "")
+        assert "~100 %" in desc and "deploy" in desc and "LOG-TRACE-ID" in desc

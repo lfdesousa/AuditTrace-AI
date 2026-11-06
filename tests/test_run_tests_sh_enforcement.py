@@ -557,7 +557,7 @@ def test_a_scratch_run_with_an_altered_lock_copy_is_refused_before_pytest(
     root = _scratch_script_root(tmp_path)
     lock = root / "requirements-dev.txt"
     lock.write_text(
-        lock.read_text().replace("\nfastapi==0.146.0 ", "\nfastapi==0.141.1 ", 1)
+        lock.read_text().replace("\nfastapi==0.162.0 ", "\nfastapi==0.161.0 ", 1)
     )
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
@@ -598,7 +598,7 @@ def test_g5_runs_again_after_pytest_and_refuses_a_run_that_broke_the_lock(
     `check_environments post` line -> this goes RED (exit 0)."""
     root, bin_dir = _fakes(
         tmp_path,
-        body=("sed -i 's/^fastapi==0.146.0 /fastapi==0.141.1 /' requirements-dev.txt"),
+        body=("sed -i 's/^fastapi==0.162.0 /fastapi==0.161.0 /' requirements-dev.txt"),
     )
     result = _run_script(root, bin_dir)
 
@@ -882,7 +882,7 @@ def test_g5_runs_after_pytest_on_the_full_path_too(tmp_path: Path):
     Neuter: delete ONLY the full-mode `check_environments post` -> exit 0, RED."""
     root, bin_dir = _fakes(
         tmp_path,
-        body="sed -i 's/^fastapi==0.146.0 /fastapi==0.141.1 /' requirements-dev.txt",
+        body="sed -i 's/^fastapi==0.162.0 /fastapi==0.161.0 /' requirements-dev.txt",
         coverage_report=PASSING_REPORT,
     )
     result = _run_script(root, bin_dir, subset=False)

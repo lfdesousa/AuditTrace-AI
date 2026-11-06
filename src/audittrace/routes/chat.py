@@ -22,7 +22,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
@@ -57,7 +57,9 @@ from audittrace.routes._memory_tool_loop import (
     run_memory_tool_loop,
 )
 from audittrace.routes._model_route import resolve_chat_upstream, upstream_host
+from audittrace.routes._session_bind import stream_with_bound_session
 from audittrace.routes._sources_trailer import build_sources_trailer
+from audittrace.services.console_store._context import bound_session_id
 from audittrace.services.context_builder import (
     ContextBuilderService,
     build_ambient_context,
@@ -65,6 +67,11 @@ from audittrace.services.context_builder import (
 from audittrace.tools import tools_visible_to
 
 _tracer = trace.get_tracer(__name__)
+
+# X-TRACE-ID D1: ONE trace-id derivation. This name is kept (call sites in
+# audit.py / mcp.py / the tests import it) as an ALIAS of the same object,
+# pinned by identity in tests/test_x_trace_id_header.py.
+_current_trace_id_hex = telemetry.current_trace_id_hex
 
 # Failure taxonomy (ADR-033 seed). Stored verbatim in
 # ``interactions.failure_class``. Kept as module-level constants rather than
@@ -500,24 +507,6 @@ async def _stream_upstream_with_keepalive_from_t0(
             with contextlib.suppress(asyncio.CancelledError):
                 await send_task
         raise
-
-
-def _current_trace_id_hex() -> str | None:
-    """Return the active OpenTelemetry trace_id as a 32-char hex string.
-
-    Returns ``None`` when no span is active or when the captured context is
-    invalid (e.g. tools-mode persist after the @_lf_observe decorator's span
-    has closed). Defensive try/except mirrors the pattern at
-    ``server.py:330``: instrumentation should never break the request path.
-    """
-    try:
-        span = trace.get_current_span()
-        ctx = span.get_span_context() if span is not None else None
-        if ctx and ctx.is_valid:
-            return format(ctx.trace_id, "032x")
-    except Exception:  # pragma: no cover - defensive instrumentation read
-        return None
-    return None
 
 
 async def _persist_interaction(
@@ -1533,7 +1522,7 @@ async def _handle_tools_mode(
     # user received (single generation — no double-gen, ADR-049).
     if is_stream:
 
-        async def _iter_tools_stream_and_capture() -> AsyncIterator[bytes]:
+        async def _iter_tools_stream_and_capture() -> AsyncGenerator[bytes, None]:
             result = _ToolsStreamResult()
             stream_perf_start = time.perf_counter()
             try:
@@ -1707,7 +1696,7 @@ async def _handle_tools_mode(
             )
 
         return StreamingResponse(
-            _iter_tools_stream_and_capture(),
+            stream_with_bound_session(session_id, _iter_tools_stream_and_capture()),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1929,6 +1918,24 @@ async def chat_completions(
     would close before the generator ran. The explicit ``@observe`` on
     ``_build_memory_context_with_trace`` owns the request span instead.
     """
+    # SESSION-ID-BIND (v1.31.0 WP-6): the implementation binds the resolved
+    # ``session_id`` into the request scope opened here, so it is restored
+    # when the response object is returned; the streaming branches re-bind
+    # inside their body generator (``_session_bind.stream_with_bound_session``).
+    # (A comment, not docstring text: the docstring is the OpenAPI description.)
+    with contextlib.ExitStack() as request_scope:
+        return await _chat_completions_impl(
+            http_request, context_builder, user, request_scope
+        )
+
+
+async def _chat_completions_impl(
+    http_request: Request,
+    context_builder: ContextBuilderService,
+    user: UserContext,
+    request_scope: contextlib.ExitStack,
+) -> Any:
+    """The body of :func:`chat_completions` (see its docstring)."""
     settings = get_settings()
     reset_langgraph_step()  # backlog #02: per-trace step counter
     try:
@@ -1984,6 +1991,9 @@ async def chat_completions(
         query or "",
     )
     session_id = _resolve_session_id(http_request, source, first_user, user.user_id)
+    # SESSION-ID-BIND: every log line below carries ``session_id``; restored
+    # when ``chat_completions`` exits ``request_scope`` (AC-6.3).
+    request_scope.enter_context(bound_session_id(session_id))
 
     # ADR-025 Phase 4: branch on memory_mode. The inject path (default)
     # runs the pre-Phase-4 4-layer context build; the tools path runs
@@ -2035,7 +2045,7 @@ async def chat_completions(
     # ─────────────────────────── Streaming branch ───────────────────────────
     if is_stream:
 
-        async def _iter_and_capture() -> AsyncIterator[bytes]:
+        async def _iter_and_capture() -> AsyncGenerator[bytes, None]:
             state = _StreamState()
             perf_start = time.perf_counter()
             try:
@@ -2240,7 +2250,7 @@ async def chat_completions(
             )
 
         return StreamingResponse(
-            _iter_and_capture(),
+            stream_with_bound_session(session_id, _iter_and_capture()),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )

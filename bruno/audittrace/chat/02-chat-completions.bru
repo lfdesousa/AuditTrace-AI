@@ -38,6 +38,12 @@ script:post-response {
       bru.setEnvVar("exampleSessionId", session);
       console.log("session_id stashed:", session);
     }
+    // X-TRACE-ID-HEADER (additive): stash the response's trace id so
+    // audit/02-list-by-trace-id.bru reconstructs THIS request.
+    const traceId = res.getHeader("x-trace-id");
+    if (traceId) {
+      bru.setEnvVar("traceId", traceId);
+    }
   }
 }
 
@@ -63,6 +69,9 @@ tests {
     const raw = res.getBody().choices[0].message.content;
     const visible = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
     expect(visible).to.not.be.empty;
+  });
+  test("X-Trace-Id header is one 32-lowercase-hex W3C trace id (X-TRACE-ID-HEADER)", function() {
+    expect(res.getHeader("x-trace-id")).to.match(/^[0-9a-f]{32}$/);
   });
   test("prompt_tokens > 100 (memory augmentation actually ran)", function() {
     // A bare /v1/chat/completions without the memory-server's

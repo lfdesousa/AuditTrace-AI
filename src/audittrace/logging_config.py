@@ -21,6 +21,7 @@ documented in full on ``render_value``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import itertools
 import json
@@ -29,7 +30,7 @@ import re
 import sys
 import time
 import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
 from datetime import date, datetime
@@ -41,6 +42,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from opentelemetry import metrics, trace
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from audittrace import telemetry
@@ -905,12 +907,15 @@ class StructuredFormatter(logging.Formatter):
     Field names map to Loki's ``| json | field="..."`` filter so the
     reconstructibility walkthrough (docs/reconstructibility-walkthrough.md
     Hop 5) works directly. ``trace_id`` is the canonical top-level
-    name; OTel's ``LoggingInstrumentor`` attaches it as ``otelTraceID``
-    on each ``LogRecord`` and we rename it here so operators do not
-    have to remember the SDK's internal attr name.
+    name; ``TraceContextFilter`` (LOG-TRACE-ID) stamps ``trace_id`` /
+    ``span_id`` / ``user_id`` / ``session_id`` on each ``LogRecord`` and
+    the #457 merge loop below renders them. The ``otel*`` rename map is
+    kept for a record that still carries the SDK's own attribute names
+    (the contrib ``LoggingInstrumentor`` is no longer attached, so none
+    does in production).
     """
 
-    # Map OTel LoggingInstrumentor attribute name → doc-canonical
+    # Map the OTel SDK's own LogRecord attribute names → doc-canonical
     # top-level JSON field. Centralised so an OTel SDK rename only
     # changes this dict.
     _OTEL_FIELD_RENAMES: dict[str, str] = {
@@ -951,6 +956,124 @@ class StructuredFormatter(logging.Formatter):
         return json.dumps(log_data, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# LOG-TRACE-ID: every record that crosses the one stdout handler carries the
+# server-minted trace identity of the request that emitted it.
+#
+# The contrib ``LoggingInstrumentor`` never stamped on any released image
+# (gated on ``inject_trace_context`` since 0.64b0), so the project owns the
+# mechanism: one ``logging.Filter`` on the one handler ``setup_logging`` builds.
+# Falsifiability: tests/test_log_trace_id.py (neuters N1-N10, each alone).
+# ---------------------------------------------------------------------------
+TRACE_CONTEXT_FIELDS = ("trace_id", "span_id", "user_id", "session_id")
+
+# The handler ``setup_logging`` built, held by identity so the startup
+# self-test (``telemetry._run_startup_log_correlation_self_test``) checks THAT
+# object's filters and never the root handler list. ``None`` until
+# ``setup_logging`` runs; only ``setup_logging`` assigns it.
+_STDOUT_HANDLER: logging.StreamHandler[Any] | None = None
+
+# Re-entrancy guard (A4): a record emitted while the Filter is counting (the
+# metrics SDK logging from inside ``Counter.add``) must not recurse or stamp.
+_IN_FILTER: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_audittrace_log_filter_active", default=False
+)
+
+# AC12/D6. Labels: ``user_bound`` and ``trace_present`` (true|false) ONLY, so
+# 4 series and no PII. ``user_bound`` reads the RLS ContextVar - a different
+# source from the span - so user_bound=true AND trace_present=false is exactly
+# "a request-scoped record lost its span". No-op-safe before ``init_telemetry``.
+_log_records_counter = metrics.get_meter("audittrace.logging").create_counter(
+    name="audittrace_log_records_total",
+    description=(
+        "Log records that crossed the stdout handler. Labels: user_bound "
+        "(true|false), trace_present (true|false). No PII."
+    ),
+)
+
+
+@contextlib.contextmanager
+def _filter_reentrancy_guard() -> Iterator[None]:
+    """Hold ``_IN_FILTER`` for the duration of the block (reset on any exit)."""
+    token = _IN_FILTER.set(True)
+    try:
+        yield
+    finally:
+        _IN_FILTER.reset(token)
+
+
+def _bound_user_id() -> str | None:
+    """The user bound by ``auth.require_user`` (``db.rls``), lazily imported."""
+    try:
+        from audittrace.db.rls import current_user_id
+    except ImportError:  # pragma: no cover - rls is always importable at runtime
+        return None
+    return current_user_id()
+
+
+def _bound_session_id() -> str | None:
+    """The session bound through the console-store ContextVar, lazily imported.
+
+    Lazy because ``audittrace.services.console_store`` imports this module's
+    consumers. ``POST /v1/chat/completions`` and ``POST /mcp`` ``tools/call``
+    bind it (SESSION-ID-BIND, v1.31.0 WP-6); on any other line it is absent.
+    """
+    try:
+        from audittrace.services.console_store._context import current_session_id
+    except ImportError:  # pragma: no cover - always importable at runtime
+        return None
+    return current_session_id()
+
+
+class TraceContextFilter(logging.Filter):
+    """Stamp ``trace_id``/``span_id``/``user_id``/``session_id`` on every record.
+
+    ``trace_id`` comes from ``telemetry.current_trace_id_hex()`` (the one
+    derivation) and ``span_id`` from the same valid span context; when the
+    span is valid the context ALWAYS wins over an explicit ``extra=`` of the
+    same name. ``user_id`` and ``session_id`` are set only when the record
+    does not already carry a non-empty value (explicit ``extra=`` wins).
+    Outside a span nothing is stamped: absent is absent, never a ``"0"``
+    sentinel. Adds nothing outside ``TRACE_CONTEXT_FIELDS`` and returns
+    ``True`` always (it enriches, never drops). Message scrubbing stays with
+    ``StructuredFormatter`` (the #385 net is untouched).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if _IN_FILTER.get():
+            return True
+        with _filter_reentrancy_guard():
+            # The ONE validity decision lives in the helper: it returns None
+            # unless the active span context is valid, so the span id is read
+            # (and anything stamped) only on its word.
+            trace_hex = telemetry.current_trace_id_hex()
+            trace_present = trace_hex is not None
+            if trace_hex is not None:
+                record.trace_id = trace_hex
+                record.span_id = format(
+                    trace.get_current_span().get_span_context().span_id, "016x"
+                )
+            bound_user = _bound_user_id()
+            if bound_user and not getattr(record, "user_id", None):
+                record.user_id = bound_user
+            bound_session = _bound_session_id()
+            if bound_session and not getattr(record, "session_id", None):
+                record.session_id = bound_session
+            # Counting is best-effort telemetry: a failure inside the metrics
+            # SDK must never turn a log call into a request failure (measured:
+            # a test that patches ``trace.get_current_span`` made the SDK's
+            # exemplar filter raise ``TypeError`` from inside ``add``).
+            with contextlib.suppress(Exception):
+                _log_records_counter.add(
+                    1,
+                    {
+                        "user_bound": "true" if bound_user else "false",
+                        "trace_present": "true" if trace_present else "false",
+                    },
+                )
+        return True
+
+
 def setup_logging(
     level: str = "INFO",
     structured: bool = False,
@@ -960,13 +1083,19 @@ def setup_logging(
     Args:
         level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
         structured: If True, emit JSON lines; otherwise plain format.
+
+    The one handler carries exactly one ``TraceContextFilter`` in BOTH modes
+    (plain mode: the attributes exist on the record, the format string is
+    unchanged) and is held in ``_STDOUT_HANDLER`` for the startup self-test.
     """
+    global _STDOUT_HANDLER
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper()))
     root.handlers.clear()
 
     handler = logging.StreamHandler(sys.stdout)
     handler.setLevel(getattr(logging, level.upper()))
+    handler.addFilter(TraceContextFilter())
 
     if structured:
         handler.setFormatter(StructuredFormatter())
@@ -978,6 +1107,7 @@ def setup_logging(
             )
         )
     root.addHandler(handler)
+    _STDOUT_HANDLER = handler
 
 
 def _operation_name(func: Callable[..., Any], args: tuple[Any, ...]) -> str:

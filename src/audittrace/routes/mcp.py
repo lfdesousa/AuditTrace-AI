@@ -99,6 +99,7 @@ from audittrace.routes.chat import (
     _resolve_project,
     _resolve_session_id,
 )
+from audittrace.services.console_store._context import bound_session_id
 from audittrace.services.mcp_bridge import call_read_tool, list_read_tools, to_mcp_tool
 from audittrace.services.mcp_broker import (
     broker_tool_call,
@@ -278,68 +279,79 @@ async def _handle_tools_call(
         request, _MCP_SOURCE, tool_name, user_context.user_id
     )
 
-    # Dispatch routing (ADR-063 Phase 2 Track A + Track B): a
-    # ``broker:<server>:<tool>`` name goes to the broker; a name
-    # registered in the MCP-only write/curation registry goes to Track
-    # A's write dispatch; every other name keeps the exact Phase 1
-    # own-tool path.
-    if parse_namespaced_tool_name(tool_name) is not None:
-        (
-            result,
-            pending,
-            status,
-            failure_class,
-            error_detail,
-        ) = await _dispatch_broker_tool(
-            tool_name=tool_name, arguments=arguments, user_context=user_context
-        )
-    elif get_write_tool_by_name(tool_name) is not None:
-        (
-            result,
-            pending,
-            status,
-            failure_class,
-            error_detail,
-        ) = await _dispatch_write_tool(
-            tool_name=tool_name, arguments=arguments, user_context=user_context
-        )
-    else:
-        result, pending, status, failure_class, error_detail = await _dispatch_own_tool(
-            tool_name=tool_name,
-            arguments=arguments,
-            user_context=user_context,
+    # SESSION-ID-BIND (v1.31.0 WP-6): every log line of the dispatch and the
+    # audit write carries ``session_id``; restored when the block exits.
+    with bound_session_id(session_id):
+        # Dispatch routing (ADR-063 Phase 2 Track A + Track B): a
+        # ``broker:<server>:<tool>`` name goes to the broker; a name
+        # registered in the MCP-only write/curation registry goes to Track
+        # A's write dispatch; every other name keeps the exact Phase 1
+        # own-tool path.
+        if parse_namespaced_tool_name(tool_name) is not None:
+            (
+                result,
+                pending,
+                status,
+                failure_class,
+                error_detail,
+            ) = await _dispatch_broker_tool(
+                tool_name=tool_name, arguments=arguments, user_context=user_context
+            )
+        elif get_write_tool_by_name(tool_name) is not None:
+            (
+                result,
+                pending,
+                status,
+                failure_class,
+                error_detail,
+            ) = await _dispatch_write_tool(
+                tool_name=tool_name, arguments=arguments, user_context=user_context
+            )
+        else:
+            (
+                result,
+                pending,
+                status,
+                failure_class,
+                error_detail,
+            ) = await _dispatch_own_tool(
+                tool_name=tool_name,
+                arguments=arguments,
+                user_context=user_context,
+                session_id=session_id,
+            )
+
+        duration_ms = int((time.perf_counter() - started_perf) * 1000)
+        trace_id = _current_trace_id_hex()
+
+        # One InteractionRecord (one trace) per call regardless of how many
+        # ToolCall rows the dispatcher produced — the broker's request+result
+        # pair shares this single parent, matching the spec's "one trace
+        # spans caller→gateway→downstream→result".
+        answer_source = pending[-1].result_summary or ""
+        interaction_id = await _persist_interaction(
+            project=project,
+            source=_MCP_SOURCE,
+            question=json.dumps({"tool": tool_name, "arguments": arguments})[:2000],
+            answer=answer_source[:2000],
+            prompt_tokens=0,
+            completion_tokens=0,
             session_id=session_id,
+            model=None,
+            user_id=user_context.user_id,
+            status=status,
+            failure_class=failure_class,
+            error_detail=error_detail,
+            duration_ms=duration_ms,
+            trace_id=trace_id,
         )
+        await _flush_pending_tool_calls(pending, interaction_id)
 
-    duration_ms = int((time.perf_counter() - started_perf) * 1000)
-    trace_id = _current_trace_id_hex()
-
-    # One InteractionRecord (one trace) per call regardless of how many
-    # ToolCall rows the dispatcher produced — the broker's request+result
-    # pair shares this single parent, matching the spec's "one trace
-    # spans caller→gateway→downstream→result".
-    answer_source = pending[-1].result_summary or ""
-    interaction_id = await _persist_interaction(
-        project=project,
-        source=_MCP_SOURCE,
-        question=json.dumps({"tool": tool_name, "arguments": arguments})[:2000],
-        answer=answer_source[:2000],
-        prompt_tokens=0,
-        completion_tokens=0,
-        session_id=session_id,
-        model=None,
-        user_id=user_context.user_id,
-        status=status,
-        failure_class=failure_class,
-        error_detail=error_detail,
-        duration_ms=duration_ms,
-        trace_id=trace_id,
-    )
-    await _flush_pending_tool_calls(pending, interaction_id)
-
-    return JSONResponse(
-        _jsonrpc_result(request_id, result.model_dump(exclude_none=True, by_alias=True))
-    )
+        return JSONResponse(
+            _jsonrpc_result(
+                request_id, result.model_dump(exclude_none=True, by_alias=True)
+            )
+        )
 
 
 @router.post("/mcp")

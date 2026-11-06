@@ -38,13 +38,14 @@ fi
 
 # ---- the lock matrix: ONE definition. name|output|inputs ----
 # dev is constrained by the runtime lock (-c) so shared packages resolve to the
-# identical version; bff likewise. The stub keeps its own old fastapi on purpose.
+# identical version; bff and the llm-stub likewise (WP-1: the stub no longer
+# keeps its own old fastapi; one fastapi/starlette/uvicorn across the locks).
 NO_EMIT="--no-emit-package audittrace-object-storage"
 LOCKS=(
   "requirements.txt|pyproject.toml requirements-build.in $NO_EMIT"
   "requirements-dev.txt|pyproject.toml requirements-build.in --extra dev -c requirements.txt $NO_EMIT"
   "bff/requirements.txt|bff/requirements.in -c requirements.txt"
-  "images/llm-stub/requirements.txt|images/llm-stub/requirements.in"
+  "images/llm-stub/requirements.txt|images/llm-stub/requirements.in -c requirements.txt"
   "requirements-gate.txt|requirements-gate.in"
 )
 

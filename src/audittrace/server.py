@@ -40,6 +40,7 @@ from audittrace.routes.console_tool_favorites import (
 from audittrace.routes.memory_upload import router as memory_upload_status_router
 from audittrace.services.session_gc_janitor import SessionGCJanitor
 from audittrace.services.session_summarizer import SessionSummarizer
+from audittrace.trace_id_header import TRACE_ID_HEADER, TraceIdHeaderMiddleware
 
 logger = getLogger(__name__)
 
@@ -771,6 +772,18 @@ def create_app() -> FastAPI:
         version=_resolve_version(),
         openapi_tags=OPENAPI_TAGS,
         lifespan=lifespan,
+        # WP-1: FastAPI 0.162 ships native OTel (tracing/metrics/logs/operation
+        # spans). Ours is the contrib FastAPIInstrumentor behind
+        # attach_instrumentor + install_trace_context_policy (TRACEPARENT-TRUST);
+        # native telemetry stays OFF (whole-config equality, pinned by
+        # tests/test_fastapi_native_telemetry_off.py).
+        telemetry={
+            "tracing": False,
+            "metrics": False,
+            "logs": False,
+            "operation_spans": False,
+            "auto_configure": False,
+        },
     )
 
     # CORS — required by the minimalist webui (ADR-042 reference impl)
@@ -800,8 +813,15 @@ def create_app() -> FastAPI:
                 # the SPA can send the header — TypeError NetworkError.
                 "X-Source",
             ],
-            expose_headers=["X-Trace-Id"],
+            expose_headers=[TRACE_ID_HEADER],
         )
+
+    # X-TRACE-ID-HEADER: every response carries the request's server-span trace
+    # id. Registered AFTER the CORS block (add_middleware is outer-last), so it
+    # is outer to CORS and stamps preflight responses; unconditional because it
+    # does not depend on cors_origins. The unhandled-500 response bypasses user
+    # middleware, so ``unhandled_exception_handler`` stamps its own.
+    app.add_middleware(TraceIdHeaderMiddleware)
 
     app.include_router(chat.router, prefix="/v1", tags=["chat"])
     app.include_router(context.router, tags=["context"])
@@ -931,16 +951,7 @@ def create_app() -> FastAPI:
         signal for three audiences (user, operator, engineer). ``trace_id``
         is the pivot that links the 5xx back to Loki / Langfuse / Grafana.
         """
-        from opentelemetry import trace
-
-        try:
-            span = trace.get_current_span()
-            ctx = span.get_span_context() if span is not None else None
-            trace_id_hex = (
-                format(ctx.trace_id, "032x") if ctx and ctx.is_valid else None
-            )
-        except Exception:  # pragma: no cover - defensive
-            trace_id_hex = None
+        trace_id_hex = telemetry.current_trace_id_hex()
 
         logger.exception(
             "Unhandled exception on %s %s (trace_id=%s): %s",
@@ -973,6 +984,10 @@ def create_app() -> FastAPI:
                     "user_facing_message": ("Something went wrong. Please try again."),
                 }
             },
+            # X-TRACE-ID-HEADER D3: this response is sent by ServerErrorMiddleware,
+            # outside TraceIdHeaderMiddleware, so it carries its own header from
+            # the same helper (absent when there is no valid span).
+            headers={TRACE_ID_HEADER: trace_id_hex} if trace_id_hex else None,
         )
 
     # FastAPI instrumentation must run at app-construction time so the

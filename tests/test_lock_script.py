@@ -168,7 +168,9 @@ def test_compile_uses_the_exact_flags_and_matrix(tmp_path: Path, fake_uv: Path) 
     assert "--extra dev" in dev and "-c requirements.txt" in dev
     assert "--no-emit-package audittrace-object-storage" in dev
     assert "-c requirements.txt" in by_out["bff/requirements.txt"]
-    assert "-c requirements.txt" not in by_out["images/llm-stub/requirements.txt"]
+    # WP-1 (v1.31.0) reversed the stub's old "own fastapi" choice (ADDENDUM-2 S6):
+    # the stub is constrained by the server lock like bff.
+    assert "-c requirements.txt" in by_out["images/llm-stub/requirements.txt"]
     assert "requirements-gate.in" in by_out["requirements-gate.txt"]
 
 

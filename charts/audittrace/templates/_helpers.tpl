@@ -214,6 +214,24 @@ operator with an unrenderable Deployment template downstream.
 {{- end -}}
 
 {{/*
+Langfuse key delivery (WP-13). Both helpers answer "yes" with a non-empty
+string and "no" with the empty string (use with `include ... | `).
+
+audittrace.langfuseKeysFromVault: the Vault Agent template exports the pair
+(vault.enabled AND memoryServer.langfuseKeys.vaultSecret).
+audittrace.langfuseKeysFromSecret: the Deployment env entries are
+valueFrom.secretKeyRef -- Langfuse not switched off AND the pair is not
+delivered by Vault.
+*/}}
+{{- define "audittrace.langfuseKeysFromVault" -}}
+{{- if and .Values.vault.enabled .Values.memoryServer.langfuseKeys.vaultSecret -}}yes{{- end -}}
+{{- end }}
+
+{{- define "audittrace.langfuseKeysFromSecret" -}}
+{{- if and (ne (toString (index .Values.memoryServer.env "AUDITTRACE_LANGFUSE_ENABLED")) "false") (not (include "audittrace.langfuseKeysFromVault" .)) -}}yes{{- end -}}
+{{- end }}
+
+{{/*
 Vault Agent Injector annotations — memory-server (ADR-043 §4).
 Emits /vault/secrets/env as shell-sourceable exports for the four
 secret-sourced env vars the memory-server consumes (postgres URL,
@@ -251,6 +269,16 @@ vault.hashicorp.com/agent-inject-template-env: |
   export AUDITTRACE_LLAMA_API_KEY='{{ "{{ .Data.data.api_key }}" }}'
   export AUDITTRACE_EMBED_API_KEY='{{ "{{ .Data.data.api_key }}" }}'
   export AUDITTRACE_SUMMARIZER_API_KEY='{{ "{{ .Data.data.api_key }}" }}'
+  {{ "{{ end }}" }}
+  {{- end }}
+  {{- if include "audittrace.langfuseKeysFromVault" . }}
+  {{ "{{ with secret \"kv/data/audittrace/langfuse/keys\" }}" }}
+  # WP-13 -- the Langfuse key pair. Pass 2 only (memoryServer.langfuseKeys.
+  # vaultSecret=true, AFTER setup-vault.sh seeded the path): the two env
+  # entries are then absent from the Deployment spec. Single-quoted exports
+  # (PM-4); the stored values carry no trailing newline (seed_kv strips it).
+  export AUDITTRACE_LANGFUSE_PUBLIC_KEY='{{ "{{ .Data.data.public_key }}" }}'
+  export AUDITTRACE_LANGFUSE_SECRET_KEY='{{ "{{ .Data.data.secret_key }}" }}'
   {{ "{{ end }}" }}
   {{- end }}
   {{- if eq (include "audittrace.objectStorageBackend" .) "minio" }}

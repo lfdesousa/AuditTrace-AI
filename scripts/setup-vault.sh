@@ -232,6 +232,11 @@ seed_kv minio/root secret_key=minio_secret_key.txt kms_master_key=minio_kms_key.
 # LC-5 / M3-WU-4 -- the shared llama API key (the host key file every llama
 # launcher reads with --api-key-file; ONE value, two agreeing witnesses).
 seed_kv_stdin llm/api-key api_key llama-api-key.txt
+# WP-13 -- the Langfuse key pair. The two host files live ONLY under SECRETS_DIR
+# (audittrace-private/secrets/, mode 0600, no trailing newline); the chart never
+# carries them. A missing file skips the seed (seed_kv) -- the deployer then runs
+# `vault kv metadata get kv/audittrace/langfuse/keys` (no values) before pass 2.
+seed_kv langfuse/keys public_key=langfuse-public-key.txt secret_key=langfuse-secret-key.txt
 
 # ── ADR-048 PR-B7 — MinIO IAM split (audittrace_app + content_control) ──
 # Two scoped users provisioned by `charts/audittrace/templates/minio/

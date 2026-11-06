@@ -55,6 +55,7 @@ from typing import Any, Literal
 
 from fastapi import BackgroundTasks
 
+from audittrace import telemetry
 from audittrace.db.models import InteractionRecord
 from audittrace.dependencies import get_postgres_factory
 from audittrace.identity import UserContext
@@ -75,17 +76,13 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _current_trace_id_hex() -> str | None:
-    """Lazy import of the chat route's trace-id helper.
-
-    Deferred (rather than a module-level import) so this module never
-    creates an import-time coupling to ``routes/chat.py`` — mirrors the
-    same lazy-import pattern already used by ``routes/audit.py``'s
-    ``create_assessment`` handler for the identical helper.
-    """
-    from audittrace.routes.chat import _current_trace_id_hex as _impl
-
-    return _impl()
+# X-TRACE-ID D1: the ONE trace-id derivation, as an ALIAS of the same object
+# (identity pinned in tests/test_x_trace_id_header.py). It replaces the former
+# lazy-import wrapper around ``routes.chat``; ``audittrace.telemetry`` has no
+# import of this module or of ``routes.chat``, so there is no import-time
+# coupling to avoid. Patching ``routes.chat._current_trace_id_hex`` therefore no
+# longer reaches this module (gate C5): patch this module's name instead.
+_current_trace_id_hex = telemetry.current_trace_id_hex
 
 
 def _build_row(

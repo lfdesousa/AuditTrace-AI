@@ -40,7 +40,6 @@ METRIC = "audittrace.instrumentation.attached_total"
 FAMILIES = {
     "FastAPIInstrumentor",
     "HTTPXClientInstrumentor",
-    "LoggingInstrumentor",
     "RedisInstrumentor",
     "SQLAlchemyInstrumentor",
     "URLLib3Instrumentor",
@@ -173,7 +172,7 @@ def test_declined_fastapi_under_non_strict_is_an_error_log_and_a_metric_point(
 
 
 def test_every_family_reports_disabled_when_tracing_is_off(tmp_path: Path) -> None:
-    """G5 - tracing OFF, strict ON, product boot order: each of the six
+    """G5 - tracing OFF, strict ON, product boot order: each of the five
     families reaches the chokepoint and the PRODUCT meter exactly once as
     ``disabled`` (the three lifespan attaches used to sit behind a caller-side
     ``if settings.tracing_enabled`` and reported nothing: review A4)."""

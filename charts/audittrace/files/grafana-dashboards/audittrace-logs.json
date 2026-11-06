@@ -28,11 +28,47 @@
   },
   "panels": [
     {
+      "id": 3,
+      "type": "stat",
+      "title": "request-scoped lines missing trace_id (memory.read, 24 h)",
+      "description": "Share of memory.read log lines with no trace_id over the last 24 h (LOG-TRACE-ID). Reads ~100 % until the first deploy carrying LOG-TRACE-ID; the render check compares against the deploy timestamp.",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({container=\"memory-server\"} |= \"memory.read\" | json | trace_id=\"\" [24h])) / sum(count_over_time({container=\"memory-server\"} |= \"memory.read\" [24h]))",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "missing trace_id"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.01 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
       "id": 1,
       "type": "timeseries",
       "title": "Log volume — $service",
       "description": "Log lines per interval for the selected service, honouring the grep filter. Loki count_over_time.",
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 4 },
       "datasource": { "type": "loki", "uid": "loki" },
       "targets": [
         {
@@ -53,7 +89,7 @@
       "type": "logs",
       "title": "Logs — $service",
       "description": "Raw log stream for the selected service. Type in the Filter box to grep (LogQL |=).",
-      "gridPos": { "h": 20, "w": 24, "x": 0, "y": 6 },
+      "gridPos": { "h": 20, "w": 24, "x": 0, "y": 10 },
       "datasource": { "type": "loki", "uid": "loki" },
       "targets": [
         { "refId": "A", "expr": "{service_name=\"$service\"} |= \"$search\"" }

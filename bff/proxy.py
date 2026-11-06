@@ -44,6 +44,7 @@ async def proxy_chat_completions(
     minted_token: str,
     settings: Settings,
     http_client: httpx.AsyncClient,
+    session_id: str | None = None,
 ) -> StreamingResponse:
     """Forward ``raw_body`` unchanged to the orchestrator's
     ``/v1/chat/completions`` and stream the response back byte-identical.
@@ -63,6 +64,11 @@ async def proxy_chat_completions(
         "Content-Type": content_type or "application/json",
         "X-Source": settings.proxy_source_label,
     }
+    # LANGFUSE-WU-3 / SESSION-ID-BIND: the caller's own session grouping rides
+    # to the orchestrator (``chat._resolve_session_id`` precedence 1). Absent or
+    # blank -> no header, byte-for-byte the previous request.
+    if session_id is not None and session_id.strip():
+        headers["X-Session-Id"] = session_id.strip()
     request = http_client.build_request(
         "POST",
         url,

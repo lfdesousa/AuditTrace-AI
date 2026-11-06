@@ -84,6 +84,22 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+            {{- if include "audittrace.langfuseKeysFromSecret" . }}
+            # ── Langfuse key pair (WP-13): never a chart value ─────────
+            # secretKeyRef on the operator-created Secret. Absent when
+            # Langfuse is off, and when the Vault Agent template delivers
+            # the pair (vault.enabled + memoryServer.langfuseKeys.vaultSecret).
+            - name: AUDITTRACE_LANGFUSE_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.memoryServer.langfuseKeys.secretName | quote }}
+                  key: public_key
+            - name: AUDITTRACE_LANGFUSE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.memoryServer.langfuseKeys.secretName | quote }}
+                  key: secret_key
+            {{- end }}
             {{- if not .Values.vault.enabled }}
             # ── Computed service URLs (vault.enabled=false branch) ────
             # When vault.enabled=true these are set at runtime by the
