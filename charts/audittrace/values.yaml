@@ -886,6 +886,17 @@ keycloak:
     # log — off by default, flipped on for one deploy by the re-enable
     # runbook so the real Keycloak layout lands in the evidence.
     shapeCapture: false
+  # LC-10a — the dedicated `audittrace-session-e2e` device-flow client: the
+  # sanctioned API path (Bruno `cluster-session-e2e`) to prove per-chat
+  # session recall for TWO ordinary users with a scoped JWT. Both session
+  # scopes are OPTIONAL and requested by name. SUNSET MECHANISM (same as
+  # aclE2eClient): flip `enabled` to false once the LibreChat UI path is the
+  # only demo kept — the realm template then omits the client and the scopes
+  # hook Job verifies-then-deletes it; also delete the dev-realm copy
+  # (keycloak/realm-audittrace.json), the two-realm parity guards redden
+  # until it is.
+  sessionE2eClient:
+    enabled: true
   resources:
     requests:
       cpu: 500m

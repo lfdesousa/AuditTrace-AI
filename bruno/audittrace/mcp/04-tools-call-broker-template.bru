@@ -10,6 +10,10 @@ post {
   auth: bearer
 }
 
+headers {
+  X-Session-Id: {{chatSessionId}}
+}
+
 auth:bearer {
   token: {{accessToken}}
 }
@@ -23,6 +27,21 @@ body:json {
       "name": "broker:{{mcpBrokerServerName}}:{{mcpBrokerToolName}}",
       "arguments": {}
     }
+  }
+}
+
+script:pre-request {
+  // LC-10a: ONE chat session id per run. A caller pins it with
+  // --env-var chatSessionId=...; otherwise a fresh value is generated once and
+  // shared by every request of the run (runtime variable), so "upload under
+  // this chat, recall under this chat" is a real same-session check and rows
+  // from earlier runs never share it. The id has the server's accepted shape
+  // (printable ASCII, no space, 1-255 chars).
+  if (!bru.getEnvVar("chatSessionId") && !bru.getVar("chatSessionId")) {
+    bru.setVar(
+      "chatSessionId",
+      "bru-s4-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10)
+    );
   }
 }
 

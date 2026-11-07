@@ -1,0 +1,15 @@
+vars {
+  baseUrl: https://audittrace.local:30952
+  realmIssuer: https://audittrace.allaboutdata.eu:30952/realms/audittrace
+  clientId: audittrace-session-e2e
+  scope: audittrace:query audittrace:audit memory:session:write memory:session:read-own
+  sessionRecallPrompt: What did I just attach in this chat? Use your attachment recall tool and name the file.
+  sessionNoteName: lc10a-session-note.md
+  uploadSessionFile: /tmp/lc10a-session-note.md
+  chatSessionId:
+  authRequired: true
+}
+vars:secret [
+  accessToken,
+  refreshToken
+]

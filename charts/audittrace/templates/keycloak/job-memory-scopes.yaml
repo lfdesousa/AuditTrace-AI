@@ -83,6 +83,11 @@ spec:
             # verify-then-delete.
             - name: AUDITTRACE_ACL_E2E_CLIENT_ENABLED
               value: {{ .Values.keycloak.aclE2eClient.enabled | quote }}
+            # LC-10a: the dedicated session-recall E2E client's sunset flag -
+            # same contract as the ACL one above (default true; enabled ->
+            # ensure + verify, disabled -> verify-then-delete).
+            - name: AUDITTRACE_SESSION_E2E_CLIENT_ENABLED
+              value: {{ .Values.keycloak.sessionE2eClient.enabled | quote }}
             # ACL WU-2c-A0 (Addendum F §3 / F1 §5): read-only, GET-only
             # shape capture of the E2E client's live Keycloak
             # representation (key names + typed, redacted values —

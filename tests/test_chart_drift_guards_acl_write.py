@@ -621,10 +621,22 @@ class TestAclE2eClientFlag:
         on, off = _chart_realm(True), _chart_realm(False)
         assert _client(on, E2E) is not None
         assert _client(off, E2E) is None
-        assert [c["clientId"] for c in on["clients"]][:-1] == [
-            c["clientId"] for c in off["clients"]
-        ], "the flag must add ONLY the E2E client, at the end"
-        assert on["clients"][-1]["clientId"] == E2E
+        # LC-10a appends the session E2E client (its own flag, default on)
+        # AFTER this one; compare the sequences without it.
+        on_ids = [
+            c["clientId"]
+            for c in on["clients"]
+            if c["clientId"] != "audittrace-session-e2e"
+        ]
+        off_ids = [
+            c["clientId"]
+            for c in off["clients"]
+            if c["clientId"] != "audittrace-session-e2e"
+        ]
+        assert on_ids[:-1] == off_ids, (
+            "the flag must add ONLY the E2E client, at the end"
+        )
+        assert on_ids[-1] == E2E
 
     def test_values_default_is_enabled_in_2c_a(self) -> None:
         values = yaml.safe_load((CHART_DIR / "values.yaml").read_text())
