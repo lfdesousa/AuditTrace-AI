@@ -177,14 +177,18 @@ PYPROJECT_PYTEST_INI_OPTIONS_GOLDEN: dict = {
     "python_files": ["test_*.py"],
     "python_functions": ["test_*"],
     "asyncio_mode": "auto",
-    "addopts": "-v --cov=src --cov-report=term --cov-report=xml --cov-fail-under=90",
+    "addopts": "-v --strict-markers --cov=src --cov-report=term --cov-report=xml --cov-fail-under=90",
     "filterwarnings": ["ignore::DeprecationWarning"],
     "markers": [
+        "integration: real-system tests under tests/integration (real routes, "
+        "real Postgres 18.3, no mocks) - LC-10a layer I. Registered so "
+        "--strict-markers can refuse a typo'd mark; `make test-unit` "
+        "deselects it.",
         "allow_cluster_tool(tool, reason): opt-in half of the hermetic "
         "cluster-tool guard (tests/conftest.py, SPEC "
         "2026-10-11-SPEC-test-parity-scripted-enforcement.md R3) — must be "
         "paired with a matching entry in tests/hermetic_allowlist.py or the "
-        "guard still fails the test."
+        "guard still fails the test.",
     ],
 }
 
