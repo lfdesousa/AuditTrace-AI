@@ -65,6 +65,8 @@ async def proxy_memory_request(
     minted_token: str,
     settings: Settings,
     http_client: httpx.AsyncClient,
+    *,
+    session_id: str | None = None,
 ) -> StreamingResponse:
     """Forward a ``/memory/<path_suffix>`` request to the orchestrator,
     byte-identical, and stream the response back byte-identical
@@ -76,6 +78,13 @@ async def proxy_memory_request(
     passes exactly what LibreChat sent after ``/memory/``. This module
     adds only the minted ``Authorization`` header and the ``X-Source``
     attribution header, same as ``bff/proxy.py``.
+
+    ``session_id`` (LC-10a, keyword-only) is the console chat's own id. It is
+    forwarded as ``X-Session-Id`` EXACTLY as ``bff/proxy.py`` does for chat:
+    stripped, and an absent / ``None`` / blank value sends no header at all.
+    The BFF applies no shape regex; the server's ``header_session_id`` owns
+    the accepted shape. Only ``console_files`` passes it, so every other
+    ``/memory/*`` proxy stays byte-identical.
     """
     url = (
         settings.orchestrator_base_url.rstrip("/")
@@ -91,6 +100,8 @@ async def proxy_memory_request(
     }
     if content_type:
         headers["Content-Type"] = content_type
+    if session_id is not None and session_id.strip():
+        headers["X-Session-Id"] = session_id.strip()
     request = http_client.build_request(
         method,
         url,

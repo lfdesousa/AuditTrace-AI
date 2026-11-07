@@ -411,6 +411,10 @@ def create_app() -> FastAPI:
                 minted_token,
                 settings,
                 http_client,
+                # LC-10a: the chat's own id rides to the orchestrator, read
+                # exactly as the chat route does (bff/app.py chat handler);
+                # absent / blank -> no header (proxy_memory_request strips).
+                session_id=request.headers.get("x-session-id"),
             )
         except MemoryProxyError as exc:
             logger.error("orchestrator /memory/upload unreachable: %s", exc)

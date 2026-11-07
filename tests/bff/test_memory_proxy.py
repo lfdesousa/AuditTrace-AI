@@ -325,3 +325,44 @@ class TestUnreachableOrchestrator:
             await proxy_memory_request(
                 "GET", "episodic", "", b"", None, "t", _settings(), client
             )
+
+
+class TestSessionIdKeyword:
+    """LC-10a AC-8(a): the keyword-only ``session_id`` copies
+    ``bff/proxy.py``'s rule exactly: stripped; absent / None / blank -> no
+    header at all.
+
+    Neuters: drop the header line -> the ``s1`` cells RED; drop ``.strip()``
+    -> the padded cell RED (and the blank cell, which would send ``"  "``)."""
+
+    @staticmethod
+    async def _sent(**kwargs: object) -> list[str]:
+        seen: dict[str, list[str]] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["v"] = request.headers.get_list("x-session-id")
+            return httpx.Response(200, json={"ok": True})
+
+        response = await proxy_memory_request(
+            "POST",
+            "upload",
+            "layer=session",
+            b"x",
+            None,
+            "t",
+            _settings(),
+            _client(handler),
+            **kwargs,  # type: ignore[arg-type]
+        )
+        await _collect(response)
+        return seen["v"]
+
+    async def test_session_id_kw_forwards_iff_given(self) -> None:
+        assert await self._sent(session_id="s1") == ["s1"]
+        assert await self._sent() == []
+        assert await self._sent(session_id=None) == []
+        assert await self._sent(session_id="") == []
+
+    async def test_session_id_is_stripped_and_blank_sends_nothing(self) -> None:
+        assert await self._sent(session_id=" s1 ") == ["s1"]
+        assert await self._sent(session_id="  ") == []
