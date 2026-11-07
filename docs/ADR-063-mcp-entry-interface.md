@@ -1,6 +1,6 @@
 # ADR-063 — MCP entry-interface: the audit layer as an MCP server
 
-- Status: Accepted (implementation phased; pending)
+- Status: Accepted (implemented: Phase 1 in v1.24.7; Phase 2 Tracks A and B in v1.24.8; Track C in v1.30.1)
 - Date: 2026-08-06
 - Relates to: ADR-037 (agent tool-call audit boundary), ADR-058 (recursive self-audit / tamper-evident append-only)
 
@@ -180,3 +180,10 @@ byte-unchanged. Local unit + HTTP-level tests are green (`tests/test_mcp_broker.
 deployed downstream is DEFERRED to the next candidate deploy per the ADR-049 heavy gate, same as
 Phase 1. Track A (write/curation tools over MCP) and Track C (Bruno collection coverage of the
 full MCP surface) are sequenced after this merges.
+
+**Update 2026-11-07: all phases shipped.**
+- Phase 2 Track A (the write and curation tools over MCP) shipped in code on 2026-08-24 and was released in v1.24.8, alongside Track B.
+- Track C, the Bruno collection coverage of the MCP surface, was released in v1.30.1. It is `bruno/audittrace/mcp/`, with five requests: `tools/list`, a read call, a write call, a brokered-call template and the unauthenticated case.
+- Every phase is in each release since, including v1.31.0.
+- `POST /mcp` is the audited MCP entry interface, and the sections above stay the reference for its behaviour.
+- The deferral of the deployed-image end-to-end run recorded under Phase 1 and Track B is not lifted by this note. That run is tracked as follow-up evidence, not as open implementation.
