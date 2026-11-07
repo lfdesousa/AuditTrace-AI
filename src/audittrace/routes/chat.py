@@ -57,7 +57,10 @@ from audittrace.routes._memory_tool_loop import (
     run_memory_tool_loop,
 )
 from audittrace.routes._model_route import resolve_chat_upstream, upstream_host
-from audittrace.routes._session_bind import stream_with_bound_session
+from audittrace.routes._session_bind import (
+    header_session_id,
+    stream_with_bound_session,
+)
 from audittrace.routes._sources_trailer import build_sources_trailer
 from audittrace.services.console_store._context import bound_session_id
 from audittrace.services.context_builder import (
@@ -293,15 +296,16 @@ def _resolve_session_id(
          so ``GET /interactions?session_id=<run>`` reconstructs exactly
          that agent run across every turn and every routed engine
          (per-agent-run reconstruction, SPEC "Telemetry accuracy" #3).
-         Trusted at face value — same honesty model as ``_resolve_project``
-         / ``_detect_source``; this is audit-correlation metadata, not a
-         security field.
+         The value is correlation metadata and a compartment key inside the
+         caller's own rows, never a credential; it must have the accepted
+         shape (``routes/_session_bind.header_session_id``, LC-10a H-A4).
       2. The existing deterministic ``_compute_session_id(...)`` — BYTE-
-         FOR-BYTE the prior behaviour when the header is absent or blank.
+         FOR-BYTE the prior behaviour when the header is absent, blank or
+         malformed.
     """
-    header = request.headers.get("x-session-id")
-    if isinstance(header, str) and header.strip():
-        return header.strip()
+    header = header_session_id(request)
+    if header is not None:
+        return header
     return _compute_session_id(source, first_user_content, user_id)
 
 

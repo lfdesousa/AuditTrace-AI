@@ -25,7 +25,10 @@ Non-vacuity guards covered (spec v2 §6):
 from __future__ import annotations
 
 import importlib
+import logging
+from collections.abc import Iterator
 from dataclasses import replace
+from typing import Any
 
 import fakeredis
 import pytest
@@ -37,6 +40,7 @@ import audittrace.tools.memory_handlers as handlers_mod
 from audittrace import dependencies
 from audittrace.dependencies import create_test_container
 from audittrace.identity import sentinel_user_context
+from audittrace.services.console_store._context import bound_session_id
 from audittrace.tools import (
     get_tool_by_name,
     invoke_tool,
@@ -60,6 +64,15 @@ def _fresh_registry_with_handlers():
     importlib.reload(handlers_mod)
     yield
     reset_registry_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _bound_chat_session() -> Iterator[None]:
+    """LC-10a (B3-A1): recall reads the BOUND request id, so each test
+    writes and reads under ONE chat id; cross-user tests share it, leaving
+    only ``user_id`` to separate the users."""
+    with bound_session_id("sess-bound-chat"):
+        yield
 
 
 @pytest_asyncio.fixture
@@ -375,3 +388,49 @@ class TestRecallAttachmentsToolToCollectionMapping:
         from audittrace.tools import _TOOL_TO_COLLECTION
 
         assert _TOOL_TO_COLLECTION["recall_attachments"] == "session"
+
+
+# ───────────────────── LC-10a: not cached, scope sentence ──────────────────
+
+
+class TestRecallAttachmentsLc10a:
+    async def test_recall_attachments_not_cached_within_session(
+        self,
+        _session_container: Any,
+        _fakeredis_cache: Any,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """AC-13. ask -> attach -> ask must see the new attachment in the
+        same turn, and the opted-out tool must not log the empty-identity
+        WARNING (S1).
+
+        Neuters: ``cacheable=True`` on the tool -> the second ask is the
+        stale 0 (RED); warning on ``not use_cache`` -> the caplog assert (RED)."""
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_attachments")
+        assert tool is not None and tool.cacheable is False
+        with caplog.at_level(logging.WARNING, logger="audittrace.tools"):
+            first, hit1 = await invoke_tool(
+                user, tool, {}, session_id="sess-bound-chat"
+            )
+            await dependencies.get_session_memory_service().write(
+                user, "late.txt", "attached after the first ask"
+            )
+            second, hit2 = await invoke_tool(
+                user, tool, {}, session_id="sess-bound-chat"
+            )
+        assert (first["total"], second["total"]) == (0, 1)
+        assert (hit1, hit2) == (False, False)
+        assert not [
+            r for r in caplog.records if "tool result cache bypassed" in r.getMessage()
+        ]
+
+    def test_recall_attachments_description_states_session_scope(self) -> None:
+        """AC-15. Neuter: drop the sentence from the description -> RED."""
+        tool = get_tool_by_name("recall_attachments")
+        assert tool is not None
+        assert tool.description.endswith(
+            "Returns only uploads made under the current chat's session id; "
+            "uploads without one are not recalled."
+        )
+        assert handlers_mod.RECALL_ATTACHMENTS_SCOPE_SENTENCE in tool.description

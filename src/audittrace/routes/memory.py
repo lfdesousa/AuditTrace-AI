@@ -82,6 +82,7 @@ from audittrace.models import (
 # working unchanged.
 from audittrace.routes import memory_pdf as _pdf  # noqa: E402
 from audittrace.routes import memory_scan as _scan  # noqa: E402
+from audittrace.routes._session_bind import bound_upload_session  # noqa: E402
 from audittrace.routes.memory_list_view import (
     entries_to_dicts,
     entries_with_prefix,
@@ -848,7 +849,8 @@ async def upload_memory_file(
             detail="non-PDF /memory/upload content must be UTF-8 text",
         ) from exc
 
-    await _write_layer_private(layer, user, target_filename, text_content)
+    with bound_upload_session(request):  # LC-10a: the chat compartment
+        await _write_layer_private(layer, user, target_filename, text_content)
 
     # M2 — write-telemetry counter (layer label, no PII).
     emit_memory_write(layer=layer.value)

@@ -93,6 +93,12 @@ class MemoryTool:
     :func:`tools_visible_to` and :func:`get_tool_by_name` returns
     ``None`` for it."""
 
+    cacheable: bool = True
+    """``False`` makes :func:`invoke_tool` run the handler on every call and
+    never read or write the Redis result cache (LC-10a: an ephemeral per-chat
+    list is never worth 900 s of staleness). The default keeps every existing
+    registration unchanged."""
+
 
 # ─────────────────────────── Module-level store ─────────────────────────────
 # Two maps are kept in sync by every mutator:
@@ -117,6 +123,7 @@ def register_memory_tool(
     description: str,
     parameters_schema: dict[str, Any],
     required_scope: str,
+    cacheable: bool = True,
 ) -> Callable[[ToolHandler], ToolHandler]:
     """Decorator that registers a memory tool at import time.
 
@@ -151,6 +158,7 @@ def register_memory_tool(
             required_scope=required_scope,
             handler=handler,
             enabled=True,
+            cacheable=cacheable,
         )
         MEMORY_TOOL_REGISTRY[name] = tool
         _BY_VISIBLE_NAME[name] = name
@@ -382,9 +390,13 @@ async def invoke_tool(
 
     cache = get_tool_result_cache()
     # ONE predicate guards both the read and the write below. An empty
-    # identity cannot name a cache namespace, so the handler runs uncached.
-    use_cache = bool(user_context.user_id)
-    if not use_cache:
+    # identity cannot name a cache namespace, so the handler runs uncached;
+    # a tool registered ``cacheable=False`` (LC-10a ``recall_attachments``)
+    # runs uncached by design. The WARNING is about the identity alone: an
+    # opted-out tool with a real identity must not claim an empty one.
+    has_identity = bool(user_context.user_id)
+    use_cache = has_identity and tool.cacheable
+    if not has_identity:
         logger.warning("tool result cache bypassed: empty identity tool=%s", tool.name)
     cache_id = (
         _canonical_cache_id(

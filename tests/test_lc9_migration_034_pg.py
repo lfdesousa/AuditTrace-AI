@@ -79,8 +79,18 @@ class TestMigration034Static:
 
     def test_single_alembic_head_and_it_is_034(self) -> None:
         """The single-head guard (a forked chain is a silent split-brain
-        schema). Console WU-A (035) rebases onto this id."""
-        assert _script().get_heads() == [_REVISION]
+        schema), with 034 an ANCESTOR of the head. LC-10a (039,
+        ``5b4bd766374f``) is the head after this; console WU-A (035) rebases
+        its ``down_revision`` onto 039's id when it lands second. The
+        identity of the head is pinned by the LC-10a migration's own test
+        (``tests/test_lc10a_migration_039_static.py``).
+
+        Neuters: a second head -> RED; 034 not in the chain -> RED."""
+        script = _script()
+        heads = script.get_heads()
+        assert len(heads) == 1, f"alembic must have exactly one head, got {heads}"
+        ancestors = {r.revision for r in script.walk_revisions("base", heads[0])}
+        assert _REVISION in ancestors
 
     def test_exact_substring_comparison_not_like(self) -> None:
         text_ = _text()

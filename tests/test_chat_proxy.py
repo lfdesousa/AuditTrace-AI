@@ -519,6 +519,27 @@ class TestResolveSessionId:
         assert _resolve_session_id(req, "opencode", "hello", "user-1") == expected
 
 
+class TestResolveSessionIdShape:
+    """LC-10a AC-7 (R-Q5): a header that fails the accepted shape is treated
+    as ABSENT, so the computed id wins. Neuter: drop the shape check in
+    ``routes/_session_bind.header_session_id`` -> every cell RED."""
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["x" * 256, "with space", "tab\there", "ctl\x00char", "caf\u00e9", "abc\n"],
+        ids=["256-chars", "inner-space", "tab", "nul", "non-ascii", "trailing-lf"],
+    )
+    def test_bad_shape_header_falls_back_to_computed(self, bad: str) -> None:
+        req = _FakeRequest({"x-session-id": bad})
+        expected = _compute_session_id("opencode", "hello", "user-1")
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == expected
+
+    def test_255_printable_is_accepted_verbatim(self) -> None:
+        sid = "a" * 255
+        req = _FakeRequest({"x-session-id": sid})
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == sid
+
+
 class TestResolveProject:
     """ADR-029 project tag precedence: header → metadata.project → body.project → default."""
 

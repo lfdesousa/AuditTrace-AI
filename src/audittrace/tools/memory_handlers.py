@@ -748,6 +748,14 @@ async def recall_recent_sessions(
 # (conversational history), to avoid tool-selection confusion.
 
 
+#: LC-10a R-Q6 (strict): the user-visible statement of the compartment rule.
+#: Asserted verbatim by ``tests/test_recall_attachments_tool.py``.
+RECALL_ATTACHMENTS_SCOPE_SENTENCE = (
+    "Returns only uploads made under the current chat's session id; "
+    "uploads without one are not recalled."
+)
+
+
 @register_memory_tool(
     name="recall_attachments",
     description=(
@@ -756,7 +764,8 @@ async def recall_recent_sessions(
         "refers to something they just attached or uploaded — 'summarise "
         "what I just attached', 'what does that file say' — before it has "
         "been promoted to durable memory. Scoped to the caller: only "
-        "returns uploads owned by this user."
+        "returns uploads owned by this user. "
+        f"{RECALL_ATTACHMENTS_SCOPE_SENTENCE}"
     ),
     parameters_schema={
         "type": "object",
@@ -778,6 +787,9 @@ async def recall_recent_sessions(
         "required": [],
     },
     required_scope="memory:session:read-own",
+    # LC-10a: an ephemeral per-chat list is never worth cache staleness
+    # (ask -> attach -> ask must see the new attachment in the same turn).
+    cacheable=False,
 )
 async def recall_attachments(
     user_context: UserContext, args: dict[str, Any]
