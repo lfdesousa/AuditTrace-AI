@@ -1572,6 +1572,8 @@ class TestCodeSetEquality:
             "sunset-wrong-client-id",
             "sunset-delete-failed",
             "sunset-readback-nonempty",
+            # LC-10a r6 step 2: the session client mapper reconcile's update failed.
+            "reconcile-failed",
             # The rc-based overrides + bootstrap/handler codes:
             "kcadm-timeout",
             "unwrapped-call",
