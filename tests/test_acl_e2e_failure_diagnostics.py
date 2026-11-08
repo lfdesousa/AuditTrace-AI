@@ -2209,6 +2209,13 @@ _ALLOWED_FAIL_HOMES = (
     "acl_e2e_scope_names",
     "acl_e2e_strip_scopes",
     "acl_e2e_verify",
+    # LC-10a: the session E2E clone's helpers (same shape, same rules).
+    "session_e2e_compact",
+    "session_e2e_lookup",
+    "session_e2e_scope_names",
+    "session_e2e_resolve_scope",
+    "session_e2e_strip_scopes",
+    "session_e2e_verify",
 )
 
 
@@ -3785,7 +3792,14 @@ def _run_full_state(*, scopes_present: bool, e2e_present: bool) -> dict[str, Any
         "email",
         "offline_access",
     ]
-    scopes = (
+    # LC-10a: audittrace:query / audittrace:audit are REALM-defined (realm
+    # import), so they exist even in the "all absent" state - the session
+    # E2E block resolves their ids and never creates them.
+    realm_scopes = [
+        {"id": "s-realm-query", "name": "audittrace:query"},
+        {"id": "s-realm-audit", "name": "audittrace:audit"},
+    ]
+    scopes = realm_scopes + (
         [{"id": f"s-{i}", "name": n} for i, n in enumerate(scope_names)]
         if scopes_present
         else []
@@ -3817,6 +3831,49 @@ def _run_full_state(*, scopes_present: bool, e2e_present: bool) -> dict[str, Any
                     {"id": "s-write", "name": "memory:acl:write"},
                 ],
                 "optional": [],
+                "mappers": [
+                    {
+                        "name": "aud-audittrace-server",
+                        "protocol": "openid-connect",
+                        "protocolMapper": "oidc-audience-mapper",
+                        "config": {
+                            "included.custom.audience": "audittrace-server",
+                            "id.token.claim": "false",
+                            "access.token.claim": "true",
+                        },
+                    }
+                ],
+            }
+        )
+    if e2e_present:
+        clients.append(
+            {
+                "id": "uuid-session-e2e",
+                "clientId": "audittrace-session-e2e",
+                "body": {
+                    "clientId": "audittrace-session-e2e",
+                    "publicClient": True,
+                    "standardFlowEnabled": False,
+                    "directAccessGrantsEnabled": False,
+                    "implicitFlowEnabled": False,
+                    "serviceAccountsEnabled": False,
+                    "consentRequired": True,
+                    "attributes": {
+                        "oauth2.device.authorization.grant.enabled": "true",
+                        "oauth2.device.polling.interval": "5",
+                        "oauth2.device.code.lifespan": "120",
+                        "use.refresh.tokens": "false",
+                        "access.token.lifespan": "900",
+                    },
+                },
+                "default": [
+                    {"id": "s-realm-query", "name": "audittrace:query"},
+                    {"id": "s-realm-audit", "name": "audittrace:audit"},
+                ],
+                "optional": [
+                    {"id": "s-13", "name": "memory:session:write"},
+                    {"id": "s-14", "name": "memory:session:read-own"},
+                ],
                 "mappers": [
                     {
                         "name": "aud-audittrace-server",
@@ -3995,6 +4052,31 @@ class TestRunFullWholeScriptCoverage:
         finally:
             srv.close()
 
+    def test_an_absent_realm_scope_fails_the_session_client_closed(
+        self, tmp_path: Path, site: Path
+    ) -> None:
+        """LC-10a A4: ``audittrace:query`` / ``audittrace:audit`` are
+        realm-defined; when one is missing from the live realm the session
+        client block stops with the NAMED ``id-unresolvable`` code and the
+        run never reports completion.
+
+        Neuter: make the emptiness check a no-op (``true``) in the script
+        and the ConfigMap -> the run fails with a different, unnamed code
+        (RED)."""
+        srv, port = _listening_socket()
+        try:
+            h = RunFullHarness(tmp_path, site)
+            state = _run_full_state(scopes_present=False, e2e_present=False)
+            state["scopes"] = [
+                sc for sc in state["scopes"] if sc["name"] != "audittrace:query"
+            ]
+            proc = h.run(state=state, tcp_port=port)
+            assert proc.returncode != 0
+            assert "code=id-unresolvable" in proc.stdout, proc.stdout
+            assert "memory-scopes provisioning complete" not in proc.stdout
+        finally:
+            srv.close()
+
     def test_all_present_state_reaches_the_end(
         self, tmp_path: Path, site: Path
     ) -> None:
@@ -4108,10 +4190,24 @@ class TestRunFullWholeScriptCoverage:
                 (901, 903),
                 1101,
                 (1156, 1157),
-                (1282, 1283),
+                # LC-10a: the session E2E clone (same two named reasons as
+                # the acl rows above: nothing to strip in a RunFull state;
+                # the sunset delete runs only with enabled=false).
+                (1254, 1256),
+                (1441, 1442),
+                # was (1282, 1283): shifted by the LC-10a block above it.
+                (1567, 1568),
             }
         else:
-            expected_unreached = {(834, 836), 1034, (1089, 1090)}
+            # (1187,1189)/(1374,1375): the LC-10a session E2E clone's strip
+            # delete and sunset delete (reasons as (834,836)/(1089,1090)).
+            expected_unreached = {
+                (834, 836),
+                1034,
+                (1089, 1090),
+                (1187, 1189),
+                (1374, 1375),
+            }
         # Named per range (line numbers re-measured after every edit
         # that shifts them — e.g. this round's R4/B3 production fixes;
         # update HERE, never silently, per review should-fix #7):

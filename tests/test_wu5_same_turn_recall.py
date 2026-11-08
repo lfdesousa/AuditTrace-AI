@@ -35,6 +35,7 @@ import audittrace.tools.memory_handlers as handlers_mod
 from audittrace.db.models import InteractionRecord, ToolCall
 from audittrace.dependencies import get_postgres_factory
 from audittrace.identity import SENTINEL_SUBJECT, sentinel_user_context
+from audittrace.services.console_store._context import bound_session_id
 from audittrace.tools import (
     get_tool_by_name,
     invoke_tool,
@@ -95,7 +96,7 @@ class _Auth:
 
 
 def _upload_session_doc(
-    client: TestClient, *, sub: str, filename: str, content: bytes
+    client: TestClient, *, sub: str, filename: str, content: bytes, session_id: str
 ) -> None:
     """Write via the REAL (WU-1) ``POST /memory/upload?layer=session``
     route — the actual same-turn chat-attachment write path, not a
@@ -111,7 +112,11 @@ def _upload_session_doc(
             "/memory/upload",
             params={"layer": "session"},
             files={"file": (filename, content, "text/plain")},
-            headers={"Authorization": "Bearer session-token"},
+            headers={
+                "Authorization": "Bearer session-token",
+                # LC-10a: the upload lands in this chat's compartment.
+                "X-Session-Id": session_id,
+            },
         )
     assert response.status_code == 200, response.text
 
@@ -158,6 +163,7 @@ class TestSameTurnWriteThenRecall:
             sub="wu5-e2e-alice",
             filename="just-attached.txt",
             content=b"the thing I just attached to this chat turn",
+            session_id="wu5-e2e-sess",
         )
 
         alice = _user_for("wu5-e2e-alice", "memory:session:read-own")
@@ -165,7 +171,10 @@ class TestSameTurnWriteThenRecall:
         assert tool is not None
         import asyncio
 
-        result, _ = asyncio.run(invoke_tool(alice, tool, {}, session_id="wu5-e2e-sess"))
+        with bound_session_id("wu5-e2e-sess"):
+            result, _ = asyncio.run(
+                invoke_tool(alice, tool, {}, session_id="wu5-e2e-sess")
+            )
 
         assert result["total"] == 1
         assert result["matches"][0]["title"] == "just-attached.txt"
@@ -177,6 +186,7 @@ class TestSameTurnWriteThenRecall:
             sub="wu5-e2e-alice-2",
             filename="alice-only.txt",
             content=b"alice's private turn attachment",
+            session_id="wu5-e2e-sess",
         )
 
         bob = _user_for("wu5-e2e-bob-2", "memory:session:read-own")
@@ -184,9 +194,11 @@ class TestSameTurnWriteThenRecall:
         assert tool is not None
         import asyncio
 
-        result, _ = asyncio.run(
-            invoke_tool(bob, tool, {}, session_id="wu5-e2e-sess-bob")
-        )
+        # SAME chat id as alice's upload: only user_id separates the two.
+        with bound_session_id("wu5-e2e-sess"):
+            result, _ = asyncio.run(
+                invoke_tool(bob, tool, {}, session_id="wu5-e2e-sess")
+            )
 
         assert result["total"] == 0
         assert result["matches"] == [], (

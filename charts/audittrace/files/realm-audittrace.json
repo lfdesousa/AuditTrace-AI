@@ -975,6 +975,50 @@
         }
       ]
     }
+{{- end }}{{- if .Values.keycloak.sessionE2eClient.enabled }},
+    {
+      "description": "LC-10a session-recall E2E-only device-flow client (sunset: keycloak.sessionE2eClient.enabled=false). Default: audittrace:query + audit. OPTIONAL by name: memory:session:write + read-own. No offline_access, no refresh, consent required.",
+      "clientId": "audittrace-session-e2e",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": true,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "urn:ietf:wg:oauth:2.0:oob"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true",
+        "oauth2.device.polling.interval": "5",
+        "oauth2.device.code.lifespan": "120",
+        "use.refresh.tokens": "false",
+        "access.token.lifespan": "900"
+      },
+      "defaultClientScopes": [
+        "audittrace:query",
+        "audittrace:audit"
+      ],
+      "optionalClientScopes": [
+        "memory:session:write",
+        "memory:session:read-own"
+      ],
+      "protocolMappers": [
+        {
+          "name": "aud-audittrace-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "audittrace-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
 {{- end }}
   ],
   "identityProviders": [],

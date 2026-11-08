@@ -429,6 +429,20 @@ class SessionMemoryItem(Base):
     # W3C-traceparent-derived trace_id from the originating request, when
     # a span is active — same convention as MemoryItem.trace_id.
     trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # LC-10a (migration 039): the per-chat compartment INSIDE one user's rows.
+    # ``NULL`` = written with no valid ``X-Session-Id``; no bound recall ever
+    # returns such a row. Never an RLS input: the policy compares ``user_id``
+    # only (the id is caller-influenced data, not an identity).
+    session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_session_memory_items_user_session",
+            "user_id",
+            "session_id",
+            text("created_at_ms DESC"),
+        ),
+    )
 
 
 # JSONB on Postgres, plain JSON (TEXT under the hood) on SQLite — same

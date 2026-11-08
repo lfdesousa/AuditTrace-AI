@@ -31,19 +31,40 @@ independence) is a real-HTTP-route proof and lives in
 
 from __future__ import annotations
 
+import logging
 import time
+from collections.abc import Iterator
 from dataclasses import replace
 
 import pytest
 import pytest_asyncio
+from langchain_core.documents import Document
+from opentelemetry.sdk.trace import TracerProvider
+from sqlalchemy import select
 
+from audittrace.db.models import SessionMemoryItem
 from audittrace.db.postgres import InMemoryPostgresFactory
 from audittrace.db.rls import set_current_user_id
+from audittrace.identity import UserContext
+from audittrace.services.console_store._context import bound_session_id
 from audittrace.services.session_memory import (
     MockSessionMemoryService,
     PostgresSessionMemoryService,
     SessionMemoryService,
 )
+
+DEFAULT_CHAT_SID = "s-default-chat"
+
+
+@pytest.fixture(autouse=True)
+def _bound_chat_session() -> Iterator[None]:
+    """LC-10a (B3-A1): ``list_own`` only ever reads the BOUND request id, so
+    every test in this module that writes and reads back runs under ONE
+    bound chat id. Cross-user tests therefore share the same id for both
+    users: only ``user_id`` separates them."""
+    with bound_session_id(DEFAULT_CHAT_SID):
+        yield
+
 
 # ── MockSessionMemoryService ─────────────────────────────────────────────────
 
@@ -440,6 +461,7 @@ async def _seed_session_row(
                 content="expired content",
                 size_bytes=1,
                 created_at_ms=created_at_ms,
+                session_id=DEFAULT_CHAT_SID,
             )
         )
         await session.commit()
@@ -533,3 +555,104 @@ class TestPostgresSessionMemoryServiceGcExpired:
         deleted = await service.gc_expired(older_than_ms=now, limit=100)
 
         assert deleted == 2
+
+
+# ── LC-10a: the per-chat compartment (Layer U, mock pinned to the SQL impl) ──
+
+
+@pytest.fixture(params=["mock", "postgres-sqlite-factory"])
+def any_service(
+    request: pytest.FixtureRequest, service: PostgresSessionMemoryService
+) -> SessionMemoryService:
+    """ONE test body over both implementations: the parametrised run is the
+    parity pin that stops the mock from being "faked out"."""
+    if request.param == "mock":
+        return MockSessionMemoryService()
+    return service
+
+
+def _names(docs: list[Document]) -> list[str]:
+    return [d.metadata["filename"] for d in docs]
+
+
+async def test_list_own_session_compartment(
+    any_service: SessionMemoryService, user_context: UserContext
+) -> None:
+    """AC-1/2/3/4/14. A@s1 sees its row only; another chat id, a computed
+    id and no bound id see nothing; a header-less (NULL) row is recalled by
+    no chat; user B under the SAME id sees only B's row.
+
+    Neuters: drop the ``session_id`` filter -> the s2 case RED; ``OR
+    session_id IS NULL`` -> the computed-id case RED; drop the ``user_id``
+    filter -> the B case RED; unbound -> "all rows" -> the None case RED."""
+    alice = replace(user_context, user_id="user-a-compartment", is_admin=False)
+    bob = replace(user_context, user_id="user-b-compartment", is_admin=False)
+    with bound_session_id("s1"):
+        await any_service.write(alice, "a-s1.txt", "alice in s1")
+        await any_service.write(bob, "b-s1.txt", "bob in s1")
+    with bound_session_id(None):
+        await any_service.write(alice, "a-null.txt", "alice header-less")
+
+    with bound_session_id("s1"):
+        assert _names(await any_service.list_own(alice, limit=10)) == ["a-s1.txt"]
+        assert _names(await any_service.list_own(bob, limit=10)) == ["b-s1.txt"]
+    with bound_session_id("s2"):
+        assert await any_service.list_own(alice, limit=10) == []
+    with bound_session_id("chat-2026-11-07-0123abcd"):
+        assert await any_service.list_own(alice, limit=10) == []
+    with bound_session_id(None):
+        assert await any_service.list_own(alice, limit=10) == []
+
+
+async def test_read_own_stays_session_agnostic(
+    any_service: SessionMemoryService, user_context: UserContext
+) -> None:
+    """R3: promotion reads a NAMED file of the caller's, whatever its
+    compartment (including NULL)."""
+    with bound_session_id(None):
+        await any_service.write(user_context, "promote-me.txt", "x")
+    with bound_session_id("some-other-chat"):
+        found = await any_service.read_own(user_context, "promote-me.txt")
+    assert found is not None
+
+
+async def test_write_stamps_trace_id_and_logs_event(
+    service: PostgresSessionMemoryService,
+    pg_factory: InMemoryPostgresFactory,
+    user_context: UserContext,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC-9. Under a real span the row carries the span's trace id and ONE
+    ``session_memory.write`` line carries ``layer`` and ``size_bytes``
+    (fields only the explicit ``extra`` supplies).
+
+    Neuters: drop the log call, drop ``size_bytes`` from ``extra``, drop the
+    ``trace_id=`` stamp -> each alone RED."""
+    tracer = TracerProvider().get_tracer("lc10a-test")
+    with bound_session_id("s-trace"), tracer.start_as_current_span("w") as span:
+        expected = format(span.get_span_context().trace_id, "032x")
+        with caplog.at_level(logging.INFO, logger="audittrace.services.session_memory"):
+            await service.write(user_context, "t.txt", "héllo")
+    lines = [r for r in caplog.records if r.getMessage() == "session_memory.write"]
+    assert len(lines) == 1
+    assert getattr(lines[0], "size_bytes") == len("héllo".encode())
+    assert getattr(lines[0], "layer") == "session"
+    async with pg_factory.get_session_factory()() as session:
+        row = (await session.execute(select(SessionMemoryItem))).scalars().one()
+        assert row.trace_id == expected
+        assert row.session_id == "s-trace"
+
+
+async def test_recall_logs_count_only(
+    service: PostgresSessionMemoryService,
+    user_context: UserContext,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await service.write(user_context, "r.txt", "secret body")
+    with caplog.at_level(logging.INFO, logger="audittrace.services.session_memory"):
+        await service.list_own(user_context, limit=5)
+        with bound_session_id(None):
+            await service.list_own(user_context, limit=5)
+    lines = [r for r in caplog.records if r.getMessage() == "session_memory.recall"]
+    assert [getattr(r, "count") for r in lines] == [1, 0]
+    assert all("r.txt" not in r.getMessage() for r in lines)

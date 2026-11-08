@@ -1092,6 +1092,291 @@ else
   fi
 fi
 
+# ----- LC-10a: the dedicated session-recall E2E device-flow client (audittrace-session-e2e) -----
+# A CLONE of the audittrace-acl-e2e step above under the same control set
+# (public, device grant only, consent required, no refresh, 900 s tokens,
+# audience-restricted). Flag-aware (AUDITTRACE_SESSION_E2E_CLIENT_ENABLED, set
+# by the hook Job from .Values.keycloak.sessionE2eClient.enabled; default true):
+# enabled -> ensure + VERIFY (fail closed on drift, never `kcadm update` a
+# drifted client); disabled -> verify-then-delete (exactly one match, clientId
+# equal) and read back an empty result. Failure lines reuse the Job's shared
+# `acl_e2e_fail` reporter. Both session scopes are OPTIONAL on this client and
+# requested by name; this step sits OUTSIDE the MEMORY_SESSION_*_SCOPES bind
+# loops on purpose (those loops bind audittrace-librechat only). The pinned
+# JSON below is byte-identical in scripts/setup-memory-scopes.sh and the chart
+# ConfigMap (parity-guarded).
+SESSION_E2E_CLIENT_ID="audittrace-session-e2e"
+SESSION_E2E_ENABLED="${AUDITTRACE_SESSION_E2E_CLIENT_ENABLED:-true}"
+SESSION_E2E_CLIENT_JSON='{"clientId":"audittrace-session-e2e","description":"LC-10a session-recall E2E-only device-flow client (sunset: keycloak.sessionE2eClient.enabled=false). Default: audittrace:query + audit. OPTIONAL by name: memory:session:write + read-own. No offline_access, no refresh, consent required.","enabled":true,"protocol":"openid-connect","publicClient":true,"standardFlowEnabled":false,"directAccessGrantsEnabled":false,"implicitFlowEnabled":false,"serviceAccountsEnabled":false,"consentRequired":true,"redirectUris":["urn:ietf:wg:oauth:2.0:oob"],"webOrigins":[],"attributes":{"oauth2.device.authorization.grant.enabled":"true","oauth2.device.polling.interval":"5","oauth2.device.code.lifespan":"120","use.refresh.tokens":"false","access.token.lifespan":"900"},"defaultClientScopes":["audittrace:query","audittrace:audit"],"optionalClientScopes":["memory:session:write","memory:session:read-own"],"protocolMappers":[{"name":"aud-audittrace-server","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper","config":{"included.custom.audience":"audittrace-server","id.token.claim":"false","access.token.claim":"true"}}]}'
+SESSION_E2E_DEFAULT_SCOPES=("audittrace:query" "audittrace:audit")
+SESSION_E2E_OPTIONAL_SCOPES=("memory:session:write" "memory:session:read-own")
+ACL_E2E_STAGE="pre-step:init"
+
+# Whitespace-stripped JSON of one kcadm GET (clone of acl_e2e_compact: the
+# acl step's helpers stay pinned to the acl step's own call sites).
+session_e2e_compact() {
+  local raw
+  raw=$(acl_e2e_kc get "$1" -r "${REALM}") || acl_e2e_fail read-failed "cannot read the session client"
+  echo "${raw//[[:space:]]/}"
+}
+
+# Names of the session client's default|optional scopes, one per line.
+session_e2e_scope_names() {
+  local out line
+  out=$(acl_e2e_kc get "clients/$1/$2-client-scopes" -r "${REALM}" \
+          --fields name --format csv --noquotes) \
+    || acl_e2e_fail read-failed "cannot read the $2 scopes of the session client"
+  while IFS= read -r line; do
+    line="${line//\"/}"
+    [[ -n "${line}" ]] && echo "${line}"
+  done <<< "${out}"
+  return 0
+}
+
+# Is $2 in the pinned set of kind $1 (default|optional)?
+session_e2e_in_set() {
+  local want
+  if [[ "$1" == "default" ]]; then
+    for want in "${SESSION_E2E_DEFAULT_SCOPES[@]}"; do
+      [[ "$2" == "${want}" ]] && return 0
+    done
+  else
+    for want in "${SESSION_E2E_OPTIONAL_SCOPES[@]}"; do
+      [[ "$2" == "${want}" ]] && return 0
+    done
+  fi
+  return 1
+}
+
+# audittrace:query / audittrace:audit are REALM-defined client scopes (never
+# created by this script), so their ids are resolved from the live realm here;
+# an absent one fails closed.
+session_e2e_resolve_scope() {
+  local name="$1" found
+  [[ -n "${SCOPE_ID[${name}]:-}" ]] && return 0
+  found=$(acl_e2e_kc get client-scopes -r "${REALM}" \
+            --fields id,name --format csv --noquotes \
+          | awk -F, -v n="${name}" '$2 == n {print $1; exit}') \
+    || acl_e2e_fail read-failed "cannot list the realm client scopes (session client)"
+  [[ -n "${found}" ]] \
+    || acl_e2e_fail id-unresolvable "a pinned session client scope is absent from the realm (session client)"
+  SCOPE_ID["${name}"]="${found}"
+}
+
+# Remove every default/optional scope NOT in the pinned set (Keycloak may
+# add realm-default scopes on create): each kind keeps exactly its pinned scopes.
+session_e2e_strip_scopes() {
+  local uuid="$1" kind out sid sname keep
+  ACL_E2E_STAGE="strip"
+  for kind in "default" "optional"; do
+    out=$(acl_e2e_kc get "clients/${uuid}/${kind}-client-scopes" -r "${REALM}" \
+            --fields id,name --format csv --noquotes) \
+      || acl_e2e_fail strip-list-failed "cannot list ${kind} scopes (session client)"
+    while IFS=, read -r sid sname; do
+      sid="${sid//\"/}"; sname="${sname//\"/}"
+      [[ -z "${sid}" ]] && continue
+      keep=0
+      if session_e2e_in_set "${kind}" "${sname}"; then
+        keep=1
+      fi
+      if [[ "${keep}" -eq 0 ]]; then
+        acl_e2e_kc delete "clients/${uuid}/${kind}-client-scopes/${sid}" \
+          -r "${REALM}" >/dev/null \
+          || acl_e2e_fail strip-delete-failed "could not strip unpinned ${kind} scope (session client)"
+        echo "  ✓ ${SESSION_E2E_CLIENT_ID}: stripped unpinned ${kind} scope ${sname}"
+      fi
+    done <<< "${out}"
+  done
+}
+
+# VERIFY (equality on the compared keys). Flags + consentRequired exact;
+# attributes a pinned SUBSET; default AND optional scopes EXACT sets; protocol
+# mappers EXACT (name set == {aud-audittrace-server}, protocolMapper and
+# config pinned). Any difference -> exit non-zero with the diff.
+session_e2e_verify() {
+  local uuid="$1" diffs="" compact item name names raw line incfg cfgblocks pmok n=0
+  local unexpected_default=0 unexpected_optional=0 unexpected_mapper=0 unexpected_config=0
+  ACL_E2E_STAGE="verify-client"
+  compact=$(session_e2e_compact "clients/${uuid}") \
+    || acl_e2e_fail read-failed "cannot read the client (session client)"
+  for item in \
+      '"clientId":"audittrace-session-e2e"' '"publicClient":true' \
+      '"standardFlowEnabled":false' '"directAccessGrantsEnabled":false' \
+      '"implicitFlowEnabled":false' '"serviceAccountsEnabled":false' \
+      '"consentRequired":true' \
+      '"oauth2.device.authorization.grant.enabled":"true"' \
+      '"oauth2.device.polling.interval":"5"' \
+      '"oauth2.device.code.lifespan":"120"' \
+      '"use.refresh.tokens":"false"' '"access.token.lifespan":"900"'; do
+    [[ "${compact}" == *"${item}"* ]] || diffs+=" missing:${item}"
+  done
+  # default scopes: exact set (read FIRST, so a failed read is fatal and
+  # can never look like an empty/equal set)
+  ACL_E2E_STAGE="verify-default-scopes"
+  names=$(session_e2e_scope_names "${uuid}" default) \
+    || acl_e2e_fail read-failed "cannot read default scopes (session client)"
+  n=0
+  unexpected_default=0
+  while IFS= read -r name; do
+    [[ -z "${name}" ]] && continue
+    n=$((n + 1))
+    session_e2e_in_set default "${name}" || unexpected_default=$((unexpected_default + 1))
+  done <<< "${names}"
+  # F4 §5 / R4: detail= is a CLOSED VOCABULARY built from PROPERTIES
+  # (counts, shapes) — NEVER a byte of the response itself. A deny-list
+  # mask on specific secret SHAPES (the prior round's fix) is beatable by
+  # any shape it doesn't name; omitting response-derived text entirely is
+  # the only fail-closed form.
+  [[ "${unexpected_default}" -eq 0 ]] \
+    || diffs+=" unexpected-default-scope:count=${unexpected_default}"
+  [[ "${n}" -eq "${#SESSION_E2E_DEFAULT_SCOPES[@]}" ]] \
+    || diffs+=" default-scope-count:${n}"
+  # optional scopes: exact set (both session scopes, requested by name)
+  ACL_E2E_STAGE="verify-optional-scopes"
+  names=$(session_e2e_scope_names "${uuid}" optional) \
+    || acl_e2e_fail read-failed "cannot read optional scopes (session client)"
+  n=0
+  unexpected_optional=0
+  while IFS= read -r name; do
+    [[ -z "${name}" ]] && continue
+    n=$((n + 1))
+    session_e2e_in_set optional "${name}" || unexpected_optional=$((unexpected_optional + 1))
+  done <<< "${names}"
+  [[ "${unexpected_optional}" -eq 0 ]] \
+    || diffs+=" unexpected-optional-scope:count=${unexpected_optional}"
+  [[ "${n}" -eq "${#SESSION_E2E_OPTIONAL_SCOPES[@]}" ]] \
+    || diffs+=" optional-scope-count:${n}"
+  # protocol mappers: exact name set + pinned protocolMapper/config
+  ACL_E2E_STAGE="verify-mappers"
+  names=$(acl_e2e_kc get "clients/${uuid}/protocol-mappers/models" -r "${REALM}" \
+            --fields name --format csv --noquotes) \
+    || acl_e2e_fail read-failed "cannot read protocol mappers (session client)"
+  n=0
+  unexpected_mapper=0
+  while IFS= read -r name; do
+    name="${name//\"/}"
+    [[ -z "${name}" ]] && continue
+    n=$((n + 1))
+    [[ "${name}" == "aud-audittrace-server" ]] || unexpected_mapper=$((unexpected_mapper + 1))
+  done <<< "${names}"
+  [[ "${unexpected_mapper}" -eq 0 ]] \
+    || diffs+=" unexpected-mapper:count=${unexpected_mapper}"
+  [[ "${n}" -eq 1 ]] || diffs+=" mapper-count:${n}"
+  ACL_E2E_STAGE="verify-mapper-config"
+  raw=$(acl_e2e_kc get "clients/${uuid}/protocol-mappers/models" -r "${REALM}") \
+    || acl_e2e_fail read-failed "cannot read the mapper config (session client)"
+  # SC-1, EXACT: the mapper's name and protocolMapper equal the pinned
+  # values and its `config` map holds EXACTLY the pinned three pairs - no
+  # extra key (an audience widening or a hardcoded-claim `scope` writer
+  # would be one), none missing. Lines are compared VERBATIM: only the
+  # indentation, a trailing comma and the `" : "` key separator of kcadm's
+  # pretty-printed JSON are normalised, so whitespace INSIDE a value (for
+  # example `audittrace -server`) is a difference. This relies on kcadm's
+  # one-key-per-line pretty output of a ProtocolMapperRepresentation (id,
+  # name, protocol, protocolMapper, consentRequired, config - `config` is
+  # a flat string map with unique keys); a compact or re-shaped output
+  # finds no `config` block and fails closed (mapper-config-absent). No
+  # allow-list: if a real Keycloak adds a config key on create, this fails
+  # closed and the spec is amended.
+  incfg=0
+  cfgblocks=0
+  pmok=0
+  n=0
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    line="${line%,}"
+    line="${line/ : /:}"
+    if [[ "${incfg}" -eq 1 ]]; then
+      if [[ "${line}" == "}" ]]; then
+        incfg=0
+        continue
+      fi
+      n=$((n + 1))
+      case "${line}" in
+        '"included.custom.audience":"audittrace-server"' | '"id.token.claim":"false"' | '"access.token.claim":"true"') ;;
+        *) unexpected_config=$((unexpected_config + 1)) ;;
+      esac
+    elif [[ "${line}" == '"config":{' ]]; then
+      incfg=1
+      cfgblocks=$((cfgblocks + 1))
+    elif [[ "${line}" == '"protocolMapper":"oidc-audience-mapper"' ]]; then
+      pmok=1
+    fi
+  done <<< "${raw}"
+  [[ "${unexpected_config}" -eq 0 ]] \
+    || diffs+=" unexpected-mapper-config:count=${unexpected_config}"
+  [[ "${pmok}" -eq 1 ]] || diffs+=" missing-mapper-field:protocolMapper"
+  if [[ "${cfgblocks}" -ne 1 ]]; then
+    diffs+=" mapper-config-absent"
+  else
+    [[ "${n}" -eq 3 ]] || diffs+=" mapper-config-count:${n}"
+  fi
+  if [[ "${#diffs}" -gt 0 ]]; then
+    acl_e2e_fail drift "drift from the pinned client (fail closed, no kcadm update):${diffs} (session client)"
+  fi
+  echo "  ✓ ${SESSION_E2E_CLIENT_ID}: verified equal to the pinned block"
+}
+
+session_e2e_lookup() {
+  local out
+  out=$(acl_e2e_kc get clients -r "${REALM}" -q "clientId=${SESSION_E2E_CLIENT_ID}" \
+          --fields id,clientId --format csv --noquotes) \
+    || acl_e2e_fail lookup-failed "client lookup failed (session client)"
+  echo "${out//\"/}"
+}
+
+if [[ "${SESSION_E2E_ENABLED}" == "true" ]]; then
+  echo "▶ ensuring the dedicated session E2E client ${SESSION_E2E_CLIENT_ID} (enabled)..."
+  ACL_E2E_STAGE="lookup"
+  SESSION_E2E_FOUND=$(session_e2e_lookup) || acl_e2e_fail lookup-failed "client lookup failed (session client)"
+  if [[ -z "${SESSION_E2E_FOUND//[[:space:]]/}" ]]; then
+    ACL_E2E_STAGE="create"
+    printf '%s' "${SESSION_E2E_CLIENT_JSON}" | acl_e2e_kc create clients -r "${REALM}" -f - >/dev/null \
+      || acl_e2e_fail create-failed "create failed (session client)"
+    echo "  ✓ ${SESSION_E2E_CLIENT_ID}: created"
+    ACL_E2E_STAGE="lookup"
+    SESSION_E2E_UUID=$(session_e2e_lookup) || acl_e2e_fail lookup-failed "client lookup failed (session client)"
+    SESSION_E2E_UUID="${SESSION_E2E_UUID%%,*}"
+    [[ -n "${SESSION_E2E_UUID}" ]] || acl_e2e_fail id-unresolvable "created but id not resolvable (session client)"
+    session_e2e_strip_scopes "${SESSION_E2E_UUID}"
+    ACL_E2E_STAGE="bind"
+    for SCOPE in "${SESSION_E2E_DEFAULT_SCOPES[@]}"; do
+      session_e2e_resolve_scope "${SCOPE}"
+      bind_scope "${SESSION_E2E_CLIENT_ID}" "${SCOPE}" "default"
+    done
+    for SCOPE in "${SESSION_E2E_OPTIONAL_SCOPES[@]}"; do
+      session_e2e_resolve_scope "${SCOPE}"
+      bind_scope "${SESSION_E2E_CLIENT_ID}" "${SCOPE}" "optional"
+    done
+  else
+    [[ "$(echo "${SESSION_E2E_FOUND}" | grep -c .)" -eq 1 ]] \
+      || acl_e2e_fail ambiguous-match "more than one client matches (refusing) (session client)"
+    SESSION_E2E_UUID="${SESSION_E2E_FOUND%%,*}"
+  fi
+  session_e2e_verify "${SESSION_E2E_UUID}"
+else
+  echo "▶ removing the dedicated session E2E client ${SESSION_E2E_CLIENT_ID} (disabled — sunset)..."
+  ACL_E2E_STAGE="sunset-lookup"
+  SESSION_E2E_FOUND=$(session_e2e_lookup) || acl_e2e_fail lookup-failed "client lookup failed (session client)"
+  if [[ -z "${SESSION_E2E_FOUND//[[:space:]]/}" ]]; then
+    echo "  ⊝ ${SESSION_E2E_CLIENT_ID}: absent (empty query result)"
+  else
+    [[ "$(echo "${SESSION_E2E_FOUND}" | grep -c .)" -eq 1 ]] \
+      || acl_e2e_fail ambiguous-match "refusing to delete: query did not return exactly one client (session client)"
+    [[ "${SESSION_E2E_FOUND#*,}" == "${SESSION_E2E_CLIENT_ID}" ]] \
+      || acl_e2e_fail sunset-wrong-client-id "refusing to delete: returned clientId is not the pinned session client id (session client)"
+    ACL_E2E_STAGE="sunset-delete"
+    acl_e2e_kc delete "clients/${SESSION_E2E_FOUND%%,*}" -r "${REALM}" >/dev/null \
+      || acl_e2e_fail sunset-delete-failed "delete failed (session client)"
+    ACL_E2E_STAGE="sunset-readback"
+    SESSION_E2E_FOUND=$(session_e2e_lookup) || acl_e2e_fail lookup-failed "read-back lookup failed (session client)"
+    [[ -z "${SESSION_E2E_FOUND//[[:space:]]/}" ]] \
+      || acl_e2e_fail sunset-readback-nonempty "read-back after delete is not empty (session client)"
+    echo "  ✓ ${SESSION_E2E_CLIENT_ID}: deleted (read-back empty)"
+  fi
+fi
+
 # ----- User-identity protocol mappers -----
 # Without these, JWTs from user-facing clients lack `preferred_username`,
 # `email`, `name` etc. — only a bare UUID `sub`. Found in PR A's

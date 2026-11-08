@@ -1171,7 +1171,21 @@ class TestKeycloakSessionWriteScopeGovernance:
     _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
         "audittrace-opencode",
         "audittrace-webui",
+        # LC-10a ADDENDUM-2 WU1-A2: never named by the session bind loops.
+        "audittrace-restricted",
+        "audittrace-librechat-bff",
     )
+
+    #: LC-10a WU1-A2: the wall admits exactly these clients for
+    #: ``memory:session:write``, both OPTIONAL. The e2e client is pinned by
+    #: its OWN provisioner block (C4), so the bind LOOP names only the first;
+    #: the realm-wide set equality lives in
+    #: ``tests/test_chart_drift_guards_session_e2e.py``.
+    _ADMITTED_SESSION_WRITE_CLIENTS: tuple[str, ...] = (
+        "audittrace-librechat",
+        "audittrace-session-e2e",
+    )
+    _BIND_LOOP_CLIENTS: frozenset[str] = frozenset({"audittrace-librechat"})
 
     _FORBIDDEN: frozenset[str] = frozenset(
         {
@@ -1246,6 +1260,13 @@ class TestKeycloakSessionWriteScopeGovernance:
                 f"{label}: the MEMORY_SESSION_WRITE_SCOPES bind loop does "
                 "not bind to audittrace-librechat."
             )
+            # LC-10a AC-16: SET EQUALITY, not membership - a third client in
+            # the loop (the e2e client included) reddens this.
+            assert (
+                set(re.findall(r'bind_scope "([^"]+)"', loop_body))
+                == self._BIND_LOOP_CLIENTS
+                <= set(self._ADMITTED_SESSION_WRITE_CLIENTS)
+            ), f"{label}: the session-write bind loop's client set drifted"
             for forbidden_client in self._OTHER_END_USER_CLIENTS:
                 assert forbidden_client not in loop_body, (
                     f"{label}: the MEMORY_SESSION_WRITE_SCOPES bind loop "
@@ -1340,6 +1361,13 @@ class TestSessionWriteScopeJobRenderedBinding:
                 f"WU-1: the rendered Job's bind loop references {other!r} — "
                 "scoped to audittrace-librechat only."
             )
+        # LC-10a AC-16a: the RENDERED loop's client set equals the bind-loop
+        # share of the admitted set; the e2e client is NOT in the loop (its
+        # own pinned block, optional-only: tests/..._session_e2e.py).
+        assert (
+            set(re.findall(r'bind_scope "([^"]+)"', loop_body))
+            == TestKeycloakSessionWriteScopeGovernance._BIND_LOOP_CLIENTS
+        )
         assert '"optional"' in loop_body, (
             "WU-1: the rendered Job must bind memory:session:write as an "
             "OPTIONAL client scope — the browser's own login token must "

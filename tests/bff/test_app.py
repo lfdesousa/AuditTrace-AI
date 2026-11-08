@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import time
+from typing import Any
 
 import httpx
 import pytest
@@ -304,6 +305,85 @@ class TestSessionIdForward:
             },
         )
         assert backend.orchestrator_calls[0].headers.get_list("x-session-id") == []
+
+
+class TestConsoleFilesSessionIdForward:
+    """LC-10a AC-8(b), through the real BFF app: ``/console/files`` forwards
+    the trimmed inbound ``X-Session-Id`` to ``/memory/upload`` iff present;
+    nothing else about the request changes.
+
+    Neuter: drop ``session_id=`` at the ``console_files`` call site in
+    ``bff/app.py`` -> the ``present`` cell RED while the unit test of
+    ``proxy_memory_request`` (tests/bff/test_memory_proxy.py) stays GREEN."""
+
+    _BODY = (
+        b"--b1\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="n.txt"\r\n'
+        b"Content-Type: text/plain\r\n\r\nhello\r\n--b1--\r\n"
+    )
+
+    def _post(self, memory_app_client: Any, **extra: str) -> list[str]:
+        client, backend = memory_app_client
+        response = client.post(
+            "/console/files",
+            content=self._BODY,
+            headers={
+                "Authorization": f"Bearer {make_token(sub='alice')}",
+                "Content-Type": "multipart/form-data; boundary=b1",
+                **extra,
+            },
+        )
+        assert response.status_code == 200
+        assert str(backend.orchestrator_calls[-1].url).endswith(
+            "/memory/upload?layer=session"
+        )
+        seen: list[str] = backend.orchestrator_calls[-1].headers.get_list(
+            "x-session-id"
+        )
+        return seen
+
+    def test_the_generic_memory_proxy_never_forwards_session_id(
+        self, memory_app_client: Any
+    ) -> None:
+        """Only ``/console/files`` carries the chat id (B2.1). The generic
+        ``/memory/*`` proxy and the promote route stay byte-identical, so an
+        inbound ``X-Session-Id`` must NOT reach the orchestrator there.
+
+        Neuter: pass ``session_id=`` at the generic ``memory_proxy`` call site
+        or at the promote call site in ``bff/app.py`` -> RED."""
+        client, backend = memory_app_client
+        for method, path in (("GET", "/memory/episodic"), ("POST", "/memory/semantic")):
+            response = client.request(
+                method,
+                path,
+                headers={
+                    "Authorization": f"Bearer {make_token(sub='alice')}",
+                    "X-Session-Id": "chat-7",
+                },
+            )
+            assert response.status_code == 200
+            sent = backend.orchestrator_calls[-1]
+            assert str(sent.url).endswith(path)
+            assert sent.headers.get_list("x-session-id") == []
+        # The promote route (``/console/files/{filename}/promote``) stays
+        # byte-identical too.
+        response = client.post(
+            "/console/files/note.txt/promote",
+            headers={
+                "Authorization": f"Bearer {make_token(sub='alice')}",
+                "X-Session-Id": "chat-7",
+            },
+        )
+        sent = backend.orchestrator_calls[-1]
+        assert "/promote" in str(sent.url), (response.status_code, sent.url)
+        assert sent.headers.get_list("x-session-id") == []
+
+    def test_console_files_forwards_session_id_iff_present(
+        self, memory_app_client: Any
+    ) -> None:
+        assert self._post(memory_app_client, **{"X-Session-Id": "chat-7"}) == ["chat-7"]
+        assert self._post(memory_app_client) == []
+        assert self._post(memory_app_client, **{"X-Session-Id": "   "}) == []
 
 
 class TestFailClosed:

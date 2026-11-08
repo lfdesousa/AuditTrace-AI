@@ -55,7 +55,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from audittrace.db.models import SessionMemoryItem
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
+from audittrace.services.console_store._context import current_session_id
 from audittrace.services.semantic import MAX_RECALL_WINDOW
+from audittrace.telemetry import current_trace_id_hex
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,25 @@ def _emit_session_gc_telemetry(
             "newest_created_at_ms": newest_created_at_ms,
         },
     )
+
+
+def _emit_session_write_log(*, size_bytes: int) -> None:
+    """One structured INFO line per session-layer write (LC-10a R7).
+
+    No filename, no content: only the layer and the byte size. ``user_id``,
+    ``session_id`` and ``trace_id`` are stamped by the ``TraceContextFilter``
+    from the bound request context, so the LogQL observable
+    ``{...} | json | session_id="<id>"`` finds this line.
+    """
+    logger.info(
+        "session_memory.write", extra={"layer": "session", "size_bytes": size_bytes}
+    )
+
+
+def _emit_session_recall_log(*, count: int) -> None:
+    """One structured INFO line per ``list_own`` call (LC-10a R7): the
+    layer and the row count of the window, never a filename or content."""
+    logger.info("session_memory.recall", extra={"layer": "session", "count": count})
 
 
 def _validate_session_filename(filename: str) -> bool:
@@ -158,6 +179,12 @@ class SessionMemoryService(ABC):
         """Create a session-tier document in the caller's PRIVATE,
         EPHEMERAL layer.
 
+        The row's compartment is the BOUND request ``session_id``
+        (:func:`current_session_id`), never an argument: no handler, body
+        field or query parameter can name it (LC-10a R2). Unbound -> the row
+        is written with ``session_id NULL`` and no bound recall returns it.
+        The row also carries the active ``trace_id`` (LC-10a R6).
+
         Returns the persisted ``Document``. Raises ``ValueError`` for an
         invalid filename and ``RuntimeError`` for a backend write
         failure — same contract shape as
@@ -204,6 +231,11 @@ class SessionMemoryService(ABC):
         MUST NEVER include another user's row — the non-vacuity guard
         this method exists to satisfy (spec §6.1): neuter the explicit
         ``user_id`` filter and a cross-user isolation test goes RED.
+
+        **LC-10a compartment.** The window is ALSO restricted to rows whose
+        ``session_id`` equals the bound request id (AND, never OR). With no
+        bound id the result is ``[]`` (a missing compartment is empty, never
+        "everything"); rows with ``session_id NULL`` match no id.
         """
 
     @abstractmethod
@@ -254,6 +286,8 @@ class PostgresSessionMemoryService(SessionMemoryService):
                         content=content,
                         size_bytes=size_bytes,
                         created_at_ms=created_at_ms,
+                        trace_id=current_trace_id_hex(),
+                        session_id=current_session_id(),
                     )
                 )
                 await session.commit()
@@ -262,6 +296,7 @@ class PostgresSessionMemoryService(SessionMemoryService):
                 raise RuntimeError(
                     f"PostgresSessionMemoryService.write({filename!r}) failed: {exc}"
                 ) from exc
+        _emit_session_write_log(size_bytes=size_bytes)
         return _document_from(
             row_id=row_id,
             user_id=user_context.user_id,
@@ -318,6 +353,12 @@ class PostgresSessionMemoryService(SessionMemoryService):
         self, user_context: UserContext, *, limit: int, offset: int = 0
     ) -> list[Document]:
         window = min(offset + limit + 1, MAX_RECALL_WINDOW)
+        # LC-10a R3: the compartment is the BOUND request id, read here and
+        # nowhere else. Unbound -> empty, never "all of the user's rows".
+        bound_sid = current_session_id()
+        if bound_sid is None:
+            _emit_session_recall_log(count=0)
+            return []
         # #364 discipline: extract plain values INSIDE the `async with`
         # block (see read_own above) — build the tuple list here, turn
         # each into a Document only AFTER the session has closed.
@@ -331,6 +372,10 @@ class PostgresSessionMemoryService(SessionMemoryService):
                         # neuters: drop this .filter() and another
                         # user's uploads leak into the window.
                         .filter(SessionMemoryItem.user_id == user_context.user_id)
+                        # LC-10a R3: AND the compartment. ``=`` never matches
+                        # a NULL column, so legacy / header-less rows are
+                        # invisible to every bound recall (R-Q6 strict).
+                        .filter(SessionMemoryItem.session_id == bound_sid)
                         .order_by(SessionMemoryItem.created_at_ms.desc())
                         .limit(window)
                     )
@@ -342,7 +387,7 @@ class PostgresSessionMemoryService(SessionMemoryService):
                 (row.id, row.user_id, row.filename, row.content, row.created_at_ms)
                 for row in rows
             ]
-        return [
+        documents = [
             _document_from(
                 row_id=row_id,
                 user_id=row_user_id,
@@ -352,6 +397,8 @@ class PostgresSessionMemoryService(SessionMemoryService):
             )
             for row_id, row_user_id, row_filename, row_content, row_created_at_ms in plain_rows
         ]
+        _emit_session_recall_log(count=len(documents))
+        return documents
 
     @log_call(logger=logger)
     async def gc_expired(self, *, older_than_ms: int, limit: int) -> int:
@@ -397,6 +444,8 @@ class _MockRow:
     filename: str
     content: str
     created_at_ms: int
+    session_id: str | None = None
+    trace_id: str | None = None
 
 
 class MockSessionMemoryService(SessionMemoryService):
@@ -421,8 +470,11 @@ class MockSessionMemoryService(SessionMemoryService):
                 filename=filename,
                 content=content,
                 created_at_ms=created_at_ms,
+                session_id=current_session_id(),
+                trace_id=current_trace_id_hex(),
             )
         )
+        _emit_session_write_log(size_bytes=len(content.encode("utf-8")))
         return _document_from(
             row_id=row_id,
             user_id=user_context.user_id,
@@ -456,6 +508,13 @@ class MockSessionMemoryService(SessionMemoryService):
         self, user_context: UserContext, *, limit: int, offset: int = 0
     ) -> list[Document]:
         window = min(offset + limit + 1, MAX_RECALL_WINDOW)
+        # Same compartment rule as the Postgres impl (LC-10a R3): the bound
+        # id, AND-ed with ``user_id``; unbound -> empty; ``None`` matches
+        # nothing (the mock really filters, it never returns a canned answer).
+        bound_sid = current_session_id()
+        if bound_sid is None:
+            _emit_session_recall_log(count=0)
+            return []
         # Reverse insertion order FIRST, then a stable sort by
         # created_at_ms (descending) — `time.time()` millisecond
         # resolution means two writes issued back-to-back (no I/O
@@ -466,10 +525,10 @@ class MockSessionMemoryService(SessionMemoryService):
         mine = [
             item
             for item in reversed(self._items)
-            if item.user_id == user_context.user_id
+            if item.user_id == user_context.user_id and item.session_id == bound_sid
         ]
         mine.sort(key=lambda item: item.created_at_ms, reverse=True)
-        return [
+        documents = [
             _document_from(
                 row_id=row.id,
                 user_id=row.user_id,
@@ -479,6 +538,8 @@ class MockSessionMemoryService(SessionMemoryService):
             )
             for row in mine[:window]
         ]
+        _emit_session_recall_log(count=len(documents))
+        return documents
 
     @log_call(logger=logger)
     async def gc_expired(self, *, older_than_ms: int, limit: int) -> int:
