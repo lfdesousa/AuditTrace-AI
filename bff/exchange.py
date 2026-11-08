@@ -124,7 +124,29 @@ async def exchange_token(
             "identity assertion failed: minted token sub "
             f"{minted_sub!r} != inbound token sub {inbound_sub!r}"
         )
+    _log_scope_outcome(requested_scope, minted_claims)
     return minted
+
+
+def _log_scope_outcome(requested_scope: str | None, claims: dict[str, Any]) -> None:
+    """Name the scopes the minted token carries, and any REQUESTED scope it
+    does not (names only, never the token).
+
+    Keycloak 24's legacy token exchange silently drops a requested optional
+    scope the subject token lacks and still answers 200, so the downstream
+    403 is otherwise the first sign. A warning here makes the cause visible.
+    """
+    granted = sorted(set(str(claims.get("scope", "")).split()))
+    requested = sorted(set((requested_scope or "").split()))
+    missing = [name for name in requested if name not in granted]
+    if missing:
+        logger.warning(
+            "token_exchange.scopes_missing missing=%s granted=%s",
+            ",".join(missing),
+            ",".join(granted),
+        )
+    else:
+        logger.info("token_exchange.scopes granted=%s", ",".join(granted))
 
 
 async def _revalidate_minted_token(
