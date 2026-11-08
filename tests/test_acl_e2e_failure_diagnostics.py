@@ -4052,6 +4052,31 @@ class TestRunFullWholeScriptCoverage:
         finally:
             srv.close()
 
+    def test_an_absent_realm_scope_fails_the_session_client_closed(
+        self, tmp_path: Path, site: Path
+    ) -> None:
+        """LC-10a A4: ``audittrace:query`` / ``audittrace:audit`` are
+        realm-defined; when one is missing from the live realm the session
+        client block stops with the NAMED ``id-unresolvable`` code and the
+        run never reports completion.
+
+        Neuter: make the emptiness check a no-op (``true``) in the script
+        and the ConfigMap -> the run fails with a different, unnamed code
+        (RED)."""
+        srv, port = _listening_socket()
+        try:
+            h = RunFullHarness(tmp_path, site)
+            state = _run_full_state(scopes_present=False, e2e_present=False)
+            state["scopes"] = [
+                sc for sc in state["scopes"] if sc["name"] != "audittrace:query"
+            ]
+            proc = h.run(state=state, tcp_port=port)
+            assert proc.returncode != 0
+            assert "code=id-unresolvable" in proc.stdout, proc.stdout
+            assert "memory-scopes provisioning complete" not in proc.stdout
+        finally:
+            srv.close()
+
     def test_all_present_state_reaches_the_end(
         self, tmp_path: Path, site: Path
     ) -> None:

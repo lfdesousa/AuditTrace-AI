@@ -43,7 +43,7 @@ import audittrace.tools.memory_handlers as handlers_mod
 from audittrace import config as config_mod
 from audittrace import dependencies, instrumentation
 from audittrace.dependencies import create_test_container
-from audittrace.identity import sentinel_user_context
+from audittrace.identity import SENTINEL_SUBJECT, sentinel_user_context
 from audittrace.server import create_app
 from audittrace.services.session_memory import PostgresSessionMemoryService
 from audittrace.tools import reset_registry_for_tests
@@ -330,3 +330,96 @@ def test_migration_039_on_postgres_18(admin_url: str) -> None:
         assert state(url) == (False, None)
         _alembic(url, "upgrade", "head")
         assert state(url)[0] is True
+
+
+def _rows_named(db: dict[str, str], name: str) -> list[tuple[str, str | None]]:
+    """The owner-side read-back: ``(user_id, session_id)`` of every row with
+    this filename, read as the superuser so RLS cannot hide a row."""
+    eng = create_engine(db["admin"], isolation_level="AUTOCOMMIT")
+    try:
+        with eng.connect() as c:
+            rows = c.execute(
+                text(
+                    "SELECT user_id, session_id FROM session_memory_items"
+                    " WHERE filename = :f"
+                ),
+                {"f": name},
+            ).fetchall()
+    finally:
+        eng.dispose()
+    return [(r[0], r[1]) for r in rows]
+
+
+@pytest.mark.parametrize(
+    "bad_sid", ["x" * 256, "a b"], ids=["256-chars", "inner-space"]
+)
+def test_malformed_header_on_upload_is_stored_with_no_compartment(
+    client: TestClient, db: dict[str, str], bad_sid: str
+) -> None:
+    """F1. The upload path's shape guard: a header that fails the accepted
+    shape is ABSENT, so the route answers exactly 200 and the row lands with
+    ``session_id IS NULL`` (never the raw value: 256 characters would not
+    even fit VARCHAR(255)). A recall bound to that same header value gets
+    nothing, and the owner read-back shows the row exists.
+
+    Neuter: bind the raw header (``request.headers.get("x-session-id")``)
+    in ``bound_upload_session`` -> the row carries the raw id (RED)."""
+    name = f"bad-shape-{uuid.uuid4().hex[:8]}.txt"
+    r = client.post(
+        "/memory/upload",
+        params={"layer": "session"},
+        files={"file": (name, _SENTINEL.encode(), "text/plain")},
+        headers={"X-Session-Id": bad_sid},
+    )
+    assert r.status_code == 200, r.text
+    assert _rows_named(db, name) == [(SENTINEL_SUBJECT, None)]
+    res = _mcp(client, bad_sid)
+    assert res["total"] == 0 and res["matches"] == []
+    _assert_absent(json.dumps(res), name)
+
+
+def test_a_caller_naming_another_chat_of_another_user_sees_only_its_own_row(
+    client: TestClient, db: dict[str, str]
+) -> None:
+    """A6 (two users, route level, RLS live, non-owner app role). A row of
+    ``victim-user-0001`` lives under chat id ``sid``. The caller (the sentinel
+    user) supplies that same chat id, uploads its own row under it, and
+    recalls through the real chat route (stream false and true) and ``/mcp``:
+    only its own row comes back.
+
+    Neuters: drop the service ``user_id`` filter alone -> still GREEN (RLS is
+    an independent wall); drop it AND the whole ``_is_postgres()`` block of
+    migration 022 -> RED."""
+    sid = f"shared-chat-{uuid.uuid4().hex[:8]}"
+    victim_name = f"victim-{uuid.uuid4().hex[:8]}.txt"
+    victim_content = f"VICTIM-CONTENT-{uuid.uuid4().hex}"
+    eng = create_engine(db["admin"], isolation_level="AUTOCOMMIT")
+    try:
+        with eng.connect() as c:
+            c.execute(
+                text(
+                    "INSERT INTO session_memory_items (id, user_id, filename,"
+                    " content, size_bytes, created_at_ms, session_id) VALUES"
+                    " (:i, :u, :f, :c, 1, 1, :s)"
+                ),
+                {
+                    "i": str(uuid.uuid4()),
+                    "u": "victim-user-0001",
+                    "f": victim_name,
+                    "c": victim_content,
+                    "s": sid,
+                },
+            )
+    finally:
+        eng.dispose()
+    own_name = f"own-{uuid.uuid4().hex[:8]}.txt"
+    _upload(client, sid, own_name)
+    for stream in (False, True):
+        body = _chat(client, sid, stream=stream)
+        assert own_name in body, body
+        assert victim_name not in body and victim_content[:20] not in body, body
+    res = _mcp(client, sid)
+    assert res["total"] == 1, res
+    assert [m["title"] for m in res["matches"]] == [own_name]
+    dumped = json.dumps(res)
+    assert victim_name not in dumped and victim_content[:20] not in dumped, dumped

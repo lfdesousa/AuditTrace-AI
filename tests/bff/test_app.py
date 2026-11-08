@@ -342,6 +342,30 @@ class TestConsoleFilesSessionIdForward:
         )
         return seen
 
+    def test_the_generic_memory_proxy_never_forwards_session_id(
+        self, memory_app_client: Any
+    ) -> None:
+        """Only ``/console/files`` carries the chat id (B2.1). The generic
+        ``/memory/*`` proxy and the promote route stay byte-identical, so an
+        inbound ``X-Session-Id`` must NOT reach the orchestrator there.
+
+        Neuter: pass ``session_id=`` at the generic ``memory_proxy`` call site
+        in ``bff/app.py`` -> RED."""
+        client, backend = memory_app_client
+        for method, path in (("GET", "/memory/episodic"), ("POST", "/memory/semantic")):
+            response = client.request(
+                method,
+                path,
+                headers={
+                    "Authorization": f"Bearer {make_token(sub='alice')}",
+                    "X-Session-Id": "chat-7",
+                },
+            )
+            assert response.status_code == 200
+            sent = backend.orchestrator_calls[-1]
+            assert str(sent.url).endswith(path)
+            assert sent.headers.get_list("x-session-id") == []
+
     def test_console_files_forwards_session_id_iff_present(
         self, memory_app_client: Any
     ) -> None:

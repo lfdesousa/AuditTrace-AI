@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import threading
 from collections.abc import Iterator
 from http.server import ThreadingHTTPServer
 
@@ -26,6 +25,7 @@ from tests.integration._lc10a_support import (
     _create_role,
     _Llama,
     fresh_db,
+    serving,
 )
 
 
@@ -82,13 +82,7 @@ def db(admin_url: str) -> Iterator[dict[str, str]]:
 
 @pytest.fixture(scope="module")
 def llama() -> Iterator[ThreadingHTTPServer]:
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Llama)
-    srv.seen = []  # type: ignore[attr-defined]
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    try:
-        yield srv
-    finally:
-        srv.shutdown()
-        srv.server_close()
-        t.join(timeout=5)
+    with ThreadingHTTPServer(("127.0.0.1", 0), _Llama) as srv:
+        srv.seen = []  # type: ignore[attr-defined]
+        with serving(srv):
+            yield srv

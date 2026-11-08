@@ -9,10 +9,11 @@
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +69,8 @@ def fresh_db(admin: str) -> Iterator[str]:
 
 
 def _create_role(c: Any, role: str, grants: str) -> None:
-    c.execute(text(f'DROP OWNED BY "{role}"')) if _role_exists(c, role) else None
+    if _role_exists(c, role):
+        c.execute(text(f'DROP OWNED BY "{role}"'))
     c.execute(text(f'DROP ROLE IF EXISTS "{role}"'))
     c.execute(
         text(
@@ -83,6 +85,19 @@ def _role_exists(c: Any, role: str) -> bool:
     return bool(
         c.execute(text("SELECT 1 FROM pg_roles WHERE rolname=:r"), {"r": role}).first()
     )
+
+
+@contextmanager
+def serving(srv: ThreadingHTTPServer) -> Iterator[ThreadingHTTPServer]:
+    """Serve ``srv`` on a thread for the block; shut it down and join on every
+    exit path. (Close the socket with ``with srv:`` around this.)"""
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield srv
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
 
 
 # ───────────────────────────── the LLM substitute ───────────────────────────
