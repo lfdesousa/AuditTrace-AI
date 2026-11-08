@@ -89,3 +89,26 @@ def test_rejection_logs_the_length_only_never_the_value(
     assert len(rows) == 1
     assert rows[0].header_length == len(secret)  # type: ignore[attr-defined]
     assert secret not in caplog.text and "zzzz" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["{{" + "z" * 40, "z" * 40 + "}}", "{{" + "z" * 40 + "}}"],
+    ids=["open-only", "close-only", "both"],
+)
+def test_a_template_rejection_logs_the_length_only_never_the_value(
+    value: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F2 (A3 log property). A value that PASSES the shape regex but carries a
+    template marker is rejected with exactly ONE ``session_id.header_rejected``
+    warning that carries ``header_length`` and nothing of the value.
+
+    Neuters: give the template check its own branch that logs the raw value
+    -> RED; make the template branch reject silently -> RED."""
+    assert SESSION_ID_RE.fullmatch(value) is not None
+    with caplog.at_level(logging.WARNING, logger="audittrace.routes._session_bind"):
+        assert header_session_id(_Req(value)) is None
+    rows = [r for r in caplog.records if r.getMessage() == "session_id.header_rejected"]
+    assert len(rows) == 1
+    assert getattr(rows[0], "header_length") == len(value)
+    assert value not in caplog.text and "zzzz" not in caplog.text

@@ -350,7 +350,7 @@ class TestConsoleFilesSessionIdForward:
         inbound ``X-Session-Id`` must NOT reach the orchestrator there.
 
         Neuter: pass ``session_id=`` at the generic ``memory_proxy`` call site
-        in ``bff/app.py`` -> RED."""
+        or at the promote call site in ``bff/app.py`` -> RED."""
         client, backend = memory_app_client
         for method, path in (("GET", "/memory/episodic"), ("POST", "/memory/semantic")):
             response = client.request(
@@ -365,6 +365,18 @@ class TestConsoleFilesSessionIdForward:
             sent = backend.orchestrator_calls[-1]
             assert str(sent.url).endswith(path)
             assert sent.headers.get_list("x-session-id") == []
+        # The promote route (``/console/files/{filename}/promote``) stays
+        # byte-identical too.
+        response = client.post(
+            "/console/files/note.txt/promote",
+            headers={
+                "Authorization": f"Bearer {make_token(sub='alice')}",
+                "X-Session-Id": "chat-7",
+            },
+        )
+        sent = backend.orchestrator_calls[-1]
+        assert "/promote" in str(sent.url), (response.status_code, sent.url)
+        assert sent.headers.get_list("x-session-id") == []
 
     def test_console_files_forwards_session_id_iff_present(
         self, memory_app_client: Any
