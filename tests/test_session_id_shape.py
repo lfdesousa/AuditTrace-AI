@@ -12,7 +12,10 @@ turns the padded cell RED.
 
 from __future__ import annotations
 
+import base64
 import logging
+import random
+import string
 
 import pytest
 
@@ -31,47 +34,74 @@ class _Req:
 _BARE_RECORD_KEYS = frozenset(
     logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
 )
-#: Keys the installed ``TraceContextFilter`` may stamp (LOG-TRACE-ID) ...
-_FILTER_STAMPED = frozenset({"trace_id", "span_id", "user_id", "session_id"})
-#: ... and keys the capture handler's formatter adds while formatting.
+#: Keys the capture handler's formatter adds while formatting. NOTHING else is
+#: tolerated: caplog's handler carries no ``TraceContextFilter``, so a
+#: ``trace_id`` / ``session_id`` / ``user_id`` extra on the event can only come
+#: from the code under test (an encoded value hidden there would ship to Loki).
 _FORMATTER_STAMPED = frozenset({"message", "asctime"})
 _EVENT = "session_id.header_rejected"
 
+#: Varied characters on purpose: a 4-character slice check is meaningless on a
+#: single repeated character.
+_TEMPLATE_CORE = "Q7mx2Rk9Lp4Wv8Tn3Bz6"
+_SHAPE_VALUE = "".join(
+    random.Random(20261108).choices(string.ascii_letters + string.digits, k=256)
+)
 
-def _windows(value: str, size: int = 4) -> set[str]:
-    """Every ``size``-character slice of the value's non-marker part."""
+
+def _forbidden_forms(value: str) -> set[str]:
+    """Every form of ``value`` that must appear nowhere in the log output:
+
+    * the value itself;
+    * each 4-character slice of its non-marker part;
+    * its hex encoding (lower and upper case);
+    * its base64 encoding, standard and urlsafe, with and without padding.
+
+    Known limit: other transforms (reversal, a different cipher) are not
+    covered; the property cannot be proven against every transform.
+    """
     part = value.replace("{{", "").replace("}}", "")
-    return {part[i : i + size] for i in range(len(part) - size + 1)}
+    raw = value.encode()
+    forms = {value} | {part[i : i + 4] for i in range(len(part) - 3)}
+    hexed = raw.hex()
+    forms |= {hexed, hexed.upper()}
+    for encoded in (base64.b64encode(raw), base64.urlsafe_b64encode(raw)):
+        text = encoded.decode()
+        forms |= {text, text.rstrip("=")}
+    return forms
 
 
 def assert_rejection_logs_the_length_only(
     caplog: pytest.LogCaptureFixture, value: str
 ) -> None:
-    """The shared F2 / F2-r3 assertion, on the RECORD (``caplog.text`` never
-    shows ``extra=`` fields, but ``StructuredFormatter`` ships every one of
-    them to Loki):
+    """The shared F2 assertion. Capture EVERY record from EVERY logger at DEBUG
+    (the caller sets the level) and check on the records, not on
+    ``caplog.text``, which never shows ``extra=`` fields while
+    ``StructuredFormatter`` ships every one of them to Loki:
 
-    * exactly one ``session_id.header_rejected`` record;
-    * its ``extra=`` attributes are exactly ``{"header_length"}`` (filter- and
-      formatter-stamped ids are listed above and tolerated);
-    * ``header_length == len(value)``;
-    * no attribute, in its ``str()`` form, holds the value or any 4-character
-      slice of it;
-    * the real ``StructuredFormatter`` line holds neither the value nor a slice.
+    * every captured record, every attribute's ``str()`` and its real
+      ``StructuredFormatter`` line hold none of ``_forbidden_forms(value)``
+      (so a second warning, a second logger or an encoded extra is caught);
+    * exactly one ``session_id.header_rejected`` record, whose ``extra=`` keys
+      (record keys minus a bare ``LogRecord``'s, minus the formatter's
+      ``message`` / ``asctime``) are exactly ``{"header_length"}``;
+    * ``header_length == len(value)``.
     """
+    forbidden = _forbidden_forms(value)
+    formatter = StructuredFormatter()
+    for record in caplog.records:
+        line = formatter.format(record)
+        for attr, attr_value in record.__dict__.items():
+            rendered = str(attr_value)
+            hit = [f for f in forbidden if f in rendered]
+            assert not hit, (record.name, attr, hit)
+        hit = [f for f in forbidden if f in line]
+        assert not hit, (record.name, line)
     rows = [r for r in caplog.records if r.getMessage() == _EVENT]
     assert len(rows) == 1
-    record = rows[0]
-    extras = set(record.__dict__) - _BARE_RECORD_KEYS
-    assert extras - _FILTER_STAMPED - _FORMATTER_STAMPED == {"header_length"}, extras
-    assert getattr(record, "header_length") == len(value)
-    needles = {value} | _windows(value)
-    for attr, attr_value in record.__dict__.items():
-        rendered = str(attr_value)
-        leaked = [n for n in needles if n in rendered]
-        assert not leaked, (attr, leaked)
-    line = StructuredFormatter().format(record)
-    assert not [n for n in needles if n in line], line
+    extras = set(rows[0].__dict__) - _BARE_RECORD_KEYS - _FORMATTER_STAMPED
+    assert extras == {"header_length"}, extras
+    assert getattr(rows[0], "header_length") == len(value)
 
 
 def test_the_pattern_is_the_pinned_literal() -> None:
@@ -130,17 +160,24 @@ def test_absent_or_blank_is_none_without_warning(
 def test_rejection_logs_the_length_only_never_the_value(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Neuters: log the value, or any slice of it, under any ``extra=`` key on
-    the shared warning (for example ``header_value``) -> RED."""
-    secret = "tok-" + "z" * 300
-    with caplog.at_level(logging.WARNING, logger="audittrace.routes._session_bind"):
-        assert header_session_id(_Req(secret)) is None
-    assert_rejection_logs_the_length_only(caplog, secret)
+    """A 256-character value of varied characters fails the shape check.
+
+    Neuters: the value, a slice, its hex or base64 under ANY extra key
+    (``session_id`` and ``user_id`` included), a second warning or a second
+    logger carrying it -> RED."""
+    caplog.set_level(logging.DEBUG)
+    assert SESSION_ID_RE.fullmatch(_SHAPE_VALUE) is None
+    assert header_session_id(_Req(_SHAPE_VALUE)) is None
+    assert_rejection_logs_the_length_only(caplog, _SHAPE_VALUE)
 
 
 @pytest.mark.parametrize(
     "value",
-    ["{{" + "z" * 40, "z" * 40 + "}}", "{{" + "z" * 40 + "}}"],
+    [
+        "{{" + _TEMPLATE_CORE,
+        _TEMPLATE_CORE + "}}",
+        "{{" + _TEMPLATE_CORE + "}}",
+    ],
     ids=["open-only", "close-only", "both"],
 )
 def test_a_template_rejection_logs_the_length_only_never_the_value(
@@ -153,7 +190,7 @@ def test_a_template_rejection_logs_the_length_only_never_the_value(
     Neuters: give the template check its own branch that logs the raw value
     (in the message or under any ``extra=`` key, prefix included) -> RED; make
     the template branch reject silently -> RED."""
+    caplog.set_level(logging.DEBUG)
     assert SESSION_ID_RE.fullmatch(value) is not None
-    with caplog.at_level(logging.WARNING, logger="audittrace.routes._session_bind"):
-        assert header_session_id(_Req(value)) is None
+    assert header_session_id(_Req(value)) is None
     assert_rejection_logs_the_length_only(caplog, value)
