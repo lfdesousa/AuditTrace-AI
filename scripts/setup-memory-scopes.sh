@@ -842,7 +842,7 @@ acl_e2e_strip_scopes() {
 # config pinned). Any difference -> exit non-zero with the diff.
 acl_e2e_verify() {
   local uuid="$1" diffs="" compact item name names raw line incfg cfgblocks pmok n=0
-  local unexpected_default=0 unexpected_optional=0 unexpected_mapper=0 unexpected_config=0
+  local unexpected_default=0 unexpected_optional=0 unexpected_mapper=0 unexpected_config=0 unexpected_keys='' cfgkey=''
   ACL_E2E_STAGE="verify-client"
   compact=$(acl_e2e_compact "clients/${uuid}") \
     || acl_e2e_fail read-failed "cannot read the client"
@@ -938,7 +938,12 @@ acl_e2e_verify() {
       n=$((n + 1))
       case "${line}" in
         '"included.custom.audience":"audittrace-server"' | '"id.token.claim":"false"' | '"access.token.claim":"true"') ;;
-        *) unexpected_config=$((unexpected_config + 1)) ;;
+        *)
+          unexpected_config=$((unexpected_config + 1))
+          # key NAME only (text before the first closing quote); the value is never kept
+          cfgkey="${line#\"}"
+          unexpected_keys+="${cfgkey%%\"*}"$'\n'
+          ;;
       esac
     elif [[ "${line}" == '"config":{' ]]; then
       incfg=1
@@ -948,7 +953,7 @@ acl_e2e_verify() {
     fi
   done <<< "${raw}"
   [[ "${unexpected_config}" -eq 0 ]] \
-    || diffs+=" unexpected-mapper-config:count=${unexpected_config}"
+    || diffs+=" unexpected-mapper-config:count=${unexpected_config} keys=$(printf '%s' "${unexpected_keys}" | LC_ALL=C sort | paste -sd, -)"
   [[ "${pmok}" -eq 1 ]] || diffs+=" missing-mapper-field:protocolMapper"
   if [[ "${cfgblocks}" -ne 1 ]]; then
     diffs+=" mapper-config-absent"
@@ -1195,7 +1200,7 @@ session_e2e_strip_scopes() {
 # config pinned). Any difference -> exit non-zero with the diff.
 session_e2e_verify() {
   local uuid="$1" diffs="" compact item name names raw line incfg cfgblocks pmok n=0
-  local unexpected_default=0 unexpected_optional=0 unexpected_mapper=0 unexpected_config=0
+  local unexpected_default=0 unexpected_optional=0 unexpected_mapper=0 unexpected_config=0 unexpected_keys='' cfgkey=''
   ACL_E2E_STAGE="verify-client"
   compact=$(session_e2e_compact "clients/${uuid}") \
     || acl_e2e_fail read-failed "cannot read the client (session client)"
@@ -1295,7 +1300,12 @@ session_e2e_verify() {
       n=$((n + 1))
       case "${line}" in
         '"included.custom.audience":"audittrace-server"' | '"id.token.claim":"false"' | '"access.token.claim":"true"') ;;
-        *) unexpected_config=$((unexpected_config + 1)) ;;
+        *)
+          unexpected_config=$((unexpected_config + 1))
+          # key NAME only (text before the first closing quote); the value is never kept
+          cfgkey="${line#\"}"
+          unexpected_keys+="${cfgkey%%\"*}"$'\n'
+          ;;
       esac
     elif [[ "${line}" == '"config":{' ]]; then
       incfg=1
@@ -1305,7 +1315,7 @@ session_e2e_verify() {
     fi
   done <<< "${raw}"
   [[ "${unexpected_config}" -eq 0 ]] \
-    || diffs+=" unexpected-mapper-config:count=${unexpected_config}"
+    || diffs+=" unexpected-mapper-config:count=${unexpected_config} keys=$(printf '%s' "${unexpected_keys}" | LC_ALL=C sort | paste -sd, -)"
   [[ "${pmok}" -eq 1 ]] || diffs+=" missing-mapper-field:protocolMapper"
   if [[ "${cfgblocks}" -ne 1 ]]; then
     diffs+=" mapper-config-absent"

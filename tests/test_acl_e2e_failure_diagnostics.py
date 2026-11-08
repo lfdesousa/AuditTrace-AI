@@ -867,7 +867,7 @@ class TestNamedFailureLineOnEveryExit:
         assert "<redacted-token>" not in proc.stdout
         assert planted not in proc.stdout
         assert planted not in proc.stderr
-        assert "unexpected-mapper-config:count=1" in proc.stdout
+        assert "unexpected-mapper-config:count=1 keys=" in proc.stdout
 
     @pytest.mark.parametrize(
         ("label", "planted"),
@@ -1099,6 +1099,48 @@ class TestNamedFailureLineOnEveryExit:
         assert planted in proc.stdout, (
             "the neuter should have reopened the leak — detail= fix is unproven"
         )
+
+    def test_printing_the_config_value_in_the_keys_list_reddens(
+        self, harness: StepHarness
+    ) -> None:
+        """LC-10a r6 neuter: make the key collector keep the whole
+        `"key":"value"` line instead of the key name; the planted value
+        then reaches detail= (so the value-absent assertion in
+        TestEnabledCreateServerAddedConfig is a real guard)."""
+        planted = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+        raw_stdout = "\n".join(
+            [
+                '  "protocolMapper" : "oidc-audience-mapper",',
+                '  "config" : {',
+                f'    "evil.widening.key" : "{planted}"',
+                "  }",
+            ]
+        )
+        script = harness._script_text(
+            clients=[],
+            enabled="true",
+            fail_match=[
+                {
+                    "substr": "protocol-mappers/models",
+                    "nth": 2,
+                    "rc": 0,
+                    "stdout": raw_stdout,
+                }
+            ],
+        )
+        needle = 'unexpected_keys+="${cfgkey%%\\"*}"$\'\\n\''
+        assert script.count(needle) == 1
+        mutated = script.replace(needle, "unexpected_keys+=\"${line}\"$'\\n'", 1)
+        env = {
+            **os.environ,
+            "FAKE_STATE": str(harness.state_path),
+            "FAKE_LOG": str(harness.log),
+            "FAKE_MARKER_LOG": str(harness.marker_log),
+        }
+        proc = subprocess.run(
+            ["bash", "-c", mutated], capture_output=True, text=True, env=env, timeout=30
+        )
+        assert planted in proc.stdout, "the neuter should print the value"
 
     def test_f2i_kcadm_timeout_in_the_real_step(self, harness: StepHarness) -> None:
         """R3: a timed-out kcadm call INSIDE the real ACL-E2E step (the
@@ -4188,25 +4230,25 @@ class TestRunFullWholeScriptCoverage:
                 (560, 561),
                 (607, 609),
                 (901, 903),
-                1101,
-                (1156, 1157),
+                1106,
+                (1161, 1162),
                 # LC-10a: the session E2E clone (same two named reasons as
                 # the acl rows above: nothing to strip in a RunFull state;
                 # the sunset delete runs only with enabled=false).
-                (1254, 1256),
-                (1441, 1442),
-                # was (1282, 1283): shifted by the LC-10a block above it.
-                (1567, 1568),
+                (1259, 1261),
+                (1451, 1452),
+                # was (1282, 1283): shifted by the LC-10a blocks above it.
+                (1577, 1578),
             }
         else:
-            # (1187,1189)/(1374,1375): the LC-10a session E2E clone's strip
-            # delete and sunset delete (reasons as (834,836)/(1089,1090)).
+            # (1192,1194)/(1384,1385): the LC-10a session E2E clone's strip
+            # delete and sunset delete (reasons as (834,836)/(1094,1095)).
             expected_unreached = {
                 (834, 836),
-                1034,
-                (1089, 1090),
-                (1187, 1189),
-                (1374, 1375),
+                1039,
+                (1094, 1095),
+                (1192, 1194),
+                (1384, 1385),
             }
         # Named per range (line numbers re-measured after every edit
         # that shifts them — e.g. this round's R4/B3 production fixes;

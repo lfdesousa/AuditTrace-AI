@@ -447,6 +447,30 @@ class TestEnabledCreateServerAddedConfig:
         assert "unexpected-mapper-config:" in proc.stderr
         assert "STEP-COMPLETED" not in proc.stdout
 
+    def test_drift_line_names_the_unexpected_keys_sorted_never_the_values(
+        self, run: Run
+    ) -> None:
+        """LC-10a r6: the drift detail names each unexpected config KEY
+        (sorted), and never a value. Falsifiable: the neuter in
+        tests/test_acl_e2e_failure_diagnostics.py prints the value."""
+        value_a, value_b = "PLANTED-VALUE-Zq81", "PLANTED-VALUE-Kd42"
+        proc = run.go(
+            clients=[],
+            extra_mapper_config_on_create={
+                "lightweight.claim": value_a,
+                "introspection.token.claim": value_b,
+            },
+            **REALM_DEFAULTS,
+        )
+        assert proc.returncode != 0
+        assert (
+            "unexpected-mapper-config:count=2 "
+            "keys=introspection.token.claim,lightweight.claim" in proc.stderr
+        )
+        for stream in (proc.stdout, proc.stderr):
+            assert value_a not in stream
+            assert value_b not in stream
+
 
 class TestEnabledPresent:
     # R4 re-review #2 advisory: the response-derived VALUE each
