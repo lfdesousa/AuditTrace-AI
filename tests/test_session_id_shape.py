@@ -40,6 +40,25 @@ def test_regex_rejects(value: str) -> None:
     assert header_session_id(_Req(value)) is None
 
 
+PLACEHOLDER = "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [PLACEHOLDER, "a{{b", "x}}y", "{{", "}}"],
+    ids=["literal", "open-inside", "close-inside", "open", "close"],
+)
+def test_an_unresolved_template_placeholder_is_rejected(value: str) -> None:
+    """A3 (operator ruling 2026-11-08, option 1). The placeholder is valid
+    printable ASCII, so the pinned regex alone accepts it; the template clause
+    rejects it like any other malformed value (absent -> None). The regex
+    literal stays the fork's.
+
+    Neuter: drop the template clause -> every cell RED."""
+    assert SESSION_ID_RE.fullmatch(value) is not None
+    assert header_session_id(_Req(value)) is None
+
+
 @pytest.mark.parametrize("value", ["s1", "a" * 255, "!", "~", "run-42_x.y:z/1"])
 def test_regex_accepts(value: str) -> None:
     assert SESSION_ID_RE.fullmatch(value) is not None

@@ -11,7 +11,7 @@ unchanged.
   `POST /v1/chat/completions` and `POST /mcp`.
 * Accepted shape: printable ASCII without space, 1 to 255 characters
   (`^[\x21-\x7e]{1,255}$`, matched with `re.fullmatch`). Surrounding spaces are
-  trimmed first. A value of any other shape is treated as absent; the log
+  trimmed first. A value of any other shape, or one containing `{{` or `}}` (an unresolved template placeholder), is treated as absent; the log
   records its length only.
 * The id is correlation and compartment data, never a credential: it is read
   from the header only, never from a tool argument, body field or query

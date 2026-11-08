@@ -39,6 +39,18 @@ logger = logging.getLogger(__name__)
 SESSION_ID_RE = re.compile(r"^[\x21-\x7e]{1,255}$")
 
 
+#: An unresolved template placeholder (for example the console's
+#: ``{{LIBRECHAT_BODY_CONVERSATIONID}}`` when the client could not fill it)
+#: matches the printable-ASCII shape but names no chat: every such request
+#: would pool into ONE compartment. Rejected like any other malformed value
+#: (operator ruling 2026-11-08, option 1).
+_TEMPLATE_MARKERS = ("{{", "}}")
+
+
+def _looks_like_template(value: str) -> bool:
+    return any(marker in value for marker in _TEMPLATE_MARKERS)
+
+
 def header_session_id(request: Any) -> str | None:
     """Return the request's ``X-Session-Id`` if it has the accepted shape.
 
@@ -48,7 +60,8 @@ def header_session_id(request: Any) -> str | None:
     ``fullmatch`` :data:`SESSION_ID_RE`.
 
     * absent or blank -> ``None``, silently (it is simply not there);
-    * present but malformed -> ``None`` plus a WARNING that carries the
+    * present but malformed (wrong shape, or an unresolved ``{{...}}``
+      template placeholder) -> ``None`` plus a WARNING that carries the
       LENGTH only, never the value (the id is caller-chosen text).
 
     The caller decides what ``None`` means: chat and MCP fall back to the
@@ -65,7 +78,7 @@ def header_session_id(request: Any) -> str | None:
     value = raw.strip(" ")
     if not value:
         return None
-    if SESSION_ID_RE.fullmatch(value) is None:
+    if SESSION_ID_RE.fullmatch(value) is None or _looks_like_template(value):
         logger.warning(
             "session_id.header_rejected", extra={"header_length": len(value)}
         )

@@ -351,7 +351,9 @@ def _rows_named(db: dict[str, str], name: str) -> list[tuple[str, str | None]]:
 
 
 @pytest.mark.parametrize(
-    "bad_sid", ["x" * 256, "a b"], ids=["256-chars", "inner-space"]
+    "bad_sid",
+    ["x" * 256, "a b", "{{LIBRECHAT_BODY_CONVERSATIONID}}"],
+    ids=["256-chars", "inner-space", "unresolved-template"],
 )
 def test_malformed_header_on_upload_is_stored_with_no_compartment(
     client: TestClient, db: dict[str, str], bad_sid: str
@@ -362,8 +364,12 @@ def test_malformed_header_on_upload_is_stored_with_no_compartment(
     even fit VARCHAR(255)). A recall bound to that same header value gets
     nothing, and the owner read-back shows the row exists.
 
-    Neuter: bind the raw header (``request.headers.get("x-session-id")``)
-    in ``bound_upload_session`` -> the row carries the raw id (RED)."""
+    The unresolved ``{{...}}`` placeholder (A3, operator ruling 2026-11-08)
+    is rejected the same way.
+
+    Neuters: bind the raw header (``request.headers.get("x-session-id")``)
+    in ``bound_upload_session`` -> the row carries the raw id (RED); drop the
+    template clause -> the placeholder cell is RED."""
     name = f"bad-shape-{uuid.uuid4().hex[:8]}.txt"
     r = client.post(
         "/memory/upload",

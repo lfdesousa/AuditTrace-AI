@@ -526,8 +526,24 @@ class TestResolveSessionIdShape:
 
     @pytest.mark.parametrize(
         "bad",
-        ["x" * 256, "with space", "tab\there", "ctl\x00char", "caf\u00e9", "abc\n"],
-        ids=["256-chars", "inner-space", "tab", "nul", "non-ascii", "trailing-lf"],
+        [
+            "x" * 256,
+            "with space",
+            "tab\there",
+            "ctl\x00char",
+            "caf\u00e9",
+            "abc\n",
+            "{{LIBRECHAT_BODY_CONVERSATIONID}}",
+        ],
+        ids=[
+            "256-chars",
+            "inner-space",
+            "tab",
+            "nul",
+            "non-ascii",
+            "trailing-lf",
+            "unresolved-template",
+        ],
     )
     def test_bad_shape_header_falls_back_to_computed(self, bad: str) -> None:
         req = _FakeRequest({"x-session-id": bad})
