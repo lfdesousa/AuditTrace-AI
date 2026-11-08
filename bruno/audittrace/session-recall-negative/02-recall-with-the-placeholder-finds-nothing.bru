@@ -1,0 +1,48 @@
+meta {
+  name: session-recall-negative 02 - MCP recall with the same placeholder header finds nothing
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "recall_attachments",
+      "arguments": { "n": 20 }
+    }
+  }
+}
+
+script:pre-request {
+  req.setHeader("X-Session-Id", "{" + "{LIBRECHAT_BODY_CONVERSATIONID}" + "}");
+}
+
+tests {
+  test("returns exactly 200 with a JSON-RPC result and no error", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody()).to.not.have.property("error");
+    expect(res.getBody().result.isError).to.equal(false);
+  });
+  test("the placeholder-scoped upload is never recalled", function() {
+    const text = JSON.stringify(res.getBody());
+    expect(text).to.not.include("lc10a-e9-placeholder-note.md");
+  });
+}
+
+docs {
+  LC-10a E9: the placeholder is not a session id, so no compartment named
+  after it exists; the note from 01 (session_id NULL) is not returned.
+}

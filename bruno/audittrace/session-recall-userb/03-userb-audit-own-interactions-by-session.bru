@@ -1,0 +1,34 @@
+meta {
+  name: session-recall-userb 03 - user B, own interactions under the chat id (the recall was audited)
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/interactions?session_id={{chatSessionId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{tokenUserB}}
+}
+
+tests {
+  test("returns exactly 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("user B sees its own recall interactions and none of user A's", function() {
+    const rows = res.getBody().interactions;
+    expect(rows.length).to.be.greaterThan(0);
+    const text = JSON.stringify(rows);
+    expect(text).to.include("recall_attachments");
+    expect(text).to.not.include(bru.getEnvVar("sessionNoteName"));
+  });
+}
+
+docs {
+  LC-10a E4 (AC-12 step 5): user B's own MCP/chat calls under the chat id were
+  audited under user B. Its rows carry B's user_id server-side (RLS). User A's
+  note text never appears.
+}

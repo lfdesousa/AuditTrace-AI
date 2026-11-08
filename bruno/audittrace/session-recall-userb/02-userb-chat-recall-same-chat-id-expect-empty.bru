@@ -1,0 +1,45 @@
+meta {
+  name: session-recall-userb 02 - user B, chat recall under user A's chat id, stream:false (expect nothing)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+headers {
+  X-Session-Id: {{chatSessionId}}
+}
+
+auth:bearer {
+  token: {{tokenUserB}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": "{{sessionRecallPrompt}}" }
+    ],
+    "stream": false,
+    "max_tokens": 1024
+  }
+}
+
+tests {
+  test("returns exactly 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("user A's note is not recalled for user B (file name absent)", function() {
+    const text = JSON.stringify(res.getBody());
+    expect(text).to.not.include(bru.getEnvVar("sessionNoteName"));
+  });
+}
+
+docs {
+  LC-10a E4: the chat path of the same check as 01. Includes an LLM call.
+  Run with the SAME chat id user A used (see 01's docs).
+}

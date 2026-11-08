@@ -1,0 +1,43 @@
+meta {
+  name: session-recall-negative 01 - upload with the unresolved placeholder as X-Session-Id (stored with no chat scope)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/memory/upload?layer=session&filename=lc10a-e9-placeholder-note.md
+  body: multipartForm
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  layer: session
+  filename: lc10a-e9-placeholder-note.md
+}
+
+body:multipart-form {
+  file: @file({{uploadSessionFile}})
+}
+
+script:pre-request {
+  // Set the header in script so the literal LibreChat placeholder is sent
+  // byte-for-byte (a header block would be interpolated by Bruno).
+  req.setHeader("X-Session-Id", "{" + "{LIBRECHAT_BODY_CONVERSATIONID}" + "}");
+}
+
+tests {
+  test("returns exactly 200 (the upload is accepted, the header is not)", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+}
+
+docs {
+  LC-10a E9 / A3: a console that failed to resolve its header template sends
+  the literal `{{LIBRECHAT_BODY_CONVERSATIONID}}`. The server rejects that value
+  as a session id: the upload is stored with session_id NULL, so no chat ever
+  recalls it (02). The rejection is logged with the header length only.
+}
