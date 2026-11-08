@@ -96,6 +96,8 @@ FAKE_KCADM = (
             if "--fields" in args:
                 for m in c["mappers"]:
                     print(m["name"])
+            elif c.get("raw_mappers_text"):
+                print(c["raw_mappers_text"])
             else:
                 print(pretty(c["mappers"]))
         sys.exit(0)
@@ -114,6 +116,9 @@ FAKE_KCADM = (
         sys.exit(0)
     if cmd == "update":
         parts = args[1].split("/")
+        if state.get("update_fail"):
+            print("kcadm: simulated update failure", file=sys.stderr)
+            sys.exit(1)
         if state.get("update_noop"):
             sys.exit(0)
         m = next(x for x in state["client"]["mappers"] if x["id"] == parts[-1])
@@ -145,7 +150,13 @@ def _step_text(path: Path) -> str:
     return text[start : end + len(closing)]
 
 
-def _client_state(config: dict[str, str], **over: Any) -> dict[str, Any]:
+def _client_state(
+    config: dict[str, str],
+    *,
+    mapper_id: str = MAPPER_ID,
+    protocol_mapper: str = "oidc-audience-mapper",
+    **over: Any,
+) -> dict[str, Any]:
     _raw, pinned = _pinned_json(SCRIPT)
     body = {
         k: v
@@ -160,10 +171,10 @@ def _client_state(config: dict[str, str], **over: Any) -> dict[str, Any]:
         ],
         "mappers": [
             {
-                "id": MAPPER_ID,
+                "id": mapper_id,
                 "name": "aud-audittrace-server",
                 "protocol": "openid-connect",
-                "protocolMapper": "oidc-audience-mapper",
+                "protocolMapper": protocol_mapper,
                 "config": dict(config),
             }
         ],
@@ -237,6 +248,30 @@ class Run:
 @pytest.fixture(params=[SCRIPT, CONFIGMAP], ids=["script", "configmap"])
 def run(request: pytest.FixtureRequest, tmp_path: Path) -> Run:
     return Run(tmp_path, request.param)
+
+
+def _raw_mapper(blocks: list[list[tuple[str, str]]]) -> str:
+    """kcadm-style pretty text of ONE mapper whose `config` appears once per
+    entry of `blocks` (a duplicated or re-shaped read), each block a list of
+    (key, value) lines - duplicates allowed, unlike a JSON object."""
+    out = [
+        "[ {",
+        f'  "id" : "{MAPPER_ID}",',
+        '  "name" : "aud-audittrace-server",',
+        '  "protocol" : "openid-connect",',
+        '  "protocolMapper" : "oidc-audience-mapper",',
+        '  "consentRequired" : false,',
+    ]
+    for lines in blocks:
+        out.append('  "config" : {')
+        out.extend(
+            f'    "{k}" : "{v}"' + ("," if i < len(lines) - 1 else "")
+            for i, (k, v) in enumerate(lines)
+        )
+        out.append("  },")
+    out[-1] = "  }"
+    out.append("} ]")
+    return "\n".join(out)
 
 
 def _without(key: str) -> dict[str, str]:
@@ -465,3 +500,92 @@ class TestParity:
             ]
             assert "reconcile" not in acl, path.name
             assert "acl_e2e_kc update" not in acl, path.name
+
+
+_TWO_KEY_SHAPE = {**PINNED_FIVE, "introspection.token.claim": "false"}
+
+
+def _assert_closed_no_update(run: Run, proc: subprocess.CompletedProcess[str]) -> None:
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "STEP-COMPLETED" not in proc.stdout
+    assert "code=reconciled" not in proc.stdout
+    assert run.updates() == []
+
+
+class TestReconcilePreconditionsAreEachEnforced:
+    """r6 review B1-B5: each precondition and the failure paths, one test
+    each, against BOTH sites. Every case is the Keycloak-24 two-key shape
+    EXCEPT for the one property under test."""
+
+    @pytest.mark.parametrize(
+        "mapper_id",
+        ["../x", "a/b", "../../uuid-session", ""],
+        ids=lambda v: v or "empty",
+    )
+    def test_b1_a_bad_mapper_id_sends_no_update(self, run: Run, mapper_id: str) -> None:
+        proc = run.go(client=_client_state(_TWO_KEY_SHAPE, mapper_id=mapper_id))
+        _assert_closed_no_update(run, proc)
+        assert "code=drift" in proc.stdout
+
+    def test_b2_a_wrong_protocol_mapper_sends_no_update(self, run: Run) -> None:
+        proc = run.go(
+            client=_client_state(
+                _TWO_KEY_SHAPE, protocol_mapper="oidc-hardcoded-claim-mapper"
+            )
+        )
+        _assert_closed_no_update(run, proc)
+        assert "missing-mapper-field:protocolMapper" in proc.stdout
+
+    def test_b3_two_config_blocks_send_no_update(self, run: Run) -> None:
+        first = [
+            ("included.custom.audience", "audittrace-server"),
+            ("id.token.claim", "false"),
+            ("access.token.claim", "true"),
+            ("introspection.token.claim", "false"),
+        ]
+        second = [("userinfo.token.claim", "false")]
+        client = _client_state(_TWO_KEY_SHAPE)
+        client["raw_mappers_text"] = _raw_mapper([first, second])
+        proc = run.go(client=client)
+        _assert_closed_no_update(run, proc)
+        assert "mapper-config-absent" in proc.stdout
+
+    def test_b4_a_failing_update_is_reconcile_failed_not_reconciled(
+        self, run: Run
+    ) -> None:
+        proc = run.go(client=_client_state(_TWO_KEY_SHAPE), update_fail=True)
+        assert proc.returncode != 0
+        assert "code=reconcile-failed" in proc.stdout
+        assert "code=reconciled" not in proc.stdout
+        assert "STEP-COMPLETED" not in proc.stdout
+        assert len(run.updates()) == 1
+
+    @pytest.mark.parametrize(
+        "dup", ["introspection.token.claim", "userinfo.token.claim"]
+    )
+    def test_b5_duplicated_key_lines_send_no_update_and_are_named(
+        self, run: Run, dup: str
+    ) -> None:
+        """Five lines, one pinned key twice and the other absent: n == 5 and
+        no unknown key, so ONLY the duplicate-key guards stand in the way of
+        a reconcile (t_intro / t_user) and of a false 'verified equal'
+        (mapper-config-duplicate-key)."""
+        other = (
+            "userinfo.token.claim"
+            if dup == "introspection.token.claim"
+            else "introspection.token.claim"
+        )
+        lines = [
+            ("included.custom.audience", "audittrace-server"),
+            ("id.token.claim", "false"),
+            ("access.token.claim", "true"),
+            (dup, PINNED_FIVE[dup]),
+            (dup, PINNED_FIVE[dup]),
+        ]
+        assert other not in dict(lines)
+        client = _client_state(_TWO_KEY_SHAPE)
+        client["raw_mappers_text"] = _raw_mapper([lines])
+        proc = run.go(client=client)
+        _assert_closed_no_update(run, proc)
+        assert "mapper-config-duplicate-key" in proc.stdout
+        assert "verified equal" not in proc.stdout
