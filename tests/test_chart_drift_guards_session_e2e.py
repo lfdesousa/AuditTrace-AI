@@ -59,6 +59,16 @@ READ = "memory:session:read-own"
 ADMITTED_SESSION_WRITE_CLIENTS = (LIBRECHAT, E2E)
 DEFAULT_SCOPES = {"audittrace:query", "audittrace:audit"}
 OPTIONAL_SCOPES = [WRITE, READ]
+# LC-10a r6 ("pin all 5"): the session client's audience mapper pins all five
+# config keys; the ACL e2e client's PINNED_MAPPER keeps three.
+SESSION_PINNED_MAPPER = {
+    **PINNED_MAPPER,
+    "config": {
+        **PINNED_MAPPER["config"],
+        "introspection.token.claim": "true",
+        "userinfo.token.claim": "false",
+    },
+}
 
 
 @functools.lru_cache(maxsize=2)
@@ -119,7 +129,7 @@ class TestSessionE2eClient:
         label, realm = _both_enabled()[which]
         c = _client(realm, E2E)
         assert c is not None
-        assert [m for m in c["protocolMappers"]] == [PINNED_MAPPER], label
+        assert [m for m in c["protocolMappers"]] == [SESSION_PINNED_MAPPER], label
 
     def test_realm_files_agree_on_the_compared_keys(self) -> None:
         dev, chart = (_client(r, E2E) for _l, r in _both_enabled())
@@ -249,8 +259,16 @@ class TestSessionE2eClientFlag:
             start = text.index("SESSION_E2E_CLIENT_ID=")
             step = text[start : text.rindex("deleted (read-back empty)")]
             assert "acl_e2e_fail drift" in step, path.name
-            assert not re.search(r'acl_e2e_kc update "clients/\$\{(uuid|SESSION)', step)
+            # LC-10a r6: the ONLY update is the narrow mapper reconcile
+            # (tests/test_session_e2e_mapper_reconcile.py); the client
+            # itself is never updated.
+            assert not re.search(r'acl_e2e_kc update "clients/\$\{SESSION', step)
             assert 'acl_e2e_kc update "clients/${uuid}"' not in step, path.name
+            assert step.count("acl_e2e_kc update ") == 1, path.name
+            assert (
+                'acl_e2e_kc update "clients/${uuid}/protocol-mappers/models/${mid}"'
+                in step
+            ), path.name
 
 
 def _pinned_json(path: Path) -> tuple[str, dict[str, Any]]:
@@ -278,7 +296,9 @@ class TestSessionE2eProvisionerParity:
             == c["optionalClientScopes"]
             == OPTIONAL_SCOPES
         )
-        assert pinned["protocolMappers"] == c["protocolMappers"] == [PINNED_MAPPER]
+        assert (
+            pinned["protocolMappers"] == c["protocolMappers"] == [SESSION_PINNED_MAPPER]
+        )
         assert pinned["description"] == c["description"]
 
     def test_pinned_json_is_shell_and_keycloak_safe(self) -> None:

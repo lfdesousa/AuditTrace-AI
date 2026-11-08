@@ -3925,6 +3925,8 @@ def _run_full_state(*, scopes_present: bool, e2e_present: bool) -> dict[str, Any
                             "included.custom.audience": "audittrace-server",
                             "id.token.claim": "false",
                             "access.token.claim": "true",
+                            "introspection.token.claim": "true",
+                            "userinfo.token.claim": "false",
                         },
                     }
                 ],
@@ -4235,20 +4237,26 @@ class TestRunFullWholeScriptCoverage:
                 # LC-10a: the session E2E clone (same two named reasons as
                 # the acl rows above: nothing to strip in a RunFull state;
                 # the sunset delete runs only with enabled=false).
-                (1259, 1261),
-                (1451, 1452),
+                (1260, 1262),
+                # LC-10a r6 step 2: the narrow mapper reconcile's update
+                # (only for the Keycloak-24-defaults shape; exercised by
+                # tests/test_session_e2e_mapper_reconcile.py).
+                (1422, 1425),
+                (1497, 1498),
                 # was (1282, 1283): shifted by the LC-10a blocks above it.
-                (1577, 1578),
+                (1623, 1624),
             }
         else:
-            # (1192,1194)/(1384,1385): the LC-10a session E2E clone's strip
+            # (1193,1195)/(1430,1431): the LC-10a session E2E clone's strip
             # delete and sunset delete (reasons as (834,836)/(1094,1095)).
             expected_unreached = {
                 (834, 836),
                 1039,
                 (1094, 1095),
-                (1192, 1194),
-                (1384, 1385),
+                (1193, 1195),
+                # LC-10a r6 step 2: the narrow mapper reconcile's update.
+                (1355, 1358),
+                (1430, 1431),
             }
         # Named per range (line numbers re-measured after every edit
         # that shifts them — e.g. this round's R4/B3 production fixes;
