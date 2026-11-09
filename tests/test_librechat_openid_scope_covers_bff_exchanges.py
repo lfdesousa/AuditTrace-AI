@@ -8,8 +8,7 @@ that exchange silently drops it and the memory-server answers 403.
 
 The expected set is DERIVED from ``bff/*_scopes.py`` (every ``*_SCOPES``
 tuple, plus the durable promote layers' single write scope), never typed
-here. Each scope must also be offered to ``audittrace-librechat`` (realm
-default/optional, or bound by the provisioning hook).
+here. Each scope must also be offered to ``audittrace-librechat`` (bound by the provisioning hook, r8 O3; the realm file alone is not enough).
 """
 
 from __future__ import annotations
@@ -105,13 +104,51 @@ class TestLoginRequestCoversEveryExchange:
         assert not extra, f"unexpected scopes in OPENID_SCOPE: {sorted(extra)}"
 
 
-class TestRealmOffersEveryExchangeScopeToLibrechat:
-    def test_each_scope_is_default_optional_or_hook_bound(self) -> None:
+# The four core read scopes every realm has carried since its first import:
+# an already-imported realm has them as defaults for audittrace-librechat, so
+# the hook never needed to bind them. Every OTHER exchange scope reaches an
+# existing realm ONLY through the provisioning hook (the realm file is
+# first-boot-only), so it must be hook-bound. Explicit, not derived: a new
+# scope never silently joins this set.
+BASELINE_REALM_DEFAULT_READS = frozenset(
+    {
+        "memory:conversational:read-own",
+        "memory:episodic:read",
+        "memory:procedural:read",
+        "memory:semantic:read",
+    }
+)
+
+
+class TestHookOffersEveryExchangeScopeToLibrechat:
+    """LC-10a review r8, O3. The old form accepted realm-file OR hook, so a
+    scope present only in the realm file passed here and then 403'd live
+    (an existing realm is never re-imported). Neuter: unbind a write scope
+    from the hook while the realm file still lists it -> RED."""
+
+    def test_every_exchange_scope_is_hook_bound_or_a_baseline_read(self) -> None:
+        bound = _hook_bound_to_librechat(SCRIPT.read_text(encoding="utf-8"))
+        unbound = sorted(bff_exchange_scopes() - bound - BASELINE_REALM_DEFAULT_READS)
+        assert not unbound, (
+            f"not bound to {LIBRECHAT} by the provisioning hook: {unbound} "
+            "(an already-imported realm only gets new bindings from the hook)"
+        )
+
+    def test_the_baseline_exemption_is_real_and_not_widened(self) -> None:
+        client = _client(_chart_realm(True), LIBRECHAT)
+        assert client is not None
+        defaults = set(client.get("defaultClientScopes", []))
+        assert BASELINE_REALM_DEFAULT_READS <= defaults
+        assert BASELINE_REALM_DEFAULT_READS <= bff_exchange_scopes()
+        assert all(
+            s.endswith(("read", "read-own")) for s in BASELINE_REALM_DEFAULT_READS
+        )
+
+    def test_the_realm_file_still_offers_every_scope_on_a_fresh_import(self) -> None:
         client = _client(_chart_realm(True), LIBRECHAT)
         assert client is not None
         offered = set(client.get("defaultClientScopes", [])) | set(
             client.get("optionalClientScopes", [])
         )
-        offered |= _hook_bound_to_librechat(SCRIPT.read_text(encoding="utf-8"))
-        unbound = sorted(bff_exchange_scopes() - offered)
-        assert not unbound, f"not offered to {LIBRECHAT}: {unbound}"
+        unoffered = sorted(bff_exchange_scopes() - offered)
+        assert not unoffered, f"realm file does not offer {unoffered} to {LIBRECHAT}"
