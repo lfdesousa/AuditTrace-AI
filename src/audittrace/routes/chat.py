@@ -43,6 +43,7 @@ from audittrace.db.models import InteractionRecord, ToolCall
 from audittrace.dependencies import get_context_builder, get_postgres_factory
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call, reset_langgraph_step
+from audittrace.routes import _upstream_errors as upstream_errors
 from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS, llama_auth_headers
 from audittrace.routes._memory_tool_loop import (
     PendingToolCall,
@@ -1620,10 +1621,14 @@ async def _handle_tools_mode(
                 )
                 return
             except httpx.HTTPStatusError as exc:
-                yield _emit_sse_error_frame(
-                    FAILURE_UPSTREAM_ERROR,
-                    f"llama-server returned status {exc.response.status_code}",
-                    502,
+                hit = upstream_errors.classify_status_error(exc, loop_payload)
+                yield upstream_errors.frame_or(
+                    hit,
+                    _emit_sse_error_frame(
+                        FAILURE_UPSTREAM_ERROR,
+                        f"llama-server returned status {exc.response.status_code}",
+                        502,
+                    ),
                 )
                 await _persist_interaction(
                     project=project,
@@ -1637,7 +1642,7 @@ async def _handle_tools_mode(
                     user_id=user.user_id,
                     status="failed",
                     failure_class=FAILURE_UPSTREAM_ERROR,
-                    error_detail=f"status={exc.response.status_code}: {str(exc)[:400]}",
+                    error_detail=upstream_errors.stream_detail(hit, exc),
                     duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
                 )
                 return
@@ -1808,6 +1813,19 @@ async def _handle_tools_mode(
             duration_ms=int((time.perf_counter() - perf_start) * 1000),
         )
         raise  # let the FastAPI global handler shape the 500
+
+    if upstream_errors.match_unsupported_content_body(final_body):
+        return await upstream_errors.reject_tools_non_stream(
+            final_body,
+            loop_payload,
+            project=project,
+            source=source,
+            question=query,
+            session_id=session_id,
+            model=requested_model,
+            user_id=user.user_id,
+            perf_start=perf_start,
+        )
 
     # 3 — Extract answer text + usage for the interaction row
     choices = final_body.get("choices") or []
@@ -2078,6 +2096,7 @@ async def _chat_completions_impl(
                             " upstream response"
                         )
                     async with contextlib.aclosing(resp):
+                        await upstream_errors.read_error_body(resp)
                         resp.raise_for_status()
                         async for line in _iter_with_idle_timeout(
                             resp,
@@ -2161,10 +2180,14 @@ async def _chat_completions_impl(
                 )
                 return
             except httpx.HTTPStatusError as exc:
-                yield _emit_sse_error_frame(
-                    FAILURE_UPSTREAM_ERROR,
-                    f"llama-server returned status {exc.response.status_code}",
-                    502,
+                hit = upstream_errors.classify_status_error(exc, proxy_payload)
+                yield upstream_errors.frame_or(
+                    hit,
+                    _emit_sse_error_frame(
+                        FAILURE_UPSTREAM_ERROR,
+                        f"llama-server returned status {exc.response.status_code}",
+                        502,
+                    ),
                 )
                 await _persist_interaction(
                     project=project,
@@ -2178,7 +2201,7 @@ async def _chat_completions_impl(
                     user_id=user.user_id,
                     status="failed",
                     failure_class=FAILURE_UPSTREAM_ERROR,
-                    error_detail=f"status={exc.response.status_code}: {str(exc)[:400]}",
+                    error_detail=upstream_errors.stream_detail(hit, exc),
                     duration_ms=int((time.perf_counter() - perf_start) * 1000),
                 )
                 return
@@ -2367,6 +2390,9 @@ async def _chat_completions_impl(
     # as ``status='success'`` because we still extracted empty choices below.
     err_envelope = body.get("error") if isinstance(body, dict) else None
     if isinstance(err_envelope, dict):
+        hit = upstream_errors.classify_unsupported_content(
+            response.status_code, response.text, proxy_payload
+        )
         usage = body.get("usage") or {}
         await _persist_interaction(
             project=project,
@@ -2381,9 +2407,13 @@ async def _chat_completions_impl(
             user_id=user.user_id,
             status="failed",
             failure_class=_map_error_code_to_failure_class(err_envelope.get("code")),
-            error_detail=str(err_envelope.get("message", ""))[:500],
+            error_detail=upstream_errors.detail_from_hit_or(
+                hit, str(err_envelope.get("message", ""))[:500]
+            ),
             duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
         )
+        if hit:
+            return upstream_errors.client_error_response(hit)
         return body
     try:
         choices = body.get("choices") or []

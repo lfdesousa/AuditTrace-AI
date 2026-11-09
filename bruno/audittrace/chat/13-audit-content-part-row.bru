@@ -1,0 +1,47 @@
+meta {
+  name: GET /interactions?session_id= (audit row of the unsupported-content turn)
+  type: http
+  seq: 13
+}
+
+get {
+  url: {{baseUrl}}/interactions?session_id={{contentPartSessionId}}&limit=5
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200 with exactly one row for the session", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().interactions).to.be.an("array").with.lengthOf(1);
+  });
+  test("the row is failed / upstream_error and keeps the upstream text", function() {
+    const r = res.getBody().interactions[0];
+    expect(r.status).to.equal("failed");
+    expect(r.failure_class).to.equal("upstream_error");
+    expect(r.error_detail.startsWith("status=400: ")).to.equal(true);
+    expect(r.error_detail).to.contain("unsupported content[].type");
+  });
+  test("the row echoes neither the filename nor the file data", function() {
+    const raw = JSON.stringify(res.getBody());
+    expect(raw).to.not.contain(bru.getEnvVar("contentPartFilename"));
+    expect(raw).to.not.contain("aGVsbG8gd29ybGQ");
+  });
+  test("trace_id is 32 lowercase hex (stashed for audit/02)", function() {
+    const r = res.getBody().interactions[0];
+    expect(r.trace_id).to.match(/^[0-9a-f]{32}$/);
+    bru.setVar("contentPartTraceId", r.trace_id);
+  });
+}
+
+docs {
+  Run right after chat/11 or chat/12 (same collection run, so the stashed
+  `contentPartSessionId` is set). Reads the audit row through the public API
+  (scope audittrace:audit). Then reconstruct by trace:
+  `audit/02-list-by-trace-id.bru --env-var traceId=<contentPartTraceId>`.
+  E-D order: 11, 13, 12, 13, then audit/02.
+}
