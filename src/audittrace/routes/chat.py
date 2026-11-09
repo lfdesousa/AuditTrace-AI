@@ -29,7 +29,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Security
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from opentelemetry import trace
 
 # Side-effect import so the four @register_memory_tool decorators run at
@@ -1642,9 +1642,7 @@ async def _handle_tools_mode(
                     user_id=user.user_id,
                     status="failed",
                     failure_class=FAILURE_UPSTREAM_ERROR,
-                    error_detail=upstream_errors.detail_from_hit_or(
-                        hit, f"status={exc.response.status_code}: {str(exc)[:400]}"
-                    ),
+                    error_detail=upstream_errors.stream_detail(hit, exc),
                     duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
                 )
                 return
@@ -1817,24 +1815,16 @@ async def _handle_tools_mode(
         raise  # let the FastAPI global handler shape the 500
 
     if upstream_errors.match_unsupported_content_body(final_body):
-        await _persist_interaction(
+        return await upstream_errors.reject_tools_non_stream(
+            final_body,
+            loop_payload,
             project=project,
             source=source,
             question=query,
-            answer="",
-            prompt_tokens=0,
-            completion_tokens=0,
             session_id=session_id,
             model=requested_model,
             user_id=user.user_id,
-            status="failed",
-            failure_class=FAILURE_UPSTREAM_ERROR,
-            error_detail=upstream_errors.error_detail_from_body(final_body),
-            duration_ms=int((time.perf_counter() - perf_start) * 1000),
-        )
-        return JSONResponse(
-            status_code=400,
-            content=upstream_errors.unsupported_content_error_body(loop_payload),
+            perf_start=perf_start,
         )
 
     # 3 — Extract answer text + usage for the interaction row
@@ -2106,9 +2096,7 @@ async def _chat_completions_impl(
                             " upstream response"
                         )
                     async with contextlib.aclosing(resp):
-                        if resp.status_code >= 400:
-                            # unread streamed body has no .text to classify
-                            await resp.aread()
+                        await upstream_errors.read_error_body(resp)
                         resp.raise_for_status()
                         async for line in _iter_with_idle_timeout(
                             resp,
@@ -2213,9 +2201,7 @@ async def _chat_completions_impl(
                     user_id=user.user_id,
                     status="failed",
                     failure_class=FAILURE_UPSTREAM_ERROR,
-                    error_detail=upstream_errors.detail_from_hit_or(
-                        hit, f"status={exc.response.status_code}: {str(exc)[:400]}"
-                    ),
+                    error_detail=upstream_errors.stream_detail(hit, exc),
                     duration_ms=int((time.perf_counter() - perf_start) * 1000),
                 )
                 return
@@ -2427,7 +2413,7 @@ async def _chat_completions_impl(
             duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
         )
         if hit:
-            return JSONResponse(status_code=400, content=hit.error_body)
+            return upstream_errors.client_error_response(hit)
         return body
     try:
         choices = body.get("choices") or []

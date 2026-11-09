@@ -29,10 +29,12 @@ import contextlib
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
@@ -191,3 +193,59 @@ def frame_or(hit: UnsupportedContentHit | None, default_frame: bytes) -> bytes:
 def emit_sse_error_frame_from_body(error_body: dict[str, Any]) -> bytes:
     """SSE frame + ``[DONE]`` for an already-built error body (same bytes as chat.py's)."""
     return ("data: " + json.dumps(error_body) + "\n\n" + "data: [DONE]\n\n").encode()
+
+
+def stream_detail(hit: UnsupportedContentHit | None, exc: httpx.HTTPStatusError) -> str:
+    """Audit detail for a streamed upstream status error (hit's, else the 5xx form)."""
+    return detail_from_hit_or(
+        hit, f"status={exc.response.status_code}: {str(exc)[:_MAX_BODY_CHARS]}"
+    )
+
+
+async def read_error_body(resp: httpx.Response) -> None:
+    """Read a streamed >= 400 body so ``.text`` exists to classify (ADR-024 untouched)."""
+    if resp.status_code >= _UPSTREAM_STATUS:
+        await resp.aread()
+
+
+def client_error_response(hit: UnsupportedContentHit) -> JSONResponse:
+    """The explicit HTTP 400 reply for a recognised rejection."""
+    return JSONResponse(status_code=_UPSTREAM_STATUS, content=hit.error_body)
+
+
+async def reject_tools_non_stream(
+    final_body: dict[str, Any],
+    loop_payload: dict[str, Any],
+    *,
+    project: str,
+    source: str,
+    question: str,
+    session_id: str,
+    model: str,
+    user_id: str,
+    perf_start: float,
+) -> JSONResponse:
+    """Tools non-stream arm: audit the failed interaction, return the explicit 400."""
+    # Function-local import: chat.py imports this module at import time and
+    # defines _persist_interaction / FAILURE_UPSTREAM_ERROR (cycle, as above).
+    from audittrace.routes.chat import FAILURE_UPSTREAM_ERROR, _persist_interaction
+
+    await _persist_interaction(
+        project=project,
+        source=source,
+        question=question,
+        answer="",
+        prompt_tokens=0,
+        completion_tokens=0,
+        session_id=session_id,
+        model=model,
+        user_id=user_id,
+        status="failed",
+        failure_class=FAILURE_UPSTREAM_ERROR,
+        error_detail=error_detail_from_body(final_body),
+        duration_ms=int((time.perf_counter() - perf_start) * 1000),
+    )
+    return JSONResponse(
+        status_code=_UPSTREAM_STATUS,
+        content=unsupported_content_error_body(loop_payload),
+    )

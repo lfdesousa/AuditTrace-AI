@@ -137,3 +137,31 @@ class TestHelpers:
         # A2: fullmatch, not match+$ — "file\n" must not reach the message.
         payload = {"messages": [{"content": [{"type": "file\n"}]}]}
         assert ue.unsupported_part_types(payload) == []
+
+
+class TestMovedArmHelpers:
+    def test_stream_detail_hit_else_5xx_form(self):
+        response = httpx.Response(
+            500, json={"x": 1}, request=httpx.Request("POST", "http://l/v1")
+        )
+        exc = httpx.HTTPStatusError("boom", request=response.request, response=response)
+        assert ue.stream_detail(None, exc) == "status=500: boom"
+        hit = ue.classify_unsupported_content(400, _text(400), PAYLOAD)
+        assert ue.stream_detail(hit, exc) == hit.error_detail  # type: ignore[union-attr]
+
+    async def test_read_error_body_reads_only_on_400_and_above(self):
+        req = httpx.Request("POST", "http://l/v1")
+        err = httpx.Response(400, stream=httpx.ByteStream(b"{}"), request=req)
+        ok = httpx.Response(200, stream=httpx.ByteStream(b"{}"), request=req)
+        await ue.read_error_body(err)
+        await ue.read_error_body(ok)
+        assert err.text == "{}"
+        with pytest.raises(httpx.ResponseNotRead):
+            ok.text  # noqa: B018
+
+    def test_client_error_response_is_a_400_with_the_hit_body(self):
+        hit = ue.classify_unsupported_content(400, _text(400), PAYLOAD)
+        assert hit is not None
+        resp = ue.client_error_response(hit)
+        assert resp.status_code == 400
+        assert json.loads(resp.body) == hit.error_body
