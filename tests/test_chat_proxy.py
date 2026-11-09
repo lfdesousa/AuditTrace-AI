@@ -137,11 +137,19 @@ class _FakeStreamCtx:
 
 
 class _FakeStreamResponse:
+    # Like a real ``httpx.Response``: production reads ``status_code`` and
+    # (on >= 400) ``aread()``s the body before ``raise_for_status()``.
+    status_code = 200
+    text = ""
+
     def __init__(self, lines: list[str]) -> None:
         self._lines = lines
 
     def raise_for_status(self):
         return None
+
+    async def aread(self) -> bytes:
+        return b""
 
     async def aiter_lines(self):
         for line in self._lines:
