@@ -123,3 +123,90 @@ def test_the_stream_true_assertion_scans_the_assembled_delta_text() -> None:
     assert "expect(assembled).to.include(" in tests
     # the old form: the raw SSE text asserted directly
     assert "expect(raw).to.include" not in tests
+
+
+# O4 (LC-10a review r8): the assertion text above is pinned, but the JS that
+# ASSEMBLES the stream must actually run. Bruno's `tests {}` body is executed
+# here under node with Bruno's globals stubbed (test / expect / res / bru), on
+# a fixture whose note name is split across token deltas. Neuters: `assembled
+# = piece` (overwrite) and asserting the raw SSE both go RED. node is a hard
+# requirement (zero-skip policy): its absence FAILS this test.
+_NODE_HARNESS = r"""
+const results = [];
+const test = (name, fn) => {
+  try { fn(); results.push([name, "pass"]); }
+  catch (e) { results.push([name, "fail: " + e.message]); }
+};
+const expect = (actual) => ({
+  to: {
+    include: (needle) => {
+      if (!String(actual).includes(needle)) {
+        throw new Error("expected " + JSON.stringify(actual) + " to include " + needle);
+      }
+    },
+    equal: (want) => {
+      if (actual !== want) throw new Error("expected " + actual + " to equal " + want);
+    },
+  },
+});
+const fixture = JSON.parse(process.env.SSE_FIXTURE);
+const res = { getStatus: () => 200, getBody: () => fixture.body };
+const bru = { getEnvVar: (k) => fixture.env[k] };
+%s
+console.log(JSON.stringify(results));
+"""
+
+
+def _run_stream_tests_under_node(sse: str, note_name: str) -> dict[str, str]:
+    import json
+    import os
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    assert node is not None, "node is required to execute the Bruno test JS"
+    body = _block(STREAM.read_text(), "tests")
+    assert body is not None
+    env = {
+        **os.environ,
+        "SSE_FIXTURE": json.dumps({"body": sse, "env": {"sessionNoteName": note_name}}),
+    }
+    proc = subprocess.run(  # noqa: S603
+        [node, "-e", _NODE_HARNESS % body],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    return dict(json.loads(proc.stdout))
+
+
+def _frame(piece: str | None, role: bool = False) -> str:
+    import json
+
+    delta: dict[str, str] = {"role": "assistant"} if role else {}
+    if piece is not None:
+        delta["content"] = piece
+    return "data: " + json.dumps({"choices": [{"delta": delta}]}) + "\n\n"
+
+
+def test_the_stream_assembly_js_finds_a_name_split_across_token_deltas() -> None:
+    sse = (
+        _frame(None, role=True)
+        + _frame("The file is lc10")
+        + "data: not-json\n\n"
+        + _frame("a-sess")
+        + ": keepalive comment\n\n"
+        + _frame("ion-note.md")
+        + "data: [DONE]\n\n"
+    )
+    results = _run_stream_tests_under_node(sse, "lc10a-session-note.md")
+    assert results["returns 200"] == "pass"
+    assert results["the streamed answer names the uploaded file"] == "pass"
+
+
+def test_the_stream_assembly_js_fails_when_the_name_is_absent() -> None:
+    sse = _frame("nothing relevant here") + "data: [DONE]\n\n"
+    results = _run_stream_tests_under_node(sse, "lc10a-session-note.md")
+    assert results["the streamed answer names the uploaded file"].startswith("fail:")
