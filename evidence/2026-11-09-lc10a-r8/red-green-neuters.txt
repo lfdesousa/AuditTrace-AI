@@ -1,0 +1,15 @@
+LC-10a review r8 (F1, O3, O4), base 60309cf8
+
+RED (no fix: bff.logging_setup.configure_logging is a no-op, i.e. 60309cf8 behaviour):
+  tests/bff/test_logging_setup.py  5 failed
+    test_create_app_makes_the_info_granted_line_emit       FAILED (len([]) == 0 granted records)
+    test_the_deployed_import_path_prints_level_and_logger_name_to_stdout  FAILED (INFO line absent from stdout)
+    test_idempotent_one_handler / test_level_follows_the_setting / test_an_unknown_level_fails_closed  FAILED
+GREEN after fix: tests/bff 418 passed.
+
+Neuters (each restored, tree clean):
+  N1 drop configure_logging() call in create_app     -> test_logging_setup 2 failed, 3 passed; test_exchange_scope_log 3 passed (caplog tests stay green, as the review said)
+  N2 level ignored (hardcode WARNING)                -> test_logging_setup 3 failed, 2 passed
+  N3 Bruno 04 `assembled += piece` -> `assembled = piece` -> test_bruno_session_recall_extra_folders 1 failed, 12 passed
+  N4 hook unbinds memory:files:write (realm file still lists it) -> test_librechat_openid_scope_covers_bff_exchanges 1 failed, 6 passed
+  N6 exchange success line also logs the claims      -> test_exchange_scope_log 2 failed, 1 passed (token never logged guard)
