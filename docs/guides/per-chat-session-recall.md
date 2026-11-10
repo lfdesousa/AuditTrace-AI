@@ -42,3 +42,5 @@ default on): a public device-flow client, consent required, no refresh token,
 900 s access tokens. Default scopes `audittrace:query` and `audittrace:audit`;
 `memory:session:write` and `memory:session:read-own` are OPTIONAL and requested
 by name through the Bruno environment `cluster-session-e2e`.
+
+See also: [Attachments in LibreChat with AuditTrace](librechat-attachments-support.md).

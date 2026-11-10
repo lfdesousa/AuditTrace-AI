@@ -1,0 +1,88 @@
+meta {
+  name: POST /v1/chat/completions (unsupported content part, stream)
+  type: http
+  seq: 12
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": [
+        { "type": "text", "text": "{{contentPartPrompt}}" },
+        { "type": "{{contentPartType}}", "file": { "filename": "{{contentPartFilename}}", "file_data": "{{contentPartData}}" } }
+      ] }
+    ],
+    "stream": true,
+    "max_tokens": 64
+  }
+}
+
+script:pre-request {
+  // Body rebuilt here so values containing quotes cannot break the JSON.
+  // A content part of an unsupported `type` (default `file`, the OpenAI
+  // file-input part) is the "Upload to Provider" shape; llama-server rejects
+  // it and the memory server turns that into an explicit error.
+  req.setBody({
+    model: "audittrace-default",
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: bru.getEnvVar("contentPartPrompt") },
+        {
+          type: bru.getEnvVar("contentPartType"),
+          file: {
+            filename: bru.getEnvVar("contentPartFilename"),
+            file_data: bru.getEnvVar("contentPartData")
+          }
+        }
+      ]
+    }],
+    stream: true,
+    max_tokens: 64
+  });
+  // X-Session-Id: the caller's `contentPartSessionId`, else a generated one;
+  // stashed so chat/13 can read the audit row of THIS turn.
+  const given = bru.getEnvVar("contentPartSessionId");
+  const sid = given ? given : "bru-content-part-st-" + Date.now();
+  req.setHeader("X-Session-Id", sid);
+  bru.setVar("contentPartSessionId", sid);
+}
+
+tests {
+  test("HTTP 200 (headers already sent) on the streaming call", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("an error frame with the stable code, closed by [DONE]", function() {
+    const raw = String(res.getBody());
+    expect(raw).to.contain('"code": "unsupported_content_type"');
+    expect(raw).to.match(/data: \[DONE\]\s*$/);
+  });
+  test("no echo of the filename or the file data", function() {
+    const raw = String(res.getBody());
+    expect(raw).to.not.contain(bru.getEnvVar("contentPartFilename"));
+    expect(raw).to.not.contain("aGVsbG8gd29ybGQ");
+  });
+}
+
+docs {
+  AT-UNSUPPORTED-CONTENT-ERROR (E-D). Sends a user turn carrying a content
+  part of an unsupported type (the "Upload to Provider" shape). The request
+  reaches llama-server unchanged; its "unsupported content[].type" rejection
+  is turned into an explicit OpenAI-shaped error that names "Upload as Text".
+
+  Inputs (env vars, defaults in environments/*.bru): `contentPartType`,
+  `contentPartFilename`, `contentPartData`, `contentPartPrompt`,
+  `contentPartSessionId` (empty = generated; stashed for chat/13).
+  Needs scope audittrace:query; the audit row is read by chat/13.
+}
