@@ -1019,8 +1019,11 @@ console:
       # pinned to THIS specific published version, so tag and digest must
       # move together on every bump (mirrors console.librechat.image
       # below, not memoryServer).
-      tag: "1.31.0"
-      # Phase-E re-pin (2026-11-06, release v1.31.0) — the published digest
+      tag: "1.32.0"
+      # Phase-E re-pin (2026-11-10, release v1.32.0) — the published digest
+      # for docker.io/lfds/audittrace-librechat-bff:1.32.0, confirmed live on
+      # Docker Hub 2026-11-10 via a registry-1.docker.io HEAD (Docker-Content-Digest).
+      # Prior pin (2026-11-06, v1.31.0) — the published digest
       # for docker.io/lfds/audittrace-librechat-bff:1.31.0, confirmed
       # live on Docker Hub 2026-11-06 via a registry-1.docker.io HEAD
       # (Docker-Content-Digest).
@@ -1039,7 +1042,7 @@ console:
       # hand-edited without re-verifying against the registry. When set,
       # the rendered image ref becomes `<repository>:<tag>@<digest>`
       # (deployment-bff.yaml).
-      digest: "sha256:baa48f9ebd494a84b0269f85a0af1767f9f90507c005411bf547b6e768f57a8a"
+      digest: "sha256:a5722e2192e87fdef55bbaffb73d3a96ecc22e0c8ba12f21e6568a17bbdee12f"
       pullPolicy: IfNotPresent
     replicaCount: 1
     port: 8766
@@ -1084,8 +1087,12 @@ console:
   librechat:
     image:
       repository: docker.io/lfds/audittrace-librechat
-      tag: "768de61"
-      # Phase-E re-pin (2026-09-18) — pinned so the deploy is reproducible
+      tag: "6143572"
+      # Phase-E re-pin (2026-11-10, release v1.32.0): fork main 6143572 (fork PR #15,
+      # LC-10a session-id forwarding), the image validated live as the lc10a-6143572
+      # candidate (E5/E8, 2026-11-10) and pushed unchanged; digest confirmed on
+      # Docker Hub 2026-11-10 via a registry-1.docker.io HEAD (Docker-Content-Digest).
+      # Prior pin: Phase-E re-pin (2026-09-18) — pinned so the deploy is reproducible
       # with no live `docker pull ... && docker inspect` compute step. This
       # is the pushed INDEX digest for
       # docker.io/lfds/audittrace-librechat:768de61, confirmed live on
@@ -1102,7 +1109,7 @@ console:
       # like any pinned digest (operator verifies against the registry,
       # never fabricated). When set, the rendered image ref becomes
       # `<repository>:<tag>@<digest>`.
-      digest: "sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
+      digest: "sha256:7bce9819ce6b25b5ab353d7e89895333c47161c23a835851718653c052c94510"
     # M3-WU-D2-4 — the fork's sovereign-backend switch. The fork's
     # config.js reads AUDITTRACE_MEMORY_BACKEND and selects the sovereign
     # one-brain path ONLY when it is exactly "sovereign" — any other value
@@ -1263,8 +1270,11 @@ tests:
     # Explicit release version, tag+digest move together on every bump —
     # mirrors console.bff.image / console.librechat.image above, not
     # memoryServer's AppVersion-tracking empty-string convenience.
-    tag: "1.31.0"
-    # Phase-E re-pin (2026-11-06, release v1.31.0): the published digest
+    tag: "1.32.0"
+    # Phase-E re-pin (2026-11-10, release v1.32.0): the published digest
+    # for docker.io/lfds/audittrace-tests:1.32.0, confirmed live on Docker Hub
+    # 2026-11-10 via a registry HEAD (Docker-Content-Digest).
+    # Prior pin (2026-11-06, v1.31.0): the published digest
     # for docker.io/lfds/audittrace-tests:1.31.0, confirmed live on
     # Docker Hub 2026-11-06 via a registry HEAD (Docker-Content-Digest).
     # Prior pins (2026-11-05, v1.30.1; 2026-10-26, v1.30.0) via a registry
@@ -1273,7 +1283,7 @@ tests:
     # manifest reads (registry HEAD with an OCI-index Accept header, and
     # `docker buildx imagetools inspect`), never fabricated. Tag+digest move
     # together on every bump.
-    digest: "sha256:68a89afd8e5834ba6ff4ab88fe2c6a18b6feec97f61f35ac0ee9464e587e49ec"
+    digest: "sha256:25e259808e419d63e8c28dd99346dfaf046b2e41c12efa931de39c5ebc0f9130"
     pullPolicy: IfNotPresent
   resources:
     requests:
