@@ -166,6 +166,7 @@ from bff.console_tool_favorites_proxy import (
 )
 from bff.console_tool_favorites_scopes import CONSOLE_TOOL_FAVORITES_SCOPE_STRING
 from bff.exchange import TokenExchangeError, exchange_token
+from bff.logging_setup import configure_logging
 from bff.memory_proxy import MemoryProxyError, proxy_memory_request
 from bff.memory_scopes import MEMORY_SCOPE_STRING
 from bff.proxy import ProxyError, proxy_chat_completions
@@ -215,6 +216,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
+    # F1 (LC-10a r8): bare ``uvicorn bff.app:app`` never configures ``bff.*``.
+    configure_logging(get_settings().log_level)
     app = FastAPI(
         title="audittrace-librechat-bff",
         description=(

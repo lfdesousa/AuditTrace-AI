@@ -1,0 +1,59 @@
+meta {
+  name: session-recall-userb 01 - user B, MCP recall_attachments under user A's chat id (expect nothing)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/mcp
+  body: json
+  auth: bearer
+}
+
+headers {
+  X-Session-Id: {{chatSessionId}}
+}
+
+auth:bearer {
+  token: {{tokenUserB}}
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "recall_attachments",
+      "arguments": { "n": 5 }
+    }
+  }
+}
+
+tests {
+  test("returns exactly 200 with a JSON-RPC result and no error", function() {
+    expect(res.getStatus()).to.equal(200);
+    const body = res.getBody();
+    expect(body.jsonrpc).to.equal("2.0");
+    expect(body).to.not.have.property("error");
+    expect(body.result.isError).to.equal(false);
+  });
+  test("user B recalls nothing under user A's chat id", function() {
+    const sc = res.getBody().result.structuredContent;
+    expect(sc.total).to.equal(0);
+    expect(sc.matches).to.have.length(0);
+  });
+  test("user A's note never appears in user B's body", function() {
+    const text = JSON.stringify(res.getBody());
+    expect(text).to.not.include(bru.getEnvVar("sessionNoteName"));
+  });
+}
+
+docs {
+  LC-10a E4 (AC-12 step 5): the per-chat compartment is per user too. Run it
+  AFTER the session-recall folder, with the SAME chat id pinned:
+    bru run session-recall-userb --env cluster-session-e2e --env-var chatSessionId=<user A's id>
+  `tokenUserB` is a second realm user's token from
+  `audittrace-login --env-key tokenUserB` (session-e2e client). The isolation
+  comes from the user_id filter and Postgres RLS together, not from the header.
+}

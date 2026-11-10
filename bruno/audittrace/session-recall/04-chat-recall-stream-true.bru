@@ -48,13 +48,33 @@ tests {
   test("returns 200", function() {
     expect(res.getStatus()).to.equal(200);
   });
-  test("the SSE frames name the uploaded file", function() {
-    const raw = typeof res.getBody() === "string" ? res.getBody() : JSON.stringify(res.getBody());
-    expect(raw).to.include(bru.getEnvVar("sessionNoteName"));
+  test("the streamed answer names the uploaded file", function() {
+    // The file name is split across token deltas, so scan the ASSEMBLED text
+    // (choices[].delta.content of every `data:` frame), never the raw SSE.
+    const body = res.getBody();
+    const raw = typeof body === "string" ? body : JSON.stringify(body);
+    let assembled = "";
+    for (const line of raw.split("\n")) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const payload = t.slice(5).trim();
+      if (payload === "" || payload === "[DONE]") continue;
+      try {
+        for (const choice of (JSON.parse(payload).choices || [])) {
+          const piece = choice.delta && choice.delta.content;
+          if (typeof piece === "string") assembled += piece;
+        }
+      } catch (e) {
+        // a non-JSON data frame carries no delta text
+      }
+    }
+    expect(assembled).to.include(bru.getEnvVar("sessionNoteName"));
   });
 }
 
 docs {
   The streaming twin of 03: the tool loop runs inside the response stream,
-  so the bound session id must still be visible there (WP-6 binder).
+  so the bound session id must still be visible there (WP-6 binder). The
+  assertion reads the concatenated delta text of all frames: a file name is
+  split across token deltas and never appears whole in the raw SSE.
 }
