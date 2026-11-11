@@ -113,8 +113,14 @@ v1.30.0).
 **Superseded at the v1.31.0 Phase-E re-pin (2026-11-06):** BFF moved to
 ``1.31.0`` / ``sha256:baa48f9e...`` and the tests image to ``1.31.0`` /
 ``sha256:68a89afd...`` (registry HEAD, 2026-11-06). The fork pin is
-untouched (no fork change in v1.31.0). Assertions below reflect the
-``1.31.0`` pins.
+untouched (no fork change in v1.31.0).
+
+**Superseded at the v1.32.0 Phase-E re-pin (2026-11-10):** BFF moved to
+``1.32.0`` / ``sha256:a5722e21...``, the tests image to ``1.32.0`` /
+``sha256:25e25980...``, and the fork pin to ``6143572`` / ``sha256:7bce9819...``
+(fork PR #15, LC-10a session-id forwarding; the image validated live as the
+``lc10a-6143572`` candidate and pushed unchanged), each by a registry HEAD
+(2026-11-10). Assertions below reflect the ``1.32.0`` / ``6143572`` pins.
 
 **Superseded again at the v1.29.5 Phase-E re-pin (2026-10-15):** BFF moved
 to ``1.29.5`` / ``sha256:fe16703c...`` and the tests image to ``1.29.5`` /
@@ -244,13 +250,13 @@ class TestBothImagesRenderWithDigest:
         repo_tag, _, digest = image.partition("@")
         assert digest, f"BFF image {image!r} carries no @digest suffix"
         assert _SHA256_RE.match(digest), f"malformed digest {digest!r}"
-        assert repo_tag.endswith(":1.31.0"), f"unexpected BFF tag: {repo_tag!r}"
+        assert repo_tag.endswith(":1.32.0"), f"unexpected BFF tag: {repo_tag!r}"
 
     def test_bff_digest_matches_pinned_values_digest(self) -> None:
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         pinned = values["console"]["bff"]["image"]["digest"]
         assert pinned == (
-            "sha256:baa48f9ebd494a84b0269f85a0af1767f9f90507c005411bf547b6e768f57a8a"
+            "sha256:a5722e2192e87fdef55bbaffb73d3a96ecc22e0c8ba12f21e6568a17bbdee12f"
         ), f"BFF digest in values.yaml drifted from the verified pin: {pinned!r}"
         resources = _render(_CONSOLE_ENABLED)
         assert _bff_image(resources).endswith(f"@{pinned}")
@@ -265,13 +271,13 @@ class TestBothImagesRenderWithDigest:
         repo_tag, _, digest = image.partition("@")
         assert digest, f"LibreChat image {image!r} carries no @digest suffix"
         assert _SHA256_RE.match(digest), f"malformed digest {digest!r}"
-        assert repo_tag.endswith(":768de61"), f"unexpected LibreChat tag: {repo_tag!r}"
+        assert repo_tag.endswith(":6143572"), f"unexpected LibreChat tag: {repo_tag!r}"
 
     def test_librechat_digest_matches_pinned_values_digest(self) -> None:
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         pinned = values["console"]["librechat"]["image"]["digest"]
         assert pinned == (
-            "sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
+            "sha256:7bce9819ce6b25b5ab353d7e89895333c47161c23a835851718653c052c94510"
         ), f"LibreChat digest in values.yaml drifted from the Phase-E pin: {pinned!r}"
         resources = _render(_CONSOLE_ENABLED)
         assert _librechat_image(resources).endswith(f"@{pinned}")
@@ -317,7 +323,7 @@ class TestBffDigestPlumbing:
             f"suffix entirely, got {image!r} — the conditional either "
             "isn't guarding the digest, or a stale value leaked through"
         )
-        assert image == "docker.io/lfds/audittrace-librechat-bff:1.31.0"
+        assert image == "docker.io/lfds/audittrace-librechat-bff:1.32.0"
 
     def test_restore_setting_digest_brings_the_suffix_back(self) -> None:
         custom_digest = "sha256:" + "ab" * 32
@@ -421,9 +427,9 @@ class TestNoLocalRegistryOrStaleTagSurvives:
         test_rendered_tests_image_equals_v1_28_0_pin_exactly."""
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         image = values["tests"]["image"]
-        assert image["tag"] == "1.31.0"
+        assert image["tag"] == "1.32.0"
         assert image["digest"] == (
-            "sha256:68a89afd8e5834ba6ff4ab88fe2c6a18b6feec97f61f35ac0ee9464e587e49ec"
+            "sha256:25e259808e419d63e8c28dd99346dfaf046b2e41c12efa931de39c5ebc0f9130"
         )
 
 
@@ -507,8 +513,8 @@ class TestD2FourAndEAndHCoexist:
             gate["image"]
             == main["image"]
             == (
-                "docker.io/lfds/audittrace-librechat:768de61"
-                "@sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
+                "docker.io/lfds/audittrace-librechat:6143572"
+                "@sha256:7bce9819ce6b25b5ab353d7e89895333c47161c23a835851718653c052c94510"
             )
         )
 

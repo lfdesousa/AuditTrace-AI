@@ -70,11 +70,11 @@ LAPTOP_VALUES_FILE = CHART_DIR / "values-laptop.yaml"
 # so a regression that silently stops reading them is caught, not just
 # "some string present".
 _REAL_LIBRECHAT_DIGEST = (
-    "sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
+    "sha256:7bce9819ce6b25b5ab353d7e89895333c47161c23a835851718653c052c94510"
 )
-# Phase-E re-pin (2026-11-06, release v1.31.0).
+# Phase-E re-pin (2026-11-10, release v1.32.0; fork console 6143572).
 _REAL_BFF_DIGEST = (
-    "sha256:baa48f9ebd494a84b0269f85a0af1767f9f90507c005411bf547b6e768f57a8a"
+    "sha256:a5722e2192e87fdef55bbaffb73d3a96ecc22e0c8ba12f21e6568a17bbdee12f"
 )
 
 # Mirrors the Makefile helm-lint / tests/test_deploy_runner_console_image_pins.py
