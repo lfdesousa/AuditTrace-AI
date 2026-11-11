@@ -85,6 +85,7 @@ services:
       - AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET=${AUDITTRACE_BFF_CLIENT_SECRET:?set AUDITTRACE_BFF_CLIENT_SECRET — retrieve via kcadm, see bff/README.md; never commit it}
       - AUDITTRACE_BFF_EXCHANGE_CLIENT_ID=${AUDITTRACE_BFF_EXCHANGE_CLIENT_ID:-audittrace-librechat-bff}
       - AUDITTRACE_BFF_EXCHANGE_AUDIENCE=${AUDITTRACE_BFF_EXCHANGE_AUDIENCE:-audittrace-librechat}
+      - AUDITTRACE_BFF_CHAT_EXCHANGE_AUDIENCE=${AUDITTRACE_BFF_CHAT_EXCHANGE_AUDIENCE:-audittrace-librechat-chat}
       # Front door — laptop default is the reference target (portability
       # invariant); override for a cloud rig via env, never a rewrite.
       # Routing (JWKS fetch, token endpoint) always goes through the
