@@ -103,6 +103,8 @@ FAKE_KCADM = (
         }
         save()
         sys.exit(0)
+    if cmd == "delete" and state.get("delete_noop"):
+        sys.exit(0)  # a strip that does not take effect: verify must still refuse
     if cmd == "delete":
         parts = args[1].split("/")
         key = "default" if parts[2].startswith("default") else "optional"
@@ -266,6 +268,26 @@ class TestTheClientIsEnsuredOnAnExistingRealm:
         assert f'missing:"{flag}"' in proc.stdout
         assert "BLOCK-COMPLETED" not in proc.stdout
         assert run.calls("update") == []
+
+    @pytest.mark.parametrize(
+        ("kind", "name", "expected"),
+        [
+            ("optional", "memory:files:read-own", "unexpected-optional-scope:count=1"),
+            ("default", "memory:episodic:write", "unexpected-default-scope:count=1"),
+        ],
+    )
+    def test_verify_refuses_an_extra_scope_the_strip_failed_to_remove(
+        self, run: Run, kind: str, name: str, expected: str
+    ) -> None:
+        """The strip runs first, so verify's scope checks are the second line
+        of defence: with a strip that takes no effect they must still stop it."""
+        planted = _state()
+        planted[kind].append({"id": "s-x", "name": name})
+        proc = run.go(client=planted, delete_noop=True)
+        assert proc.returncode != 0
+        assert "code=drift" in proc.stdout
+        assert expected in proc.stdout
+        assert "BLOCK-COMPLETED" not in proc.stdout
 
     def test_an_extra_mapper_fails_closed(self, run: Run) -> None:
         proc = run.go(client=_state(mappers=["aud-audittrace-server", "roles"]))
