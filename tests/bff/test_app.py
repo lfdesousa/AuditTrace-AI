@@ -43,6 +43,7 @@ from jose import jwt
 
 import bff.app as app_module
 from bff.app import create_app, get_http_client, lifespan
+from bff.chat_scopes import CHAT_SCOPE_STRING
 from bff.config import Settings, get_settings
 from tests.bff.conftest import (
     TEST_ISSUER,
@@ -58,6 +59,8 @@ KEYCLOAK_TOKEN_URL = (
     "http://keycloak:8080/realms/audittrace/protocol/openid-connect/token"
 )
 ORCHESTRATOR_BASE = "http://orchestrator:8765"
+
+CHAT_CALLER_CLAIMS = {"scope": CHAT_SCOPE_STRING}
 
 
 def _make_self_signed_test_ca_pem() -> str:
@@ -240,7 +243,7 @@ class TestHealth:
 class TestHappyPath:
     def test_valid_token_streams_orchestrator_response(self, app_client) -> None:
         client, backend = app_client
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         response = client.post(
             "/v1/chat/completions",
             content=b'{"model":"audittrace-chat","messages":[]}',
@@ -255,7 +258,7 @@ class TestHappyPath:
 
     def test_request_body_forwarded_byte_identical(self, app_client) -> None:
         client, backend = app_client
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         raw = b'{"messages":  [{"role":"user","content":"caf\xc3\xa9"}],"zeta":1,"alpha":2}'
         client.post(
             "/v1/chat/completions",
@@ -284,7 +287,7 @@ class TestSessionIdForward:
             "/v1/chat/completions",
             content=b'{"model":"audittrace-chat","messages":[]}',
             headers={
-                "Authorization": f"Bearer {make_token(sub='alice')}",
+                "Authorization": f"Bearer {make_token(sub='alice', extra_claims=CHAT_CALLER_CLAIMS)}",
                 "Content-Type": "application/json",
                 "X-Session-Id": "librechat-conversation-7",
             },
@@ -300,7 +303,7 @@ class TestSessionIdForward:
             "/v1/chat/completions",
             content=b'{"model":"audittrace-chat","messages":[]}',
             headers={
-                "Authorization": f"Bearer {make_token(sub='alice')}",
+                "Authorization": f"Bearer {make_token(sub='alice', extra_claims=CHAT_CALLER_CLAIMS)}",
                 "Content-Type": "application/json",
             },
         )
@@ -328,7 +331,7 @@ class TestConsoleFilesSessionIdForward:
             "/console/files",
             content=self._BODY,
             headers={
-                "Authorization": f"Bearer {make_token(sub='alice')}",
+                "Authorization": f"Bearer {make_token(sub='alice', extra_claims=CHAT_CALLER_CLAIMS)}",
                 "Content-Type": "multipart/form-data; boundary=b1",
                 **extra,
             },
@@ -357,7 +360,7 @@ class TestConsoleFilesSessionIdForward:
                 method,
                 path,
                 headers={
-                    "Authorization": f"Bearer {make_token(sub='alice')}",
+                    "Authorization": f"Bearer {make_token(sub='alice', extra_claims=CHAT_CALLER_CLAIMS)}",
                     "X-Session-Id": "chat-7",
                 },
             )
@@ -370,7 +373,7 @@ class TestConsoleFilesSessionIdForward:
         response = client.post(
             "/console/files/note.txt/promote",
             headers={
-                "Authorization": f"Bearer {make_token(sub='alice')}",
+                "Authorization": f"Bearer {make_token(sub='alice', extra_claims=CHAT_CALLER_CLAIMS)}",
                 "X-Session-Id": "chat-7",
             },
         )
@@ -419,7 +422,9 @@ class TestFailClosed:
 
     def test_expired_token_401_never_reaches_orchestrator(self, app_client) -> None:
         client, backend = app_client
-        token = make_token(sub="alice", exp_offset=-3600)
+        token = make_token(
+            sub="alice", extra_claims=CHAT_CALLER_CLAIMS, exp_offset=-3600
+        )
         response = client.post(
             "/v1/chat/completions",
             content=b"{}",
@@ -450,7 +455,7 @@ class TestFailClosed:
     ) -> None:
         client, backend = app_client
         backend.keycloak_down = True
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         response = client.post(
             "/v1/chat/completions",
             content=b"{}",
@@ -471,8 +476,8 @@ class TestTwoDistinctCallers:
 
     def test_two_callers_produce_two_distinct_minted_subs(self, app_client) -> None:
         client, backend = app_client
-        alice_token = make_token(sub="alice")
-        bob_token = make_token(sub="bob")
+        alice_token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
+        bob_token = make_token(sub="bob", extra_claims=CHAT_CALLER_CLAIMS)
 
         client.post(
             "/v1/chat/completions",
@@ -519,7 +524,7 @@ class TestOrchestratorUnreachable:
         app.dependency_overrides[get_settings] = _settings
         app.dependency_overrides[get_http_client] = lambda: mock_client
         with TestClient(app) as client:
-            token = make_token(sub="alice")
+            token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
             response = client.post(
                 "/v1/chat/completions",
                 content=b"{}",
@@ -644,7 +649,7 @@ class TestLifespanTlsTrust:
 class TestMemoryProxyHappyPath:
     def test_get_forwards_and_streams_response(self, memory_app_client) -> None:
         client, backend = memory_app_client
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         response = client.get(
             "/memory/episodic",
             headers={"Authorization": f"Bearer {token}"},
@@ -660,7 +665,7 @@ class TestMemoryProxyHappyPath:
         self, memory_app_client, method: str
     ) -> None:
         client, backend = memory_app_client
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         response = client.request(
             method,
             "/memory/episodic/some-doc",
@@ -675,7 +680,7 @@ class TestMemoryProxyHappyPath:
 
     def test_request_body_forwarded_byte_identical(self, memory_app_client) -> None:
         client, backend = memory_app_client
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         raw = b'{"content":  "caf\xc3\xa9","zeta":1,"alpha":2}'
         client.post(
             "/memory/semantic",
@@ -689,7 +694,7 @@ class TestMemoryProxyHappyPath:
 
     def test_query_string_forwarded(self, memory_app_client) -> None:
         client, backend = memory_app_client
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         client.get(
             "/memory/episodic?limit=500&sort=recency",
             headers={"Authorization": f"Bearer {token}"},
@@ -700,7 +705,7 @@ class TestMemoryProxyHappyPath:
 
     def test_nested_path_forwarded(self, memory_app_client) -> None:
         client, backend = memory_app_client
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         client.get(
             "/memory/semantic/decisions/some-doc-id",
             headers={"Authorization": f"Bearer {token}"},
@@ -726,7 +731,7 @@ class TestMemoryProxyScopeSelection:
         from bff.memory_scopes import MEMORY_SCOPE_STRING
 
         client, backend = memory_app_client
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         client.get("/memory/episodic", headers={"Authorization": f"Bearer {token}"})
         assert len(backend.exchange_request_bodies) == 1
         parsed = parse_qs(backend.exchange_request_bodies[0])
@@ -736,31 +741,11 @@ class TestMemoryProxyScopeSelection:
         from urllib.parse import parse_qs
 
         client, backend = memory_app_client
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         client.get("/memory/procedural", headers={"Authorization": f"Bearer {token}"})
         parsed = parse_qs(backend.exchange_request_bodies[0])
         requested_scopes = parsed["scope"][0].split(" ")
         assert "audittrace:admin" not in requested_scopes
-
-    def test_chat_path_exchange_requests_no_scope_field(self, app_client) -> None:
-        """Sibling/regression check: the ORIGINAL chat-path exchange
-        shape is unregressed by the memory path's addition — no ``scope``
-        form field at all (Keycloak falls back to the target client's own
-        default scopes, exactly WU-1/WU-2's behaviour). Neuter
-        ``bff/app.py::chat_completions`` to also pass
-        ``requested_scope=MEMORY_SCOPE_STRING`` and this test goes RED."""
-        client, backend = app_client
-        token = make_token(sub="alice")
-        client.post(
-            "/v1/chat/completions",
-            content=b"{}",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-        )
-        assert len(backend.exchange_request_bodies) == 1
-        assert "scope=" not in backend.exchange_request_bodies[0]
 
 
 class TestMemoryProxyFailClosed:
@@ -782,7 +767,9 @@ class TestMemoryProxyFailClosed:
         self, memory_app_client
     ) -> None:
         client, backend = memory_app_client
-        token = make_token(sub="alice", exp_offset=-3600)
+        token = make_token(
+            sub="alice", extra_claims=CHAT_CALLER_CLAIMS, exp_offset=-3600
+        )
         response = client.get(
             "/memory/episodic", headers={"Authorization": f"Bearer {token}"}
         )
@@ -794,7 +781,7 @@ class TestMemoryProxyFailClosed:
     ) -> None:
         client, backend = memory_app_client
         backend.keycloak_down = True
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         response = client.get(
             "/memory/episodic", headers={"Authorization": f"Bearer {token}"}
         )
@@ -815,7 +802,7 @@ class TestMemoryProxyFailClosed:
             json={"detail": "denied"},
             headers={"content-type": "application/json"},
         )
-        token = make_token(sub="alice")
+        token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
         response = client.get(
             "/memory/episodic", headers={"Authorization": f"Bearer {token}"}
         )
@@ -844,7 +831,7 @@ class TestMemoryProxyOrchestratorUnreachable:
         app.dependency_overrides[get_settings] = _settings
         app.dependency_overrides[get_http_client] = lambda: mock_client
         with TestClient(app) as client:
-            token = make_token(sub="alice")
+            token = make_token(sub="alice", extra_claims=CHAT_CALLER_CLAIMS)
             response = client.get(
                 "/memory/episodic", headers={"Authorization": f"Bearer {token}"}
             )

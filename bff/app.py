@@ -41,7 +41,10 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
 3. RFC 8693 token-exchange it for an ``aud=audittrace-server`` token
    minted for the SAME ``sub``. Keycloak failure / identity mismatch →
    502, orchestrator never contacted. The chat route exchanges for
-   ``audittrace:query`` (the default scope, unchanged since WU-2); the
+   ``bff.chat_scopes.CHAT_SCOPE_STRING`` (six read scopes) from the dedicated
+   ``audittrace-librechat-chat`` audience, bounded by a scope ceiling, after
+   a pre-check that refuses a caller whose own token lacks one of them
+   (explicit 403, ``bff/chat_caller_scope.py``); the
    memory route exchanges explicitly for
    ``bff.memory_scopes.MEMORY_SCOPE_STRING``; the console-files route
    exchanges explicitly for
@@ -120,6 +123,12 @@ from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
 
 from bff.auth import InboundTokenError, validate_inbound_token
+from bff.chat_caller_scope import insufficient_scope_response, missing_chat_scopes
+from bff.chat_scopes import (
+    CHAT_SCOPE_CEILING,
+    CHAT_SCOPE_STRING,
+    OIDC_PROTOCOL_SCOPES,
+)
 from bff.config import Settings, get_settings
 from bff.console_agents_proxy import (
     ConsoleAgentsProxyError,
@@ -260,12 +269,20 @@ def create_app() -> FastAPI:
         # — the assert makes that narrowing explicit for mypy too.
         assert token is not None
         inbound_sub = claims["sub"]
+        inbound_scopes = frozenset(str(claims.get("scope", "")).split())
+        missing = missing_chat_scopes(inbound_scopes)
+        if missing:
+            return insufficient_scope_response(inbound_sub, missing)
         try:
             minted_token = await exchange_token(
                 token,
                 inbound_sub,
                 settings,
                 http_client,
+                requested_scope=CHAT_SCOPE_STRING,
+                audience=settings.chat_exchange_audience,
+                scope_ceiling=CHAT_SCOPE_CEILING
+                & (inbound_scopes | OIDC_PROTOCOL_SCOPES),
             )
         except TokenExchangeError as exc:
             logger.error("token exchange failed for sub=%s: %s", inbound_sub, exc)
