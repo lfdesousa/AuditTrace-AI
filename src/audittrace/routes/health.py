@@ -9,6 +9,10 @@ from sqlalchemy import func, select
 
 from audittrace.auth import validate_jwt
 from audittrace.config import Settings, get_settings
+from audittrace.db.index_predicates import (
+    dead_lettered_index_clauses,
+    pending_index_clauses,
+)
 from audittrace.db.models import MemoryItem
 from audittrace.logging_config import log_call
 from audittrace.models import HealthResponse, MetricsResponse
@@ -192,16 +196,12 @@ async def _scan_index_health_fields() -> dict[str, str]:
                 )
                 unindexed_count = await _count_memory_items(
                     session,
-                    MemoryItem.scan_status == "scanned_clean",
-                    MemoryItem.indexed_at_ms.is_(None),
-                    MemoryItem.index_failed_at_ms.is_(None),
-                    MemoryItem.deleted_at_ms.is_(None),
+                    *pending_index_clauses(),
                     field_name="unindexed_count",
                 )
                 dead_lettered_index_count = await _count_memory_items(
                     session,
-                    MemoryItem.index_failed_at_ms.is_not(None),
-                    MemoryItem.deleted_at_ms.is_(None),
+                    *dead_lettered_index_clauses(),
                     field_name="dead_lettered_index_count",
                 )
                 fields["pending_scan_orphans"] = pending_scan_orphans

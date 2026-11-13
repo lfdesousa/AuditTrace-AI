@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
+from audittrace.db.index_predicates import pending_index_clauses
 from audittrace.db.models import MemoryItem
 from audittrace.services.index_routing import bare_key_from_uri, collection_for_key
 from audittrace.services.index_worker import IndexRequestEnvelope
@@ -39,10 +40,6 @@ logger = logging.getLogger(__name__)
 
 # Bounded batch keeps the janitor's per-tick cost predictable.
 _JANITOR_BATCH_SIZE = 100
-
-# Closed-set: only clean-scanned rows are eligible for auto-index —
-# mirrors GAP-1's exact trigger condition (SPEC #387 §2).
-_ELIGIBLE_SCAN_STATUS = "scanned_clean"
 
 
 def _now_ms() -> int:
@@ -76,11 +73,8 @@ class IndexJanitor:
         async with self._session_factory() as session:
             stmt = (
                 select(MemoryItem)
-                .where(MemoryItem.scan_status == _ELIGIBLE_SCAN_STATUS)
-                .where(MemoryItem.indexed_at_ms.is_(None))
+                .where(*pending_index_clauses())
                 .where(MemoryItem.created_at_ms < cutoff)
-                .where(MemoryItem.deleted_at_ms.is_(None))
-                .where(MemoryItem.index_failed_at_ms.is_(None))
                 .limit(_JANITOR_BATCH_SIZE)
             )
             for row in (await session.execute(stmt)).scalars():
