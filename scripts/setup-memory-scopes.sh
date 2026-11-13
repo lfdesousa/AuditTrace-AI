@@ -1158,12 +1158,20 @@ session_e2e_in_set() {
 # created by this script), so their ids are resolved from the live realm here;
 # an absent one fails closed.
 session_e2e_resolve_scope() {
-  local name="$1" found
+  local name="$1" found="" csv sid sname
   [[ -n "${SCOPE_ID[${name}]:-}" ]] && return 0
-  found=$(acl_e2e_kc get client-scopes -r "${REALM}" \
-            --fields id,name --format csv --noquotes \
-          | awk -F, -v n="${name}" '$2 == n {print $1; exit}') \
+  # Pure bash (no awk in this image): list first so a kcadm failure reaches
+  # the read-failed branch directly, then take the FIRST row whose 2nd CSV
+  # field equals the name exactly (a prefix of another name never matches).
+  csv=$(acl_e2e_kc get client-scopes -r "${REALM}" \
+          --fields id,name --format csv --noquotes) \
     || acl_e2e_fail read-failed "cannot list the realm client scopes (session client)"
+  while IFS=, read -r sid sname _; do
+    if [[ "${sname}" == "${name}" ]]; then
+      found="${sid}"
+      break
+    fi
+  done <<< "${csv}"
   [[ -n "${found}" ]] \
     || acl_e2e_fail id-unresolvable "a pinned session client scope is absent from the realm (session client)"
   SCOPE_ID["${name}"]="${found}"
@@ -1479,12 +1487,20 @@ chat_aud_in_default_set() {
 # audittrace:query is a REALM-defined client scope (never created by this
 # script), so its id is resolved from the live realm; an absent one fails closed.
 chat_aud_resolve_scope() {
-  local name="$1" found
+  local name="$1" found="" csv sid sname
   [[ -n "${SCOPE_ID[${name}]:-}" ]] && return 0
-  found=$(acl_e2e_kc get client-scopes -r "${REALM}" \
-            --fields id,name --format csv --noquotes \
-          | awk -F, -v n="${name}" '$2 == n {print $1; exit}') \
+  # Pure bash (no awk in this image): list first so a kcadm failure reaches
+  # the read-failed branch directly, then take the FIRST row whose 2nd CSV
+  # field equals the name exactly (a prefix of another name never matches).
+  csv=$(acl_e2e_kc get client-scopes -r "${REALM}" \
+          --fields id,name --format csv --noquotes) \
     || acl_e2e_fail read-failed "cannot list the realm client scopes (chat audience client)"
+  while IFS=, read -r sid sname _; do
+    if [[ "${sname}" == "${name}" ]]; then
+      found="${sid}"
+      break
+    fi
+  done <<< "${csv}"
   [[ -n "${found}" ]] \
     || acl_e2e_fail id-unresolvable "a pinned chat audience client scope is absent from the realm"
   SCOPE_ID["${name}"]="${found}"

@@ -12,6 +12,7 @@ wins instead of first).
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 
@@ -45,7 +46,7 @@ def _run(fn: str, *, csv: str, kcadm_rc: int = 0, preset: str = "") -> tuple[int
         ["bash", "-c", prog],
         capture_output=True,
         text=True,
-        env={"PATH": "/usr/bin:/bin", "FAKE_CSV": csv, "FAKE_RC": str(kcadm_rc)},
+        env={**os.environ, "FAKE_CSV": csv, "FAKE_RC": str(kcadm_rc)},
         timeout=60,
     )
     return proc.returncode, proc.stdout + proc.stderr

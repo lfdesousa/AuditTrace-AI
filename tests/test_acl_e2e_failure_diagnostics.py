@@ -4322,19 +4322,21 @@ class TestRunFullWholeScriptCoverage:
                 (1818, 1819),
             }
         else:
+            # LC10A-HOOK-AWK: rows after the session resolver moved +8, after the
+            # chat resolver +16 (pure-bash row scan replaces awk).
             # (1193,1195)/(1430,1431): the LC-10a session E2E clone's strip
             # delete and sunset delete (reasons as (834,836)/(1094,1095)).
             expected_unreached = {
                 (834, 836),
                 1039,
                 (1094, 1095),
-                (1193, 1195),
+                (1201, 1203),
                 # LC-10a r6 step 2: the narrow mapper reconcile's update.
-                (1355, 1358),
-                (1430, 1431),
+                (1363, 1366),
+                (1438, 1439),
                 # LC10A-CHAT-EXCHANGE-SCOPE: the chat audience client's strip
                 # delete (reason as (1584,1586) of the ConfigMap site).
-                (1515, 1517),
+                (1531, 1533),
             }
         # Named per range (line numbers re-measured after every edit
         # that shifts them — e.g. this round's R4/B3 production fixes;
