@@ -1,0 +1,41 @@
+meta {
+  name: GET /interactions?session_id= (audit row of the unmatched upstream-400 turn)
+  type: http
+  seq: 15
+}
+
+get {
+  url: {{baseUrl}}/interactions?session_id={{upstream4xxSessionId}}&limit=5
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200 with exactly one row for the session", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().interactions).to.be.an("array").with.lengthOf(1);
+  });
+  test("the row is failed / upstream_error and keeps the upstream text", function() {
+    const r = res.getBody().interactions[0];
+    expect(r.status).to.equal("failed");
+    expect(r.failure_class).to.equal("upstream_error");
+    expect(r.error_detail.startsWith("status=400: ")).to.equal(true);
+    expect(r.error_detail).to.contain("response_format");
+  });
+  test("trace_id is 32 lowercase hex (stashed as upstream4xxTraceId)", function() {
+    const r = res.getBody().interactions[0];
+    expect(r.trace_id).to.match(/^[0-9a-f]{32}$/);
+    bru.setVar("upstream4xxTraceId", r.trace_id);
+  });
+}
+
+docs {
+  Run right after chat/14 (same collection run, so the stashed
+  `upstream4xxSessionId` is set). Reads the audit row through the public API
+  (scope audittrace:audit). Then reconstruct by trace:
+  `audit/02-list-by-trace-id.bru --env-var traceId=<upstream4xxTraceId>`.
+}
