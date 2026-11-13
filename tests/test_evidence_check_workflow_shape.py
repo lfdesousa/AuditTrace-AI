@@ -9,6 +9,7 @@ ci.yml no longer carries a duplicate.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -129,12 +130,15 @@ def _run_checker_step(
     py = stub / "python3"
     py.write_text(f'#!/bin/bash\necho "$@" > {argv_log}\nexit 0\n')
     py.chmod(0o755)
-    env = {
-        "PATH": f"{stub}:/usr/bin:/bin",
-        "PR_NUMBER": "7",
-        "REPO": "o/r",
-        "GH_TOKEN": "x",
-    }
+    # A CI-shaped run (scripts/ci/run-tests.sh) pins PATH[0] to the hermetic
+    # shim dir: keep it first and put the stub dir right after it. A bare run
+    # has no shim, so the stub dir goes first.
+    env = dict(os.environ)
+    parts = env.get("PATH", "/usr/bin:/bin").split(os.pathsep)
+    shim = os.environ.get("HERMETIC_SHIM_DIR")
+    head = [parts[0]] if shim and parts[0] == shim else []
+    env["PATH"] = os.pathsep.join([*head, str(stub), *parts[len(head) :]])
+    env.update({"PR_NUMBER": "7", "REPO": "o/r", "GH_TOKEN": "x"})
     res = subprocess.run(
         ["bash", "-e", "-c", _checker_steps()[0]["run"]],
         env=env,
