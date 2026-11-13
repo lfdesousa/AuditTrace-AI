@@ -1630,7 +1630,7 @@ async def _handle_tools_mode(
                         502,
                     ),
                 )
-                await _persist_interaction(
+                interaction_id = await _persist_interaction(
                     project=project,
                     source=source,
                     question=query,
@@ -1645,6 +1645,7 @@ async def _handle_tools_mode(
                     error_detail=upstream_errors.stream_detail(hit, exc),
                     duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
                 )
+                await _flush_pending_tool_calls(result.pending, interaction_id)
                 return
             except Exception as exc:
                 logger.exception("tools-mode streaming generator failed unexpectedly")
@@ -1713,12 +1714,12 @@ async def _handle_tools_mode(
     # 2 — Run the loop. On TimeoutException or unexpected Exception we
     # persist a failed-interaction audit row BEFORE propagating, so a
     # request that times out mid-loop still has a forensic DB trail.
-    # Accumulated ``pending`` tool_calls from pre-failure iterations
-    # are intentionally dropped — the tool_calls FK needs an
-    # interaction_id and linking them to a failed parent is out of
-    # scope for this fix (see migration 007 plan, "pending tool_calls
-    # … deliberately NOT flushed").
+    # ``pending`` is caller-owned and passed into the loop, so it survives a
+    # raise. An upstream STATUS error flushes it onto the failed interaction
+    # row (tools_non_stream_upstream_error); the timeout, connect and internal
+    # arms below still drop it (AT-FAILED-TURN-TOOLCALLS-NON-STATUS-ARMS).
     perf_start = time.perf_counter()
+    pending: list[PendingToolCall] = []
     try:
         final_body, pending = await run_memory_tool_loop(
             llama_url=llama_url,
@@ -1728,6 +1729,7 @@ async def _handle_tools_mode(
             max_iterations=settings.memory_tool_loop_max_iterations,
             timeout_seconds=settings.llama_chunk_timeout,
             llama_api_key=settings.llama_api_key,
+            pending=pending,
         )
     except httpx.TimeoutException as exc:
         await _persist_interaction(
@@ -1750,32 +1752,18 @@ async def _handle_tools_mode(
             detail=(f"llama-server timeout after {settings.llama_chunk_timeout}s"),
         ) from exc
     except httpx.HTTPStatusError as exc:
-        await _persist_interaction(
+        return await upstream_errors.tools_non_stream_upstream_error(
+            exc,
+            loop_payload,
+            pending,
             project=project,
             source=source,
             question=query,
-            answer="",
-            prompt_tokens=0,
-            completion_tokens=0,
             session_id=session_id,
             model=requested_model,
             user_id=user.user_id,
-            status="failed",
-            failure_class=FAILURE_UPSTREAM_ERROR,
-            # Record the upstream response BODY, not str(exc) — httpx's
-            # HTTPStatusError message omits the body, which is where
-            # llama-server's real reason lives (e.g. "context size
-            # exceeded", KV-cache-full). Fall back to str(exc) if empty.
-            error_detail=(
-                f"status={exc.response.status_code}: "
-                f"{exc.response.text[:400] or str(exc)[:400]}"
-            ),
-            duration_ms=int((time.perf_counter() - perf_start) * 1000),
+            perf_start=perf_start,
         )
-        raise HTTPException(
-            status_code=502,
-            detail=f"llama-server returned {exc.response.status_code}",
-        ) from exc
     except httpx.ConnectError as exc:
         await _persist_interaction(
             project=project,
@@ -1813,19 +1801,6 @@ async def _handle_tools_mode(
             duration_ms=int((time.perf_counter() - perf_start) * 1000),
         )
         raise  # let the FastAPI global handler shape the 500
-
-    if upstream_errors.match_unsupported_content_body(final_body):
-        return await upstream_errors.reject_tools_non_stream(
-            final_body,
-            loop_payload,
-            project=project,
-            source=source,
-            question=query,
-            session_id=session_id,
-            model=requested_model,
-            user_id=user.user_id,
-            perf_start=perf_start,
-        )
 
     # 3 — Extract answer text + usage for the interaction row
     choices = final_body.get("choices") or []
