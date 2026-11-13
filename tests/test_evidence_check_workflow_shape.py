@@ -57,6 +57,12 @@ def test_least_privilege_permissions() -> None:
     assert job["permissions"] == {"contents": "read", "pull-requests": "read"}
 
 
+# The stubbed checker exits with this sentinel so the tests can prove the
+# shell step propagates the checker's exit code (a `|| true` or a trailing
+# `exit 0` would turn the merge gate green).
+_CHECKER_RC = 3
+
+
 def _checker_steps() -> list[dict[str, Any]]:
     steps = _load(_WF)["jobs"]["evidence-check"]["steps"]
     return [s for s in steps if "adr049_evidence_check.py" in s.get("run", "")]
@@ -128,7 +134,7 @@ def _run_checker_step(
     )
     gh.chmod(0o755)
     py = stub / "python3"
-    py.write_text(f'#!/bin/bash\necho "$@" > {argv_log}\nexit 0\n')
+    py.write_text(f'#!/bin/bash\necho "$@" > {argv_log}\nexit {_CHECKER_RC}\n')
     py.chmod(0o755)
     # A CI-shaped run (scripts/ci/run-tests.sh) pins PATH[0] to the hermetic
     # shim dir: keep it first and put the stub dir right after it. A bare run
@@ -139,8 +145,10 @@ def _run_checker_step(
     head = [parts[0]] if shim and parts[0] == shim else []
     env["PATH"] = os.pathsep.join([*head, str(stub), *parts[len(head) :]])
     env.update({"PR_NUMBER": "7", "REPO": "o/r", "GH_TOKEN": "x"})
+    # Plain `bash -c` (no -e): the exit code must come from the script's own
+    # structure, so a trailing `exit 0` cannot hide behind errexit.
     res = subprocess.run(
-        ["bash", "-e", "-c", _checker_steps()[0]["run"]],
+        ["bash", "-c", _checker_steps()[0]["run"]],
         env=env,
         capture_output=True,
         text=True,
@@ -154,7 +162,7 @@ def test_step_uses_draft_mode_only_when_live_value_is_exactly_true(
     tmp_path: Path,
 ) -> None:
     res, argv = _run_checker_step(tmp_path, "true")
-    assert res.returncode == 0
+    assert res.returncode == _CHECKER_RC
     assert argv.split()[0] == "scripts/adr049_evidence_check.py"
     assert "--draft" in argv
 
@@ -164,7 +172,7 @@ def test_step_is_hard_gate_for_anything_but_exactly_true(tmp_path: Path) -> None
         sub = tmp_path / f"m{i}"
         sub.mkdir()
         res, argv = _run_checker_step(sub, mode)
-        assert res.returncode == 0, (mode, res.stderr)
+        assert res.returncode == _CHECKER_RC, (mode, res.stderr)
         assert "scripts/adr049_evidence_check.py" in argv, mode
         assert "--draft" not in argv, mode
 
