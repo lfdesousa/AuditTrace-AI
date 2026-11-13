@@ -10,9 +10,14 @@ see it. This guard reads the RENDERED script statically and refuses any command
 word that is not on the allow-list MEASURED from the image.
 
 Neuters (RED, then GREEN on restore, recorded in the build record): put ``awk``
-on the allow-list; make ``unlisted_commands`` return an empty list; inject an
-``awk`` call into the rendered script (the test below must go RED on the
-injected script only when the guard is live).
+on the allow-list; make ``unlisted_commands`` return an empty list; revert the
+scanner's wrapper handling (every ``TestWrappedFormsAreCaught`` row goes RED);
+change the hook image repository, tag or template (the rendered-image test goes
+RED). The runtime twin is ``tests/test_hook_script_image_runtime.py``.
+
+Limit, stated plainly: the image is referenced by the floating tag ``24.0``, so
+a re-push of that tag with different contents is NOT detected here. Pinning by
+digest is an operator decision (backlog KEYCLOAK-HOOK-IMAGE-DIGEST-PIN).
 """
 
 from __future__ import annotations
@@ -20,10 +25,8 @@ from __future__ import annotations
 import functools
 
 import pytest
-import yaml
 
-from tests._shell_commands import scan_commands
-from tests.test_chart_drift_guards import CHART_DIR
+from tests._shell_commands import NON_LITERAL, scan_commands
 from tests.test_chart_rendering import _find_workload, _render
 
 # MEASURED, not assumed: `docker run --entrypoint /bin/bash
@@ -33,7 +36,7 @@ from tests.test_chart_rendering import _find_workload, _render
 # Output: ~/work/audittrace-private/evidence/2026-11-13-lc10a-hook-awk/measured.txt
 # Measured MISSING in that image: awk gawk mawk jq curl wget python python3 perl
 # diff rev xxd hostname ps column.
-MEASURED_IMAGE_TAG = "24.0"
+MEASURED_IMAGE_REF = "quay.io/keycloak/keycloak:24.0"
 IMAGE_EXTERNALS = frozenset(
     {
         "bash",
@@ -99,11 +102,14 @@ def _rendered_hook_script() -> str:
 
 
 class TestHookScriptUsesOnlyImageCommands:
-    def test_the_measurement_still_describes_the_chart_image(self) -> None:
-        """If the chart moves the Keycloak image, the measured allow-list is stale."""
-        values = yaml.safe_load((CHART_DIR / "values.yaml").read_text())
-        assert values["keycloak"]["image"]["tag"] == MEASURED_IMAGE_TAG, (
-            "the hook image tag changed: re-measure the allow-list in this file"
+    def test_the_rendered_hook_job_image_is_the_measured_one(self) -> None:
+        """The RENDERED Job's container image (repository, tag and template all
+        covered) must be the image the allow-list was measured on."""
+        out = _render(["--set", "vault.enabled=true"])
+        job = _find_workload(out, "Job", "audittrace-ensure-memory-scopes")
+        images = [c["image"] for c in job["spec"]["template"]["spec"]["containers"]]
+        assert images == [MEASURED_IMAGE_REF], (
+            "the hook image changed: re-measure the allow-list in this file"
         )
 
     def test_no_command_outside_the_measured_allow_list(self) -> None:
@@ -117,6 +123,67 @@ class TestHookScriptUsesOnlyImageCommands:
 
     def test_awk_is_not_on_the_allow_list(self) -> None:
         assert "awk" not in ALLOWED
+
+
+# Every form the review table named, appended to the REAL rendered script: each
+# must be reported (the in-suite neuter: revert the scanner's wrapper handling
+# and every row below goes RED).
+WRAPPED_FORMS = {
+    "command": "x=$(printf a | command awk 1)",
+    "command -p": "x=$(printf a | command -p awk 1)",
+    "exec": "x=$(printf a | (exec awk 1))",
+    "bare exec": "exec awk 1",
+    "exec -a": "exec -a name awk 1",
+    "bash -c": "x=$(printf a | bash -c 'awk 1')",
+    "bash -c double quoted": 'bash -c "printf a | awk 1"',
+    "timeout then bash -c": "timeout 5 bash -c 'awk 1'",
+    "trap": "trap 'awk 1' EXIT",
+    "unquoted heredoc $()": "cat <<EOF\n$(awk 1)\nEOF",
+    "unquoted heredoc backtick": "cat <<EOF\n`awk 1`\nEOF",
+    "unquoted heredoc nested": "cat <<-EOF\n\t${y:-$(awk 1)}\n\tEOF",
+    "bash heredoc": "bash <<'EOF'\nawk 1\nEOF",
+    "bash here-string": "bash <<< 'awk 1'",
+    "arith with $()": "x=$(( $(awk 1) + 1 ))",
+    "arith command": "(( $(awk 1) ))",
+}
+
+
+class TestWrappedFormsAreCaught:
+    @pytest.mark.parametrize("form", sorted(WRAPPED_FORMS))
+    def test_the_form_injected_into_the_rendered_script_is_reported(
+        self, form: str
+    ) -> None:
+        base = _rendered_hook_script()
+        script = base + "\n" + WRAPPED_FORMS[form] + "\n"
+        found = unlisted_commands(script)
+        assert len(found) == 1 and found[0].startswith("awk (line "), (form, found)
+
+    @pytest.mark.parametrize(
+        "snippet",
+        [
+            "command -v awk",
+            "command -V awk",
+            "exec 3>&1 4>&2",
+            "(exec 4<>/dev/tcp/127.0.0.1/15020)",
+            "trap - EXIT",
+            "trap 'helper' TERM",
+            "cat <<'EOF'\n$(awk 1)\nEOF",
+            "cat <<EOF\nplain text with awk and $HOME\nEOF",
+            'timeout 5 bash -c "exec 3<>/dev/tcp/${H}/${P}"',
+            "echo 'awk' \"$(echo awk)\"",
+        ],
+    )
+    def test_lookups_data_and_declared_helpers_are_not_flagged(
+        self, snippet: str
+    ) -> None:
+        script = "helper() { echo hi; }\n" + snippet + "\n"
+        assert unlisted_commands(script) == []
+
+    @pytest.mark.parametrize(
+        "snippet", ['bash -c "$payload"', "bash -c $payload", 'trap "$action" EXIT']
+    )
+    def test_a_non_literal_c_or_trap_string_is_refused(self, snippet: str) -> None:
+        assert unlisted_commands(snippet + "\n") == [f"{NON_LITERAL} (line 1)"]
 
 
 class TestScannerFindsCommandWords:
@@ -148,6 +215,10 @@ class TestScannerFindsCommandWords:
             ('x="${y:-$(awk 1)}"', ["awk"]),
             ("a=( awk jq # c\n curl ); cat", ["cat"]),
             ("echo a \\\n | awk 1", ["echo", "awk"]),
+            ("command awk 1", ["command", "awk"]),
+            ("command -v awk", ["command"]),
+            ("bash -c 'awk 1'", ["bash", "awk"]),
+            ("trap 'awk 1' EXIT", ["trap", "awk"]),
         ],
     )
     def test_command_words(self, snippet: str, expected: list[str]) -> None:
