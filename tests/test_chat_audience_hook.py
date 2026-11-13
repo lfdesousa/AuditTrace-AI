@@ -48,10 +48,12 @@ FAKE_KCADM = (
     LOG, STATE = os.environ["FAKE_LOG"], os.environ["FAKE_STATE"]
     with open(LOG, "a") as fh:
         fh.write(" ".join(args) + "\\n")
-    state = json.load(open(STATE))
+    with open(STATE) as fh:
+        state = json.load(fh)
 
     def save():
-        json.dump(state, open(STATE, "w"))
+        with open(STATE, "w") as fh:
+            json.dump(state, fh)
 
     def flag(name):
         return args[args.index(name) + 1] if name in args else None
@@ -91,7 +93,8 @@ FAKE_KCADM = (
         sys.exit(0)
     if cmd == "create":
         body = json.load(sys.stdin)
-        open(os.environ["FAKE_CREATED"], "w").write(json.dumps(body))
+        with open(os.environ["FAKE_CREATED"], "w") as fh:
+            fh.write(json.dumps(body))
         stored = {k: v for k, v in body.items() if k not in
                   ("defaultClientScopes", "optionalClientScopes", "protocolMappers")}
         # Keycloak adds realm-default scopes on create: model it.
@@ -206,7 +209,8 @@ class Run:
         return [ln for ln in self.log.read_text().splitlines() if ln.startswith(verb)]
 
     def final(self) -> dict[str, Any]:
-        return json.loads(self.state_path.read_text())["client"]
+        client: dict[str, Any] = json.loads(self.state_path.read_text())["client"]
+        return client
 
 
 @pytest.fixture(params=[SCRIPT, CONFIGMAP], ids=["script", "configmap"])
@@ -351,7 +355,9 @@ class TestStep4bAuthorizesTheSourceClientForTheChatAudience:
             "}\n" + _step4b(site)
         )
 
-    def _run(self, tmp_path: Path, site: Path, *, missing: bool = False):
+    def _run(
+        self, tmp_path: Path, site: Path, *, missing: bool = False
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         log = tmp_path / "calls.log"
         log.write_text("")
         proc = subprocess.run(

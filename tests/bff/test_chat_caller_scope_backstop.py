@@ -13,8 +13,10 @@ from __future__ import annotations
 import logging
 
 import pytest
+from fastapi.testclient import TestClient
 
 from tests.bff.test_chat_exchange_scope import (  # noqa: F401  (chat is a fixture)
+    Keycloak24AndOrchestrator,
     _chat_turn,
     chat,
     restricted_token_scopes,
@@ -24,7 +26,7 @@ from tests.bff.test_chat_exchange_scope import (  # noqa: F401  (chat is a fixtu
 class TestTheCeilingBoundsTheGrantByTheCallerAsABackstop:
     def test_an_under_scoped_caller_is_refused_when_the_pre_check_is_bypassed(
         self,
-        chat,  # noqa: F811
+        chat: tuple[TestClient, Keycloak24AndOrchestrator],  # noqa: F811
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:

@@ -73,14 +73,14 @@ def _chat_route_scopes() -> set[str]:
         for r in chat_router.routes
         if isinstance(r, APIRoute)
         and r.path.endswith("/chat/completions")
-        and "POST" in r.methods
+        and "POST" in r.methods  # type: ignore[operator]
     ]
     assert len(routes) == 1, [r.path for r in routes]
     scopes = {
         scope
         for param in inspect.signature(routes[0].endpoint).parameters.values()
         if isinstance(param.default, Security)
-        for scope in param.default.scopes
+        for scope in param.default.scopes  # type: ignore[union-attr]
     }
     assert scopes, "the chat route declares no Security scope"
     return scopes
@@ -141,7 +141,7 @@ def expected_insufficient_scope_body(missing: list[str]) -> dict[str, object]:
     """The explicit refusal, built by the SERVER's own error-body helper (the
     reference the BFF image cannot import): the shape of the #445 explicit error."""
     named = ", ".join(f"'{scope}'" for scope in missing)
-    return _openai_error_body(
+    return _openai_error_body(  # type: ignore[no-any-return]
         message=(
             "This sign-in cannot use chat: its access token lacks the required "
             f"scope(s) {named}. Sign out and sign in again. If this message "
@@ -250,7 +250,7 @@ def _chat_turn(
 
 
 def _post_chat(client: TestClient, login: str) -> httpx.Response:
-    return client.post(
+    return client.post(  # type: ignore[return-value]
         "/v1/chat/completions",
         content=CHAT_BODY,
         headers={
@@ -277,17 +277,23 @@ class TestTheFixtureIsTheMeasuredDefect:
 
 
 class TestChatExchangeIsLeastPrivilege:
-    def test_the_forwarded_token_carries_exactly_the_chat_scopes(self, chat) -> None:
+    def test_the_forwarded_token_carries_exactly_the_chat_scopes(
+        self, chat: tuple[TestClient, Keycloak24AndOrchestrator]
+    ) -> None:
         client, backend = chat
         assert _chat_turn(client).status_code == 200
         assert backend.forwarded_scopes() == expected_chat_scopes()
 
-    def test_the_forwarded_token_carries_no_write_scope(self, chat) -> None:
+    def test_the_forwarded_token_carries_no_write_scope(
+        self, chat: tuple[TestClient, Keycloak24AndOrchestrator]
+    ) -> None:
         client, backend = chat
         assert _chat_turn(client).status_code == 200
         assert [s for s in backend.forwarded_scopes() if s.endswith(":write")] == []
 
-    def test_the_exchange_requests_the_chat_scopes_by_name(self, chat) -> None:
+    def test_the_exchange_requests_the_chat_scopes_by_name(
+        self, chat: tuple[TestClient, Keycloak24AndOrchestrator]
+    ) -> None:
         client, backend = chat
         _chat_turn(client)
         assert len(backend.exchange_forms) == 1
@@ -295,13 +301,17 @@ class TestChatExchangeIsLeastPrivilege:
             " ".join(expected_chat_scopes())
         ]
 
-    def test_the_exchange_targets_the_chat_audience(self, chat) -> None:
+    def test_the_exchange_targets_the_chat_audience(
+        self, chat: tuple[TestClient, Keycloak24AndOrchestrator]
+    ) -> None:
         client, backend = chat
         _chat_turn(client)
         assert backend.exchange_forms[0]["audience"] == [CHAT_AUDIENCE]
 
     def test_the_granted_log_line_names_exactly_the_chat_scopes(
-        self, chat, caplog: pytest.LogCaptureFixture
+        self,
+        chat: tuple[TestClient, Keycloak24AndOrchestrator],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         client, _ = chat
         with caplog.at_level(logging.INFO, logger="bff.exchange"):
@@ -315,7 +325,9 @@ class TestChatExchangeIsLeastPrivilege:
             "token_exchange.scopes granted=" + ",".join(expected_chat_scopes())
         ]
 
-    def test_the_request_body_reaches_v1_byte_identical(self, chat) -> None:
+    def test_the_request_body_reaches_v1_byte_identical(
+        self, chat: tuple[TestClient, Keycloak24AndOrchestrator]
+    ) -> None:
         client, backend = chat
         _chat_turn(client)
         assert len(backend.orchestrator_requests) == 1
@@ -330,7 +342,10 @@ class TestAnOverGrantFailsClosed:
         "extra", ["memory:episodic:write", "audittrace:admin", "memory:files:read-own"]
     )
     def test_a_scope_beyond_the_ceiling_is_refused_before_v1(
-        self, chat, caplog: pytest.LogCaptureFixture, extra: str
+        self,
+        chat: tuple[TestClient, Keycloak24AndOrchestrator],
+        caplog: pytest.LogCaptureFixture,
+        extra: str,
     ) -> None:
         client, backend = chat
         backend.grant_override = set(expected_chat_scopes()) | {extra}
@@ -346,7 +361,7 @@ class TestAnOverGrantFailsClosed:
 
     @pytest.mark.parametrize("protocol_scope", ["openid", "offline_access"])
     def test_an_oidc_protocol_scope_is_not_an_over_grant(
-        self, chat, protocol_scope: str
+        self, chat: tuple[TestClient, Keycloak24AndOrchestrator], protocol_scope: str
     ) -> None:
         client, backend = chat
         backend.grant_override = set(expected_chat_scopes()) | {protocol_scope}
@@ -368,7 +383,10 @@ class TestTheGrantIsBoundedByTheCaller:
         "caller", ["restricted-client", "one-scope-short", "no-scope-claim"]
     )
     def test_a_caller_lacking_a_required_scope_gets_an_explicit_403_and_no_exchange(
-        self, chat, caplog: pytest.LogCaptureFixture, caller: str
+        self,
+        chat: tuple[TestClient, Keycloak24AndOrchestrator],
+        caplog: pytest.LogCaptureFixture,
+        caller: str,
     ) -> None:
         client, backend = chat
         held = _callers_lacking_a_required_scope()[caller]
@@ -391,7 +409,9 @@ class TestTheGrantIsBoundedByTheCaller:
         ]
         assert "scope ceiling exceeded" not in caplog.text
 
-    def test_a_caller_holding_exactly_the_chat_scopes_is_served(self, chat) -> None:
+    def test_a_caller_holding_exactly_the_chat_scopes_is_served(
+        self, chat: tuple[TestClient, Keycloak24AndOrchestrator]
+    ) -> None:
         client, backend = chat
         response = _chat_turn(client, set(expected_chat_scopes()))
         assert response.status_code == 200
