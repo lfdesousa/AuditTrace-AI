@@ -1,6 +1,6 @@
 .PHONY: help venv install install-hooks lint security-lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
-       deploy-preflight verify-deploy lock lock-check lock-freshness lock-upgrade gate-venv lint-ruff check-pr-body \
+       deploy-preflight verify-deploy lock lock-check lock-freshness lock-upgrade gate-venv lint-ruff check-pr-body check-pr-body-draft \
        token-guard sync-dashboards check-dashboard-drift check-retention-drift integration \
        release-bump-files release release-cut
 
@@ -360,6 +360,13 @@ check-pr-body: ## Validate a PR-body file against the ADR-049 evidence gate (loc
 		exit 1; \
 	fi
 	@python3 scripts/adr049_evidence_check.py "$(BODY)"
+
+check-pr-body-draft: ## Draft report mode: pending Validation/Reconstruction reported, exit 0; Verification must still be populated. Usage: make check-pr-body-draft BODY=<path>
+	@if [ -z "$(BODY)" ]; then \
+		echo "❌ usage: make check-pr-body-draft BODY=<path-to-pr-body.md>"; \
+		exit 1; \
+	fi
+	@python3 scripts/adr049_evidence_check.py --draft "$(BODY)"
 
 openapi-export: ## Regenerate docs/reference/audittrace/openapi.yaml + tests/fixtures/openapi.snapshot.yaml from the live FastAPI app (ADR-046 / v1.0.10).
 	@OPENAPI_SNAPSHOT_UPDATE=1 .venv/bin/pytest tests/test_openapi_drift.py -q --no-cov

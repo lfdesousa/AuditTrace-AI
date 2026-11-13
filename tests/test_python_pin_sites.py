@@ -38,7 +38,8 @@ EXPECTED_SITES = {
     "images/llm-stub/Dockerfile": 1,
     "pyproject.toml": 4,
     ".python-version": 1,
-    ".github/workflows/ci.yml": 4,
+    ".github/workflows/ci.yml": 3,
+    ".github/workflows/evidence-check.yml": 1,
     ".github/workflows/integration-content-control.yml": 1,
     ".github/workflows/test-count-badge.yml": 1,
 }
@@ -80,6 +81,7 @@ def collect_sites(root: Path) -> dict[str, list[str]]:
     sites[".python-version"] = [(root / ".python-version").read_text().strip()]
     for rel in (
         ".github/workflows/ci.yml",
+        ".github/workflows/evidence-check.yml",
         ".github/workflows/integration-content-control.yml",
         ".github/workflows/test-count-badge.yml",
     ):
