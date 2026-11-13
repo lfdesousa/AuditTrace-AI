@@ -102,6 +102,42 @@ class TestClassifyStatusError:
         assert ue.classify_status_error(self._exc(response), PAYLOAD) is None
 
 
+class TestStatusErrorDetail:
+    """``status_error_detail``: upstream text, else ``str(exc)`` (operator Q3, C1)."""
+
+    def _exc(self, response: httpx.Response) -> httpx.HTTPStatusError:
+        return httpx.HTTPStatusError(
+            "boom " + "u" * 600, request=response.request, response=response
+        )
+
+    def test_unread_streamed_500_falls_back_to_str_exc_without_raising(self):
+        # C1: reading .text on an unread stream raises ResponseNotRead; the
+        # suppress turns that into the str(exc) fallback. Deleting the
+        # contextlib.suppress(httpx.ResponseNotRead) reddens this test.
+        response = httpx.Response(
+            500,
+            stream=httpx.ByteStream(b"never read"),
+            request=httpx.Request("POST", "http://l/v1"),
+        )
+        exc = self._exc(response)
+        assert ue.status_error_detail(exc) == "status=500: " + str(exc)[:400]
+
+    def test_read_body_is_preferred_and_cut_at_400(self):
+        response = httpx.Response(
+            400, text="r" * 601, request=httpx.Request("POST", "http://l/v1")
+        )
+        detail = ue.status_error_detail(self._exc(response))
+        assert detail == "status=400: " + "r" * 400
+        assert len(detail) == len("status=400: ") + 400
+
+    def test_empty_body_falls_back_to_str_exc(self):
+        response = httpx.Response(
+            500, text="", request=httpx.Request("POST", "http://l/v1")
+        )
+        exc = self._exc(response)
+        assert ue.status_error_detail(exc) == "status=500: " + str(exc)[:400]
+
+
 class TestHelpers:
     def test_detail_from_hit_or_prefers_the_hit(self):
         hit = ue.classify_unsupported_content(400, _text(400), PAYLOAD)
