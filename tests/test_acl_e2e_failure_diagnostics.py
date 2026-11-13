@@ -4290,6 +4290,10 @@ class TestRunFullWholeScriptCoverage:
                 assert substr in combined_log, (
                     f"expected call never logged at all: {substr}"
                 )
+            # LC10A-HOOK-AWK: the two resolve-scope functions grew by 8 lines
+            # each (pure-bash row scan replaces awk), so every row after the
+            # session resolver moved by +8 and every row after the chat
+            # resolver by +16; same reasons, same calls.
             # LC10A-CHAT-EXCHANGE-SCOPE: every row before the chat audience
             # block moved by +2 (a two-line comment correction above it);
             # the rows after it moved by the block as well.
@@ -4302,20 +4306,20 @@ class TestRunFullWholeScriptCoverage:
                 # LC-10a: the session E2E clone (same two named reasons as
                 # the acl rows above: nothing to strip in a RunFull state;
                 # the sunset delete runs only with enabled=false).
-                (1262, 1264),
+                (1270, 1272),
                 # LC-10a r6 step 2: the narrow mapper reconcile's update
                 # (only for the Keycloak-24-defaults shape; exercised by
                 # tests/test_session_e2e_mapper_reconcile.py).
-                (1424, 1427),
-                (1499, 1500),
+                (1432, 1435),
+                (1507, 1508),
                 # LC10A-CHAT-EXCHANGE-SCOPE: the chat audience client's strip
                 # delete (the created client's defaults equal the pinned set
                 # and the verify-existing state has nothing extra, so there is
                 # never anything to strip in a RunFull state; exercised by
                 # tests/test_chat_audience_hook.py).
-                (1584, 1586),
+                (1600, 1602),
                 # was (1623, 1624): shifted by the blocks above it.
-                (1802, 1803),
+                (1818, 1819),
             }
         else:
             # (1193,1195)/(1430,1431): the LC-10a session E2E clone's strip
