@@ -1841,6 +1841,9 @@ class TestCorpusStatusEnrichment374:
             tier="corpus",
         )
         manifest.set_index_state(
+            "semantic", "decisions/pending.pdf", scan_status="scanned_clean"
+        )
+        manifest.set_index_state(
             "semantic",
             "decisions/ADR-058-dead.pdf",
             index_failed_at_ms=1,
@@ -1908,6 +1911,9 @@ class TestCorpusStatusEnrichment374:
         await manifest.record_create(
             "procedural", "skills/SKILL-374.md", None, 1, user.user_id, tier="corpus"
         )
+        manifest.set_index_state(
+            "procedural", "skills/SKILL-374.md", scan_status="scanned_clean"
+        )
         tool = get_tool_by_name("recall_skills")
         result, _ = await invoke_tool(
             user, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-1"
@@ -1943,6 +1949,9 @@ class TestCorpusStatusEnrichment374:
         await manifest.record_create(
             "semantic", "decisions/pending.pdf", None, 1, user.user_id, tier="corpus"
         )
+        manifest.set_index_state(
+            "semantic", "decisions/pending.pdf", scan_status="scanned_clean"
+        )
         tool = get_tool_by_name("recall_decisions")
         result, _ = await invoke_tool(
             user, tool, {"query": "cache compression"}, "sess-1"
@@ -1968,6 +1977,11 @@ class TestCorpusStatusEnrichment374:
             1,
             user.user_id,
             tier="corpus",
+        )
+        manifest.set_index_state(
+            "semantic",
+            "decisions/ADR-009-cache-compression.pdf",
+            scan_status="scanned_clean",
         )
         tool = get_tool_by_name("recall_decisions")
         result, _ = await invoke_tool(
@@ -2089,6 +2103,9 @@ class TestCorpusStatusTenancy374:
         manifest = _populated_container._instances["memory_manifest"]
         await manifest.record_create(
             "semantic", "decisions/shared.pdf", None, 1, "curator", tier="corpus"
+        )
+        manifest.set_index_state(
+            "semantic", "decisions/shared.pdf", scan_status="scanned_clean"
         )
         bob = replace(
             sentinel_user_context(),
