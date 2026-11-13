@@ -141,7 +141,7 @@ def expected_insufficient_scope_body(missing: list[str]) -> dict[str, object]:
     """The explicit refusal, built by the SERVER's own error-body helper (the
     reference the BFF image cannot import): the shape of the #445 explicit error."""
     named = ", ".join(f"'{scope}'" for scope in missing)
-    return _openai_error_body(  # type: ignore[no-any-return]
+    return _openai_error_body(  # type: ignore[no-any-return, unused-ignore]
         message=(
             "This sign-in cannot use chat: its access token lacks the required "
             f"scope(s) {named}. Sign out and sign in again. If this message "
