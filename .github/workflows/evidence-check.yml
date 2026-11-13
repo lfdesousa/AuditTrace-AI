@@ -1,0 +1,60 @@
+name: Evidence check
+
+# ADR-049 Test, Evidence, and Reconstructibility Gate. Its own workflow so
+# that editing the PR body (`edited`) re-runs ONLY this check, not all of CI.
+# Draft-aware: a Draft PR with honestly pending Validation/Reconstruction is
+# reported (green with a notice) but Verification must still be populated;
+# a non-Draft PR gets the hard gate, no override. The job name
+# `evidence-check` is what branch protection matches: keep it.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - "feat/**"
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+      - ready_for_review
+      - converted_to_draft
+
+permissions:
+  contents: read
+
+jobs:
+  evidence-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Fetch PR body
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr view "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --json body \
+            --jq .body > /tmp/pr_body.md
+          echo "PR body fetched ($(wc -l < /tmp/pr_body.md) lines)"
+
+      - name: Parse evidence sections (Draft - report mode)
+        # Draft: pending Validation/Reconstruction are reported, exit 0.
+        # Verification must still be populated. Explicit flag, no env bypass.
+        if: github.event.pull_request.draft == true
+        run: python3 scripts/adr049_evidence_check.py --draft /tmp/pr_body.md
+
+      - name: Parse evidence sections (hard gate)
+        # Single source of truth: scripts/adr049_evidence_check.py (also
+        # behind `make check-pr-body`). Any empty section fails.
+        if: github.event.pull_request.draft != true
+        run: python3 scripts/adr049_evidence_check.py /tmp/pr_body.md

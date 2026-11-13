@@ -234,7 +234,7 @@ scripts/audittrace-login`, not a workaround.
   `src/audittrace/routes/**` or `src/audittrace/services/**`
   whose commit message lacks an evidence reference (PR draft URL,
   evidence-file path, or trace-ID-shaped string).
-- **CI gate** (`evidence-check` job in
+- **CI gate** (`evidence-check` job (own workflow `evidence-check.yml`; Draft-aware via `--draft`) in
   `.github/workflows/ci.yml`) — parses the PR body via `gh api`;
   fails the check if the **Verification** / **Validation** /
   **Reconstruction** sections are missing or empty. Branch
