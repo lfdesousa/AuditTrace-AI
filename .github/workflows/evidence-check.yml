@@ -2,7 +2,7 @@ name: Evidence check
 
 # ADR-049 Test, Evidence, and Reconstructibility Gate. Its own workflow so
 # that editing the PR body (`edited`) re-runs ONLY this check, not all of CI.
-# Draft-aware: a Draft PR with honestly pending Validation/Reconstruction is
+# Draft-aware (live state, see the step): a Draft PR with honestly pending Validation/Reconstruction is
 # reported (green with a notice) but Verification must still be populated;
 # a non-Draft PR gets the hard gate, no override. The job name
 # `evidence-check` is what branch protection matches: keep it.
@@ -22,6 +22,11 @@ on:
 
 permissions:
   contents: read
+
+# One run per PR at a time; a newer event supersedes a stale one.
+concurrency:
+  group: evidence-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   evidence-check:
@@ -47,14 +52,22 @@ jobs:
             --jq .body > /tmp/pr_body.md
           echo "PR body fetched ($(wc -l < /tmp/pr_body.md) lines)"
 
-      - name: Parse evidence sections (Draft - report mode)
-        # Draft: pending Validation/Reconstruction are reported, exit 0.
-        # Verification must still be populated. Explicit flag, no env bypass.
-        if: github.event.pull_request.draft == true
-        run: python3 scripts/adr049_evidence_check.py --draft /tmp/pr_body.md
-
-      - name: Parse evidence sections (hard gate)
-        # Single source of truth: scripts/adr049_evidence_check.py (also
-        # behind `make check-pr-body`). Any empty section fails.
-        if: github.event.pull_request.draft != true
-        run: python3 scripts/adr049_evidence_check.py /tmp/pr_body.md
+      - name: Parse evidence sections (mode from LIVE Draft state)
+        # ONE step, no `if:`: it runs on every listed event. The Draft state
+        # is read from the API at run time, never from the event payload, so a
+        # re-run of an old run cannot replay a stale Draft state onto a PR
+        # that is now Ready. --draft only when the live value is exactly
+        # "true"; any other value, or a gh failure, is the hard gate (fail
+        # closed). Explicit flag, no env bypass.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          is_draft="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json isDraft --jq .isDraft)" || is_draft=""
+          if [ "$is_draft" = "true" ]; then
+            echo "Draft PR (live state): report mode"
+            python3 scripts/adr049_evidence_check.py --draft /tmp/pr_body.md
+          else
+            python3 scripts/adr049_evidence_check.py /tmp/pr_body.md
+          fi

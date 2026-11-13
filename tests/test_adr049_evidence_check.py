@@ -319,9 +319,41 @@ def test_plan_or_not_yet_run_block_is_not_evidence(mod, block, which) -> None:
     assert which.capitalize() in failures[0]
 
 
-def test_plan_rule_does_not_apply_to_verification(mod) -> None:
+def test_plan_rule_does_not_apply_to_verification_in_hard_mode(mod) -> None:
     body = _make_body(_PLAN_BLOCK, _CHECKED_BOX, _CHECKED_BOX)
     assert mod.check_evidence(body) == []
+
+
+@pytest.mark.parametrize("block", [_PLAN_BLOCK, _NOT_YET_BLOCK])
+def test_draft_with_plan_only_verification_fails(mod, tmp_path, block) -> None:
+    """N2: a Draft's Verification is the only enforced section, so a plan
+    block there must not pass."""
+    f = tmp_path / "b.md"
+    f.write_text(_make_body(block, _EMPTY_BOX, _EMPTY_BOX))
+    assert mod.main(["x.py", "--draft", str(f)]) == 1
+
+
+@pytest.mark.parametrize("first", ["plan: x", "Plan: x", "PLAN", "  plan x"])
+def test_plan_rule_is_case_insensitive(mod, first) -> None:
+    """N1."""
+    block = f"```\n\n{first}\n```"
+    failures = mod.check_evidence(_make_body(_FENCED_REAL, block, _CHECKED_BOX))
+    assert len(failures) == 1 and "Validation" in failures[0]
+
+
+@pytest.mark.parametrize("first", ["planet earth ok", "planning-output 200", "plans"])
+def test_plan_rule_needs_a_word_boundary(mod, first) -> None:
+    block = f"```\n{first}\n```"
+    assert mod.check_evidence(_make_body(_FENCED_REAL, block, block)) == []
+
+
+def test_abbreviated_flag_is_rejected(mod, tmp_path) -> None:
+    """N3: --dr must NOT be accepted as --draft."""
+    f = tmp_path / "b.md"
+    f.write_text(_make_body(_FENCED_REAL, _EMPTY_BOX, _EMPTY_BOX))
+    with pytest.raises(SystemExit) as exc:
+        mod.main(["x.py", "--dr", str(f)])
+    assert exc.value.code == 2
 
 
 def test_real_output_block_still_counts_in_validation(mod) -> None:

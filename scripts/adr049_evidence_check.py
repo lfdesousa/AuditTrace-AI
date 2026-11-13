@@ -2,7 +2,7 @@
 """ADR-049 evidence-gate parser — single source of truth (local == CI).
 
 Ported VERBATIM from the inline ``python3 <<'PY'`` heredoc that used to
-live in the ``evidence-check`` job of ``.github/workflows/ci.yml``. This
+live in the ``evidence-check`` job (now ``.github/workflows/evidence-check.yml``). This
 module is now the ONE place the rule is expressed; both the CI job and the
 local ``make check-pr-body`` target call it, so a cloud-only blind spot
 (the 2026-07-30 inline-backtick regression, #396) cannot re-open.
@@ -22,9 +22,12 @@ by that line. Inline-backtick prose is NOT a code block and does NOT
 populate a section (the specific bug #396 guards against).
 
 In Validation and Reconstruction a code block whose first non-blank line
-starts with ``PLAN`` or contains "not yet run" is a statement of intent, not
+starts with the word ``plan`` (any case) or contains "not yet run" is a statement of intent, not
 evidence, and does NOT populate the section (closes the route of pasting plan
 text into a fence to turn the check green).
+
+In ``--draft`` mode the same rule also applies to Verification (the only
+enforced section there).
 
 Draft mode (``--draft``, an explicit flag; never an environment bypass): for a
 Draft PR whose Validation/Reconstruction are honestly pending, print what is
@@ -76,9 +79,9 @@ _PLAN_RULE_LABELS = frozenset({"Validation", "Reconstruction"})
 def _is_plan_block(collected: str) -> bool:
     """True if a code block's first non-blank line is PLAN... / "not yet run"."""
     first = next((ln.strip() for ln in collected.splitlines() if ln.strip()), "")
-    # PLAN is matched case-sensitively; "not yet run" case-insensitively.
-    return first.startswith("PLAN") or bool(
-        re.search(r"not yet run", first, re.IGNORECASE)
+    return bool(
+        re.match(r"plan\b", first, re.IGNORECASE)
+        or re.search(r"not yet run", first, re.IGNORECASE)
     )
 
 
@@ -133,7 +136,7 @@ def check_evidence(body: str, *, draft: bool = False) -> list[str]:
             failures.append(f"Missing required section: ## {label}")
             continue
         if not _section_is_populated(
-            sections[matched_key], reject_plan=label in _PLAN_RULE_LABELS
+            sections[matched_key], reject_plan=draft or label in _PLAN_RULE_LABELS
         ):
             failures.append(
                 f"Section ## {matched_key} has no checked box "
@@ -164,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Prints CI-identical ``::error::`` lines, returns
     the process exit code (0 pass / 1 fail)."""
     argv = list(sys.argv if argv is None else argv)
-    parser = argparse.ArgumentParser(prog=argv[0] if argv else None)
+    parser = argparse.ArgumentParser(prog=argv[0] if argv else None, allow_abbrev=False)
     parser.add_argument("--draft", action="store_true")
     parser.add_argument("body_file", nargs="?", default=None)
     args = parser.parse_args(argv[1:])
