@@ -139,14 +139,6 @@ class TestParsedBodyMatcherIsEquality:
     def test_parsed_body_wrong_shape_does_not_match(self, body):
         assert _mod().match_unsupported_content_body(body) is False
 
-    def test_error_detail_from_parsed_body_is_compact_json(self):
-        detail = _mod().error_detail_from_body(LLAMA_UNSUPPORTED_BODY)
-        assert detail == (
-            'status=400: {"error":{"code":400,"message":"unsupported content[].type",'
-            '"type":"invalid_request_error"}}'
-        )
-        assert len(detail) <= 12 + 400
-
     def test_error_detail_from_text_keeps_upstream_text(self):
         text = json.dumps(LLAMA_UNSUPPORTED_BODY)
         assert _mod().error_detail_from_text(400, text) == "status=400: " + text

@@ -77,8 +77,6 @@ class TestClassify:
         assert (
             len(ue.error_detail_from_text(400, "x" * 1000)) == len("status=400: ") + 400
         )
-        big = {"error": {"code": 400, "message": MSG, "pad": "y" * 1000}}
-        assert len(ue.error_detail_from_body(big)) == len("status=400: ") + 400
 
 
 class TestClassifyStatusError:
@@ -100,6 +98,42 @@ class TestClassifyStatusError:
             400, json={"error": {"code": 400, "message": "other"}}
         )
         assert ue.classify_status_error(self._exc(response), PAYLOAD) is None
+
+
+class TestStatusErrorDetail:
+    """``status_error_detail``: upstream text, else ``str(exc)`` (operator Q3, C1)."""
+
+    def _exc(self, response: httpx.Response) -> httpx.HTTPStatusError:
+        return httpx.HTTPStatusError(
+            "boom " + "u" * 600, request=response.request, response=response
+        )
+
+    def test_unread_streamed_500_falls_back_to_str_exc_without_raising(self):
+        # C1: reading .text on an unread stream raises ResponseNotRead; the
+        # suppress turns that into the str(exc) fallback. Deleting the
+        # contextlib.suppress(httpx.ResponseNotRead) reddens this test.
+        response = httpx.Response(
+            500,
+            stream=httpx.ByteStream(b"never read"),
+            request=httpx.Request("POST", "http://l/v1"),
+        )
+        exc = self._exc(response)
+        assert ue.status_error_detail(exc) == "status=500: " + str(exc)[:400]
+
+    def test_read_body_is_preferred_and_cut_at_400(self):
+        response = httpx.Response(
+            400, text="r" * 601, request=httpx.Request("POST", "http://l/v1")
+        )
+        detail = ue.status_error_detail(self._exc(response))
+        assert detail == "status=400: " + "r" * 400
+        assert len(detail) == len("status=400: ") + 400
+
+    def test_empty_body_falls_back_to_str_exc(self):
+        response = httpx.Response(
+            500, text="", request=httpx.Request("POST", "http://l/v1")
+        )
+        exc = self._exc(response)
+        assert ue.status_error_detail(exc) == "status=500: " + str(exc)[:400]
 
 
 class TestHelpers:
@@ -140,14 +174,21 @@ class TestHelpers:
 
 
 class TestMovedArmHelpers:
-    def test_stream_detail_hit_else_5xx_form(self):
+    def test_stream_detail_hit_else_upstream_text(self):
         response = httpx.Response(
             500, json={"x": 1}, request=httpx.Request("POST", "http://l/v1")
         )
         exc = httpx.HTTPStatusError("boom", request=response.request, response=response)
-        assert ue.stream_detail(None, exc) == "status=500: boom"
+        assert ue.stream_detail(None, exc) == "status=500: " + response.text
         hit = ue.classify_unsupported_content(400, _text(400), PAYLOAD)
         assert ue.stream_detail(hit, exc) == hit.error_detail  # type: ignore[union-attr]
+
+    def test_stream_detail_empty_body_falls_back_to_str_exc(self):
+        response = httpx.Response(
+            500, text="", request=httpx.Request("POST", "http://l/v1")
+        )
+        exc = httpx.HTTPStatusError("boom", request=response.request, response=response)
+        assert ue.stream_detail(None, exc) == "status=500: boom"
 
     async def test_read_error_body_reads_only_on_400_and_above(self):
         req = httpx.Request("POST", "http://l/v1")

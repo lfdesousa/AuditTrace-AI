@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
@@ -142,10 +143,16 @@ def error_detail_from_text(status_code: int, body_text: str) -> str:
     return f"status={status_code}: {body_text[:_MAX_BODY_CHARS]}"
 
 
-def error_detail_from_body(body: dict[str, Any]) -> str:
-    """Audit-row detail from a parsed upstream body (compact JSON, bounded)."""
-    compact = json.dumps(body, separators=(",", ":"))
-    return f"status={_UPSTREAM_STATUS}: {compact[:_MAX_BODY_CHARS]}"
+def status_error_detail(exc: httpx.HTTPStatusError) -> str:
+    """Audit detail of a raised upstream status error: body text, else ``str(exc)``.
+
+    A body that was never read has no ``.text`` (``ResponseNotRead``) and an
+    empty body carries no reason: both fall back to httpx's own sentence.
+    """
+    text = ""
+    with contextlib.suppress(httpx.ResponseNotRead):
+        text = exc.response.text
+    return error_detail_from_text(exc.response.status_code, text or str(exc))
 
 
 def classify_unsupported_content(
@@ -196,10 +203,8 @@ def emit_sse_error_frame_from_body(error_body: dict[str, Any]) -> bytes:
 
 
 def stream_detail(hit: UnsupportedContentHit | None, exc: httpx.HTTPStatusError) -> str:
-    """Audit detail for a streamed upstream status error (hit's, else the 5xx form)."""
-    return detail_from_hit_or(
-        hit, f"status={exc.response.status_code}: {str(exc)[:_MAX_BODY_CHARS]}"
-    )
+    """Audit detail for a streamed upstream status error (hit's, else the body text)."""
+    return detail_from_hit_or(hit, status_error_detail(exc))
 
 
 async def read_error_body(resp: httpx.Response) -> None:
@@ -213,9 +218,10 @@ def client_error_response(hit: UnsupportedContentHit) -> JSONResponse:
     return JSONResponse(status_code=_UPSTREAM_STATUS, content=hit.error_body)
 
 
-async def reject_tools_non_stream(
-    final_body: dict[str, Any],
+async def tools_non_stream_upstream_error(
+    exc: httpx.HTTPStatusError,
     loop_payload: dict[str, Any],
+    pending: list[Any],
     *,
     project: str,
     source: str,
@@ -225,12 +231,25 @@ async def reject_tools_non_stream(
     user_id: str,
     perf_start: float,
 ) -> JSONResponse:
-    """Tools non-stream arm: audit the failed interaction, return the explicit 400."""
-    # Function-local import: chat.py imports this module at import time and
-    # defines _persist_interaction / FAILURE_UPSTREAM_ERROR (cycle, as above).
-    from audittrace.routes.chat import FAILURE_UPSTREAM_ERROR, _persist_interaction
+    """Tools non-stream arm: audit any upstream non-2xx as failed, then reply.
 
-    await _persist_interaction(
+    The failed row carries ``status=<code>: <upstream text[:400]>`` and the
+    turn's already-recorded memory ``tool_calls`` (``pending``) are flushed
+    onto it. Reply: a recognised unsupported-content rejection -> explicit
+    400; a JSON object body below 500 -> 200 passed through verbatim; any
+    other (non-JSON 4xx, 5xx) -> 502. Logs nothing: the retry helper's single
+    WARNING is the one line.
+    """
+    # Function-local import: chat.py imports this module at import time (cycle).
+    from audittrace.routes.chat import (
+        FAILURE_UPSTREAM_ERROR,
+        _flush_pending_tool_calls,
+        _persist_interaction,
+    )
+
+    status = exc.response.status_code
+    text = exc.response.text
+    interaction_id = await _persist_interaction(
         project=project,
         source=source,
         question=question,
@@ -242,10 +261,20 @@ async def reject_tools_non_stream(
         user_id=user_id,
         status="failed",
         failure_class=FAILURE_UPSTREAM_ERROR,
-        error_detail=error_detail_from_body(final_body),
+        error_detail=status_error_detail(exc),
         duration_ms=int((time.perf_counter() - perf_start) * 1000),
     )
-    return JSONResponse(
-        status_code=_UPSTREAM_STATUS,
-        content=unsupported_content_error_body(loop_payload),
-    )
+    await _flush_pending_tool_calls(pending, interaction_id)
+    if match_unsupported_content(status, text):
+        return JSONResponse(
+            status_code=_UPSTREAM_STATUS,
+            content=unsupported_content_error_body(loop_payload),
+        )
+    body: object = None
+    with contextlib.suppress(ValueError):
+        body = json.loads(text)
+    if isinstance(body, dict) and status < 500:
+        return JSONResponse(status_code=200, content=body)
+    raise HTTPException(
+        status_code=502, detail=f"llama-server returned {status}"
+    ) from exc

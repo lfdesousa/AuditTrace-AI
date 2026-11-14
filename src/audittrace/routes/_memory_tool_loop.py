@@ -370,22 +370,24 @@ async def _post_with_tool_parse_retry(
          ``httpx.HTTPStatusError`` handler emits a clean 502 + failed
          audit row + ADR-033 envelope.
 
+    Only a 2xx reply is returned; every other status (4xx, 3xx, 5xx) raises
+    ``httpx.HTTPStatusError`` so the caller audits the turn as failed.
     Non-parse-error 5xx (e.g. OOM, segfault) and 4xx are NOT retried —
     those are real upstream errors and retrying could amplify the damage.
     """
     response = await client.post(url, json=payload)
-    if response.status_code < 500:
-        # 4xx is returned (not raised) so the caller can surface a body-shaped
-        # error — but log the upstream reason here, else it's invisible. The
-        # common case is llama-server's 400 "context size exceeded" when an
-        # OpenCode prompt overruns --ctx-size.
-        if response.status_code >= 400:
-            logger.warning(
-                "llama-server client error HTTP %d — upstream body: %s",
-                response.status_code,
-                response.text[:500],
-            )
+    if response.is_success:
         return response
+    if response.status_code < 500:
+        # Only a 2xx is returned. Any other reply below 500 is logged once
+        # (the upstream reason, e.g. llama-server's 400 "context size
+        # exceeded") and raised, so the caller audits it as a failed turn.
+        logger.warning(
+            "llama-server client error HTTP %d — upstream body: %s",
+            response.status_code,
+            response.text[:500],
+        )
+        response.raise_for_status()
 
     if _is_tool_parse_error_500(response):
         # Phase 1: same-payload retries (model rolls fresh tokens each time).
@@ -398,7 +400,7 @@ async def _post_with_tool_parse_retry(
                 _TOOL_PARSE_ERROR_RETRIES,
             )
             response = await client.post(url, json=payload)
-            if response.status_code < 500:
+            if response.is_success:
                 return response
             if not _is_tool_parse_error_500(response):
                 break  # different failure class — don't keep retrying
@@ -419,7 +421,7 @@ async def _post_with_tool_parse_retry(
             )
             fallback_payload = _strip_tools_for_fallback(payload)
             response = await client.post(url, json=fallback_payload)
-            if response.status_code < 500:
+            if response.is_success:
                 return response
 
     # Persistent failure even after fallback — genuinely broken upstream.
@@ -448,6 +450,7 @@ async def run_memory_tool_loop(
     max_iterations: int,
     timeout_seconds: int = 120,
     llama_api_key: str = "",
+    pending: list[PendingToolCall] | None = None,
 ) -> tuple[dict[str, Any], list[PendingToolCall]]:
     """Run the proxy-internal tool-call loop and return the final body.
 
@@ -462,6 +465,10 @@ async def run_memory_tool_loop(
     llama POST this loop makes (built per request by ``llama_auth_headers``;
     this loop opens a fresh client per iteration). Empty sends no header.
 
+    ``pending`` (optional, caller-owned) is appended to in place, so the
+    caller still holds the rows already recorded when the loop raises (a
+    failed turn keeps its memory ``tool_calls`` rows).
+
     Returns ``(final_body, pending_audit_rows)``. The caller flushes
     ``pending_audit_rows`` after ``_persist_interaction`` returns the
     parent interaction id so the FK constraint is satisfied.
@@ -472,7 +479,7 @@ async def run_memory_tool_loop(
     # Messages: mutable working copy so we can append tool_result entries.
     messages = list(proxy_payload.get("messages") or [])
 
-    pending: list[PendingToolCall] = []
+    pending = [] if pending is None else pending
     last_body: dict[str, Any] = {}
     # ADR-030: signatures of the PREVIOUS iteration's memory tool calls.
     # When the current iteration's signatures equal this set, the model
