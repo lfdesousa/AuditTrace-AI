@@ -2402,6 +2402,12 @@ async def _chat_completions_impl(
             tool_text = _render_tool_calls_text(tc_acc)
             answer = (answer + "\n" + tool_text) if answer else tool_text
         usage = body.get("usage") or {}
+        if not isinstance(usage, dict):
+            logger.warning(
+                "upstream usage is not a JSON object (type=%s); stored as absent",
+                type(usage).__name__,
+            )
+            usage = {}
         finish_reason = (choices[0].get("finish_reason") if choices else None) or "stop"
         # ADR-046: success-path persistence honours X-Persist-Mode.
         # Gate #5 (request-model fidelity): record the CLIENT-REQUESTED

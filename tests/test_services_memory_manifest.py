@@ -645,6 +645,9 @@ class TestIndexStatusSummaryMock:
             index_failed_at_ms=123,
             index_failure_code="pdf_corrupted_structure",
         )
+        manifest.set_index_state(
+            "semantic", "decisions/pending.md", scan_status="scanned_clean"
+        )
         summary = await manifest.index_status_summary(_user("alice"), [])
         assert summary.pending == 1
         assert summary.dead_lettered == 1
@@ -655,7 +658,12 @@ class TestIndexStatusSummaryMock:
         await manifest.record_create(
             "semantic", "decisions/done.md", None, 1, "alice", tier="corpus"
         )
-        manifest.set_index_state("semantic", "decisions/done.md", indexed_at_ms=999)
+        manifest.set_index_state(
+            "semantic",
+            "decisions/done.md",
+            indexed_at_ms=999,
+            scan_status="scanned_clean",
+        )
         summary = await manifest.index_status_summary(_user("alice"), [])
         assert summary.pending == 0
         assert summary.dead_lettered == 0
@@ -665,6 +673,9 @@ class TestIndexStatusSummaryMock:
     ) -> None:
         await manifest.record_create(
             "semantic", "decisions/gone.md", None, 1, "alice", tier="corpus"
+        )
+        manifest.set_index_state(
+            "semantic", "decisions/gone.md", scan_status="scanned_clean"
         )
         # SPEC security-memory-manifest-tier-authz (2026-08-30): deleting a
         # corpus-tier row (even one's own) now requires
@@ -709,6 +720,9 @@ class TestIndexStatusSummaryMock:
             index_failed_at_ms=1,
             index_failure_code="pdf_corrupted_structure",
         )
+        manifest.set_index_state(
+            "semantic", "decisions/pending.md", scan_status="scanned_clean"
+        )
         # query token-matches NOTHING, hot-path short-circuit on
         summary = await manifest.index_status_summary(
             _user("alice"), ["zzznomatchxyz"], skip_counts_if_no_match=True
@@ -739,7 +753,9 @@ class TestIndexStatusSummaryMock:
             index_failed_at_ms=1,
             index_failure_code="pdf_corrupted_structure",
         )
-        manifest.set_index_state("semantic", "decisions/unrelated.pdf")
+        manifest.set_index_state(
+            "semantic", "decisions/unrelated.pdf", scan_status="scanned_clean"
+        )
         summary = await manifest.index_status_summary(_user("alice"), ["adr-058"])
         assert [m.key for m in summary.matched] == ["decisions/ADR-058-outage.pdf"]
         assert summary.matched[0].state == "dead_lettered"
@@ -753,7 +769,7 @@ class TestIndexStatusSummaryMock:
             await manifest.record_create(
                 "semantic", key, None, 1, "alice", tier="corpus"
             )
-            manifest.set_index_state("semantic", key)
+            manifest.set_index_state("semantic", key, scan_status="scanned_clean")
         summary = await manifest.index_status_summary(_user("alice"), ["adr"])
         assert len(summary.matched) == 5
 
@@ -766,7 +782,9 @@ class TestIndexStatusSummaryMock:
         await manifest.record_create(
             "semantic", "decisions/adr-dead.pdf", None, 1, "alice", tier="corpus"
         )
-        manifest.set_index_state("semantic", "decisions/adr-pending.pdf")
+        manifest.set_index_state(
+            "semantic", "decisions/adr-pending.pdf", scan_status="scanned_clean"
+        )
         manifest.set_index_state(
             "semantic",
             "decisions/adr-dead.pdf",
@@ -803,6 +821,9 @@ class TestIndexStatusSummaryMock:
         await manifest.record_create(
             "semantic", "decisions/shared.pdf", None, 1, "curator", tier="corpus"
         )
+        manifest.set_index_state(
+            "semantic", "decisions/shared.pdf", scan_status="scanned_clean"
+        )
         summary = await manifest.index_status_summary(_user("alice"), [])
         assert summary.pending == 1
 
@@ -811,6 +832,9 @@ class TestIndexStatusSummaryMock:
     ) -> None:
         await manifest.record_create(
             "semantic", "decisions/bob-private.pdf", None, 1, "bob", tier="private"
+        )
+        manifest.set_index_state(
+            "semantic", "bob/decisions/bob-private.pdf", scan_status="scanned_clean"
         )
         summary = await manifest.index_status_summary(_user("ops", is_admin=True), [])
         assert summary.pending == 1
@@ -858,6 +882,7 @@ class TestIndexStatusSummaryPostgres:
         indexed_at_ms: int | None = None,
         index_failed_at_ms: int | None = None,
         index_failure_code: str | None = None,
+        scan_status: str | None = None,
     ) -> None:
         """Directly UPDATE the migration-019/020 columns ``record_create``
         never touches — mirrors how ``IndexWorker``/``ScanVerdictConsumer``
@@ -871,6 +896,7 @@ class TestIndexStatusSummaryPostgres:
                     indexed_at_ms=indexed_at_ms,
                     index_failed_at_ms=index_failed_at_ms,
                     index_failure_code=index_failure_code,
+                    scan_status=scan_status,
                 )
             )
             await session.commit()
@@ -883,6 +909,9 @@ class TestIndexStatusSummaryPostgres:
         )
         await pg_manifest.record_create(
             "semantic", "decisions/dead.md", None, 1, "alice", tier="corpus"
+        )
+        await self._stamp(
+            pg_manifest, "semantic", "decisions/pending.md", scan_status="scanned_clean"
         )
         await self._stamp(
             pg_manifest,
@@ -901,6 +930,9 @@ class TestIndexStatusSummaryPostgres:
         )
         await pg_manifest.record_create(
             "semantic", "decisions/dead.md", None, 1, "alice", tier="corpus"
+        )
+        await self._stamp(
+            pg_manifest, "semantic", "decisions/pending.md", scan_status="scanned_clean"
         )
         await self._stamp(
             pg_manifest,
@@ -968,7 +1000,7 @@ class TestIndexStatusSummaryPostgres:
             await pg_manifest.record_create(
                 "semantic", key, None, 1, "alice", tier="corpus"
             )
-            await self._stamp(pg_manifest, "semantic", key)
+            await self._stamp(pg_manifest, "semantic", key, scan_status="scanned_clean")
         summary = await pg_manifest.index_status_summary(_user("alice"), ["adr"])
         assert len(summary.matched) == 5
 
@@ -981,7 +1013,7 @@ class TestIndexStatusSummaryPostgres:
         await self._stamp(
             pg_manifest,
             "semantic",
-            "decisions/bob-private.pdf",
+            "bob/decisions/bob-private.pdf",
             index_failed_at_ms=1,
             index_failure_code="pdf_corrupted_structure",
         )
@@ -996,6 +1028,12 @@ class TestIndexStatusSummaryPostgres:
         await pg_manifest.record_create(
             "semantic", "decisions/bob-private.pdf", None, 1, "bob", tier="private"
         )
+        await self._stamp(
+            pg_manifest,
+            "semantic",
+            "bob/decisions/bob-private.pdf",
+            scan_status="scanned_clean",
+        )
         summary = await pg_manifest.index_status_summary(
             _user("ops", is_admin=True), []
         )
@@ -1006,6 +1044,9 @@ class TestIndexStatusSummaryPostgres:
     ) -> None:
         await pg_manifest.record_create(
             "semantic", "decisions/gone.md", None, 1, "alice", tier="corpus"
+        )
+        await self._stamp(
+            pg_manifest, "semantic", "decisions/gone.md", scan_status="scanned_clean"
         )
         # SPEC security-memory-manifest-tier-authz (2026-08-30): deleting a
         # corpus-tier row (even one's own) now requires

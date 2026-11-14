@@ -38,6 +38,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 
 from audittrace.db.models import MemoryItem
 from audittrace.identity import UserContext
@@ -119,6 +120,19 @@ class Env:
                 )
             )
             await session.commit()
+
+    async def scanned_clean(self, layer: str, stored_key: str) -> None:
+        """Put the row AT ``stored_key`` in the index outbox: scanned clean, not indexed."""
+        if self.kind == "mock":
+            self.svc.set_index_state(layer, stored_key, scan_status="scanned_clean")
+            return
+        async with self.svc._session_factory() as session:
+            for row in await session.scalars(
+                select(MemoryItem).filter_by(layer=layer, key=stored_key)
+            ):
+                row.scan_status = "scanned_clean"
+            await session.commit()
+        assert (await self.raw(layer, stored_key)) is not None
 
     async def raw(self, layer: str, stored_key: str) -> Any:
         return await self.svc.get(layer, stored_key)
@@ -643,11 +657,13 @@ class TestIndexStatusLogicalKey:
 
     async def test_matched_key_is_logical(self, env: Env) -> None:
         await env.svc.record_create("semantic", "decisions/adr-77.md", None, 1, A)
+        await env.scanned_clean("semantic", f"{A}/decisions/adr-77.md")
         summary = await env.svc.index_status_summary(_user(A), ["adr-77"])
         assert [m.key for m in summary.matched] == ["decisions/adr-77.md"]
 
     async def test_other_users_new_form_row_is_not_counted(self, env: Env) -> None:
         await env.svc.record_create("semantic", "decisions/adr-77.md", None, 1, A)
+        await env.scanned_clean("semantic", f"{A}/decisions/adr-77.md")
         summary = await env.svc.index_status_summary(_user(B), ["adr-77"])
         assert summary.matched == [] and summary.pending == 0
 

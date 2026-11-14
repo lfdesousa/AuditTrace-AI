@@ -237,3 +237,136 @@ def test_module_has_scoped_logger(mod) -> None:
     """feedback_module_scoped_loggers — the module uses a
     ``__name__``-scoped logger."""
     assert mod.logger.name == "audittrace_adr049_evidence_check"
+
+
+# --- Draft-aware report mode (--draft) + PLAN-block rule --------------------
+
+_PLAN_BLOCK = "```\nPLAN: deploy the image, then curl /v1/chat\n```"
+_NOT_YET_BLOCK = "```\nvalidation output (not yet run)\n```"
+_EMPTY_BOX = "- [ ] Image tag deployed:"
+
+
+def test_hard_gate_default_still_fails_on_pending_validation(
+    mod, tmp_path, capsys
+) -> None:
+    """No flag => exactly today's hard gate (rc 1, ::error:: lines)."""
+    f = tmp_path / "b.md"
+    f.write_text(_make_body(_FENCED_REAL, _EMPTY_BOX, _EMPTY_BOX))
+    assert mod.main(["x.py", str(f)]) == 1
+    assert "::error::ADR-049 evidence gate FAILED" in capsys.readouterr().out
+
+
+def test_draft_flag_pending_validation_reconstruction_is_rc0(
+    mod, tmp_path, capsys
+) -> None:
+    f = tmp_path / "b.md"
+    f.write_text(_make_body(_FENCED_REAL, _EMPTY_BOX, _EMPTY_BOX))
+    assert mod.main(["x.py", "--draft", str(f)]) == 0
+    out = capsys.readouterr().out
+    assert "Draft: evidence pending" in out
+    assert "Validation" in out and "Reconstruction" in out
+    assert "::error::" not in out
+
+
+def test_draft_flag_empty_verification_still_fails(mod, tmp_path, capsys) -> None:
+    f = tmp_path / "b.md"
+    f.write_text(_make_body(_EMPTY_BOX, _CHECKED_BOX, _CHECKED_BOX))
+    assert mod.main(["x.py", "--draft", str(f)]) == 1
+    assert "::error::" in capsys.readouterr().out
+
+
+def test_draft_flag_missing_verification_section_fails(mod, tmp_path) -> None:
+    f = tmp_path / "b.md"
+    f.write_text("## Validation\n\n- [x] a\n\n## Reconstruction\n\n- [x] b\n")
+    assert mod.main(["x.py", "--draft", str(f)]) == 1
+
+
+def test_draft_flag_fully_populated_reports_no_pending(mod, tmp_path, capsys) -> None:
+    f = tmp_path / "b.md"
+    f.write_text(_GOOD_BODY)
+    assert mod.main(["x.py", "--draft", str(f)]) == 0
+    out = capsys.readouterr().out
+    assert "Draft: evidence pending" not in out
+    assert "PASSED" in out
+
+
+def test_draft_flag_works_with_stdin(mod, monkeypatch, capsys) -> None:
+    import io
+
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO(_make_body(_FENCED_REAL, _EMPTY_BOX, _EMPTY_BOX))
+    )
+    assert mod.main(["x.py", "--draft"]) == 0
+    assert "Draft: evidence pending" in capsys.readouterr().out
+
+
+def test_no_env_bypass(mod, tmp_path, monkeypatch) -> None:
+    """Never an env switch: the flag is the only way into report mode."""
+    for name in ("DRAFT", "ADR049_DRAFT", "EVIDENCE_DRAFT", "CI_DRAFT"):
+        monkeypatch.setenv(name, "1")
+    f = tmp_path / "b.md"
+    f.write_text(_make_body(_FENCED_REAL, _EMPTY_BOX, _EMPTY_BOX))
+    assert mod.main(["x.py", str(f)]) == 1
+
+
+@pytest.mark.parametrize("block", [_PLAN_BLOCK, _NOT_YET_BLOCK])
+@pytest.mark.parametrize("which", ["validation", "reconstruction"])
+def test_plan_or_not_yet_run_block_is_not_evidence(mod, block, which) -> None:
+    val = block if which == "validation" else _CHECKED_BOX
+    rec = block if which == "reconstruction" else _CHECKED_BOX
+    failures = mod.check_evidence(_make_body(_FENCED_REAL, val, rec))
+    assert len(failures) == 1
+    assert which.capitalize() in failures[0]
+
+
+def test_plan_rule_does_not_apply_to_verification_in_hard_mode(mod) -> None:
+    body = _make_body(_PLAN_BLOCK, _CHECKED_BOX, _CHECKED_BOX)
+    assert mod.check_evidence(body) == []
+
+
+@pytest.mark.parametrize("block", [_PLAN_BLOCK, _NOT_YET_BLOCK])
+def test_draft_with_plan_only_verification_fails(mod, tmp_path, block) -> None:
+    """N2: a Draft's Verification is the only enforced section, so a plan
+    block there must not pass."""
+    f = tmp_path / "b.md"
+    f.write_text(_make_body(block, _EMPTY_BOX, _EMPTY_BOX))
+    assert mod.main(["x.py", "--draft", str(f)]) == 1
+
+
+@pytest.mark.parametrize("first", ["plan: x", "Plan: x", "PLAN", "  plan x"])
+def test_plan_rule_is_case_insensitive(mod, first) -> None:
+    """N1."""
+    block = f"```\n\n{first}\n```"
+    failures = mod.check_evidence(_make_body(_FENCED_REAL, block, _CHECKED_BOX))
+    assert len(failures) == 1 and "Validation" in failures[0]
+
+
+@pytest.mark.parametrize("first", ["planet earth ok", "planning-output 200", "plans"])
+def test_plan_rule_needs_a_word_boundary(mod, first) -> None:
+    block = f"```\n{first}\n```"
+    assert mod.check_evidence(_make_body(_FENCED_REAL, block, block)) == []
+
+
+def test_abbreviated_flag_is_rejected(mod, tmp_path) -> None:
+    """N3: --dr must NOT be accepted as --draft."""
+    f = tmp_path / "b.md"
+    f.write_text(_make_body(_FENCED_REAL, _EMPTY_BOX, _EMPTY_BOX))
+    with pytest.raises(SystemExit) as exc:
+        mod.main(["x.py", "--dr", str(f)])
+    assert exc.value.code == 2
+
+
+def test_real_output_block_still_counts_in_validation(mod) -> None:
+    real = "```\nHTTP/2 200\ntrace_id=abc123\n```"
+    assert mod.check_evidence(_make_body(_FENCED_REAL, real, real)) == []
+
+
+def test_later_real_block_counts_even_if_first_is_plan(mod) -> None:
+    both = _PLAN_BLOCK + "\n\n```\nHTTP/2 200\n```"
+    assert mod.check_evidence(_make_body(_FENCED_REAL, both, both)) == []
+
+
+def test_checker_script_has_no_environ_access() -> None:
+    text = _SCRIPT_PATH.read_text()
+    for forbidden in ("os.environ", "getenv", "import os"):
+        assert forbidden not in text
