@@ -1019,8 +1019,12 @@ console:
       # pinned to THIS specific published version, so tag and digest must
       # move together on every bump (mirrors console.librechat.image
       # below, not memoryServer).
-      tag: "1.32.0"
-      # Phase-E re-pin (2026-11-10, release v1.32.0) — the published digest
+      tag: "1.33.0"
+      # Phase-E re-pin (2026-11-14, release v1.33.0) — the published digest
+      # for docker.io/lfds/audittrace-librechat-bff:1.33.0, confirmed live on
+      # Docker Hub 2026-11-14 via TWO independent manifest reads (registry
+      # HEAD and `docker buildx imagetools inspect`), which agree.
+      # Prior pin (2026-11-10, v1.32.0) — the published digest
       # for docker.io/lfds/audittrace-librechat-bff:1.32.0, confirmed live on
       # Docker Hub 2026-11-10 via a registry-1.docker.io HEAD (Docker-Content-Digest).
       # Prior pin (2026-11-06, v1.31.0) — the published digest
@@ -1042,7 +1046,7 @@ console:
       # hand-edited without re-verifying against the registry. When set,
       # the rendered image ref becomes `<repository>:<tag>@<digest>`
       # (deployment-bff.yaml).
-      digest: "sha256:a5722e2192e87fdef55bbaffb73d3a96ecc22e0c8ba12f21e6568a17bbdee12f"
+      digest: "sha256:75663c7bea46c68b07e107926944eca1c70cd1a33ef3c4d1386c8debfd88def8"
       pullPolicy: IfNotPresent
     replicaCount: 1
     port: 8766
@@ -1275,8 +1279,12 @@ tests:
     # Explicit release version, tag+digest move together on every bump —
     # mirrors console.bff.image / console.librechat.image above, not
     # memoryServer's AppVersion-tracking empty-string convenience.
-    tag: "1.32.0"
-    # Phase-E re-pin (2026-11-10, release v1.32.0): the published digest
+    tag: "1.33.0"
+    # Phase-E re-pin (2026-11-14, release v1.33.0): the published digest
+    # for docker.io/lfds/audittrace-tests:1.33.0, confirmed live on Docker Hub
+    # 2026-11-14 via TWO independent manifest reads (registry HEAD and
+    # `docker buildx imagetools inspect`), which agree.
+    # Prior pin (2026-11-10, v1.32.0): the published digest
     # for docker.io/lfds/audittrace-tests:1.32.0, confirmed live on Docker Hub
     # 2026-11-10 via a registry HEAD (Docker-Content-Digest).
     # Prior pin (2026-11-06, v1.31.0): the published digest
@@ -1288,7 +1296,7 @@ tests:
     # manifest reads (registry HEAD with an OCI-index Accept header, and
     # `docker buildx imagetools inspect`), never fabricated. Tag+digest move
     # together on every bump.
-    digest: "sha256:25e259808e419d63e8c28dd99346dfaf046b2e41c12efa931de39c5ebc0f9130"
+    digest: "sha256:a842e95a7f3fe2dd408a917bd983805f3394630923123d2f4b663ec790677e83"
     pullPolicy: IfNotPresent
   resources:
     requests:
