@@ -1,0 +1,72 @@
+meta {
+  name: POST /v1/chat/completions (unmatched upstream 400, non-stream)
+  type: http
+  seq: 14
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": "{{contentPartPrompt}}" }
+    ],
+    "response_format": { "type": "{{upstreamBadResponseFormatType}}" },
+    "stream": false,
+    "max_tokens": 64
+  }
+}
+
+script:pre-request {
+  // Body rebuilt here so values containing quotes cannot break the JSON.
+  // `response_format.type` outside text|json_object|json_schema is rejected
+  // by llama-server with a 400 that the memory server does NOT recognise as
+  // an unsupported content part: the unmatched upstream-4xx path.
+  req.setBody({
+    model: "audittrace-default",
+    messages: [{ role: "user", content: bru.getEnvVar("contentPartPrompt") }],
+    response_format: { type: bru.getEnvVar("upstreamBadResponseFormatType") },
+    stream: false,
+    max_tokens: 64
+  });
+  // X-Session-Id: the caller's `upstream4xxSessionId`, else a generated one;
+  // stashed so chat/15 can read the audit row of THIS turn.
+  const given = bru.getEnvVar("upstream4xxSessionId");
+  const sid = given ? given : "bru-upstream-4xx-ns-" + Date.now();
+  req.setHeader("X-Session-Id", sid);
+  bru.setVar("upstream4xxSessionId", sid);
+}
+
+tests {
+  test("HTTP 200 on the non-streaming call (the upstream error body is passed through)", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("the upstream error envelope is returned verbatim, not a completion", function() {
+    const b = res.getBody();
+    expect(b.error.type).to.equal("invalid_request_error");
+    expect(b.error.code).to.equal(400);
+    expect(b.error.message).to.contain("response_format");
+    expect(b).to.not.have.property("choices");
+  });
+}
+
+docs {
+  AT-TOOLS-NONSTREAM-UPSTREAM-4XX-AUDIT (E-A). A non-stream tools turn whose
+  upstream reply is an UNMATCHED 400 (an invalid `response_format.type`).
+  The client reply is unchanged (HTTP 200 + the upstream body); the audit row
+  is what this change fixes: it must be `failed` / `upstream_error`, read by
+  chat/15.
+
+  Inputs (env vars, defaults in environments/*.bru): `contentPartPrompt`,
+  `upstreamBadResponseFormatType` (default `bogus`), `upstream4xxSessionId`
+  (empty = generated; stashed for chat/15). Needs scope audittrace:query.
+}

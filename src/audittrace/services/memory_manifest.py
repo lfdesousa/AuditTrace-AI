@@ -24,10 +24,16 @@ from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Row, func, or_, select
+from sqlalchemy import Row, and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from audittrace.db.index_predicates import (
+    dead_lettered_index_clauses,
+    is_dead_lettered_index,
+    is_pending_index,
+    pending_index_clauses,
+)
 from audittrace.db.models import MemoryItem
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
@@ -1007,11 +1013,14 @@ class MemoryManifestService:
         ``feedback_never_trust_caller_metadata_for_security_fields``.
 
         Two bounded queries, both scoped ``deleted_at_ms IS NULL``:
-          - counts: ``pending`` (``indexed_at_ms IS NULL AND
-            index_failed_at_ms IS NULL``) and ``dead_lettered``
-            (``index_failed_at_ms IS NOT NULL``);
-          - match (only when ``tokens`` is non-empty): un-indexed OR
-            dead-lettered rows whose ``key`` or ``title`` ILIKE-matches
+          - counts: ``pending`` and ``dead_lettered``, as defined by
+            :mod:`audittrace.db.index_predicates` (the ONE rule shared with
+            ``/health``, the index janitor and the replay CLI: pending =
+            ``scan_status = 'scanned_clean' AND indexed_at_ms IS NULL AND
+            index_failed_at_ms IS NULL AND deleted_at_ms IS NULL``; a row
+            that never entered the scan pipeline is not pending);
+          - match (only when ``tokens`` is non-empty): pending OR
+            dead-lettered rows (same shared rule) whose ``key`` or ``title`` ILIKE-matches
             any token, capped at :data:`_MAX_MATCHED_UNINDEXED`, ordered
             by ``key`` for determinism (sub-decision #5: "deterministic +
             testable").
@@ -1057,8 +1066,8 @@ class MemoryManifestService:
                             .where(
                                 *filters,
                                 or_(
-                                    MemoryItem.indexed_at_ms.is_(None),
-                                    MemoryItem.index_failed_at_ms.is_not(None),
+                                    and_(*pending_index_clauses()),
+                                    and_(*dead_lettered_index_clauses()),
                                 ),
                                 or_(*token_clauses),
                             )
@@ -1092,18 +1101,14 @@ class MemoryManifestService:
                 await session.execute(
                     select(func.count())
                     .select_from(MemoryItem)
-                    .where(
-                        *filters,
-                        MemoryItem.indexed_at_ms.is_(None),
-                        MemoryItem.index_failed_at_ms.is_(None),
-                    )
+                    .where(*filters, *pending_index_clauses())
                 )
             ).scalar_one()
             dead_lettered_count = (
                 await session.execute(
                     select(func.count())
                     .select_from(MemoryItem)
-                    .where(*filters, MemoryItem.index_failed_at_ms.is_not(None))
+                    .where(*filters, *dead_lettered_index_clauses())
                 )
             ).scalar_one()
 
@@ -1423,6 +1428,7 @@ class MockMemoryManifestService(MemoryManifestService):
         indexed_at_ms: int | None = None,
         index_failed_at_ms: int | None = None,
         index_failure_code: str | None = None,
+        scan_status: str | None = None,
     ) -> None:
         """Test-only seam (SPEC #374 WU-4). The mock's ``_rows`` dict has
         no schema, so ``record_create``/``upsert_pdf_metadata`` never
@@ -1435,6 +1441,7 @@ class MockMemoryManifestService(MemoryManifestService):
         row["indexed_at_ms"] = indexed_at_ms
         row["index_failed_at_ms"] = index_failed_at_ms
         row["index_failure_code"] = index_failure_code
+        row["scan_status"] = scan_status
 
     async def index_status_summary(
         self,
@@ -1463,8 +1470,16 @@ class MockMemoryManifestService(MemoryManifestService):
                 (
                     r
                     for r in rows
-                    if r.get("indexed_at_ms") is None
-                    or r.get("index_failed_at_ms") is not None
+                    if is_pending_index(
+                        scan_status=r.get("scan_status"),
+                        indexed_at_ms=r.get("indexed_at_ms"),
+                        index_failed_at_ms=r.get("index_failed_at_ms"),
+                        deleted_at_ms=r.get("deleted_at_ms"),
+                    )
+                    or is_dead_lettered_index(
+                        index_failed_at_ms=r.get("index_failed_at_ms"),
+                        deleted_at_ms=r.get("deleted_at_ms"),
+                    )
                 ),
                 key=lambda r: r["key"],
             )
@@ -1495,9 +1510,21 @@ class MockMemoryManifestService(MemoryManifestService):
         pending = sum(
             1
             for r in rows
-            if r.get("indexed_at_ms") is None and r.get("index_failed_at_ms") is None
+            if is_pending_index(
+                scan_status=r.get("scan_status"),
+                indexed_at_ms=r.get("indexed_at_ms"),
+                index_failed_at_ms=r.get("index_failed_at_ms"),
+                deleted_at_ms=r.get("deleted_at_ms"),
+            )
         )
-        dead_lettered = sum(1 for r in rows if r.get("index_failed_at_ms") is not None)
+        dead_lettered = sum(
+            1
+            for r in rows
+            if is_dead_lettered_index(
+                index_failed_at_ms=r.get("index_failed_at_ms"),
+                deleted_at_ms=r.get("deleted_at_ms"),
+            )
+        )
 
         return IndexStatusSummary(
             pending=pending, dead_lettered=dead_lettered, matched=matched

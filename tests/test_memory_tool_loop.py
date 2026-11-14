@@ -1057,6 +1057,7 @@ class _SeqStatusClient(_FakeAsyncClient):
         self._i += 1
         resp = MagicMock()
         resp.status_code = status
+        resp.is_success = 200 <= status < 300
         resp.json.return_value = body
         resp.text = _json.dumps(body)
 
@@ -1268,16 +1269,16 @@ class TestToolParseErrorRetry:
         )
 
     @pytest.mark.asyncio
-    async def test_4xx_passes_through_unchanged(
+    async def test_4xx_raises_http_status_error_after_one_warning(
         self, _populated_container, _fakeredis_cache
     ):
-        """A 4xx response (e.g., context-size-exceeded) goes back unmodified —
-        NOT a server failure, so the loop returns it as if it were the final
-        body for the caller to inspect. The upstream reason MUST still be
-        logged (the common case is OpenCode overrunning --ctx-size)."""
-        # Note: 4xx with no `choices` field will be returned as-is per the
-        # existing exit condition (no tool_calls in body → final answer).
+        """A 4xx (e.g. context-size-exceeded) is raised, not returned: the
+        caller audits it as a failed turn. It is still NOT retried (one POST)
+        and the upstream reason is logged exactly once (the common case is
+        OpenCode overrunning --ctx-size)."""
         from unittest.mock import patch
+
+        import httpx
 
         user = sentinel_user_context()
         fake = _SeqStatusClient(
@@ -1285,13 +1286,12 @@ class TestToolParseErrorRetry:
                 (400, {"error": {"message": "the request exceeds the context size"}}),
             ]
         )
-        # Should NOT raise — 4xx is a client/upstream concern, not the
-        # transient model flake we retry on.
         with (
             patch.object(_loop_mod.logger, "warning") as mock_warn,
             _patch_async_client(fake),
+            pytest.raises(httpx.HTTPStatusError) as raised,
         ):
-            final_body, _ = await run_memory_tool_loop(
+            await run_memory_tool_loop(
                 llama_url="http://llama/chat/completions",
                 payload={
                     "model": "qwen3.5-35b",
@@ -1302,15 +1302,14 @@ class TestToolParseErrorRetry:
                 session_id="sess-retry-4",
                 max_iterations=5,
             )
-        assert final_body == {
-            "error": {"message": "the request exceeds the context size"}
-        }
+        assert raised.value.response.status_code == 400
+        assert "context size" in raised.value.response.text
         assert len(fake.post_calls) == 1
-        # The 4xx reason is surfaced in the logs (HTTP 400 + body).
-        assert any(
-            "client error HTTP" in str(c) and "context size" in str(c)
-            for c in mock_warn.call_args_list
-        )
+        client_warnings = [
+            c for c in mock_warn.call_args_list if "client error HTTP" in str(c)
+        ]
+        assert len(client_warnings) == 1
+        assert "context size" in str(client_warnings[0])
 
 
 # ───────────────── Phase A.2 — pre-emptive tool_call sanitisation ────────────

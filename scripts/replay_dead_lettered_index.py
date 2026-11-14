@@ -43,6 +43,11 @@ session factory from ``src/audittrace`` for reads/writes only.
   NOT NULL``) and **not soft-deleted** (``deleted_at_ms IS NULL``) ever
   match any scope — a pending/never-failed row or a soft-deleted row is
   never a candidate under any of the three scope flags, including ``--all``.
+  That dead-lettered rule is NOT spelled here: both the plan ``SELECT`` and the
+  re-guarded ``UPDATE`` take it from
+  :func:`audittrace.db.index_predicates.dead_lettered_index_clauses`, the one
+  definition ``/health`` and ``IndexStatusSummary`` also use, so the CLI cannot
+  drift from them.
 """
 
 from __future__ import annotations
@@ -57,6 +62,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import select, update
 
 from audittrace.config import get_settings
+from audittrace.db.index_predicates import dead_lettered_index_clauses
 from audittrace.db.models import MemoryItem
 from audittrace.db.postgres import PostgresFactory, URLPostgresFactory
 from audittrace.services.index_routing import bare_key_from_uri, collection_for_key
@@ -155,11 +161,7 @@ class DeadLetterReplayer:
         """Read-only. Only rows that are dead-lettered AND not soft-deleted
         are ever candidates, under every scope including ``--all``."""
         async with self._session_factory() as session:
-            stmt = (
-                select(MemoryItem)
-                .where(MemoryItem.index_failed_at_ms.is_not(None))
-                .where(MemoryItem.deleted_at_ms.is_(None))
-            )
+            stmt = select(MemoryItem).where(*dead_lettered_index_clauses())
             if scope.key is not None:
                 stmt = stmt.where(MemoryItem.key == scope.key)
             stmt = stmt.order_by(MemoryItem.key).limit(limit)
@@ -198,8 +200,7 @@ class DeadLetterReplayer:
             stmt = (
                 update(MemoryItem)
                 .where(MemoryItem.id.in_(ids))
-                .where(MemoryItem.index_failed_at_ms.is_not(None))
-                .where(MemoryItem.deleted_at_ms.is_(None))
+                .where(*dead_lettered_index_clauses())
                 .values(
                     index_failed_at_ms=None, index_attempts=0, index_failure_code=None
                 )
