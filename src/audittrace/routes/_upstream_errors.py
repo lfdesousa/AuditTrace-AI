@@ -29,7 +29,9 @@ with HTTP 500 and ``image input is not supported - hint: ...``
 the int ``code`` 500 and the message, and answered with an explicit HTTP 400
 ``image_input_unsupported`` (a routed model, e.g. ``AUDITTRACE_MODEL_ROUTES``,
 can reach such a server). Every other 500 keeps today's behaviour; the file
-matcher is NOT widened. Falsifiability: ``tests/test_chat_image_input_unsupported_error.py``.
+matcher is NOT widened. Falsifiability:
+``tests/test_chat_image_input_unsupported_error.py`` and
+``tests/test_chat_image_error_tools_nonstream_logging.py``.
 """
 
 from __future__ import annotations
@@ -220,7 +222,10 @@ def status_error_detail(exc: httpx.HTTPStatusError) -> str:
 def classify_unsupported_content(
     status_code: int, body_text: str, payload: dict[str, Any]
 ) -> UnsupportedContentHit | None:
-    """Match the raw upstream reply (file part OR no-projector image); on a hit log ONE WARNING."""
+    """Match the raw upstream reply (file part or no-projector image).
+
+    On a hit, log ONE WARNING and return the result.
+    """
     if match_image_input_unsupported(status_code, body_text):
         error_body = image_input_unsupported_error_body()
     elif match_unsupported_content(status_code, body_text):
@@ -302,9 +307,9 @@ async def tools_non_stream_upstream_error(
     The failed row carries ``status=<code>: <upstream text[:400]>`` and the
     turn's already-recorded memory ``tool_calls`` (``pending``) are flushed
     onto it. Reply: the no-projector image rejection (after that flush) or a
-    recognised unsupported-content rejection -> explicit 400; a JSON object body below 500 -> 200 passed through verbatim; any
-    other (non-JSON 4xx, 5xx) -> 502. Logs nothing: the retry helper's single
-    WARNING is the one line.
+    recognised unsupported-content rejection -> explicit 400; a JSON object
+    body below 500 -> 200 passed through verbatim; any other (non-JSON 4xx,
+    5xx) -> 502. Logs nothing: the retry helper's single WARNING is the one line.
     """
     # Function-local import: chat.py imports this module at import time (cycle).
     from audittrace.routes.chat import (

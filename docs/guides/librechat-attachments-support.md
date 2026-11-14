@@ -30,8 +30,8 @@ LibreChat shows the `message`. Choose **Upload as Text** for the same file and s
 
 - An image sent to a model whose server has no vision projector gets its own explicit error,
   `image_input_unsupported` (HTTP 400): choose a model that accepts images, or remove the image.
-
-- The error is specific: only the model server's "unsupported content part type" rejection is
-  translated. Any other rejected request keeps its previous behaviour.
+- The errors are specific: only the model server's "unsupported content part type" rejection and
+  its "image input is not supported" rejection are translated, each into its own explicit error.
+  Any other rejected request keeps its previous behaviour.
 - The audit record of the failed turn keeps the model server's original text, so the event is
   reconstructible.

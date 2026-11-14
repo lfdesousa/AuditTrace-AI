@@ -52,7 +52,7 @@ if [[ "$mmproj_sha" != "$MMPROJ_SHA256" ]]; then
   exit 1
 fi
 
-# `--check` runs every validation above (binary, model, key file, bind address)
+# `--check` runs every validation above (binary, model, projector, key file, bind address)
 # and stops before exec -- the apply script's preflight uses it so a unit is
 # never installed that cannot start. The units never pass an argument.
 if [[ "${1:-}" == "--check" ]]; then
