@@ -1,0 +1,73 @@
+name: Evidence check
+
+# ADR-049 Test, Evidence, and Reconstructibility Gate. Its own workflow so
+# that editing the PR body (`edited`) re-runs ONLY this check, not all of CI.
+# Draft-aware (live state, see the step): a Draft PR with honestly pending Validation/Reconstruction is
+# reported (green with a notice) but Verification must still be populated;
+# a non-Draft PR gets the hard gate, no override. The job name
+# `evidence-check` is what branch protection matches: keep it.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - "feat/**"
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+      - ready_for_review
+      - converted_to_draft
+
+permissions:
+  contents: read
+
+# One run per PR at a time; a newer event supersedes a stale one.
+concurrency:
+  group: evidence-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  evidence-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Fetch PR body
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr view "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --json body \
+            --jq .body > /tmp/pr_body.md
+          echo "PR body fetched ($(wc -l < /tmp/pr_body.md) lines)"
+
+      - name: Parse evidence sections (mode from LIVE Draft state)
+        # ONE step, no `if:`: it runs on every listed event. The Draft state
+        # is read from the API at run time, never from the event payload, so a
+        # re-run of an old run cannot replay a stale Draft state onto a PR
+        # that is now Ready. --draft only when the live value is exactly
+        # "true"; any other value, or a gh failure, is the hard gate (fail
+        # closed). Explicit flag, no env bypass.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          is_draft="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json isDraft --jq .isDraft)" || is_draft=""
+          if [ "$is_draft" = "true" ]; then
+            echo "Draft PR (live state): report mode"
+            python3 scripts/adr049_evidence_check.py --draft /tmp/pr_body.md
+          else
+            python3 scripts/adr049_evidence_check.py /tmp/pr_body.md
+          fi

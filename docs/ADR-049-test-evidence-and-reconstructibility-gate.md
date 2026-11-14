@@ -220,8 +220,8 @@ This ADR moves to **Accepted** at creation. It is considered
    this ADR.
 3. `.github/pull_request_template.md` exists and pre-populates
    every new PR with the three required sections.
-4. `evidence-check` job in `.github/workflows/ci.yml` triggers on
-   every PR to `main` and parses the PR body for the three
+4. `evidence-check` job in `.github/workflows/evidence-check.yml`
+   triggers on every PR to `main` (and re-runs on body edits) and parses the PR body for the three
    required sections; missing/empty sections fail the check.
 5. `scripts/check-commit-evidence.sh` exists and is registered in
    `.pre-commit-config.yaml` under `repo: local`. The hook fails
