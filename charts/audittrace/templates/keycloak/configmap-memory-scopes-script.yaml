@@ -300,11 +300,13 @@ data:
     # MEMORY_SESSION_WRITE_SCOPES above: this is a READ-OWN scope, the same
     # family as memory:conversational:read-own/memory:semantic:read (both
     # already DEFAULT on this client), not a write grant. The chat path's
-    # plain RFC 8693 exchange (bff/exchange.py::exchange_token,
-    # requested_scope=None) mints a token carrying only the TARGET client's
-    # DEFAULT scopes — an OPTIONAL-only grant would never reach the /v1 tool
-    # loop through that path, silently making recall_attachments
-    # unreachable from the real console. Own array/bind loop so a future
+    # chat exchange (bff/exchange.py::exchange_token, requested_scope=
+    # CHAT_SCOPE_STRING, audience=audittrace-librechat-chat) is granted the
+    # TARGET client's DEFAULT scopes plus requested optionals the subject
+    # holds — so this scope must be a DEFAULT of the chat audience (it is,
+    # in the realm files and in the CHAT_AUD client block below), never only
+    # optional: that would silently make recall_attachments unreachable from
+    # the real console. Own array/bind loop so a future
     # edit to MEMORY_SESSION_WRITE_SCOPES's "optional" binding cannot
     # silently also flip this one.
     MEMORY_SESSION_READ_SCOPES=(
@@ -1271,12 +1273,20 @@ data:
     # created by this script), so their ids are resolved from the live realm here;
     # an absent one fails closed.
     session_e2e_resolve_scope() {
-      local name="$1" found
+      local name="$1" found="" csv sid sname
       [[ -n "${SCOPE_ID[${name}]:-}" ]] && return 0
-      found=$(acl_e2e_kc get client-scopes -r "${REALM}" \
-                --fields id,name --format csv --noquotes \
-              | awk -F, -v n="${name}" '$2 == n {print $1; exit}') \
+      # Pure bash (no awk in this image): list first so a kcadm failure reaches
+      # the read-failed branch directly, then take the FIRST row whose 2nd CSV
+      # field equals the name exactly (a prefix of another name never matches).
+      csv=$(acl_e2e_kc get client-scopes -r "${REALM}" \
+              --fields id,name --format csv --noquotes) \
         || acl_e2e_fail read-failed "cannot list the realm client scopes (session client)"
+      while IFS=, read -r sid sname _; do
+        if [[ "${sname}" == "${name}" ]]; then
+          found="${sid}"
+          break
+        fi
+      done <<< "${csv}"
       [[ -n "${found}" ]] \
         || acl_e2e_fail id-unresolvable "a pinned session client scope is absent from the realm (session client)"
       SCOPE_ID["${name}"]="${found}"
@@ -1546,6 +1556,191 @@ data:
       fi
     fi
 
+    # ----- LC10A-CHAT-EXCHANGE-SCOPE: the chat-turn token-exchange audience client (audittrace-librechat-chat) -----
+    # The BFF's chat turn exchanges to THIS client (bff/chat_scopes.py): a public
+    # client with every flow off whose DEFAULT scopes are exactly the six chat read
+    # scopes and which has no optional scope, so Keycloak's legacy token exchange
+    # grants exactly those six and nothing else (bff/exchange.py). Created on an
+    # existing realm (realm-audittrace.json only imports on the first run), never by
+    # hand. Idempotent: an existing client is verified, never `kcadm update`d; any
+    # drift fails closed via the Job's shared `acl_e2e_fail` reporter. The pinned
+    # JSON below is byte-identical in scripts/setup-memory-scopes.sh and the chart
+    # ConfigMap (parity-guarded). Step 4b below authorizes the BFF to exchange for it.
+    CHAT_AUD_CLIENT_ID="audittrace-librechat-chat"
+    CHAT_AUD_CLIENT_JSON='{"clientId":"audittrace-librechat-chat","description":"Token-exchange audience for the chat turn (LC10A-CHAT-EXCHANGE-SCOPE). No flow of its own: its DEFAULT scopes are exactly the chat read scopes (bff/chat_scopes.py), so an exchange to this audience grants exactly those and nothing else.","enabled":true,"protocol":"openid-connect","publicClient":true,"standardFlowEnabled":false,"directAccessGrantsEnabled":false,"implicitFlowEnabled":false,"serviceAccountsEnabled":false,"fullScopeAllowed":false,"attributes":{"token-exchange.authorized-source-client":"audittrace-librechat-bff"},"defaultClientScopes":["audittrace:query","memory:conversational:read-own","memory:episodic:read","memory:procedural:read","memory:semantic:read","memory:session:read-own"],"optionalClientScopes":[],"protocolMappers":[{"name":"aud-audittrace-server","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper","config":{"included.custom.audience":"audittrace-server","id.token.claim":"false","access.token.claim":"true"}}]}'
+    CHAT_AUD_DEFAULT_SCOPES=("audittrace:query" "memory:conversational:read-own" "memory:episodic:read" "memory:procedural:read" "memory:semantic:read" "memory:session:read-own")
+    ACL_E2E_STAGE="pre-step:init"
+
+    # Whitespace-stripped JSON of one kcadm GET.
+    chat_aud_compact() {
+      local raw
+      raw=$(acl_e2e_kc get "$1" -r "${REALM}") || acl_e2e_fail read-failed "cannot read the chat audience client"
+      echo "${raw//[[:space:]]/}"
+    }
+
+    # Names of the chat audience client's default|optional scopes, one per line.
+    chat_aud_scope_names() {
+      local out line
+      out=$(acl_e2e_kc get "clients/$1/$2-client-scopes" -r "${REALM}" \
+              --fields name --format csv --noquotes) \
+        || acl_e2e_fail read-failed "cannot read the $2 scopes of the chat audience client"
+      while IFS= read -r line; do
+        line="${line//\"/}"
+        [[ -n "${line}" ]] && echo "${line}"
+      done <<< "${out}"
+      return 0
+    }
+
+    chat_aud_in_default_set() {
+      local want
+      for want in "${CHAT_AUD_DEFAULT_SCOPES[@]}"; do
+        [[ "$1" == "${want}" ]] && return 0
+      done
+      return 1
+    }
+
+    # audittrace:query is a REALM-defined client scope (never created by this
+    # script), so its id is resolved from the live realm; an absent one fails closed.
+    chat_aud_resolve_scope() {
+      local name="$1" found="" csv sid sname
+      [[ -n "${SCOPE_ID[${name}]:-}" ]] && return 0
+      # Pure bash (no awk in this image): list first so a kcadm failure reaches
+      # the read-failed branch directly, then take the FIRST row whose 2nd CSV
+      # field equals the name exactly (a prefix of another name never matches).
+      csv=$(acl_e2e_kc get client-scopes -r "${REALM}" \
+              --fields id,name --format csv --noquotes) \
+        || acl_e2e_fail read-failed "cannot list the realm client scopes (chat audience client)"
+      while IFS=, read -r sid sname _; do
+        if [[ "${sname}" == "${name}" ]]; then
+          found="${sid}"
+          break
+        fi
+      done <<< "${csv}"
+      [[ -n "${found}" ]] \
+        || acl_e2e_fail id-unresolvable "a pinned chat audience client scope is absent from the realm"
+      SCOPE_ID["${name}"]="${found}"
+    }
+
+    # Remove every default/optional scope NOT in the pinned set (Keycloak may add
+    # realm-default scopes on create): default keeps the six chat scopes, optional
+    # keeps none.
+    chat_aud_strip_scopes() {
+      local uuid="$1" kind out sid sname keep
+      ACL_E2E_STAGE="strip"
+      for kind in "default" "optional"; do
+        out=$(acl_e2e_kc get "clients/${uuid}/${kind}-client-scopes" -r "${REALM}" \
+                --fields id,name --format csv --noquotes) \
+          || acl_e2e_fail strip-list-failed "cannot list ${kind} scopes (chat audience client)"
+        while IFS=, read -r sid sname; do
+          sid="${sid//\"/}"; sname="${sname//\"/}"
+          [[ -z "${sid}" ]] && continue
+          keep=0
+          if [[ "${kind}" == "default" ]] && chat_aud_in_default_set "${sname}"; then
+            keep=1
+          fi
+          if [[ "${keep}" -eq 0 ]]; then
+            acl_e2e_kc delete "clients/${uuid}/${kind}-client-scopes/${sid}" \
+              -r "${REALM}" >/dev/null \
+              || acl_e2e_fail strip-delete-failed "could not strip unpinned ${kind} scope (chat audience client)"
+            echo "  ✓ ${CHAT_AUD_CLIENT_ID}: stripped unpinned ${kind} scope ${sname}"
+          fi
+        done <<< "${out}"
+      done
+    }
+
+    # VERIFY (equality on the compared keys): every flow off, fullScopeAllowed
+    # false, the authorized-source-client attribute, the default scopes EXACTLY the
+    # six, NO optional scope, and exactly one protocol mapper (the audience
+    # mapper). Any difference -> exit non-zero with a closed-vocabulary diff (counts
+    # and shapes, never a byte of the response).
+    chat_aud_verify() {
+      local uuid="$1" diffs="" compact item name names n=0 unexpected=0
+      ACL_E2E_STAGE="verify-client"
+      compact=$(chat_aud_compact "clients/${uuid}") \
+        || acl_e2e_fail read-failed "cannot read the chat audience client"
+      for item in \
+          '"clientId":"audittrace-librechat-chat"' '"publicClient":true' \
+          '"standardFlowEnabled":false' '"directAccessGrantsEnabled":false' \
+          '"implicitFlowEnabled":false' '"serviceAccountsEnabled":false' \
+          '"fullScopeAllowed":false' \
+          '"token-exchange.authorized-source-client":"audittrace-librechat-bff"'; do
+        [[ "${compact}" == *"${item}"* ]] || diffs+=" missing:${item}"
+      done
+      ACL_E2E_STAGE="verify-default-scopes"
+      names=$(chat_aud_scope_names "${uuid}" default) \
+        || acl_e2e_fail read-failed "cannot read default scopes (chat audience client)"
+      while IFS= read -r name; do
+        [[ -z "${name}" ]] && continue
+        n=$((n + 1))
+        chat_aud_in_default_set "${name}" || unexpected=$((unexpected + 1))
+      done <<< "${names}"
+      [[ "${unexpected}" -eq 0 ]] || diffs+=" unexpected-default-scope:count=${unexpected}"
+      [[ "${n}" -eq "${#CHAT_AUD_DEFAULT_SCOPES[@]}" ]] || diffs+=" default-scope-count:${n}"
+      ACL_E2E_STAGE="verify-optional-scopes"
+      names=$(chat_aud_scope_names "${uuid}" optional) \
+        || acl_e2e_fail read-failed "cannot read optional scopes (chat audience client)"
+      n=0
+      while IFS= read -r name; do
+        [[ -z "${name}" ]] && continue
+        n=$((n + 1))
+      done <<< "${names}"
+      [[ "${n}" -eq 0 ]] || diffs+=" unexpected-optional-scope:count=${n}"
+      ACL_E2E_STAGE="verify-mappers"
+      names=$(acl_e2e_kc get "clients/${uuid}/protocol-mappers/models" -r "${REALM}" \
+                --fields name --format csv --noquotes) \
+        || acl_e2e_fail read-failed "cannot read protocol mappers (chat audience client)"
+      n=0
+      unexpected=0
+      while IFS= read -r name; do
+        name="${name//\"/}"
+        [[ -z "${name}" ]] && continue
+        n=$((n + 1))
+        [[ "${name}" == "aud-audittrace-server" ]] || unexpected=$((unexpected + 1))
+      done <<< "${names}"
+      [[ "${unexpected}" -eq 0 ]] || diffs+=" unexpected-mapper:count=${unexpected}"
+      [[ "${n}" -eq 1 ]] || diffs+=" mapper-count:${n}"
+      if [[ "${#diffs}" -gt 0 ]]; then
+        acl_e2e_fail drift "drift from the pinned client (fail closed, no kcadm update):${diffs} (chat audience client)"
+      fi
+      echo "  ✓ ${CHAT_AUD_CLIENT_ID}: verified equal to the pinned block"
+    }
+
+    chat_aud_lookup() {
+      local out
+      out=$(acl_e2e_kc get clients -r "${REALM}" -q "clientId=${CHAT_AUD_CLIENT_ID}" \
+              --fields id,clientId --format csv --noquotes) \
+        || acl_e2e_fail lookup-failed "client lookup failed (chat audience client)"
+      echo "${out//\"/}"
+    }
+
+    echo "▶ ensuring the chat token-exchange audience client ${CHAT_AUD_CLIENT_ID}..."
+    ACL_E2E_STAGE="lookup"
+    CHAT_AUD_FOUND=$(chat_aud_lookup) || acl_e2e_fail lookup-failed "client lookup failed (chat audience client)"
+    if [[ -z "${CHAT_AUD_FOUND//[[:space:]]/}" ]]; then
+      ACL_E2E_STAGE="create"
+      printf '%s' "${CHAT_AUD_CLIENT_JSON}" | acl_e2e_kc create clients -r "${REALM}" -f - >/dev/null \
+        || acl_e2e_fail create-failed "create failed (chat audience client)"
+      echo "  ✓ ${CHAT_AUD_CLIENT_ID}: created"
+      ACL_E2E_STAGE="lookup"
+      CHAT_AUD_UUID=$(chat_aud_lookup) || acl_e2e_fail lookup-failed "client lookup failed (chat audience client)"
+      CHAT_AUD_UUID="${CHAT_AUD_UUID%%,*}"
+      [[ -n "${CHAT_AUD_UUID}" ]] || acl_e2e_fail id-unresolvable "created but id not resolvable (chat audience client)"
+    else
+      [[ "$(echo "${CHAT_AUD_FOUND}" | grep -c .)" -eq 1 ]] \
+        || acl_e2e_fail ambiguous-match "more than one client matches (refusing) (chat audience client)"
+      CHAT_AUD_UUID="${CHAT_AUD_FOUND%%,*}"
+    fi
+    # Strip then bind on EVERY run (both are idempotent): a client created by the
+    # realm import, by an earlier run, or by hand converges to exactly the six
+    # defaults, and the verify below then pins the result.
+    chat_aud_strip_scopes "${CHAT_AUD_UUID}"
+    ACL_E2E_STAGE="bind"
+    for SCOPE in "${CHAT_AUD_DEFAULT_SCOPES[@]}"; do
+      chat_aud_resolve_scope "${SCOPE}"
+      bind_scope "${CHAT_AUD_CLIENT_ID}" "${SCOPE}" "default"
+    done
+    chat_aud_verify "${CHAT_AUD_UUID}"
+
     # ── Step 3: ensure user-identity protocol mappers ─────────────
     #
     # Without these mappers on user-facing clients, JWTs carry only a
@@ -1713,6 +1908,32 @@ data:
     acl_e2e_kc update "clients/${REALM_MGMT_UUID}/authz/resource-server/permission/scope/${TOKEN_EXCHANGE_PERM_ID}" \
       -r "${REALM}" -s "policies=[\"${TOKEN_EXCHANGE_POLICY_ID}\"]" >/dev/null
     echo "  ✓ ${TOKEN_EXCHANGE_SOURCE_CLIENT} authorized to exchange for ${TOKEN_EXCHANGE_TARGET_CLIENT}"
+
+    # ── Step 4b: authorize the same exchange for the CHAT audience (LC10A-CHAT-EXCHANGE-SCOPE) ──
+    # The chat turn exchanges to `audittrace-librechat-chat`, a SECOND target of the
+    # same source client. Same three idempotent kcadm calls as Step 4, the same
+    # Client policy (TOKEN_EXCHANGE_POLICY_ID, resolved above) attached to the
+    # chat client's own token-exchange scope-permission. Without it the exchange
+    # answers `access_denied` and chat answers 502 (no fallback audience).
+    TOKEN_EXCHANGE_CHAT_TARGET_CLIENT="audittrace-librechat-chat"
+    echo "▶ authorizing ${TOKEN_EXCHANGE_SOURCE_CLIENT} to exchange for ${TOKEN_EXCHANGE_CHAT_TARGET_CLIENT}..."
+    ACL_E2E_STAGE="token-exchange-chat"
+    if ! CHAT_TARGET_UUID=$(find_client_id "${TOKEN_EXCHANGE_CHAT_TARGET_CLIENT}"); then
+      echo "❌ target client ${TOKEN_EXCHANGE_CHAT_TARGET_CLIENT} not found — cannot authorize exchange." >&2
+      exit 1
+    fi
+    acl_e2e_kc update "clients/${CHAT_TARGET_UUID}/management/permissions" \
+      -r "${REALM}" -s enabled=true >/dev/null
+    TOKEN_EXCHANGE_CHAT_PERM_ID=$(acl_e2e_kc get "clients/${CHAT_TARGET_UUID}/management/permissions" -r "${REALM}" \
+      | grep '"token-exchange"' | sed -E 's/.*"token-exchange" *: *"([^"]+)".*/\1/')
+    if [[ -z "${TOKEN_EXCHANGE_CHAT_PERM_ID}" ]]; then
+      echo "❌ could not resolve the token-exchange scope-permission id for ${TOKEN_EXCHANGE_CHAT_TARGET_CLIENT}." >&2
+      exit 1
+    fi
+    echo "  ✓ token-exchange permission id (chat audience): ${TOKEN_EXCHANGE_CHAT_PERM_ID}"
+    acl_e2e_kc update "clients/${REALM_MGMT_UUID}/authz/resource-server/permission/scope/${TOKEN_EXCHANGE_CHAT_PERM_ID}" \
+      -r "${REALM}" -s "policies=[\"${TOKEN_EXCHANGE_POLICY_ID}\"]" >/dev/null
+    echo "  ✓ ${TOKEN_EXCHANGE_SOURCE_CLIENT} authorized to exchange for ${TOKEN_EXCHANGE_CHAT_TARGET_CLIENT}"
 
     echo "✅ memory-scopes provisioning complete."
 

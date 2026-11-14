@@ -1,8 +1,8 @@
 """The memory-scope set the BFF requests when exchanging a token for the
 Souvenirs panel's ``/memory/*`` proxy path (M3-WU-D2-1).
 
-The chat path (``bff/app.py::chat_completions``) exchanges for
-``audittrace:query`` unchanged — this module exists ONLY for the memory
+The chat path (``bff/app.py::chat_completions``) exchanges for its own
+``bff.chat_scopes.CHAT_SCOPE_STRING`` — this module exists ONLY for the memory
 proxy, so the two paths can never accidentally share a scope request.
 
 Spec (``2026-08-30-SPEC-m3-souvenirs-sovereign-memory.md``, WU-D2-1) names

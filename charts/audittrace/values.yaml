@@ -1065,6 +1065,11 @@ console:
     # value.
     exchangeClientId: audittrace-librechat-bff
     exchangeAudience: audittrace-librechat
+    # The chat turn's token-exchange audience (LC10A-CHAT-EXCHANGE-SCOPE): a
+    # dedicated client whose DEFAULT scopes are exactly the six chat read
+    # scopes, created by the ensure-memory-scopes hook (and declared in
+    # realm-audittrace.json). Never empty: there is no fallback audience.
+    chatExchangeAudience: audittrace-librechat-chat
 
   # ── D2 — LibreChat: the sovereign fork (M3-WU-D2-4 cutover) ─────────────
   # M3-WU-D2-4 (2026-08-31) supersedes the D1 "stock image, no source edit"

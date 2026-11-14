@@ -2260,6 +2260,14 @@ _ALLOWED_FAIL_HOMES = (
     "session_e2e_resolve_scope",
     "session_e2e_strip_scopes",
     "session_e2e_verify",
+    # LC10A-CHAT-EXCHANGE-SCOPE: the chat audience client's helpers (same
+    # shape, same rules).
+    "chat_aud_compact",
+    "chat_aud_lookup",
+    "chat_aud_resolve_scope",
+    "chat_aud_scope_names",
+    "chat_aud_strip_scopes",
+    "chat_aud_verify",
 )
 
 
@@ -3842,6 +3850,13 @@ def _run_full_state(*, scopes_present: bool, e2e_present: bool) -> dict[str, Any
     realm_scopes = [
         {"id": "s-realm-query", "name": "audittrace:query"},
         {"id": "s-realm-audit", "name": "audittrace:audit"},
+        # LC10A-CHAT-EXCHANGE-SCOPE: the four baseline read scopes the chat
+        # audience client binds as defaults are realm-defined too (the hook
+        # never creates them), so the chat block resolves, not creates, them.
+        {"id": "s-realm-conv-read", "name": "memory:conversational:read-own"},
+        {"id": "s-realm-epi-read", "name": "memory:episodic:read"},
+        {"id": "s-realm-proc-read", "name": "memory:procedural:read"},
+        {"id": "s-realm-sem-read", "name": "memory:semantic:read"},
     ]
     scopes = realm_scopes + (
         [{"id": f"s-{i}", "name": n} for i, n in enumerate(scope_names)]
@@ -3850,6 +3865,51 @@ def _run_full_state(*, scopes_present: bool, e2e_present: bool) -> dict[str, Any
     )
     clients = _base_clients()
     if e2e_present:
+        # LC10A-CHAT-EXCHANGE-SCOPE: an already-provisioned chat audience
+        # client (the verify-existing path); the all-absent state exercises
+        # the create path.
+        clients.append(
+            {
+                "id": "uuid-chat-aud",
+                "clientId": "audittrace-librechat-chat",
+                "body": {
+                    "clientId": "audittrace-librechat-chat",
+                    "publicClient": True,
+                    "standardFlowEnabled": False,
+                    "directAccessGrantsEnabled": False,
+                    "implicitFlowEnabled": False,
+                    "serviceAccountsEnabled": False,
+                    "fullScopeAllowed": False,
+                    "attributes": {
+                        "token-exchange.authorized-source-client": "audittrace-librechat-bff"
+                    },
+                },
+                "default": [
+                    {"id": "s-realm-query", "name": "audittrace:query"},
+                    {
+                        "id": "s-realm-conv-read",
+                        "name": "memory:conversational:read-own",
+                    },
+                    {"id": "s-realm-epi-read", "name": "memory:episodic:read"},
+                    {"id": "s-realm-proc-read", "name": "memory:procedural:read"},
+                    {"id": "s-realm-sem-read", "name": "memory:semantic:read"},
+                    {"id": "s-14", "name": "memory:session:read-own"},
+                ],
+                "optional": [],
+                "mappers": [
+                    {
+                        "name": "aud-audittrace-server",
+                        "protocol": "openid-connect",
+                        "protocolMapper": "oidc-audience-mapper",
+                        "config": {
+                            "included.custom.audience": "audittrace-server",
+                            "id.token.claim": "false",
+                            "access.token.claim": "true",
+                        },
+                    }
+                ],
+            }
+        )
         clients.append(
             {
                 "id": "uuid-e2e",
@@ -4230,35 +4290,53 @@ class TestRunFullWholeScriptCoverage:
                 assert substr in combined_log, (
                     f"expected call never logged at all: {substr}"
                 )
+            # LC10A-HOOK-AWK: the two resolve-scope functions grew by 8 lines
+            # each (pure-bash row scan replaces awk), so every row after the
+            # session resolver moved by +8 and every row after the chat
+            # resolver by +16; same reasons, same calls.
+            # LC10A-CHAT-EXCHANGE-SCOPE: every row before the chat audience
+            # block moved by +2 (a two-line comment correction above it);
+            # the rows after it moved by the block as well.
             expected_unreached = {
-                (560, 561),
-                (607, 609),
-                (901, 903),
-                1106,
-                (1161, 1162),
+                (562, 563),
+                (609, 611),
+                (903, 905),
+                1108,
+                (1163, 1164),
                 # LC-10a: the session E2E clone (same two named reasons as
                 # the acl rows above: nothing to strip in a RunFull state;
                 # the sunset delete runs only with enabled=false).
-                (1260, 1262),
+                (1270, 1272),
                 # LC-10a r6 step 2: the narrow mapper reconcile's update
                 # (only for the Keycloak-24-defaults shape; exercised by
                 # tests/test_session_e2e_mapper_reconcile.py).
-                (1422, 1425),
-                (1497, 1498),
-                # was (1282, 1283): shifted by the LC-10a blocks above it.
-                (1623, 1624),
+                (1432, 1435),
+                (1507, 1508),
+                # LC10A-CHAT-EXCHANGE-SCOPE: the chat audience client's strip
+                # delete (the created client's defaults equal the pinned set
+                # and the verify-existing state has nothing extra, so there is
+                # never anything to strip in a RunFull state; exercised by
+                # tests/test_chat_audience_hook.py).
+                (1600, 1602),
+                # was (1623, 1624): shifted by the blocks above it.
+                (1818, 1819),
             }
         else:
+            # LC10A-HOOK-AWK: rows after the session resolver moved +8, after the
+            # chat resolver +16 (pure-bash row scan replaces awk).
             # (1193,1195)/(1430,1431): the LC-10a session E2E clone's strip
             # delete and sunset delete (reasons as (834,836)/(1094,1095)).
             expected_unreached = {
                 (834, 836),
                 1039,
                 (1094, 1095),
-                (1193, 1195),
+                (1201, 1203),
                 # LC-10a r6 step 2: the narrow mapper reconcile's update.
-                (1355, 1358),
-                (1430, 1431),
+                (1363, 1366),
+                (1438, 1439),
+                # LC10A-CHAT-EXCHANGE-SCOPE: the chat audience client's strip
+                # delete (reason as (1584,1586) of the ConfigMap site).
+                (1531, 1533),
             }
         # Named per range (line numbers re-measured after every edit
         # that shifts them — e.g. this round's R4/B3 production fixes;

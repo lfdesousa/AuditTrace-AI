@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from bff.console_promote_scopes import DURABLE_PROMOTE_LAYERS
@@ -195,6 +195,12 @@ class Settings(BaseSettings):
     # rather than declaring a second copy of the same audience/scope
     # wiring — see bff/README.md.
     exchange_audience: str = "audittrace-librechat"
+    # The dedicated token-exchange audience of the chat turn: a public
+    # client whose DEFAULT scopes are exactly bff.chat_scopes.CHAT_SCOPES
+    # (LC10A-CHAT-EXCHANGE-SCOPE). No fallback audience: min_length=1.
+    chat_exchange_audience: str = Field(
+        default="audittrace-librechat-chat", min_length=1
+    )
     exchange_subject_token_type: str = "urn:ietf:params:oauth:token-type:access_token"
     exchange_requested_token_type: str = "urn:ietf:params:oauth:token-type:access_token"
     exchange_grant_type: str = "urn:ietf:params:oauth:grant-type:token-exchange"
