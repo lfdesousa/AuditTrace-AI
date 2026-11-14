@@ -12,7 +12,7 @@
 #
 # This is the LOCAL layer of the four-layer enforcement stack. The
 # others are: PR template (.github/pull_request_template.md), CI
-# evidence-check job (.github/workflows/ci.yml), CLAUDE.md +
+# evidence-check job (.github/workflows/evidence-check.yml), CLAUDE.md +
 # AGENTS.md addenda. All four reinforce the same rule; this hook
 # catches the failure mode at the earliest possible point — before
 # the work even leaves the laptop.
