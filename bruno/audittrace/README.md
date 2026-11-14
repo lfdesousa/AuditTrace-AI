@@ -85,6 +85,8 @@ vacuously as separate runs) and F5 (no shipped request sends a
 | `chat/07-audit-inbound-trace-zero-rows.bru` | `GET /interactions?trace_id=<inbound>` returns **0 rows**: the server never adopted the caller's trace context (`telemetry.py:90` `ServerMintedTraceContext`, `:145` `inbound_trace_context_hook`). Fails if the server adopted it. |
 | `chat/08-audit-server-trace-one-row.bru` | Positive control: the same filter with the server id returns exactly the 04 interaction, so the 0 in 07 is not a broken filter. |
 | `chat/09-audit-tool-calls-of-traceparent-turn.bru` | The `tool_calls` audit rows (ids, tools, scopes) of that interaction; with `expectSourcesTrailer=true` at least one recall tool (`recall_*` / `read_decision`) is required. |
+| `chat/16-chat-image-part-non-stream.bru` | `POST /v1/chat/completions` with an `image_url` content part (default: a small test diagram, env `imagePartData`); 200, OpenAI shape, the answer names what the image shows, `x-trace-id` stashed. |
+| `chat/17-chat-image-part-no-projector.bru` | The same image part with a model routed to a server without a vision projector (env `imageNoProjectorModel`, default `mistral`): HTTP 400, `code=image_input_unsupported`, the whole error object compared; `x-trace-id` stashed. Needs that route's server up. |
 
 **These must run in ONE `bru run`.** 05-09 read runtime vars (`bru.setVar`)
 set by 04/05 and each carries a precondition test that FAILS (it does not pass vacuously)

@@ -1,0 +1,94 @@
+meta {
+  name: POST /v1/chat/completions (image part to a model server without a projector)
+  type: http
+  seq: 17
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "model": "{{imageNoProjectorModel}}",
+    "messages": [
+      { "role": "user", "content": [
+        { "type": "text", "text": "{{imagePartPrompt}}" },
+        { "type": "image_url", "image_url": { "url": "{{imagePartData}}" } }
+      ] }
+    ],
+    "stream": false,
+    "max_tokens": 64
+  }
+}
+
+script:pre-request {
+  // Body rebuilt here so values containing quotes cannot break the JSON.
+  // `imageNoProjectorModel` must be a model the deployment routes
+  // (AUDITTRACE_MODEL_ROUTES) to a model server started WITHOUT a vision
+  // projector. The image is the default of chat/16 (`imagePartData`).
+  const image = bru.getEnvVar("imagePartData");
+  if (typeof image !== "string" || !image.startsWith("data:image/")) {
+    throw new Error("imagePartData must be a data:image/... URL (default in environments/*.bru)");
+  }
+  req.setBody({
+    model: bru.getEnvVar("imageNoProjectorModel"),
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: bru.getEnvVar("imagePartPrompt") },
+        { type: "image_url", image_url: { url: image } }
+      ]
+    }],
+    stream: false,
+    max_tokens: 64
+  });
+  const sid = "bru-image-no-projector-" + Date.now();
+  req.setHeader("X-Session-Id", sid);
+  bru.setVar("imageNoProjectorSessionId", sid);
+}
+
+tests {
+  test("HTTP 400 on the non-streaming call", function() {
+    expect(res.getStatus()).to.equal(400);
+  });
+  test("explicit OpenAI-shaped error, whole object", function() {
+    expect(res.getBody().error).to.eql({
+      message: "The model server selected for this request does not accept image input. Choose a model that accepts images, or remove the image from the message.",
+      type: "invalid_request_error",
+      param: "messages",
+      code: "image_input_unsupported",
+      status: 400
+    });
+  });
+  test("no echo of the image data", function() {
+    expect(JSON.stringify(res.getBody())).to.not.contain("base64,");
+  });
+  test("x-trace-id is 32 lowercase hex (stashed for audit/02)", function() {
+    const traceId = res.getHeader("x-trace-id");
+    expect(traceId).to.match(/^[0-9a-f]{32}$/);
+    bru.setVar("imageNoProjectorTraceId", traceId);
+  });
+}
+
+docs {
+  MODEL-MMPROJ-PERMANENT ADDENDUM-1. Sends an `image_url` content part with a
+  model that the deployment routes to a model server without a vision
+  projector. That server answers HTTP 500 "image input is not supported";
+  the memory server turns that one rejection into an explicit client error.
+
+  Inputs (env vars, defaults in environments/*.bru): `imageNoProjectorModel`
+  (default `mistral`), plus chat/16's `imagePartData` and `imagePartPrompt`.
+  Precondition: the route exists and its model server is UP. A 502 here
+  means the routed server is unreachable or failed another way; it is not
+  this test passing or failing on the explicit error.
+  Stashes `imageNoProjectorSessionId` and `imageNoProjectorTraceId`; read the
+  audit row with `audit/02-list-by-trace-id.bru --env-var traceId=<id>`.
+  Needs scope audittrace:query.
+}
