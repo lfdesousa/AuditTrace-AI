@@ -21,6 +21,7 @@ from tests.bff.test_chat_exchange_scope import (  # noqa: F401  (chat is a fixtu
     chat,
     restricted_token_scopes,
 )
+from tests.bff.test_chat_route_errors import TOKEN_EXCHANGE_INVALID, _expected_body
 
 
 class TestTheCeilingBoundsTheGrantByTheCallerAsABackstop:
@@ -35,7 +36,7 @@ class TestTheCeilingBoundsTheGrantByTheCallerAsABackstop:
         with caplog.at_level(logging.INFO):
             response = _chat_turn(client, restricted_token_scopes())
         assert response.status_code == 502
-        assert response.json() == {"detail": "Upstream authentication service error"}
+        assert response.json() == _expected_body(TOKEN_EXCHANGE_INVALID)
         assert len(backend.exchange_forms) == 1
         assert backend.orchestrator_requests == []
         messages = [r.getMessage() for r in caplog.records]

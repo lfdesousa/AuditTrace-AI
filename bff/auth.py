@@ -23,8 +23,10 @@ from typing import Any
 
 import httpx
 from jose import JWTError, jwt
+from jose.exceptions import JWKError
 
 from bff.config import Settings
+from bff.inbound_token_failure import InboundTokenFailure
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +34,21 @@ logger = logging.getLogger(__name__)
 class InboundTokenError(Exception):
     """Raised when the token LibreChat forwarded fails validation.
 
-    Callers (the FastAPI route) MUST map this to HTTP 401 — never retry
-    with a fallback credential.
+    ``failure`` names the class: the caller sent no credentials (``MISSING``),
+    sent a token that is not valid for this realm (``INVALID``), or the token
+    could not be judged because the realm's keys could not be fetched or used
+    (``UNVERIFIABLE``). The chat route answers 401 for the first two and 502
+    for the last (``bff/chat_refusals.py``); the other routes keep their own
+    401. Never retry with a fallback credential.
     """
+
+    def __init__(
+        self,
+        message: str,
+        failure: InboundTokenFailure = InboundTokenFailure.INVALID,
+    ) -> None:
+        super().__init__(message)
+        self.failure = failure
 
 
 # Process-wide JWKS cache: ``{"keys": [...], "fetched_at": <epoch>}``.
@@ -64,19 +78,24 @@ def _jwks_cache_fresh(now: float, ttl_seconds: int) -> bool:
 async def _fetch_jwks_keys(client: httpx.AsyncClient, jwks_url: str) -> list[Any]:
     """Fetch the raw ``keys`` array from the Keycloak JWKS endpoint.
 
-    Raises :class:`InboundTokenError` on any transport/HTTP failure — a
-    JWKS fetch failure means the BFF cannot validate ANY token right
-    now, which is a fail-closed 401, not a silent pass-through.
+    Raises :class:`InboundTokenError` (class ``UNVERIFIABLE``) on any
+    transport/HTTP failure or a body that is not a JWKS object — a JWKS
+    fetch failure means the BFF cannot validate ANY token right now, which
+    is fail-closed, not a silent pass-through.
     """
     try:
         response = await client.get(jwks_url)
         response.raise_for_status()
         jwks = response.json()
     except (httpx.HTTPError, ValueError) as exc:
-        raise InboundTokenError(f"JWKS fetch failed: {exc}") from exc
-    keys = jwks.get("keys")
+        raise InboundTokenError(
+            f"JWKS fetch failed: {exc}", InboundTokenFailure.UNVERIFIABLE
+        ) from exc
+    keys = jwks.get("keys") if isinstance(jwks, dict) else None
     if not isinstance(keys, list):
-        raise InboundTokenError("JWKS response missing a 'keys' array")
+        raise InboundTokenError(
+            "JWKS response missing a 'keys' array", InboundTokenFailure.UNVERIFIABLE
+        )
     return keys
 
 
@@ -114,7 +133,7 @@ def _decode_with_allowed_issuers(
     )
     token_iss = payload.get("iss")
     allowed = {primary_issuer, *(extra_issuers or [])}
-    if token_iss not in allowed:
+    if not isinstance(token_iss, str) or token_iss not in allowed:
         raise JWTError(
             f"Invalid issuer {token_iss!r}; expected one of {sorted(allowed)!r}"
         )
@@ -131,12 +150,13 @@ async def validate_inbound_token(
 
     Fail-closed on every path: a missing token, a malformed
     ``Authorization`` value, an unparseable/unsigned/expired/wrong-issuer
-    JWT, or an unreachable JWKS endpoint all raise
-    :class:`InboundTokenError`. There is no fallback identity and no
+    JWT, or an unreachable or unusable JWKS endpoint all raise
+    :class:`InboundTokenError`, classified where it is raised (no catch-all
+    here: the arms name the types python-jose is measured to raise). There is no fallback identity and no
     static credential this function can return instead.
     """
     if not token or not token.strip():
-        raise InboundTokenError("missing bearer token")
+        raise InboundTokenError("missing bearer token", InboundTokenFailure.MISSING)
     try:
         keys = await get_jwks_keys(http_client, settings)
         claims = _decode_with_allowed_issuers(
@@ -146,8 +166,15 @@ async def validate_inbound_token(
             extra_issuers=settings.keycloak_issuer_extras,
         )
     except JWTError as exc:
-        logger.warning("inbound token validation failed: %s", exc)
         raise InboundTokenError(f"invalid or expired token: {exc}") from exc
+    except (JWKError, ValueError, TypeError) as exc:
+        # python-jose does not wrap these (measured): a realm key it cannot
+        # build, or a claim of a type it cannot compare. Nobody but the realm
+        # can cause either, so the token was not judged: unverifiable.
+        raise InboundTokenError(
+            f"realm keys or claims unusable: {type(exc).__name__}: {exc}",
+            InboundTokenFailure.UNVERIFIABLE,
+        ) from exc
     sub = claims.get("sub")
     if not isinstance(sub, str) or not sub.strip():
         raise InboundTokenError("token carries no usable 'sub' claim")

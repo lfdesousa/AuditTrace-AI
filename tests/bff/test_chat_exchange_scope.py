@@ -59,6 +59,7 @@ from tests.bff.test_app import (
     ORCHESTRATOR_BASE,
     _settings,
 )
+from tests.bff.test_chat_route_errors import TOKEN_EXCHANGE_INVALID, _expected_body
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CHAT_AUDIENCE = "audittrace-librechat-chat"
@@ -352,7 +353,7 @@ class TestAnOverGrantFailsClosed:
         with caplog.at_level(logging.INFO, logger="bff"):
             response = _chat_turn(client)
         assert response.status_code == 502
-        assert response.json() == {"detail": "Upstream authentication service error"}
+        assert response.json() == _expected_body(TOKEN_EXCHANGE_INVALID)
         assert backend.orchestrator_requests == []
         assert f"unexpected={extra}" in caplog.text
         assert _granted_lines(caplog) == []

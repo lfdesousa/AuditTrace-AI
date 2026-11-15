@@ -43,9 +43,11 @@ from typing import Any
 
 import httpx
 from jose import JWTError, jwt
+from jose.exceptions import JWKError
 
-from bff.auth import get_jwks_keys
+from bff.auth import InboundTokenError, get_jwks_keys
 from bff.config import Settings
+from bff.exchange_failure import ExchangeFailure
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +56,19 @@ class TokenExchangeError(Exception):
     """Raised when RFC 8693 token exchange fails, or the exchanged token
     fails re-validation / the identity (``sub``) consistency check.
 
-    Callers (the FastAPI route) MUST map this to HTTP 502 — a downstream
-    dependency (Keycloak) failure, not a caller auth failure — EXCEPT the
-    identity-mismatch case, which is a fail-closed internal-invariant
-    violation and should never reach a caller as anything but a hard
-    failure to proxy.
+    The class is ``failure``. The chat route answers 502 for every class but
+    ``SUBJECT_REFUSED``: a downstream dependency (Keycloak) failure is not a
+    caller auth failure. ``SUBJECT_REFUSED`` is Keycloak refusing the CALLER's
+    token (see :func:`_refusal_class`), answered 401. The identity-mismatch
+    case stays a fail-closed internal-invariant violation (``INVALID``) and
+    never reaches a caller as anything but a hard failure to proxy.
     """
+
+    def __init__(
+        self, message: str, failure: ExchangeFailure = ExchangeFailure.INVALID
+    ) -> None:
+        super().__init__(message)
+        self.failure = failure
 
 
 async def exchange_token(
@@ -112,17 +121,23 @@ async def exchange_token(
             timeout=settings.exchange_timeout_seconds,
         )
     except httpx.HTTPError as exc:
-        raise TokenExchangeError(f"token-exchange request failed: {exc}") from exc
+        raise TokenExchangeError(
+            f"token-exchange request failed: {exc}", ExchangeFailure.UNAVAILABLE
+        ) from exc
 
     if response.status_code != 200:
         raise TokenExchangeError(
             f"token-exchange rejected by Keycloak: HTTP {response.status_code} "
-            f"{_safe_body(response)}"
+            f"{_safe_body(response)}",
+            _refusal_class(response),
         )
     try:
         body = response.json()
     except ValueError as exc:
         raise TokenExchangeError("token-exchange response is not valid JSON") from exc
+
+    if not isinstance(body, dict):
+        raise TokenExchangeError("token-exchange response is not a JSON object")
 
     minted = body.get("access_token")
     if not isinstance(minted, str) or not minted.strip():
@@ -193,10 +208,50 @@ async def _revalidate_minted_token(
             algorithms=["RS256"],
             options={"verify_aud": False},
         )
+    except InboundTokenError as exc:
+        # The second JWKS fetch failed (the key cache had expired between the
+        # inbound check and here): the sign-in service, not the caller's token.
+        raise TokenExchangeError(
+            f"minted token could not be re-validated: {exc}",
+            ExchangeFailure.UNAVAILABLE,
+        ) from exc
     except JWTError as exc:
         raise TokenExchangeError(f"minted token failed re-validation: {exc}") from exc
+    except (JWKError, ValueError, TypeError) as exc:
+        # Not wrapped by python-jose (measured): the realm's key or a claim it
+        # cannot use. Same class as the inbound decode: unavailable.
+        raise TokenExchangeError(
+            f"realm keys or claims unusable: {type(exc).__name__}: {exc}",
+            ExchangeFailure.UNAVAILABLE,
+        ) from exc
     assert isinstance(claims, dict), "jwt.decode returned a non-dict payload"
     return claims
+
+
+def _refusal_class(response: httpx.Response) -> ExchangeFailure:
+    """Class of a non-200 answer of the token endpoint.
+
+    Keycloak answers ``400`` with ``"error": "invalid_token"`` in the RFC 6749
+    section 5.2 ``error`` field when it refuses the SUBJECT token (expired,
+    user disabled, session gone; measured on Keycloak 24.0.5). ``invalid_token``
+    is Keycloak's own value there, not an RFC 6749 section 5.2 code: RFC 8693
+    section 2.2.2 says ``invalid_request`` for an invalid ``subject_token``. A
+    standards-following exchange (Keycloak 26, exchange V2) will therefore fall
+    to ``REFUSED`` (502), the safe direction, and the 401 would silently stop;
+    re-measure on a Keycloak upgrade. Only that exact status and value pair is
+    the caller's token; every other 4xx is the BFF's configuration. The field is
+    read as data: any other shape falls to the safe class.
+    """
+    if response.status_code >= 500:
+        return ExchangeFailure.UNAVAILABLE
+    if response.status_code == 400:
+        try:
+            answer = response.json()
+        except ValueError:
+            return ExchangeFailure.REFUSED
+        if isinstance(answer, dict) and answer.get("error") == "invalid_token":
+            return ExchangeFailure.SUBJECT_REFUSED
+    return ExchangeFailure.REFUSED
 
 
 def _safe_body(response: httpx.Response) -> str:

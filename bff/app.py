@@ -37,10 +37,15 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
 1. Extract ``Authorization: Bearer <token>`` from the inbound request.
    Missing/malformed → 401, orchestrator never contacted.
 2. Validate the token against the AuditTrace realm's JWKS. Invalid/
-   expired/wrong-issuer → 401, orchestrator never contacted.
+   expired/wrong-issuer → 401, orchestrator never contacted. (The chat
+   route's refusals are explicit OpenAI-shaped answers with the RFC 6750
+   challenge on a 401 and a JWKS that cannot be fetched or used answered
+   502, ``bff/chat_refusals.py``; the other routes keep their ``detail``
+   answers.)
 3. RFC 8693 token-exchange it for an ``aud=audittrace-server`` token
    minted for the SAME ``sub``. Keycloak failure / identity mismatch →
-   502, orchestrator never contacted. The chat route exchanges for
+   502 on the chat route (401 when Keycloak refuses the caller's own
+   token), orchestrator never contacted. The chat route exchanges for
    ``bff.chat_scopes.CHAT_SCOPE_STRING`` (six read scopes) from the dedicated
    ``audittrace-librechat-chat`` audience, bounded by a scope ceiling, after
    a pre-check that refuses a caller whose own token lacks one of them
@@ -95,7 +100,9 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
    streaming the response back unchanged — including a 401/403/404 the
    orchestrator itself returns, which is forwarded as-is (fail-closed:
    the BFF never manufactures access the exchanged token doesn't carry).
-   Orchestrator unreachable → 502. The console-files route additionally
+   Orchestrator unreachable → 502 (chat: ``upstream_unavailable``). Any
+   exception the chat handler did not foresee → the fixed ``internal_error``
+   500 (``bff/chat_last_resort.py``). The console-files route additionally
    FORCES the upstream ``/memory/upload`` request's ``layer`` query
    parameter to ``settings.console_files_forced_layer`` regardless of
    what (if anything) the caller's own query string carries — the
@@ -124,6 +131,13 @@ from starlette.responses import StreamingResponse
 
 from bff.auth import InboundTokenError, validate_inbound_token
 from bff.chat_caller_scope import insufficient_scope_response, missing_chat_scopes
+from bff.chat_last_resort import last_resort
+from bff.chat_refusals import (
+    UPSTREAM_UNAVAILABLE,
+    for_exchange_failure,
+    for_inbound_failure,
+    refuse,
+)
 from bff.chat_scopes import (
     CHAT_SCOPE_CEILING,
     CHAT_SCOPE_STRING,
@@ -252,6 +266,7 @@ def create_app() -> FastAPI:
         return {"status": "ok", "component": "audittrace-librechat-bff"}
 
     @app.post("/v1/chat/completions", response_model=None)
+    @last_resort
     async def chat_completions(
         request: Request,
         settings: Settings = Depends(get_settings),
@@ -261,14 +276,16 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning("rejecting request — inbound token invalid: %s", exc)
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+            return refuse(
+                for_inbound_failure(exc.failure), request.headers, sub=None, cause=exc
+            )
 
         # validate_inbound_token raises InboundTokenError for a falsy
         # token (see bff/auth.py), so reaching here means it is non-None
         # — the assert makes that narrowing explicit for mypy too.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub  # for the last resort's event
         inbound_scopes = frozenset(str(claims.get("scope", "")).split())
         missing = missing_chat_scopes(inbound_scopes)
         if missing:
@@ -285,10 +302,11 @@ def create_app() -> FastAPI:
                 & (inbound_scopes | OIDC_PROTOCOL_SCOPES),
             )
         except TokenExchangeError as exc:
-            logger.error("token exchange failed for sub=%s: %s", inbound_sub, exc)
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse(
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         raw_body = await request.body()
@@ -303,9 +321,8 @@ def create_app() -> FastAPI:
                 session_id=request.headers.get("x-session-id"),
             )
         except ProxyError as exc:
-            logger.error("orchestrator unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse(
+                UPSTREAM_UNAVAILABLE, request.headers, sub=inbound_sub, cause=exc
             )
 
     @app.api_route(
