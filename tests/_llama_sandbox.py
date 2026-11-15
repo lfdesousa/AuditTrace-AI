@@ -15,6 +15,7 @@ stub).
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import signal
@@ -47,6 +48,9 @@ MODELS = (
     "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
     "mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf",
 )
+#: the chat unit's vision projector: a stub file plus the pins that match it
+PROJECTOR = "mmproj-Qwen3.8-27B-F16.gguf"
+PROJECTOR_BYTES = b"sandbox projector stub\n"
 KEY_VALUE = "Cd2" * 16  # 48 chars, low-entropy fake (never a real key)
 CNI0_ADDR = "10.42.0.1"
 
@@ -111,6 +115,9 @@ class Sandbox:
             if name.startswith(("LLAMA_", "IP_STUB", "SECRETS_DIR")) or name in (
                 "PORT",
                 "MODEL_PATH",
+                "MMPROJ_PATH",
+                "MMPROJ_SHA256",
+                "MMPROJ_SIZE_BYTES",
                 "CHAT_TEMPLATE",
                 "SYSTEMD_DIR",
                 "BACKUP_ROOT",
@@ -126,6 +133,8 @@ class Sandbox:
             SLEEP_LOG=str(self.sleep_log),
             IP_STUB_ADDR=CNI0_ADDR,
             LLAMA_BIND_POLL_MAX_SECONDS="0",
+            MMPROJ_SHA256=hashlib.sha256(PROJECTOR_BYTES).hexdigest(),
+            MMPROJ_SIZE_BYTES=str(len(PROJECTOR_BYTES)),
         )
         base.update(overrides)
         return base
@@ -173,6 +182,7 @@ def make_sandbox(tmp_path: Path) -> Sandbox:
     for model in MODELS:
         (home / "models").mkdir(parents=True, exist_ok=True)
         (home / "models" / model).write_text("")
+    (home / "models" / PROJECTOR).write_bytes(PROJECTOR_BYTES)
     tmpl = (
         home
         / "build/llama.cpp/models/templates/Mistral-Small-3.2-24B-Instruct-2506.jinja"

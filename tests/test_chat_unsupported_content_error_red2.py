@@ -183,15 +183,15 @@ class TestUnsupportedPartTypes:
             "error"
         ]
         assert err["message"] == (
-            "This model can't receive files or images directly in the message "
-            "(unsupported content part type 'file', 'image_url'). Use 'Upload as Text' instead."
+            "The model server does not accept one of the content part types in this message "
+            "(non-text part types sent: 'file', 'image_url'). To attach a document, use 'Upload as Text' instead."
         )
 
     def test_message_without_a_readable_type(self):
         err = _mod().unsupported_content_error_body(_payload({"a": 1}))["error"]
         assert err["message"] == (
-            "This model can't receive files or images directly in the message "
-            "(unsupported content part type). Use 'Upload as Text' instead."
+            "The model server does not accept one of the content part types in this message. "
+            "To attach a document, use 'Upload as Text' instead."
         )
         assert FILENAME not in json.dumps(err) and B64 not in json.dumps(err)
 

@@ -49,8 +49,8 @@ LLAMA_UNRELATED_400_BODY = {
 EXPECTED_CODE = "unsupported_content_type"
 EXPECTED_TYPE = "invalid_request_error"
 EXPECTED_MESSAGE = (
-    "This model can't receive files or images directly in the message "
-    "(unsupported content part type 'file'). Use 'Upload as Text' instead."
+    "The model server does not accept one of the content part types in this message "
+    "(non-text part types sent: 'file'). To attach a document, use 'Upload as Text' instead."
 )
 FILE_DATA = "data:text/plain;base64,aGVsbG8gd29ybGQ="  # never echoed back
 FILENAME = "notes-2026-11-09.txt"

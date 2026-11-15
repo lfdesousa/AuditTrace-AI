@@ -21,6 +21,17 @@ and ``tests/test_upstream_errors.py``):
   no content, filename or data is read, logged or echoed.
 * ``classify_unsupported_content`` owns the single WARNING; the body matcher
   is silent (the tools non-stream arm already has the loop's own WARNING).
+
+A SECOND rejection is recognised the same way (MODEL-MMPROJ-PERMANENT): a
+llama-server started WITHOUT a vision projector answers an ``image_url`` part
+with HTTP 500 and ``image input is not supported - hint: ...``
+(``match_image_input_unsupported``). It is matched by equality on the status,
+the int ``code`` 500 and the message, and answered with an explicit HTTP 400
+``image_input_unsupported`` (a routed model, e.g. ``AUDITTRACE_MODEL_ROUTES``,
+can reach such a server). Every other 500 keeps today's behaviour; the file
+matcher is NOT widened. Falsifiability:
+``tests/test_chat_image_input_unsupported_error.py`` and
+``tests/test_chat_image_error_tools_nonstream_logging.py``.
 """
 
 from __future__ import annotations
@@ -44,13 +55,29 @@ LLAMA_UNSUPPORTED_CONTENT_TYPE_MESSAGE = "unsupported content[].type"
 #: Stable, machine-readable ``error.code`` returned to clients.
 UNSUPPORTED_CONTENT_CODE = "unsupported_content_type"
 
+#: The exact message a llama-server WITHOUT a vision projector emits for an image
+#: part (HTTP 500); matched by equality.
+LLAMA_IMAGE_INPUT_UNSUPPORTED_MESSAGE = (
+    "image input is not supported - hint: if this is unexpected, "
+    "you may need to provide the mmproj"
+)
+#: Stable ``error.code`` for that rejection.
+IMAGE_INPUT_UNSUPPORTED_CODE = "image_input_unsupported"
+
 _UPSTREAM_STATUS = 400
+_IMAGE_UPSTREAM_STATUS = 500
+_IMAGE_MESSAGE = (
+    "The model server selected for this request does not accept image input. "
+    "Choose a model that accepts images, or remove the image from the message."
+)
 _MAX_NAMED_TYPES = 3
 _MAX_BODY_CHARS = 400
 _PART_TYPE_RE = re.compile(r"[A-Za-z0-9_.-]{1,32}")
 
-_MESSAGE_PREFIX = "This model can't receive files or images directly in the message"
-_MESSAGE_SUFFIX = "Use 'Upload as Text' instead."
+_MESSAGE_PREFIX = (
+    "The model server does not accept one of the content part types in this message"
+)
+_MESSAGE_SUFFIX = "To attach a document, use 'Upload as Text' instead."
 
 
 @dataclass(frozen=True)
@@ -91,6 +118,43 @@ def match_unsupported_content(status_code: int, body_text: str) -> bool:
     return match_unsupported_content_body(parsed)
 
 
+def match_image_input_unsupported(status_code: int, body_text: str) -> bool:
+    """True when the reply is exactly the no-projector image rejection (silent)."""
+    if status_code != _IMAGE_UPSTREAM_STATUS:
+        return False
+    try:
+        parsed = json.loads(body_text)
+    except ValueError:
+        return False
+    err = parsed.get("error") if isinstance(parsed, dict) else None
+    if not isinstance(err, dict):
+        return False
+    code = err.get("code")
+    return (
+        type(code) is int
+        and code == _IMAGE_UPSTREAM_STATUS
+        and err.get("message") == LLAMA_IMAGE_INPUT_UNSUPPORTED_MESSAGE
+    )
+
+
+def image_input_unsupported_error_body() -> dict[str, Any]:
+    """The explicit client error for the no-projector image rejection.
+
+    Names no model, route or flag: the proxy only knows the selected server
+    said it does not take image input.
+    """
+    # Function-local import: same chat.py cycle as unsupported_content_error_body.
+    from audittrace.routes.chat import _openai_error_body
+
+    return _openai_error_body(
+        message=_IMAGE_MESSAGE,
+        code=IMAGE_INPUT_UNSUPPORTED_CODE,
+        type_="invalid_request_error",
+        param="messages",
+        status=_UPSTREAM_STATUS,
+    )
+
+
 def unsupported_part_types(payload: dict[str, Any]) -> list[str]:
     """Return up to three distinct non-``text`` part types named in the request.
 
@@ -128,9 +192,9 @@ def unsupported_content_error_body(payload: dict[str, Any]) -> dict[str, Any]:
 
     types = unsupported_part_types(payload)
     named = ", ".join(f"'{t}'" for t in types)
-    detail = f"unsupported content part type {named}".rstrip()
+    detail = f" (non-text part types sent: {named})" if types else ""
     return _openai_error_body(
-        message=f"{_MESSAGE_PREFIX} ({detail}). {_MESSAGE_SUFFIX}",
+        message=f"{_MESSAGE_PREFIX}{detail}. {_MESSAGE_SUFFIX}",
         code=UNSUPPORTED_CONTENT_CODE,
         type_="invalid_request_error",
         param="messages",
@@ -158,8 +222,15 @@ def status_error_detail(exc: httpx.HTTPStatusError) -> str:
 def classify_unsupported_content(
     status_code: int, body_text: str, payload: dict[str, Any]
 ) -> UnsupportedContentHit | None:
-    """Match the raw upstream reply; on a hit log ONE WARNING and return the result."""
-    if not match_unsupported_content(status_code, body_text):
+    """Match the raw upstream reply (file part or no-projector image).
+
+    On a hit, log ONE WARNING and return the result.
+    """
+    if match_image_input_unsupported(status_code, body_text):
+        error_body = image_input_unsupported_error_body()
+    elif match_unsupported_content(status_code, body_text):
+        error_body = unsupported_content_error_body(payload)
+    else:
         return None
     logger.warning(
         "llama-server rejected a content part: HTTP %d, upstream body: %s",
@@ -167,7 +238,7 @@ def classify_unsupported_content(
         body_text[:_MAX_BODY_CHARS],
     )
     return UnsupportedContentHit(
-        error_body=unsupported_content_error_body(payload),
+        error_body=error_body,
         error_detail=error_detail_from_text(status_code, body_text),
     )
 
@@ -235,10 +306,10 @@ async def tools_non_stream_upstream_error(
 
     The failed row carries ``status=<code>: <upstream text[:400]>`` and the
     turn's already-recorded memory ``tool_calls`` (``pending``) are flushed
-    onto it. Reply: a recognised unsupported-content rejection -> explicit
-    400; a JSON object body below 500 -> 200 passed through verbatim; any
-    other (non-JSON 4xx, 5xx) -> 502. Logs nothing: the retry helper's single
-    WARNING is the one line.
+    onto it. Reply: the no-projector image rejection (after that flush) or a
+    recognised unsupported-content rejection -> explicit 400; a JSON object
+    body below 500 -> 200 passed through verbatim; any other (non-JSON 4xx,
+    5xx) -> 502. Logs nothing: the retry helper's single WARNING is the one line.
     """
     # Function-local import: chat.py imports this module at import time (cycle).
     from audittrace.routes.chat import (
@@ -265,6 +336,10 @@ async def tools_non_stream_upstream_error(
         duration_ms=int((time.perf_counter() - perf_start) * 1000),
     )
     await _flush_pending_tool_calls(pending, interaction_id)
+    if match_image_input_unsupported(status, text):
+        return JSONResponse(
+            status_code=_UPSTREAM_STATUS, content=image_input_unsupported_error_body()
+        )
     if match_unsupported_content(status, text):
         return JSONResponse(
             status_code=_UPSTREAM_STATUS,

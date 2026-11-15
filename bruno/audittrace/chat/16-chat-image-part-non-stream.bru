@@ -1,0 +1,99 @@
+meta {
+  name: POST /v1/chat/completions (image_url content part, non-stream)
+  type: http
+  seq: 16
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": [
+        { "type": "text", "text": "{{imagePartPrompt}}" },
+        { "type": "image_url", "image_url": { "url": "{{imagePartData}}" } }
+      ] }
+    ],
+    "stream": false,
+    "max_tokens": 2048
+  }
+}
+
+script:pre-request {
+  // Body rebuilt here so values containing quotes cannot break the JSON.
+  // `imagePartData` is a data URL (data:image/...;base64,...). Its default in
+  // environments/*.bru is a small test diagram that carries the text
+  // "Decision: ADR-049"; the default `imagePartPrompt` needs BOTH the image
+  // (to read the decision number) and a memory tool call (to answer).
+  const image = bru.getEnvVar("imagePartData");
+  if (typeof image !== "string" || !image.startsWith("data:image/")) {
+    throw new Error("imagePartData must be a data:image/... URL (default in environments/*.bru)");
+  }
+  req.setBody({
+    model: "audittrace-default",
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: bru.getEnvVar("imagePartPrompt") },
+        { type: "image_url", image_url: { url: image } }
+      ]
+    }],
+    stream: false,
+    max_tokens: 2048
+  });
+  // X-Session-Id: the caller's `imagePartSessionId`, else a generated one,
+  // stashed so the audit lookups can find THIS turn.
+  const given = bru.getEnvVar("imagePartSessionId");
+  const sid = given ? given : "bru-image-part-ns-" + Date.now();
+  req.setHeader("X-Session-Id", sid);
+  bru.setVar("imagePartSessionId", sid);
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("OpenAI shape preserved (feedback_openai_schema_inviolate)", function() {
+    const b = res.getBody();
+    expect(b.object).to.equal("chat.completion");
+    expect(b.choices).to.be.an("array").with.lengthOf.at.least(1);
+    expect(b.choices[0].message.role).to.equal("assistant");
+    expect(b.choices[0].message.content).to.be.a("string");
+  });
+  test("no echo of the image data", function() {
+    const raw = JSON.stringify(res.getBody());
+    expect(raw).to.not.contain("base64,");
+  });
+  test("the answer names what the image shows (imagePartExpect)", function() {
+    expect(res.getBody().choices[0].message.content).to.contain(bru.getEnvVar("imagePartExpect"));
+  });
+  test("x-trace-id is 32 lowercase hex (stashed for audit/02)", function() {
+    const traceId = res.getHeader("x-trace-id");
+    expect(traceId).to.match(/^[0-9a-f]{32}$/);
+    bru.setVar("imagePartTraceId", traceId);
+  });
+}
+
+docs {
+  MODEL-MMPROJ-PERMANENT. Sends a user turn with a text part and an
+  `image_url` part (a data URL) through the audited /v1 proxy. The chat
+  llama-server runs with a vision projector (`--mmproj`), so the model reads
+  the image and, in memory_mode=tools, also calls a recall tool.
+
+  Inputs (env vars, defaults in environments/*.bru): `imagePartData` (a
+  data:image/... URL; the default is a small test diagram), `imagePartPrompt`,
+  `imagePartExpect` (a token the answer must contain; set it together with
+  the image and the prompt), `imagePartSessionId` (empty = generated).
+  Stashes `imagePartSessionId` and `imagePartTraceId`; read the audit row
+  with `audit/02-list-by-trace-id.bru --env-var traceId=<imagePartTraceId>`.
+  Needs scope audittrace:query (+ memory read scopes for the recall).
+}

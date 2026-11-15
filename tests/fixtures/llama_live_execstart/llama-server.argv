@@ -1,6 +1,8 @@
 /home/lfdesousa/build/llama.cpp/build-vulkan-new/bin/llama-server
 --model
 /home/lfdesousa/models/Qwen_Qwen3.8-27B-Q4_K_M.gguf
+--mmproj
+/home/lfdesousa/models/mmproj-Qwen3.8-27B-F16.gguf
 --ctx-size
 163840
 --batch-size
