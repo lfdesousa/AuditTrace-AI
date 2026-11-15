@@ -1131,6 +1131,13 @@ console:
     # var below (never coerced to "sovereign"), so an operator can flip it
     # back to "mongo" and the fork reverts, no chart-code change needed.
     memoryBackend: "sovereign"
+    # BFF-CHAT-ROUTE-ERRORS R9 (operator ruling Q2) -- the retry bound of the
+    # fork's model client for the AuditTrace custom endpoint, rendered as
+    # `addParams: {maxRetries: N}` in librechat.yaml. The client retries every
+    # 5xx; absent, one refused turn is 7 requests and about 70-120 s of silence
+    # (measured on the fork's built getOpenAIConfig). 1 = one quick retry that
+    # rides out a pod restart; 0 = none. Applies to every failure of the endpoint.
+    endpointMaxRetries: 1
     # M3-WU-D2-4 — timeout for the panel's memory CRUD calls to the BFF
     # (milliseconds). Panel memory CRUD via the BFF is fast; the observed
     # ~150-180s latency belongs to the CHAT recall-tool-loop over `/v1`,
