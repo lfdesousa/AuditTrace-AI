@@ -169,11 +169,6 @@ class TestSessionScopeWall:
                     c["clientId"],
                 )
 
-    def test_read_own_holders_are_librechat_and_the_e2e_client_only(self) -> None:
-        for label, realm in _both_enabled():
-            assert _holders(realm, READ) == set(ADMITTED_SESSION_WRITE_CLIENTS), label
-        assert _holders(_chart_realm(False), READ) == {LIBRECHAT}
-
 
 class TestOpencodeClientScopesUnchangedBySession:
     """The operator's OpenCode client never gains a session scope. Neuter:

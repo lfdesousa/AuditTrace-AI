@@ -7,12 +7,17 @@ client's audience so the result deterministically carries
 ``aud=audittrace-server`` (the ``aud-audittrace-server`` protocol mapper
 WU-1 already put on that client — see ``bff/README.md``).
 
-The exchange's ``scope`` is per-caller, not fixed: the chat path
-(``bff/app.py::chat_completions``) calls :func:`exchange_token` with
-``requested_scope=None``, which omits the ``scope`` form field entirely —
-Keycloak then falls back to the target client's own DEFAULT scopes
-(``audittrace:query`` among them), exactly WU-1/WU-2's original,
-unregressed behaviour. The memory-proxy path (M3-WU-D2-1,
+The exchange's ``scope`` is per-caller, not fixed. What Keycloak 24's legacy
+exchange grants (measured, LC10A-CHAT-EXCHANGE-SCOPE): the target client's
+DEFAULT scopes, plus the requested scopes that are optional on the target and
+held by the subject token, plus ``openid``; when the ``scope`` field is
+OMITTED the requested set is the subject token's own scope set (since the
+2026-11-08 ruling the login token carries every BFF write scope, so an omitted
+field mints all of them). The chat path (``bff/app.py::chat_completions``)
+therefore requests ``bff.chat_scopes.CHAT_SCOPE_STRING`` from the dedicated
+``audittrace-librechat-chat`` audience (``audience=``) and passes a
+``scope_ceiling``: a minted token with a scope outside it is refused before
+it is returned. The memory-proxy path (M3-WU-D2-1,
 ``bff/memory_proxy.py``) passes
 ``requested_scope=bff.memory_scopes.MEMORY_SCOPE_STRING`` to explicitly
 request the memory read/write scopes, which are OPTIONAL (not default) on
@@ -63,17 +68,26 @@ async def exchange_token(
     settings: Settings,
     http_client: httpx.AsyncClient,
     requested_scope: str | None = None,
+    *,
+    audience: str | None = None,
+    scope_ceiling: frozenset[str] | None = None,
 ) -> str:
     """RFC 8693 token-exchange ``inbound_token`` for an
     ``aud=audittrace-server`` access token minted for the SAME subject.
 
     ``requested_scope`` is an explicit, space-separated RFC 8693 ``scope``
-    request (see the module docstring). ``None`` (the chat path's default)
-    omits the ``scope`` form field entirely, preserving the original
-    WU-1/WU-2 exchange shape byte-for-byte — this is a deliberate
-    non-regression choice, not an oversight: adding an always-present
-    empty-string ``scope=`` field would itself be a behaviour change for
-    Keycloak's exchange endpoint.
+    request (see the module docstring). ``None`` omits the ``scope`` form
+    field entirely, which makes Keycloak grant the subject token's own
+    scopes: only a caller that wants that passes ``None``.
+
+    ``audience`` (keyword-only) overrides ``settings.exchange_audience``; it
+    is chosen with ``is not None``, never ``or``, so an empty string is sent
+    as given and fails at Keycloak, never silently falling back to the login
+    audience. ``scope_ceiling`` (keyword-only) is an allow-list: when given
+    and the minted token's scope set is not a subset of it, a
+    :class:`TokenExchangeError` naming the unexpected scopes (names only,
+    never the token) is raised BEFORE the ``granted=`` line is logged and
+    before the token is returned.
 
     Returns the raw minted access token string. Raises
     :class:`TokenExchangeError` on any Keycloak-side failure, a
@@ -87,7 +101,7 @@ async def exchange_token(
         "subject_token": inbound_token,
         "subject_token_type": settings.exchange_subject_token_type,
         "requested_token_type": settings.exchange_requested_token_type,
-        "audience": settings.exchange_audience,
+        "audience": audience if audience is not None else settings.exchange_audience,
     }
     if requested_scope:
         data["scope"] = requested_scope
@@ -124,6 +138,14 @@ async def exchange_token(
             "identity assertion failed: minted token sub "
             f"{minted_sub!r} != inbound token sub {inbound_sub!r}"
         )
+    if scope_ceiling is not None:
+        unexpected = sorted(
+            set(str(minted_claims.get("scope", "")).split()) - scope_ceiling
+        )
+        if unexpected:
+            raise TokenExchangeError(
+                "scope ceiling exceeded: unexpected=" + ",".join(unexpected)
+            )
     _log_scope_outcome(requested_scope, minted_claims)
     return minted
 

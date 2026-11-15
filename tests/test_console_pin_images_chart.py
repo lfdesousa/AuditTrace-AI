@@ -120,7 +120,13 @@ untouched (no fork change in v1.31.0).
 ``sha256:25e25980...``, and the fork pin to ``6143572`` / ``sha256:7bce9819...``
 (fork PR #15, LC-10a session-id forwarding; the image validated live as the
 ``lc10a-6143572`` candidate and pushed unchanged), each by a registry HEAD
-(2026-11-10). Assertions below reflect the ``1.32.0`` / ``6143572`` pins.
+(2026-11-10).
+
+**Superseded at the v1.33.0 Phase-E re-pin (2026-11-14):** BFF moved to
+``1.33.0`` / ``sha256:75663c7b...`` and the tests image to ``1.33.0`` /
+``sha256:a842e95a...`` (registry HEAD and buildx, which agree, 2026-11-14).
+The fork pin is untouched (one-sided release). Assertions below reflect the
+``1.33.0`` / ``6143572`` pins.
 
 **Superseded again at the v1.29.5 Phase-E re-pin (2026-10-15):** BFF moved
 to ``1.29.5`` / ``sha256:fe16703c...`` and the tests image to ``1.29.5`` /
@@ -250,13 +256,13 @@ class TestBothImagesRenderWithDigest:
         repo_tag, _, digest = image.partition("@")
         assert digest, f"BFF image {image!r} carries no @digest suffix"
         assert _SHA256_RE.match(digest), f"malformed digest {digest!r}"
-        assert repo_tag.endswith(":1.32.0"), f"unexpected BFF tag: {repo_tag!r}"
+        assert repo_tag.endswith(":1.33.0"), f"unexpected BFF tag: {repo_tag!r}"
 
     def test_bff_digest_matches_pinned_values_digest(self) -> None:
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         pinned = values["console"]["bff"]["image"]["digest"]
         assert pinned == (
-            "sha256:a5722e2192e87fdef55bbaffb73d3a96ecc22e0c8ba12f21e6568a17bbdee12f"
+            "sha256:75663c7bea46c68b07e107926944eca1c70cd1a33ef3c4d1386c8debfd88def8"
         ), f"BFF digest in values.yaml drifted from the verified pin: {pinned!r}"
         resources = _render(_CONSOLE_ENABLED)
         assert _bff_image(resources).endswith(f"@{pinned}")
@@ -323,7 +329,7 @@ class TestBffDigestPlumbing:
             f"suffix entirely, got {image!r} — the conditional either "
             "isn't guarding the digest, or a stale value leaked through"
         )
-        assert image == "docker.io/lfds/audittrace-librechat-bff:1.32.0"
+        assert image == "docker.io/lfds/audittrace-librechat-bff:1.33.0"
 
     def test_restore_setting_digest_brings_the_suffix_back(self) -> None:
         custom_digest = "sha256:" + "ab" * 32
@@ -427,9 +433,9 @@ class TestNoLocalRegistryOrStaleTagSurvives:
         test_rendered_tests_image_equals_v1_28_0_pin_exactly."""
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         image = values["tests"]["image"]
-        assert image["tag"] == "1.32.0"
+        assert image["tag"] == "1.33.0"
         assert image["digest"] == (
-            "sha256:25e259808e419d63e8c28dd99346dfaf046b2e41c12efa931de39c5ebc0f9130"
+            "sha256:a842e95a7f3fe2dd408a917bd983805f3394630923123d2f4b663ec790677e83"
         )
 
 

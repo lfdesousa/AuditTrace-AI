@@ -17,6 +17,7 @@ import functools
 import importlib
 import re
 
+from bff.chat_scopes import CHAT_SCOPES
 from tests.test_chart_drift_guards import REPO_ROOT
 from tests.test_chart_drift_guards_acl_write import SCRIPT, _client
 from tests.test_chart_drift_guards_session_e2e import _chart_realm
@@ -71,13 +72,28 @@ class TestDerivedExchangeScopes:
             "memory:episodic:write",
         ):
             assert must in scopes
-        assert not any(s.startswith(("audittrace:", "memory:corpus")) for s in scopes)
+        # The chat route's own scope joined the union with bff/chat_scopes.py
+        # (LC10A-CHAT-EXCHANGE-SCOPE): pinned by equality, so no other
+        # audittrace:* scope (audit, admin, context) can ever join silently.
+        assert {s for s in scopes if s.startswith("audittrace:")} == {
+            "audittrace:query"
+        }
+        assert not any(s.startswith("memory:corpus") for s in scopes)
 
 
 class TestLoginRequestCoversEveryExchange:
     def test_openid_scope_is_a_superset_of_every_bff_exchange_scope(self) -> None:
-        rendered = set(_rendered_openid_scope())
-        missing = sorted(bff_exchange_scopes() - rendered)
+        # A DEFAULT scope of the login client is granted without being
+        # requested at login (measured, LC10A K2), so a scope that is a default
+        # of audittrace-librechat needs no mention in OPENID_SCOPE: the
+        # exchange scopes must be covered by the login request UNION the login
+        # client's default scopes. openidScope itself is unchanged.
+        client = _client(_chart_realm(True), LIBRECHAT)
+        assert client is not None
+        covered = set(_rendered_openid_scope()) | set(
+            client.get("defaultClientScopes", [])
+        )
+        missing = sorted(bff_exchange_scopes() - covered)
         assert not missing, (
             f"console.librechat.openidScope lacks {missing}: Keycloak 24's token "
             "exchange would drop them and the write would 403"
@@ -128,11 +144,33 @@ class TestHookOffersEveryExchangeScopeToLibrechat:
 
     def test_every_exchange_scope_is_hook_bound_or_a_baseline_read(self) -> None:
         bound = _hook_bound_to_librechat(SCRIPT.read_text(encoding="utf-8"))
-        unbound = sorted(bff_exchange_scopes() - bound - BASELINE_REALM_DEFAULT_READS)
+        # audittrace:query is the realm-defined route scope: a default of the
+        # login client since the first import and, for the chat turn, of the
+        # chat audience (bound below), so it is exempt here like the reads.
+        unbound = sorted(
+            bff_exchange_scopes()
+            - bound
+            - BASELINE_REALM_DEFAULT_READS
+            - {"audittrace:query"}
+        )
         assert not unbound, (
             f"not bound to {LIBRECHAT} by the provisioning hook: {unbound} "
             "(an already-imported realm only gets new bindings from the hook)"
         )
+
+    def test_the_chat_scopes_are_hook_bound_as_default_to_the_chat_audience(
+        self,
+    ) -> None:
+        text = SCRIPT.read_text(encoding="utf-8")
+        arr = re.search(r"^CHAT_AUD_DEFAULT_SCOPES=\((.*?)\)$", text, re.M)
+        assert arr is not None, "the hook lost its chat audience scope array"
+        assert set(re.findall(r'"([^"]+)"', arr.group(1))) == set(CHAT_SCOPES)
+        assert re.search(
+            r'for SCOPE in "\$\{CHAT_AUD_DEFAULT_SCOPES\[@\]\}"; do\s*\n'
+            r'\s*chat_aud_resolve_scope "\$\{SCOPE\}"\s*\n'
+            r'\s*bind_scope "\$\{CHAT_AUD_CLIENT_ID\}" "\$\{SCOPE\}" "default"',
+            text,
+        ), "the chat scopes are no longer bound as DEFAULT to the chat audience"
 
     def test_the_baseline_exemption_is_real_and_not_widened(self) -> None:
         client = _client(_chart_realm(True), LIBRECHAT)

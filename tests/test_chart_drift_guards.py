@@ -5232,9 +5232,9 @@ class TestLibrechatConsoleClient:
     ``memory:session:write``: it is a READ-OWN scope (same family as
     ``memory:conversational:read-own``/``memory:semantic:read``, both
     already default here), and the plain chat-token RFC 8693 exchange
-    (``bff/exchange.py::exchange_token``, ``requested_scope=None``) mints a
-    token carrying only the TARGET client's DEFAULT scopes — an
-    optional-only grant would never reach the ``/v1`` tool loop through
+    (``bff/exchange.py::exchange_token``, requested by name from the
+    ``audittrace-librechat-chat`` audience) mints a token carrying the
+    audience's DEFAULT scopes — an optional-only grant would never reach the ``/v1`` tool loop through
     that path, making ``recall_attachments`` unreachable from the real
     console. See ``TestKeycloakSessionReadOwnScopeGovernance`` for the
     dedicated provisioner-side (``configmap``/``scripts/setup-memory-

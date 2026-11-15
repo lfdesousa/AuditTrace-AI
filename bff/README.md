@@ -101,8 +101,17 @@ entry"). `clientAuthenticatorType: client-secret`,
 see `scripts/mint-dev-jwt.sh`'s header comment for the retrieval
 runbook). It carries no `defaultClientScopes` of its own: its only job
 is to authenticate the token-exchange call; the resulting token's
-audience/scope come from the `audience=audittrace-librechat` exchange
-parameter, not from this client's own scope grants.
+audience/scope come from the `audience=` exchange parameter and the
+target client's own scope profile, not from this client's scope grants.
+The chat turn's target is the dedicated `audittrace-librechat-chat`
+client (LC10A-CHAT-EXCHANGE-SCOPE; `AUDITTRACE_BFF_CHAT_EXCHANGE_AUDIENCE`),
+whose DEFAULT scopes are exactly `bff/chat_scopes.py::CHAT_SCOPES`; the
+BFF requests those six by name and refuses (502) any minted token with a
+scope outside `CHAT_SCOPE_CEILING`, and answers a caller whose own token
+lacks one of them with an explicit 403 `insufficient_scope` before any
+exchange. Keycloak 24's legacy exchange grants the target's DEFAULT scopes
+plus requested optionals the subject holds, and, when `scope` is omitted,
+the subject token's own scopes (not "the target's defaults").
 
 **Deviation note (documented per the builder's fail-closed-choice
 discipline, CONFIRMED by live evidence 2026-08-29):** wiring the

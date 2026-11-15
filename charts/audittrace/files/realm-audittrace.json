@@ -934,6 +934,42 @@
       "defaultClientScopes": [],
       "optionalClientScopes": [],
       "protocolMappers": []
+    },
+    {
+      "description": "Token-exchange audience for the chat turn (LC10A-CHAT-EXCHANGE-SCOPE). No flow of its own: its DEFAULT scopes are exactly the chat read scopes (bff/chat_scopes.py), so an exchange to this audience grants exactly those and nothing else.",
+      "clientId": "audittrace-librechat-chat",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": false,
+      "protocol": "openid-connect",
+      "attributes": {
+        "token-exchange.authorized-source-client": "audittrace-librechat-bff"
+      },
+      "defaultClientScopes": [
+        "audittrace:query",
+        "memory:conversational:read-own",
+        "memory:episodic:read",
+        "memory:procedural:read",
+        "memory:semantic:read",
+        "memory:session:read-own"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-audittrace-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "audittrace-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
     }{{- if .Values.keycloak.aclE2eClient.enabled }},
     {
       "description": "ACL WU-2c E2E-only device-flow client (sunset: WU-4 merge, keycloak.aclE2eClient.enabled=false). Holds ONLY memory:acl:read-own + memory:acl:write; no offline_access, no refresh, consent required.",
