@@ -9,6 +9,7 @@ are the repo's own (``create_test_container``) with the real
 from __future__ import annotations
 
 import asyncio
+import importlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -32,6 +33,20 @@ SCOPES = (
 )
 
 
+def reload_mcp_write_tools() -> None:
+    """Re-register the real ``write_decision`` / ``write_skill`` tools.
+
+    Other test files reset the MCP write registry on teardown (and reload the
+    handlers on setup, for themselves). Run after one of them, a test that
+    depends on the tools finds none, so every test here that needs them starts
+    from a freshly registered pair, whatever ran before it."""
+    from audittrace.tools import mcp_write_handlers
+    from audittrace.tools.mcp_write_registry import reset_mcp_write_registry_for_tests
+
+    reset_mcp_write_registry_for_tests()
+    importlib.reload(mcp_write_handlers)
+
+
 def distinct_body(n_chars: int) -> str:
     """Exactly *n_chars* characters, every 9-character line carrying its own
     index, so an omitted, repeated or reordered span is visible."""
@@ -49,6 +64,7 @@ def memory_client() -> Iterator[TestClient]:
     from audittrace.server import create_app
     from audittrace.services.semantic import ChromaSemanticService
 
+    reload_mcp_write_tools()
     stub = AsyncMock(side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts])
     chroma = asyncio.run(MockChromaDBFactory().get_client())
     container = create_test_container()

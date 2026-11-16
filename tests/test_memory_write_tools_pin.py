@@ -9,6 +9,7 @@ import inspect
 from audittrace.tools import mcp_write_handlers
 from audittrace.tools.mcp_write_registry import MCP_WRITE_TOOL_REGISTRY
 from tests import test_memory_write_limit
+from tests.memory_truncation_support import reload_mcp_write_tools
 
 # The tools ``test_mcp_write_tool_over_the_limit_is_a_tool_error_and_not_indexed``
 # is parametrized over.
@@ -18,6 +19,7 @@ BOUNDED_TOOLS = {"write_decision", "write_skill"}
 class TestMemoryWriteToolsPin:
     def test_every_registered_mcp_write_tool_has_an_over_limit_case(self) -> None:
         assert mcp_write_handlers is not None  # importing it registers the tools
+        reload_mcp_write_tools()  # whatever ran before this test
         assert set(MCP_WRITE_TOOL_REGISTRY) == BOUNDED_TOOLS
 
     def test_the_pinned_names_are_the_ones_the_limit_test_exercises(self) -> None:

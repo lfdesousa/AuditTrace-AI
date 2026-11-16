@@ -1,0 +1,5 @@
+# Test-order pollution found by the first full run (4 failed, 11167 passed)
+Other test files reset the MCP write registry on teardown; the tests of this change that need write_decision / write_skill then found none. Order that reproduces it:
+  pytest tests/test_lc9_wp2b_pg.py tests/test_memory_stamp_is_server_only.py tests/test_memory_write_limit.py tests/test_memory_write_tools_pin.py
+before the fix: 4 failed, 33 passed (test_a_stamp_in_an_mcp_write_is_stripped, both test_mcp_write_tool_over_the_limit_is_a_tool_error_and_not_indexed cases, test_every_registered_mcp_write_tool_has_an_over_limit_case)
+after the fix (reload_mcp_write_tools in tests/memory_truncation_support.py): the same order plus test_mcp_write_tools_routes.py: 52 passed
