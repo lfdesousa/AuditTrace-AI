@@ -1,0 +1,654 @@
+{
+ "K1": {
+  "failed": [
+   "tests/test_memory_stamp_is_server_only.py::TestStampIsServerOnly::test_a_stamp_in_a_direct_write_is_stripped_and_the_read_is_unverified",
+   "tests/test_memory_stamp_is_server_only.py::TestStampIsServerOnly::test_a_stamp_in_an_update_is_stripped"
+  ],
+  "failed_count": 2,
+  "files": [
+   "src/audittrace/routes/memory.py"
+  ],
+  "rc": 1,
+  "summary": "2 failed, 126 passed in 154.66s (0:02:34)",
+  "what": "the REST semantic writes keep a caller's stamp"
+ },
+ "K2": {
+  "failed": [
+   "tests/test_memory_stamp_is_server_only.py::TestStampIsServerOnly::test_a_stamp_in_an_mcp_write_is_stripped"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/tools/mcp_write_handlers.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 141.18s (0:02:21)",
+  "what": "the MCP write tools keep a caller's stamp"
+ },
+ "K3": {
+  "failed": [
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_every_chunk_manifest_row_is_tombstoned",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_blank_refold_is_audited_once_with_the_removed_count",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[empty]",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[spaces-and-newline]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[1299-trailing-newlines]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[201-trailing-newlines]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[250-trailing-newlines]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[600-trailing-spaces]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[interior-run-of-3-chunks]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[leading-run-of-2-chunks]"
+  ],
+  "failed_count": 10,
+  "files": [
+   "src/audittrace/routes/memory.py"
+  ],
+  "rc": 1,
+  "summary": "10 failed, 118 passed in 140.30s (0:02:20)",
+  "what": "the fold chunks with _chunk_text again (a whitespace window is dropped)"
+ },
+ "K4": {
+  "failed": [
+   "tests/test_memory_chunk_document.py::TestChunkDocument::test_reassembly_is_the_text_for_2000_random_documents",
+   "tests/test_memory_chunk_document.py::TestChunkDocument::test_the_whitespace_window_goes_to_the_chunk_before_it",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[1299-trailing-newlines]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[201-trailing-newlines]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[250-trailing-newlines]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[600-trailing-spaces]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[interior-run-of-3-chunks]"
+  ],
+  "failed_count": 7,
+  "files": [
+   "src/audittrace/routes/memory_chunking.py"
+  ],
+  "rc": 1,
+  "summary": "7 failed, 121 passed in 143.73s (0:02:23)",
+  "what": "chunk_document drops a whitespace window instead of attaching it"
+ },
+ "K5": {
+  "failed": [
+   "tests/test_memory_pdf_upload_cap.py::TestPdfUploadCap::test_an_upload_at_its_bound_is_held_in_one_buffer"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory_write_refusal.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 136.84s (0:02:16)",
+  "what": "the upload is read in two pieces and joined (a second copy)"
+ },
+ "K6": {
+  "failed": [
+   "tests/test_memory_pdf_upload_cap.py::TestPdfUploadCap::test_a_pdf_over_the_upload_cap_is_refused_below_the_fold_bound"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/services/memory_write_limit.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 136.70s (0:02:16)",
+  "what": "the PDF upload cap is ignored (only the fold's bound applies)"
+ },
+ "K7": {
+  "failed": [
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_a_declared_console_upload_over_the_ceiling_is_refused_unread",
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_an_undeclared_streamed_upload_is_cut_at_the_ceiling",
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_any_other_route_has_the_general_ceiling"
+  ],
+  "failed_count": 3,
+  "files": [
+   "bff/app.py"
+  ],
+  "rc": 1,
+  "summary": "3 failed, 125 passed in 138.53s (0:02:18)",
+  "what": "the BFF body ceiling is not installed"
+ },
+ "K8": {
+  "failed": [
+   "tests/test_memory_upload_refusals.py::TestMemoryUploadRefusals::test_409_when_a_concurrent_write_wins_the_object_is_overwritten_and_audited[create]",
+   "tests/test_memory_upload_refusals.py::TestMemoryUploadRefusals::test_409_when_a_concurrent_write_wins_the_object_is_overwritten_and_audited[upload]"
+  ],
+  "failed_count": 2,
+  "files": [
+   "src/audittrace/routes/memory_layer_writes.py"
+  ],
+  "rc": 1,
+  "summary": "2 failed, 126 passed in 139.43s (0:02:19)",
+  "what": "a write that lost the manifest race is not audited"
+ },
+ "K9": {
+  "failed": [
+   "tests/test_memory_refusal_audit.py::TestMemoryRefusalAudit::test_a_413_writes_no_audit_row",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[post-episodic]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_the_limit_counts_utf8_bytes_not_characters"
+  ],
+  "failed_count": 3,
+  "files": [
+   "src/audittrace/routes/memory.py"
+  ],
+  "rc": 1,
+  "summary": "3 failed, 125 passed in 135.27s (0:02:15)",
+  "what": "POST /memory/episodic refuses an over-limit document only after it has stored and audited it"
+ },
+ "M1": {
+  "failed": [
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_stamped_document_without_chunk_0_is_refused_from_any_chunk",
+   "tests/test_wu1_memory_retrieval_correctness.py::TestWholeDocumentRead::test_a_stamped_row_never_falls_back_to_one_chunk"
+  ],
+  "failed_count": 2,
+  "files": [
+   "src/audittrace/routes/memory_whole_document.py"
+  ],
+  "rc": 1,
+  "summary": "2 failed, 126 passed in 140.23s (0:02:20)",
+  "what": "a stamped document without chunk 0 falls back to one chunk"
+ },
+ "M10": {
+  "failed": [
+   "tests/test_memory_pdf_upload_bound.py::TestPdfUploadBound::test_a_pdf_one_byte_over_its_bound_is_refused_and_not_quarantined",
+   "tests/test_memory_pdf_upload_cap.py::TestPdfUploadCap::test_a_pdf_over_the_upload_cap_is_refused_below_the_fold_bound"
+  ],
+  "failed_count": 2,
+  "files": [
+   "src/audittrace/routes/memory_write_refusal.py"
+  ],
+  "rc": 1,
+  "summary": "2 failed, 126 passed in 170.64s (0:02:50)",
+  "what": "a PDF is not bounded at upload"
+ },
+ "M11": {
+  "failed": [
+   "tests/test_memory_pdf_upload_bound.py::TestPdfUploadBound::test_claiming_pdf_without_the_magic_bytes_keeps_the_text_bound"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory_write_refusal.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 169.80s (0:02:49)",
+  "what": "the claimed content type alone makes an upload a PDF"
+ },
+ "M12": {
+  "failed": [
+   "tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_a_declared_body_over_the_ceiling_is_refused_unparsed",
+   "tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_an_mcp_request_over_the_ceiling_is_refused",
+   "tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_an_undeclared_streamed_body_is_cut_at_the_ceiling",
+   "tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_an_upload_over_its_ceiling_is_refused_unspooled"
+  ],
+  "failed_count": 4,
+  "files": [
+   "src/audittrace/server.py"
+  ],
+  "rc": 1,
+  "summary": "4 failed, 124 passed in 154.92s (0:02:34)",
+  "what": "the request-body ceiling is not installed"
+ },
+ "M13": {
+  "failed": [
+   "tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_an_undeclared_streamed_body_is_cut_at_the_ceiling"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/memory_body_limit_middleware.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 137.86s (0:02:17)",
+  "what": "only a declared Content-Length is checked, a stream is not counted"
+ },
+ "M14": {
+  "failed": [
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_mcp_write_tool_over_the_limit_is_a_tool_error_and_not_indexed[write_skill-skills]",
+   "tests/test_memory_write_tools_pin.py::TestMemoryWriteToolsPin::test_every_registered_mcp_write_tool_has_an_over_limit_case"
+  ],
+  "failed_count": 2,
+  "files": [
+   "src/audittrace/tools/mcp_write_handlers.py"
+  ],
+  "rc": 1,
+  "summary": "2 failed, 126 passed in 137.91s (0:02:17)",
+  "what": "a third MCP write tool is registered with no over-limit case"
+ },
+ "M15": {
+  "failed": [
+   "tests/test_memory_upload_manifest_row.py::TestMemoryUploadManifestRow::test_upload_records_a_manifest_row_with_the_stored_size[episodic]",
+   "tests/test_memory_upload_manifest_row.py::TestMemoryUploadManifestRow::test_upload_records_a_manifest_row_with_the_stored_size[procedural]",
+   "tests/test_memory_upload_refusals.py::TestMemoryUploadRefusals::test_200_twice_for_the_same_name_the_helpers_reseed_path",
+   "tests/test_memory_upload_refusals.py::TestMemoryUploadRefusals::test_409_when_a_concurrent_write_wins_the_object_is_overwritten_and_audited[upload]",
+   "tests/test_memory_upload_refusals.py::TestMemoryUploadRefusals::test_500_when_the_write_audit_cannot_be_written"
+  ],
+  "failed_count": 5,
+  "files": [
+   "src/audittrace/routes/memory.py"
+  ],
+  "rc": 1,
+  "summary": "5 failed, 123 passed in 138.97s (0:02:18)",
+  "what": "the upload does not record what it stored"
+ },
+ "M16": {
+  "failed": [
+   "tests/test_memory_upload_refusals.py::TestMemoryUploadRefusals::test_403_when_the_name_is_a_shared_corpus_document_and_nothing_is_stored"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 145.12s (0:02:25)",
+  "what": "the upload is not authorized before it writes"
+ },
+ "M2": {
+  "failed": [
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_failed_refold_is_refused_never_read_mixed[120]"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory_whole_document.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 146.13s (0:02:26)",
+  "what": "chunks are matched on the chunk COUNT only, not the fold identity"
+ },
+ "M3": {
+  "failed": [
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_a_chunk_whose_text_changed_under_its_stamp_is_refused"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory_whole_document.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 136.78s (0:02:16)",
+  "what": "the reassembled text is not hashed against the fold"
+ },
+ "M4": {
+  "failed": [
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_a_chunk_whose_text_changed_under_its_stamp_is_refused",
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_failed_refold_is_refused_never_read_mixed[120]"
+  ],
+  "failed_count": 2,
+  "files": [
+   "src/audittrace/routes/memory_whole_document.py"
+  ],
+  "rc": 1,
+  "summary": "2 failed, 126 passed in 136.26s (0:02:16)",
+  "what": "count only AND no hash"
+ },
+ "M5": {
+  "failed": [
+   "tests/test_memory_documents_folded_before_the_stamp.py::TestDocumentsFoldedBeforeTheStamp::test_one_refold_makes_an_old_document_exact_and_verified[True]"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory_fold_tail.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 137.82s (0:02:17)",
+  "what": "the tail walk ignores chunks stored at the pre-LC-9 id"
+ },
+ "M6": {
+  "failed": [
+   "tests/test_memory_documents_folded_before_the_stamp.py::TestDocumentsFoldedBeforeTheStamp::test_an_unstamped_document_is_reported_unverified",
+   "tests/test_memory_stamp_is_server_only.py::TestStampIsServerOnly::test_a_stamp_in_a_direct_write_is_stripped_and_the_read_is_unverified",
+   "tests/test_memory_stamp_is_server_only.py::TestStampIsServerOnly::test_a_stamp_in_an_mcp_write_is_stripped",
+   "tests/test_memory_stamp_is_server_only.py::TestStampIsServerOnly::test_a_stamp_in_an_update_is_stripped"
+  ],
+  "failed_count": 4,
+  "files": [
+   "src/audittrace/routes/memory_whole_document.py"
+  ],
+  "rc": 1,
+  "summary": "4 failed, 124 passed in 139.90s (0:02:19)",
+  "what": "an unstamped document is reported verified"
+ },
+ "M7": {
+  "failed": [
+   "tests/test_memory_fold_tail_guards.py::TestFoldTailGuards::test_a_tail_the_caller_may_not_remove_refuses_the_fold_before_any_write"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory_fold_tail.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 241.40s (0:04:01)",
+  "what": "the stale tail is removed without authorization"
+ },
+ "M8": {
+  "failed": [
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_blank_refold_is_audited_once_with_the_removed_count",
+   "tests/test_memory_fold_tail_guards.py::TestFoldTailGuards::test_a_fold_that_removes_a_tail_writes_one_audit_event"
+  ],
+  "failed_count": 2,
+  "files": [
+   "src/audittrace/routes/memory_fold_tail.py"
+  ],
+  "rc": 1,
+  "summary": "2 failed, 126 passed in 134.89s (0:02:14)",
+  "what": "the tail removal writes no audit event"
+ },
+ "M9": {
+  "failed": [
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_a_forged_stamp_costs_one_window_and_is_refused"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory_whole_document.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 138.73s (0:02:18)",
+  "what": "the first window is sized by the stamp the caller supplied"
+ },
+ "N1": {
+  "failed": [
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_control_last_length_under_the_cap_reads_byte_exact",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-episodic-decisions-post]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-episodic-decisions-put]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-episodic-decisions-upload]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-procedural-skills-post]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-procedural-skills-put]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-procedural-skills-upload]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-episodic-decisions-post]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-episodic-decisions-put]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-episodic-decisions-upload]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-procedural-skills-post]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-procedural-skills-put]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-procedural-skills-upload]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_two_byte_characters_past_the_cap_read_byte_exact"
+  ],
+  "failed_count": 14,
+  "files": [
+   "src/audittrace/routes/memory_whole_document.py"
+  ],
+  "rc": 1,
+  "summary": "14 failed, 114 passed in 136.88s (0:02:16)",
+  "what": "the read stops after the first window (the cap of the base)"
+ },
+ "N10": {
+  "failed": [
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_every_memory_write_route_is_covered_or_named_exempt"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 161.96s (0:02:41)",
+  "what": "a NEW memory write route is added with no test case"
+ },
+ "N2": {
+  "failed": [
+   "tests/test_memory_documents_folded_before_the_stamp.py::TestDocumentsFoldedBeforeTheStamp::test_one_refold_makes_an_old_document_exact_and_verified[False]",
+   "tests/test_memory_documents_folded_before_the_stamp.py::TestDocumentsFoldedBeforeTheStamp::test_one_refold_makes_an_old_document_exact_and_verified[True]",
+   "tests/test_memory_verified_means_the_fold.py::TestVerifiedMeansTheFold::test_a_reupload_without_a_refold_still_reads_the_old_fold_verified",
+   "tests/test_memory_verified_means_the_fold.py::TestVerifiedMeansTheFold::test_after_the_refold_the_stamp_equals_the_stored_object",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[1299-trailing-newlines]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[201-trailing-newlines]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[250-trailing-newlines]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[600-trailing-spaces]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[interior-run-of-3-chunks]",
+   "tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[leading-run-of-2-chunks]",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_a_missing_chunk_is_an_explicit_error_never_a_prefix",
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_a_chunk_whose_text_changed_under_its_stamp_is_refused",
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_a_clean_refold_after_a_failed_one_reads_whole_again",
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_a_forged_stamp_costs_one_window_and_is_refused",
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_failed_refold_is_refused_never_read_mixed[110]",
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_failed_refold_is_refused_never_read_mixed[120]",
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_stamped_document_without_chunk_0_is_refused_from_any_chunk",
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_the_stamp_and_the_verdict_are_in_the_response"
+  ],
+  "failed_count": 18,
+  "files": [
+   "src/audittrace/routes/memory.py"
+  ],
+  "rc": 1,
+  "summary": "18 failed, 110 passed in 136.27s (0:02:16)",
+  "what": "the fold no longer stamps its chunks"
+ },
+ "N3": {
+  "failed": [
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_a_missing_chunk_is_an_explicit_error_never_a_prefix",
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_a_forged_stamp_costs_one_window_and_is_refused",
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_failed_refold_is_refused_never_read_mixed[110]",
+   "tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_failed_refold_is_refused_never_read_mixed[120]"
+  ],
+  "failed_count": 4,
+  "files": [
+   "src/audittrace/routes/memory_whole_document.py"
+  ],
+  "rc": 1,
+  "summary": "4 failed, 124 passed in 138.76s (0:02:18)",
+  "what": "a short read is returned instead of refused"
+ },
+ "N4": {
+  "failed": [
+   "tests/test_memory_pdf_upload_bound.py::TestPdfUploadBound::test_a_pdf_one_byte_over_its_bound_is_refused_and_not_quarantined",
+   "tests/test_memory_pdf_upload_bound.py::TestPdfUploadBound::test_claiming_pdf_without_the_magic_bytes_keeps_the_text_bound",
+   "tests/test_memory_pdf_upload_cap.py::TestPdfUploadCap::test_a_pdf_over_the_upload_cap_is_refused_below_the_fold_bound",
+   "tests/test_memory_refusal_audit.py::TestMemoryRefusalAudit::test_a_413_writes_no_audit_row",
+   "tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_control_under_the_ceiling_the_document_bound_answers",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[post-episodic]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[post-procedural]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[put-episodic]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[put-procedural]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[upload-episodic]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[upload-procedural]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_mcp_write_tool_over_the_limit_is_a_tool_error_and_not_indexed[write_decision-decisions]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_mcp_write_tool_over_the_limit_is_a_tool_error_and_not_indexed[write_skill-skills]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_semantic_document_one_byte_over_is_refused_and_not_indexed[post-semantic]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_semantic_document_one_byte_over_is_refused_and_not_indexed[put-semantic]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_session_upload_over_the_limit_is_refused_and_not_stored",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_the_limit_counts_utf8_bytes_not_characters"
+  ],
+  "failed_count": 17,
+  "files": [
+   "src/audittrace/services/memory_write_limit.py"
+  ],
+  "rc": 1,
+  "summary": "17 failed, 111 passed in 139.28s (0:02:19)",
+  "what": "the size check accepts everything"
+ },
+ "N5": {
+  "failed": [
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_the_limit_counts_utf8_bytes_not_characters"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/services/memory_write_limit.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 135.47s (0:02:15)",
+  "what": "the bound counts characters, not bytes"
+ },
+ "N6": {
+  "failed": [
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[put-episodic]"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 135.56s (0:02:15)",
+  "what": "ONE route loses its check (PUT /memory/episodic)"
+ },
+ "N7": {
+  "failed": [
+   "tests/test_memory_pdf_upload_bound.py::TestPdfUploadBound::test_a_pdf_one_byte_over_its_bound_is_refused_and_not_quarantined",
+   "tests/test_memory_pdf_upload_bound.py::TestPdfUploadBound::test_claiming_pdf_without_the_magic_bytes_keeps_the_text_bound",
+   "tests/test_memory_pdf_upload_cap.py::TestPdfUploadCap::test_a_pdf_over_the_upload_cap_is_refused_below_the_fold_bound",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[upload-episodic]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[upload-procedural]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_session_upload_over_the_limit_is_refused_and_not_stored"
+  ],
+  "failed_count": 6,
+  "files": [
+   "src/audittrace/routes/memory_write_refusal.py"
+  ],
+  "rc": 1,
+  "summary": "6 failed, 122 passed in 134.04s (0:02:14)",
+  "what": "the upload read does not refuse (the document is stored)"
+ },
+ "N8": {
+  "failed": [
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_mcp_write_tool_over_the_limit_is_a_tool_error_and_not_indexed[write_decision-decisions]",
+   "tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_mcp_write_tool_over_the_limit_is_a_tool_error_and_not_indexed[write_skill-skills]"
+  ],
+  "failed_count": 2,
+  "files": [
+   "src/audittrace/tools/mcp_write_handlers.py"
+  ],
+  "rc": 1,
+  "summary": "2 failed, 126 passed in 135.32s (0:02:15)",
+  "what": "the MCP write tools lose their check"
+ },
+ "N9": {
+  "failed": [
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_a_blank_refold_whose_tail_the_caller_may_not_remove_is_refused",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_every_chunk_manifest_row_is_tombstoned",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_blank_refold_is_audited_once_with_the_removed_count",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[empty]",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[long-blank]",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[spaces-and-newline]",
+   "tests/test_memory_documents_folded_before_the_stamp.py::TestDocumentsFoldedBeforeTheStamp::test_one_refold_makes_an_old_document_exact_and_verified[False]",
+   "tests/test_memory_documents_folded_before_the_stamp.py::TestDocumentsFoldedBeforeTheStamp::test_one_refold_makes_an_old_document_exact_and_verified[True]",
+   "tests/test_memory_fold_tail_guards.py::TestFoldTailGuards::test_a_fold_that_removes_a_tail_writes_one_audit_event",
+   "tests/test_memory_fold_tail_guards.py::TestFoldTailGuards::test_a_tail_the_caller_may_not_remove_refuses_the_fold_before_any_write",
+   "tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_a_shorter_reindex_removes_the_stale_tail_chunks"
+  ],
+  "failed_count": 11,
+  "files": [
+   "src/audittrace/routes/memory_fold_tail.py"
+  ],
+  "rc": 1,
+  "summary": "11 failed, 117 passed in 181.51s (0:03:01)",
+  "what": "a shorter re-fold keeps its stale tail chunks"
+ },
+ "S14a": {
+  "failed": [
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_a_blank_refold_whose_tail_the_caller_may_not_remove_is_refused",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_every_chunk_manifest_row_is_tombstoned",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_blank_refold_is_audited_once_with_the_removed_count",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[empty]",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[long-blank]",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[spaces-and-newline]"
+  ],
+  "failed_count": 6,
+  "files": [
+   "src/audittrace/routes/memory.py"
+  ],
+  "rc": 1,
+  "summary": "6 failed, 122 passed in 135.44s (0:02:15)",
+  "what": "a blank fold leaves the previous fold's chunks in place"
+ },
+ "S14b": {
+  "failed": [
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_a_blank_refold_whose_tail_the_caller_may_not_remove_is_refused"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 127 passed in 126.13s (0:02:06)",
+  "what": "a blank fold removes the tail without authorizing it"
+ },
+ "S14c": {
+  "failed": [
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_every_chunk_manifest_row_is_tombstoned",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_blank_refold_is_audited_once_with_the_removed_count",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[empty]",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[long-blank]",
+   "tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[spaces-and-newline]"
+  ],
+  "failed_count": 5,
+  "files": [
+   "src/audittrace/routes/memory.py"
+  ],
+  "rc": 1,
+  "summary": "5 failed, 123 passed in 135.33s (0:02:15)",
+  "what": "a blank fold is looked up with the old 'kept' of a non-blank fold (tail starts at 1)"
+ },
+ "S15a": {
+  "failed": [
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_a_declared_console_upload_over_the_ceiling_is_refused_unread",
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_an_undeclared_streamed_upload_is_cut_at_the_ceiling",
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_any_other_route_has_the_general_ceiling"
+  ],
+  "failed_count": 3,
+  "files": [
+   "bff/body_limit_refusal.py"
+  ],
+  "rc": 1,
+  "summary": "3 failed, 125 passed in 181.81s (0:03:01)",
+  "what": "the BFF 413 loses the additive detail key"
+ },
+ "S15b": {
+  "failed": [
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_a_declared_console_upload_over_the_ceiling_is_refused_unread",
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_an_undeclared_streamed_upload_is_cut_at_the_ceiling",
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_any_other_route_has_the_general_ceiling"
+  ],
+  "failed_count": 3,
+  "files": [
+   "bff/body_limit_refusal.py"
+  ],
+  "rc": 1,
+  "summary": "3 failed, 125 passed in 162.58s (0:02:42)",
+  "what": "the BFF 413 is the old detail-only body (no error object)"
+ },
+ "S15c": {
+  "failed": [
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_a_declared_console_upload_over_the_ceiling_is_refused_unread",
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_an_undeclared_streamed_upload_is_cut_at_the_ceiling",
+   "tests/bff/test_body_limit.py::TestBffBodyLimit::test_any_other_route_has_the_general_ceiling"
+  ],
+  "failed_count": 3,
+  "files": [
+   "bff/body_limit_refusal.py"
+  ],
+  "rc": 1,
+  "summary": "3 failed, 125 passed in 154.32s (0:02:34)",
+  "what": "the BFF 413 error object drops its numeric status"
+ },
+ "baseline": [
+  [
+   "neuter-shard1.json",
+   0,
+   "128 passed in 138.10s (0:02:18)"
+  ],
+  [
+   "neuter-shard2.json",
+   0,
+   "128 passed in 138.14s (0:02:18)"
+  ],
+  [
+   "neuter-shard3.json",
+   0,
+   "128 passed in 137.91s (0:02:17)"
+  ],
+  [
+   "neuter-s14b2.json",
+   0,
+   "128 passed in 136.24s (0:02:16)"
+  ]
+ ],
+ "restored": [
+  [
+   "neuter-shard1.json",
+   0,
+   "128 passed in 127.35s (0:02:07)"
+  ],
+  [
+   "neuter-shard2.json",
+   0,
+   "128 passed in 134.25s (0:02:14)"
+  ],
+  [
+   "neuter-shard3.json",
+   0,
+   "128 passed in 141.26s (0:02:21)"
+  ],
+  [
+   "neuter-s14b2.json",
+   0,
+   "128 passed in 139.93s (0:02:19)"
+  ]
+ ]
+}
