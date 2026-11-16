@@ -129,3 +129,37 @@ class TestBlankRefoldClearsTheDocument:
         assert [
             d for d in memory_audit_details() if d.get("reason") == "refold_stale_tail"
         ] == []
+
+    def test_a_blank_refold_whose_tail_the_caller_may_not_remove_is_refused(
+        self, client: TestClient
+    ) -> None:
+        """Chunk 3's manifest row now belongs to the shared corpus (somebody
+        else's): the blank re-fold would remove it, so it is refused with 403
+        BEFORE anything is removed, and the document still reads as the first
+        fold."""
+        from audittrace.services.memory_keys import physical_key
+
+        _old_fold(client)
+        key = m._semantic_key("decisions", m._doc_id("decisions", "doc.md", 3))
+        rows = manifest()._rows
+        del rows[("semantic", physical_key(USER, key))]
+        asyncio.run(
+            manifest().record_create(
+                layer="semantic",
+                key=key,
+                title="doc.md",
+                size_bytes=1,
+                user_id="curator",
+                tier="corpus",
+                caller_can_write_shared=True,
+            )
+        )
+        assert upload(client, "episodic", "doc.md", "   \n").status_code == 200
+
+        refused = fold(client, "episodic", "doc.md", "decisions")
+
+        assert refused.status_code == 403
+        assert rows[("semantic", key)]["deleted_at_ms"] is None
+        back = read_whole(client, "decisions", "doc.md")
+        assert back.status_code == 200
+        assert back.json()["content"] == OLD
