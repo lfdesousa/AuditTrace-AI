@@ -1,0 +1,163 @@
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-episodic-decisions-upload]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-episodic-decisions-post]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-episodic-decisions-put]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-procedural-skills-upload]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-procedural-skills-post]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1-procedural-skills-put]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-episodic-decisions-upload]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-episodic-decisions-post]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-episodic-decisions-put]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-procedural-skills-upload]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-procedural-skills-post]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_document_past_the_cap_reads_byte_exact[1300400-procedural-skills-put]
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_two_byte_characters_past_the_cap_read_byte_exact
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_a_missing_chunk_is_an_explicit_error_never_a_prefix
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_a_shorter_reindex_leaves_no_stale_tail_in_the_read
+FAILED tests/test_memory_whole_document_complete.py::TestWholeDocumentReadIsComplete::test_a_shorter_reindex_removes_the_stale_tail_chunks
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[post-episodic]
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[post-procedural]
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[put-episodic]
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[put-procedural]
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[upload-episodic]
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_file_document_one_byte_over_is_refused_and_nothing_is_stored[upload-procedural]
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_the_limit_counts_utf8_bytes_not_characters
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_session_upload_over_the_limit_is_refused_and_not_stored
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_semantic_document_one_byte_over_is_refused_and_not_indexed[post-semantic]
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_semantic_document_one_byte_over_is_refused_and_not_indexed[put-semantic]
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_mcp_write_tool_over_the_limit_is_a_tool_error_and_not_indexed[write_decision-decisions]
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_mcp_write_tool_over_the_limit_is_a_tool_error_and_not_indexed[write_skill-skills]
+FAILED tests/test_memory_upload_manifest_row.py::TestMemoryUploadManifestRow::test_upload_records_a_manifest_row_with_the_stored_size[episodic]
+FAILED tests/test_memory_upload_manifest_row.py::TestMemoryUploadManifestRow::test_upload_records_a_manifest_row_with_the_stored_size[procedural]
+FAILED tests/test_memory_documents_folded_before_the_stamp.py::TestDocumentsFoldedBeforeTheStamp::test_an_unstamped_document_is_reported_unverified
+FAILED tests/test_memory_documents_folded_before_the_stamp.py::TestDocumentsFoldedBeforeTheStamp::test_one_refold_makes_an_old_document_exact_and_verified[False]
+FAILED tests/test_memory_documents_folded_before_the_stamp.py::TestDocumentsFoldedBeforeTheStamp::test_one_refold_makes_an_old_document_exact_and_verified[True]
+FAILED tests/test_memory_fold_tail_guards.py::TestFoldTailGuards::test_a_tail_the_caller_may_not_remove_refuses_the_fold_before_any_write
+FAILED tests/test_memory_fold_tail_guards.py::TestFoldTailGuards::test_a_fold_that_removes_a_tail_writes_one_audit_event
+FAILED tests/test_memory_pdf_upload_bound.py::TestPdfUploadBound::test_a_pdf_one_byte_over_its_bound_is_refused_and_not_quarantined
+FAILED tests/test_memory_pdf_upload_bound.py::TestPdfUploadBound::test_claiming_pdf_without_the_magic_bytes_keeps_the_text_bound
+FAILED tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_a_declared_body_over_the_ceiling_is_refused_unparsed
+FAILED tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_an_undeclared_streamed_body_is_cut_at_the_ceiling
+FAILED tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_an_upload_over_its_ceiling_is_refused_unspooled
+FAILED tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_an_mcp_request_over_the_ceiling_is_refused
+FAILED tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_control_under_the_ceiling_the_document_bound_answers
+FAILED tests/test_memory_refusal_audit.py::TestMemoryRefusalAudit::test_a_413_writes_no_audit_row
+FAILED tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_stamped_document_without_chunk_0_is_refused_from_any_chunk
+FAILED tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_failed_refold_is_refused_never_read_mixed[110]
+FAILED tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_failed_refold_is_refused_never_read_mixed[120]
+FAILED tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_a_clean_refold_after_a_failed_one_reads_whole_again
+FAILED tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_a_chunk_whose_text_changed_under_its_stamp_is_refused
+FAILED tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_a_forged_stamp_costs_one_window_and_is_refused
+FAILED tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_the_stamp_and_the_verdict_are_in_the_response
+FAILED tests/test_memory_whole_document_integrity.py::TestWholeDocumentIntegrity::test_single_chunk_fallback_is_for_unstamped_rows_only
+FAILED tests/test_memory_upload_refusals.py::TestMemoryUploadRefusals::test_403_when_the_name_is_a_shared_corpus_document_and_nothing_is_stored
+FAILED tests/test_memory_upload_refusals.py::TestMemoryUploadRefusals::test_409_when_a_concurrent_write_wins_the_object_is_overwritten_and_audited[upload]
+FAILED tests/test_memory_upload_refusals.py::TestMemoryUploadRefusals::test_409_when_a_concurrent_write_wins_the_object_is_overwritten_and_audited[create]
+FAILED tests/test_memory_upload_refusals.py::TestMemoryUploadRefusals::test_500_when_the_write_audit_cannot_be_written
+FAILED tests/test_memory_upload_refusals.py::TestMemoryUploadRefusals::test_200_twice_for_the_same_name_the_helpers_reseed_path
+FAILED tests/test_memory_stamp_is_server_only.py::TestStampIsServerOnly::test_a_stamp_in_a_direct_write_is_stripped_and_the_read_is_unverified
+FAILED tests/test_memory_stamp_is_server_only.py::TestStampIsServerOnly::test_a_stamp_in_an_update_is_stripped
+FAILED tests/test_memory_stamp_is_server_only.py::TestStampIsServerOnly::test_a_stamp_in_an_mcp_write_is_stripped
+FAILED tests/test_memory_verified_means_the_fold.py::TestVerifiedMeansTheFold::test_a_reupload_without_a_refold_still_reads_the_old_fold_verified
+FAILED tests/test_memory_verified_means_the_fold.py::TestVerifiedMeansTheFold::test_after_the_refold_the_stamp_equals_the_stored_object
+FAILED tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[1299-trailing-newlines]
+FAILED tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[201-trailing-newlines]
+FAILED tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[250-trailing-newlines]
+FAILED tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[600-trailing-spaces]
+FAILED tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[interior-run-of-3-chunks]
+FAILED tests/test_memory_whitespace_documents_read_whole.py::TestWhitespaceDocumentsReadWhole::test_the_document_reads_back_exactly_and_verified[leading-run-of-2-chunks]
+FAILED tests/test_memory_chunk_document.py::TestChunkDocument::test_reassembly_is_the_text_for_2000_random_documents
+FAILED tests/test_memory_chunk_document.py::TestChunkDocument::test_same_chunks_as_chunk_text_when_it_drops_nothing
+FAILED tests/test_memory_chunk_document.py::TestChunkDocument::test_the_whitespace_window_goes_to_the_chunk_before_it
+FAILED tests/test_memory_pdf_upload_cap.py::TestPdfUploadCap::test_a_pdf_over_the_upload_cap_is_refused_below_the_fold_bound
+FAILED tests/test_memory_pdf_upload_cap.py::TestPdfUploadCap::test_the_default_upload_cap_is_below_the_fold_bound
+FAILED tests/test_memory_pdf_upload_cap.py::TestPdfUploadCap::test_an_upload_at_its_bound_is_held_in_one_buffer
+FAILED tests/bff/test_body_limit.py::TestBffBodyLimit::test_a_declared_console_upload_over_the_ceiling_is_refused_unread
+FAILED tests/bff/test_body_limit.py::TestBffBodyLimit::test_an_undeclared_streamed_upload_is_cut_at_the_ceiling
+FAILED tests/bff/test_body_limit.py::TestBffBodyLimit::test_any_other_route_has_the_general_ceiling
+FAILED tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[empty]
+FAILED tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[long-blank]
+FAILED tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_old_text_is_not_readable_after_a_blank_refold[spaces-and-newline]
+FAILED tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_every_chunk_manifest_row_is_tombstoned
+FAILED tests/test_memory_blank_refold_clears_the_document.py::TestBlankRefoldClearsTheDocument::test_the_blank_refold_is_audited_once_with_the_removed_count
+=================== 81 failed, 21 passed in 97.39s (0:01:37) ===================
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 650201
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 650201
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 650201
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 650201
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 650201
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 650201
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 1950600
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 1950600
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 1950600
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 1950600
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 1950600
+tests/test_memory_whole_document_complete.py:112: AssertionError: assert 650200 == 1950600
+tests/test_memory_whole_document_complete.py:124: AssertionError: assert b'\xc3\xa9\xc...3\xa9\xc3\xa9' == b'\xc3\xa9\xc...3\xa9\xc3\xa9'
+tests/test_memory_whole_document_complete.py:143: assert 200 == 409
+tests/test_memory_whole_document_complete.py:160: AssertionError: assert '[000000]\n[0...001443]\n[001' == '[000000]\n[0...[000432]\n[00'
+tests/test_memory_whole_document_complete.py:173: AssertionError: assert 10 == 3
+tests/test_memory_write_limit.py:107: assert 200 == 413
+tests/test_memory_write_limit.py:107: assert 200 == 413
+tests/test_memory_write_limit.py:107: assert 200 == 413
+tests/test_memory_write_limit.py:107: assert 200 == 413
+tests/test_memory_write_limit.py:107: assert 200 == 413
+tests/test_memory_write_limit.py:107: assert 200 == 413
+tests/test_memory_write_limit.py:145: assert 200 == 413
+tests/test_memory_write_limit.py:157: assert 200 == 413
+tests/test_memory_write_limit.py:177: assert 200 == 413
+tests/test_memory_write_limit.py:177: assert 200 == 413
+tests/test_memory_write_limit.py:197: assert False is True
+tests/test_memory_write_limit.py:197: assert False is True
+tests/test_memory_upload_manifest_row.py:39: assert None is not None
+tests/test_memory_upload_manifest_row.py:39: assert None is not None
+tests/test_memory_documents_folded_before_the_stamp.py:46: AssertionError: assert None is False
+tests/test_memory_documents_folded_before_the_stamp.py:66: AssertionError: assert '<000000>\n<0...001443]\n[001' == '<000000>\n<0...>\n<000432>\n'
+tests/test_memory_documents_folded_before_the_stamp.py:66: AssertionError: assert '<000000>\n<0...001443]\n[001' == '<000000>\n<0...>\n<000432>\n'
+tests/test_memory_fold_tail_guards.py:70: assert 200 == 403
+tests/test_memory_fold_tail_guards.py:86: AssertionError: assert [] == [{'op': 'dele...doc.md', ...}]
+tests/test_memory_pdf_upload_bound.py:54: assert 503 == 413
+tests/test_memory_pdf_upload_bound.py:77: assert 200 == 413
+tests/test_memory_request_body_ceiling.py:55: assert 200 == 413
+tests/test_memory_request_body_ceiling.py:74: assert 200 == 413
+tests/test_memory_request_body_ceiling.py:91: assert 200 == 413
+tests/test_memory_request_body_ceiling.py:118: assert 200 == 413
+tests/test_memory_request_body_ceiling.py:130: assert 200 == 413
+tests/test_memory_refusal_audit.py:35: assert 200 == 413
+tests/test_memory_whole_document_integrity.py:91: assert 200 == 409
+tests/test_memory_whole_document_integrity.py:109: assert 200 == 409
+tests/test_memory_whole_document_integrity.py:109: assert 200 == 409
+tests/test_memory_whole_document_integrity.py:128: AssertionError: assert '[B00000]\n[B...]\n[A17332]\n' == '[B00000]\n[B...]\n[B15887]\n'
+tests/test_memory_whole_document_integrity.py:153: assert 200 == 409
+tests/test_memory_whole_document_integrity.py:192: assert 200 == 409
+tests/test_memory_whole_document_integrity.py:208: AssertionError: assert None is True
+tests/test_memory_whole_document_integrity.py:233: AssertionError: assert None is False
+tests/test_memory_upload_refusals.py:48: assert 200 == 403
+tests/test_memory_upload_refusals.py:73: assert 200 == 409
+tests/test_memory_upload_refusals.py:76: AssertionError: assert [] == [('write', 'n...rrent_write')]
+tests/test_memory_upload_refusals.py:89: assert 200 == 500
+tests/test_memory_upload_refusals.py:101: TypeError: 'NoneType' object is not subscriptable
+tests/test_memory_stamp_is_server_only.py:60: AssertionError: assert None is False
+tests/test_memory_stamp_is_server_only.py:78: AssertionError: assert None is False
+tests/test_memory_stamp_is_server_only.py:104: AssertionError: assert None is False
+tests/test_memory_verified_means_the_fold.py:45: AssertionError: assert None is True
+tests/test_memory_verified_means_the_fold.py:61: AssertionError: assert None is True
+tests/test_memory_whitespace_documents_read_whole.py:58: AssertionError: assert '[000000]\n[0...n\n\n\n\n\n\n' == '[000000]\n[0...n\n\n\n\n\n\n'
+tests/test_memory_whitespace_documents_read_whole.py:58: AssertionError: assert '[000000]\n[0...n\n\n\n\n\n\n' == '[000000]\n[0...n\n\n\n\n\n\n'
+tests/test_memory_whitespace_documents_read_whole.py:58: AssertionError: assert '[000000]\n[0...n\n\n\n\n\n\n' == '[000000]\n[0...n\n\n\n\n\n\n'
+tests/test_memory_whitespace_documents_read_whole.py:58: AssertionError: assert '[000000]\n[0...             ' == '[000000]\n[0...             '
+tests/test_memory_whitespace_documents_read_whole.py:58: AssertionError: assert '[000000]\n[0...001443]\n[001' == '[000000]\n[0...001443]\n[001'
+tests/test_memory_whitespace_documents_read_whole.py:58: AssertionError: assert '\n\n\n\n\n\n...001443]\n[001' == '\n\n\n\n\n\n...001443]\n[001'
+tests/test_memory_chunk_document.py:18: ModuleNotFoundError: No module named 'audittrace.routes.memory_chunking'
+tests/test_memory_chunk_document.py:18: ModuleNotFoundError: No module named 'audittrace.routes.memory_chunking'
+tests/test_memory_chunk_document.py:18: ModuleNotFoundError: No module named 'audittrace.routes.memory_chunking'
+tests/test_memory_pdf_upload_cap.py:49: assert 503 == 413
+.venv/lib/python3.12/site-packages/pydantic/main.py:1105: AttributeError: 'Settings' object has no attribute 'pdf_upload_max_size_mb'
+tests/test_memory_pdf_upload_cap.py:67: ModuleNotFoundError: No module named 'audittrace.routes.memory_write_refusal'
+tests/bff/test_body_limit.py:84: assert 200 == 413
+tests/bff/test_body_limit.py:101: assert 200 == 413
+tests/bff/test_body_limit.py:116: assert 403 == 413
+tests/test_memory_blank_refold_clears_the_document.py:76: assert 1 == 0
+tests/test_memory_blank_refold_clears_the_document.py:77: AssertionError: assert ['00000000-00...dca64552ece2'] == []
+tests/test_memory_blank_refold_clears_the_document.py:76: assert 1 == 0
+tests/test_memory_blank_refold_clears_the_document.py:99: assert False
+tests/test_memory_blank_refold_clears_the_document.py:115: assert 0 == 1
