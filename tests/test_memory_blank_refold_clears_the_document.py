@@ -133,20 +133,26 @@ class TestBlankRefoldClearsTheDocument:
     def test_a_blank_refold_whose_tail_the_caller_may_not_remove_is_refused(
         self, client: TestClient
     ) -> None:
-        """Chunk 3's manifest row now belongs to the shared corpus (somebody
+        """One chunk's manifest row now belongs to the shared corpus (somebody
         else's): the blank re-fold would remove it, so it is refused with 403
         BEFORE anything is removed, and the document still reads as the first
-        fold."""
+        fold. The foreign row is the one the removal reaches LAST, so a removal
+        that authorizes chunk by chunk, as it goes, would already have
+        tombstoned every other row."""
         from audittrace.services.memory_keys import physical_key
 
         count = _old_fold(client)
-        key = m._semantic_key("decisions", m._doc_id("decisions", "doc.md", 3))
+        keys = sorted(
+            m._semantic_key("decisions", m._doc_id("decisions", "doc.md", i))
+            for i in range(count)
+        )
+        foreign = keys[-1]
         rows = manifest()._rows
-        del rows[("semantic", physical_key(USER, key))]
+        del rows[("semantic", physical_key(USER, foreign))]
         asyncio.run(
             manifest().record_create(
                 layer="semantic",
-                key=key,
+                key=foreign,
                 title="doc.md",
                 size_bytes=1,
                 user_id="curator",
@@ -159,13 +165,12 @@ class TestBlankRefoldClearsTheDocument:
         refused = fold(client, "episodic", "doc.md", "decisions")
 
         assert refused.status_code == 403
-        # Nothing was removed first: every chunk's row is still live, and the
-        # ChromaDB rows are all still there.
-        for index in range(count):
-            other = m._semantic_key(
-                "decisions", m._doc_id("decisions", "doc.md", index)
-            )
-            row = rows[("semantic", other if index == 3 else physical_key(USER, other))]
+        # Nothing was removed first: every chunk's row is still live, and every
+        # ChromaDB row is still there.
+        for key in keys:
+            row = rows[
+                ("semantic", foreign if key == foreign else physical_key(USER, key))
+            ]
             assert row["deleted_at_ms"] is None
         assert len(_stored_chunk_ids(count)) == count
         back = read_whole(client, "decisions", "doc.md")
