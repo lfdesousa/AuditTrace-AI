@@ -123,6 +123,7 @@ from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
 
 from bff.auth import InboundTokenError, validate_inbound_token
+from bff.body_limit_middleware import BodyLimitMiddleware
 from bff.chat_caller_scope import insufficient_scope_response, missing_chat_scopes
 from bff.chat_scopes import (
     CHAT_SCOPE_CEILING,
@@ -246,6 +247,9 @@ def create_app() -> FastAPI:
             "auto_configure": False,
         },
     )
+
+    # An oversized body is refused before any route buffers it.
+    app.add_middleware(BodyLimitMiddleware)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

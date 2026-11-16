@@ -19,6 +19,7 @@ from audittrace.dependencies import (
     register_default_dependencies,
 )
 from audittrace.logging_config import setup_logging
+from audittrace.memory_body_limit_middleware import MemoryBodyLimitMiddleware
 from audittrace.routes import admin, audit, chat, context, health, mcp, memory, session
 from audittrace.routes.console_acl import router as console_acl_router
 from audittrace.routes.console_agents import router as console_agents_router
@@ -815,6 +816,11 @@ def create_app() -> FastAPI:
             ],
             expose_headers=[TRACE_ID_HEADER],
         )
+
+    # A memory write request over its ceiling is refused before its body is
+    # spooled or parsed. Registered before the trace-id middleware, which is
+    # therefore outer to it and stamps the 413 too.
+    app.add_middleware(MemoryBodyLimitMiddleware)
 
     # X-TRACE-ID-HEADER: every response carries the request's server-span trace
     # id. Registered AFTER the CORS block (add_middleware is outer-last), so it

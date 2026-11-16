@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # Magic bytes for a PDF — first four bytes are always `%PDF`.
 # The fifth byte is the spec version (PDF 1.x: `-`, PDF 2.0:
 # also `-`). We only check the prefix.
-_PDF_MAGIC = b"%PDF-"
+PDF_MAGIC = b"%PDF-"
 
 
 def is_pdf_upload(*, claimed_content_type: str | None, content: bytes) -> bool:
@@ -56,7 +56,7 @@ def is_pdf_upload(*, claimed_content_type: str | None, content: bytes) -> bool:
         return False
     if not claimed_content_type.lower().startswith("application/pdf"):
         return False
-    return content.startswith(_PDF_MAGIC)
+    return content.startswith(PDF_MAGIC)
 
 
 def sha256_hex(content: bytes) -> str:
