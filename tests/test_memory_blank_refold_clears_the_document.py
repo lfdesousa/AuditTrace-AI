@@ -139,7 +139,7 @@ class TestBlankRefoldClearsTheDocument:
         fold."""
         from audittrace.services.memory_keys import physical_key
 
-        _old_fold(client)
+        count = _old_fold(client)
         key = m._semantic_key("decisions", m._doc_id("decisions", "doc.md", 3))
         rows = manifest()._rows
         del rows[("semantic", physical_key(USER, key))]
@@ -159,7 +159,15 @@ class TestBlankRefoldClearsTheDocument:
         refused = fold(client, "episodic", "doc.md", "decisions")
 
         assert refused.status_code == 403
-        assert rows[("semantic", key)]["deleted_at_ms"] is None
+        # Nothing was removed first: every chunk's row is still live, and the
+        # ChromaDB rows are all still there.
+        for index in range(count):
+            other = m._semantic_key(
+                "decisions", m._doc_id("decisions", "doc.md", index)
+            )
+            row = rows[("semantic", other if index == 3 else physical_key(USER, other))]
+            assert row["deleted_at_ms"] is None
+        assert len(_stored_chunk_ids(count)) == count
         back = read_whole(client, "decisions", "doc.md")
         assert back.status_code == 200
         assert back.json()["content"] == OLD
