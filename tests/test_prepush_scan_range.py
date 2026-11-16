@@ -95,6 +95,14 @@ class Rig:
         return int(self.git("rev-list", "--count", rng))
 
 
+def _stub_first_path(stub_dir: Path) -> str:
+    """PATH with the stub scanner ahead of everything EXCEPT the first entry:
+    the hermetic guard (tests/conftest.py) requires PATH[0] to stay the CI
+    shim dir on every child process."""
+    first, _, rest = os.environ["PATH"].partition(os.pathsep)
+    return os.pathsep.join([first, str(stub_dir), rest])
+
+
 @pytest.fixture
 def rig(tmp_path: Path) -> Rig:
     stub_dir = tmp_path / "bin"
@@ -105,7 +113,7 @@ def rig(tmp_path: Path) -> Rig:
     log = tmp_path / "scanner.log"
     env = {
         **os.environ,
-        "PATH": f"{stub_dir}:{os.environ['PATH']}",
+        "PATH": _stub_first_path(stub_dir),
         "STUB_LOG": str(log),
         "GIT_AUTHOR_NAME": "t",
         "GIT_AUTHOR_EMAIL": "t@example.invalid",

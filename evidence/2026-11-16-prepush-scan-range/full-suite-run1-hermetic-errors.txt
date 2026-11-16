@@ -1,0 +1,2 @@
+========== 11067 passed, 3 warnings, 20 errors in 4603.55s (1:16:43) ===========
+(run 1: 20 errors, all tests/test_prepush_scan_range.py, PATH[0] hermetic guard; fixed by keeping the CI shim first)
