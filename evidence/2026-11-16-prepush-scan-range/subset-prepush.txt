@@ -1,0 +1,74 @@
+run-tests: G5 (pre-pytest): .venv/bin/python / /home/lfdesousa/work/wt-prepush-scan-range/.venv/bin/python3 == requirements-dev.txt, .gate-venv == requirements-gate.txt
+check-venv-matches-lock: environment == requirements-dev.txt (195 pins)
+check-venv-matches-lock: environment == requirements-dev.txt (195 pins)
+check-freeze-matches-lock: gate venv == requirements-gate.txt (67 pins)
+run-tests: forcing CI shape — KUBECONFIG=/tmp/audittrace-run-tests-shim.fQwB66/nonexistent-kubeconfig (does not exist), kubectl+helm shim at /tmp/audittrace-run-tests-shim.fQwB66
+run-tests: diagnostic probes (non-fatal, informational only):
+run-tests: command -v helm -> /tmp/audittrace-run-tests-shim.fQwB66/helm
+probe localhost:8080 rc=7
+run-tests: subset mode -k "prepush" -> /home/lfdesousa/work/xdgcache-prepush/sub2.xml
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.7.0 -- /home/lfdesousa/work/wt-prepush-scan-range/.venv/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/lfdesousa/work/wt-prepush-scan-range
+configfile: pyproject.toml
+plugins: anyio-4.15.1, mock-3.17.0, cov-7.1.0, langsmith-0.14.11, asyncio-1.4.0, platformdirs-4.13.5, audittrace-ai-1.33.1
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 11082 items / 11036 deselected / 46 selected
+
+tests/test_prepush_pr_body_gate.py::test_classify_none_value_is_unset PASSED [  2%]
+tests/test_prepush_pr_body_gate.py::test_classify_empty_string_is_unset PASSED [  4%]
+tests/test_prepush_pr_body_gate.py::test_classify_none_literal_is_skip_case_insensitive[none] PASSED [  6%]
+tests/test_prepush_pr_body_gate.py::test_classify_none_literal_is_skip_case_insensitive[None] PASSED [  8%]
+tests/test_prepush_pr_body_gate.py::test_classify_none_literal_is_skip_case_insensitive[NONE] PASSED [ 10%]
+tests/test_prepush_pr_body_gate.py::test_classify_none_literal_is_skip_case_insensitive[ none ] PASSED [ 13%]
+tests/test_prepush_pr_body_gate.py::test_classify_none_literal_is_skip_case_insensitive[NoNe] PASSED [ 15%]
+tests/test_prepush_pr_body_gate.py::test_classify_real_path_is_path PASSED [ 17%]
+tests/test_prepush_pr_body_gate.py::test_classify_none_word_inside_longer_string_is_path PASSED [ 19%]
+tests/test_prepush_pr_body_gate.py::test_main_ref_is_protected PASSED    [ 21%]
+tests/test_prepush_pr_body_gate.py::test_master_ref_is_protected PASSED  [ 23%]
+tests/test_prepush_pr_body_gate.py::test_feature_ref_is_not_protected PASSED [ 26%]
+tests/test_prepush_pr_body_gate.py::test_empty_ref_is_not_protected PASSED [ 28%]
+tests/test_prepush_pr_body_gate.py::test_skip_mode_allows_silently PASSED [ 30%]
+tests/test_prepush_pr_body_gate.py::test_skip_mode_case_insensitive_on_main PASSED [ 32%]
+tests/test_prepush_pr_body_gate.py::test_unset_on_feature_branch_allows_with_reminder PASSED [ 34%]
+tests/test_prepush_pr_body_gate.py::test_unset_on_main_allows_silently PASSED [ 36%]
+tests/test_prepush_pr_body_gate.py::test_unset_on_master_allows_silently PASSED [ 39%]
+tests/test_prepush_pr_body_gate.py::test_set_and_passing_body_allows PASSED [ 41%]
+tests/test_prepush_pr_body_gate.py::test_set_and_failing_body_blocks_with_ci_identical_output PASSED [ 43%]
+tests/test_prepush_pr_body_gate.py::test_set_and_failing_body_on_main_still_blocks PASSED [ 45%]
+tests/test_prepush_pr_body_gate.py::test_set_mode_uses_injected_adr049_main PASSED [ 47%]
+tests/test_prepush_pr_body_gate.py::test_set_mode_injected_failure_prints_block_tail PASSED [ 50%]
+tests/test_prepush_pr_body_gate.py::test_parse_remote_ref_present PASSED [ 52%]
+tests/test_prepush_pr_body_gate.py::test_parse_remote_ref_absent PASSED  [ 54%]
+tests/test_prepush_pr_body_gate.py::test_parse_remote_ref_empty_string_arg PASSED [ 56%]
+tests/test_prepush_pr_body_gate.py::test_main_reads_pr_body_from_environment PASSED [ 58%]
+tests/test_prepush_pr_body_gate.py::test_main_with_no_pr_body_env_and_feature_ref_reminds PASSED [ 60%]
+tests/test_prepush_pr_body_gate.py::test_main_with_pr_body_none_is_silent PASSED [ 63%]
+tests/test_prepush_pr_body_gate.py::test_main_defaults_argv_to_sys_argv PASSED [ 65%]
+tests/test_prepush_pr_body_gate.py::test_module_has_scoped_logger PASSED [ 67%]
+tests/test_prepush_scan_range.py::test_new_branch_one_commit_scans_exactly_one PASSED [ 69%]
+tests/test_prepush_scan_range.py::test_new_branch_three_commits_scans_exactly_three PASSED [ 71%]
+tests/test_prepush_scan_range.py::test_new_branch_excludes_commits_already_on_default PASSED [ 73%]
+tests/test_prepush_scan_range.py::test_update_push_scans_exactly_the_new_commits[1] PASSED [ 76%]
+tests/test_prepush_scan_range.py::test_update_push_scans_exactly_the_new_commits[2] PASSED [ 78%]
+tests/test_prepush_scan_range.py::test_delete_push_scans_nothing_and_exits_zero PASSED [ 80%]
+tests/test_prepush_scan_range.py::test_new_branch_with_no_new_commits_scans_nothing_and_passes PASSED [ 82%]
+tests/test_prepush_scan_range.py::test_scanner_nonzero_exit_blocks_the_push PASSED [ 84%]
+tests/test_prepush_scan_range.py::test_new_branch_without_resolvable_default_branch_fails_closed PASSED [ 86%]
+tests/test_prepush_scan_range.py::test_update_push_with_unknown_remote_sha_fails_closed PASSED [ 89%]
+tests/test_prepush_scan_range.py::test_multi_ref_push_scans_every_ref_exactly PASSED [ 91%]
+tests/test_prepush_scan_range.py::test_scanner_failure_on_second_ref_blocks_the_whole_push PASSED [ 93%]
+tests/test_prepush_scan_range.py::test_orphan_branch_without_merge_base_fails_closed PASSED [ 95%]
+tests/test_prepush_scan_range.py::test_default_branch_falls_back_to_main_without_origin_head PASSED [ 97%]
+tests/test_prepush_scan_range.py::test_gitleaks_config_env_reaches_the_scanner PASSED [100%]
+
+------ generated xml file: /home/lfdesousa/work/xdgcache-prepush/sub2.xml ------
+==================== 46 passed, 11036 deselected in 21.63s =====================
+run-tests: G5 (post-pytest): .venv/bin/python / /home/lfdesousa/work/wt-prepush-scan-range/.venv/bin/python3 == requirements-dev.txt, .gate-venv == requirements-gate.txt
+check-venv-matches-lock: environment == requirements-dev.txt (195 pins)
+check-venv-matches-lock: environment == requirements-dev.txt (195 pins)
+check-freeze-matches-lock: gate venv == requirements-gate.txt (67 pins)
+🚫 Enforcing zero-skip policy on the subset run...
+[no-skip-check] No skipped tests in /home/lfdesousa/work/xdgcache-prepush/sub2.xml. Good.
+✅ Tests passed (scripts/ci/run-tests.sh)

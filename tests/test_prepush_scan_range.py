@@ -37,6 +37,8 @@ _STUB = """#!/usr/bin/env bash
 # Stub scanner: record argv (one invocation per line, shell-quoted).
 printf '%q ' "$@" >> "$STUB_LOG"
 printf '\\n' >> "$STUB_LOG"
+calls="$(wc -l < "$STUB_LOG")"
+[ -n "${STUB_FAIL_AT:-}" ] && [ "$calls" -eq "$STUB_FAIL_AT" ] && exit 1
 exit "${STUB_EXIT:-0}"
 """
 
@@ -69,9 +71,12 @@ class Rig:
         return shas
 
     def push(
-        self, *args: str, exit_code: str = "0"
+        self,
+        *args: str,
+        exit_code: str = "0",
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        env = {**self.env, "STUB_EXIT": exit_code}
+        env = {**self.env, "STUB_EXIT": exit_code, **(extra_env or {})}
         return subprocess.run(
             ["git", "push", *args],
             cwd=self.work,
@@ -253,3 +258,77 @@ def test_update_push_with_unknown_remote_sha_fails_closed(
     res = rig.push("--force", "origin", "feat")
     assert res.returncode != 0
     assert rig.scanner_calls() == []
+
+
+def _range_of(call: list[str]) -> str:
+    opts = [a for a in call if a.startswith("--log-opts")]
+    assert len(opts) == 1, f"scanner got no commit range: {call}"
+    return opts[0].split("=", 1)[1]
+
+
+def _two_branches(rig: Rig) -> tuple[str, str]:
+    """Fork branches a (2 commits) and b (3 commits) from main; return tips."""
+    rig.git("checkout", "-q", "-b", "a")
+    rig.commit(2, "a")
+    tip_a = rig.git("rev-parse", "HEAD")
+    rig.git("checkout", "-q", "main")
+    rig.git("checkout", "-q", "-b", "b")
+    rig.commit(3, "b")
+    return tip_a, rig.git("rev-parse", "HEAD")
+
+
+def test_multi_ref_push_scans_every_ref_exactly(rig: Rig) -> None:
+    tip_a, tip_b = _two_branches(rig)
+    res = rig.push("origin", "a", "b")
+    assert res.returncode == 0, res.stderr
+    calls = rig.scanner_calls()
+    assert len(calls) == 2, calls
+    counts = {}
+    for call in calls:
+        rng = _range_of(call)
+        counts[rng.split("..")[1]] = int(rig.git("rev-list", "--count", rng))
+    assert counts == {tip_a: 2, tip_b: 3}
+
+
+def test_scanner_failure_on_second_ref_blocks_the_whole_push(rig: Rig) -> None:
+    _two_branches(rig)
+    res = rig.push("origin", "a", "b", extra_env={"STUB_FAIL_AT": "2"})
+    assert res.returncode != 0
+    assert len(rig.scanner_calls()) == 2  # the second ref WAS scanned
+    heads = rig.git("ls-remote", "--heads", str(rig.remote))
+    assert "refs/heads/a" not in heads
+    assert "refs/heads/b" not in heads
+
+
+def test_orphan_branch_without_merge_base_fails_closed(rig: Rig) -> None:
+    # unrelated history; keep the index (scripts/ stays) so the PR-body step
+    # cannot be the reason the push fails
+    rig.git("checkout", "-q", "--orphan", "orph")
+    (rig.work / "orphan.txt").write_text("unrelated\n")
+    rig.git("add", ".")
+    rig.git("commit", "-q", "-m", "orphan root")
+    res = rig.push("-u", "origin", "orph")
+    assert res.returncode != 0
+    assert "no merge-base" in res.stderr
+    assert rig.scanner_calls() == []
+    assert rig.git("ls-remote", "--heads", str(rig.remote), "orph") == ""
+
+
+def test_default_branch_falls_back_to_main_without_origin_head(rig: Rig) -> None:
+    rig.git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    rig.git("checkout", "-q", "-b", "feat")
+    rig.commit(1, "f")
+    res = rig.push("-u", "origin", "feat")
+    assert res.returncode == 0, res.stderr
+    assert rig.scanned_commit_count() == 1
+
+
+def test_gitleaks_config_env_reaches_the_scanner(rig: Rig) -> None:
+    rig.git("checkout", "-q", "-b", "feat")
+    rig.commit(1, "f")
+    res = rig.push(
+        "-u", "origin", "feat", extra_env={"GITLEAKS_CONFIG": "/x/custom.toml"}
+    )
+    assert res.returncode == 0, res.stderr
+    (call,) = rig.scanner_calls()
+    assert call[call.index("--config") + 1] == "/x/custom.toml"

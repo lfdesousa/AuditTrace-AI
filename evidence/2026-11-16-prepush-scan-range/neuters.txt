@@ -25,3 +25,20 @@ FAILED tests/test_prepush_scan_range.py::test_new_branch_with_no_new_commits_sca
 ========================= 1 failed, 9 passed in 0.90s ==========================
 == RESTORED
 ============================== 10 passed in 0.87s ==============================
+== ROUND 2 (15 tests) BASELINE
+============================== 15 passed in 1.20s ==============================
+== NEUTER N8-scan-only-first-stdin-line
+FAILED tests/test_prepush_scan_range.py::test_multi_ref_push_scans_every_ref_exactly
+FAILED tests/test_prepush_scan_range.py::test_scanner_failure_on_second_ref_blocks_the_whole_push
+========================= 2 failed, 13 passed in 1.32s =========================
+== NEUTER N9-orphan-no-merge-base-failclosed
+FAILED tests/test_prepush_scan_range.py::test_orphan_branch_without_merge_base_fails_closed
+========================= 1 failed, 14 passed in 1.34s =========================
+== NEUTER N10-default-branch-main-fallback
+FAILED tests/test_prepush_scan_range.py::test_default_branch_falls_back_to_main_without_origin_head
+========================= 1 failed, 14 passed in 1.29s =========================
+== NEUTER N11-gitleaks-config-env-ignored
+FAILED tests/test_prepush_scan_range.py::test_gitleaks_config_env_reaches_the_scanner
+========================= 1 failed, 14 passed in 1.28s =========================
+== RESTORED
+============================== 15 passed in 1.23s ==============================
