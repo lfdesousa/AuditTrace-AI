@@ -1,5 +1,5 @@
 # Stage 1: Build dependencies
-FROM python:3.12-slim AS builder
+FROM python:3.15-slim AS builder
 
 WORKDIR /build
 
@@ -50,7 +50,7 @@ RUN SHA="$(sed -n 's#.*audittrace-object-storage\.git@\([0-9a-f]\{40\}\)".*#\1#p
 RUN pip install --user --no-cache-dir --no-deps --no-build-isolation .
 
 # Stage 2: Runtime image
-FROM python:3.12-slim AS runtime
+FROM python:3.15-slim AS runtime
 
 WORKDIR /app
 
