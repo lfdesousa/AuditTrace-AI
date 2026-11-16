@@ -1,0 +1,37 @@
+### NEW BRANCH, 3 commits (real gitleaks 8.30.1)
+pre-push: scanning 3 commit(s) in 52aed2688aebc05276a48ab09b5d083ef76933c0..bca8f96360c47051f0f26c85391c593e4b02008e (refs/heads/feat)
+    ○
+    │╲
+    │ ○
+    ○ ░
+    ░    gitleaks
+[90m8:51PM[0m [32mINF[0m [1mUnknown SCM platform. Use --platform to include links in findings.[0m [36mhost=[0m
+[90m8:51PM[0m [32mINF[0m [1m3 commits scanned.[0m
+[90m8:51PM[0m [32mINF[0m [1mscanned ~6 bytes (6 bytes) in 8.44ms[0m
+[90m8:51PM[0m [32mINF[0m [1mno leaks found[0m
+Reminder: set PR_BODY=<path-to-your-PR-body-file> to pre-validate it against the ADR-049 evidence gate before you push (or PR_BODY=none to acknowledge and skip this reminder). See ADR-049.
+To ../remote.git
+ * [new branch]      feat -> feat
+la branche 'feat' est paramétrée pour suivre 'origin/feat'.
+exit=
+### UPDATE PUSH, 2 new commits
+pre-push: scanning 2 commit(s) in bca8f96360c47051f0f26c85391c593e4b02008e..05ba10165433fe9535ac225d917e995a1b8bd7ea (refs/heads/feat)
+    ○
+    │╲
+    │ ○
+    ○ ░
+    ░    gitleaks
+[90m8:51PM[0m [32mINF[0m [1mUnknown SCM platform. Use --platform to include links in findings.[0m [36mhost=[0m
+[90m8:51PM[0m [32mINF[0m [1m2 commits scanned.[0m
+[90m8:51PM[0m [32mINF[0m [1mscanned ~4 bytes (4 bytes) in 4.02ms[0m
+[90m8:51PM[0m [32mINF[0m [1mno leaks found[0m
+Reminder: set PR_BODY=<path-to-your-PR-body-file> to pre-validate it against the ADR-049 evidence gate before you push (or PR_BODY=none to acknowledge and skip this reminder). See ADR-049.
+To ../remote.git
+   bca8f96..05ba101  feat -> feat
+exit=
+### DELETE PUSH
+pre-push: delete of refs/heads/feat - nothing to scan
+Reminder: set PR_BODY=<path-to-your-PR-body-file> to pre-validate it against the ADR-049 evidence gate before you push (or PR_BODY=none to acknowledge and skip this reminder). See ADR-049.
+To ../remote.git
+ - [deleted]         feat
+exit=

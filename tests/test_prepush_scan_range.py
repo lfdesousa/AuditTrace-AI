@@ -194,6 +194,14 @@ def test_delete_push_scans_nothing_and_exits_zero(rig: Rig) -> None:
     assert "feat" not in rig.git("branch", "-r", "--list", "origin/feat")
 
 
+def test_new_branch_with_no_new_commits_scans_nothing_and_passes(rig: Rig) -> None:
+    rig.git("checkout", "-q", "-b", "feat")
+    res = rig.push("-u", "origin", "feat")
+    assert res.returncode == 0, res.stderr
+    assert rig.scanner_calls() == []
+    assert rig.git("ls-remote", "--heads", str(rig.remote), "feat") != ""
+
+
 def test_scanner_nonzero_exit_blocks_the_push(rig: Rig) -> None:
     rig.git("checkout", "-q", "-b", "feat")
     rig.commit(1, "f")

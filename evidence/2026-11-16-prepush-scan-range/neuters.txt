@@ -1,0 +1,27 @@
+== BASELINE
+============================== 10 passed in 0.87s ==============================
+== NEUTER N1-delete-guard
+FAILED tests/test_prepush_scan_range.py::test_delete_push_scans_nothing_and_exits_zero
+========================= 1 failed, 9 passed in 0.89s ==========================
+== NEUTER N2-scanner-exit-gate
+FAILED tests/test_prepush_scan_range.py::test_scanner_nonzero_exit_blocks_the_push
+========================= 1 failed, 9 passed in 0.92s ==========================
+== NEUTER N3-no-default-branch-failclosed
+FAILED tests/test_prepush_scan_range.py::test_new_branch_without_resolvable_default_branch_fails_closed
+========================= 1 failed, 9 passed in 0.95s ==========================
+== NEUTER N4-update-base-is-remote
+FAILED tests/test_prepush_scan_range.py::test_update_push_scans_exactly_the_new_commits[1]
+FAILED tests/test_prepush_scan_range.py::test_update_push_scans_exactly_the_new_commits[2]
+FAILED tests/test_prepush_scan_range.py::test_update_push_with_unknown_remote_sha_fails_closed
+========================= 3 failed, 7 passed in 0.94s ==========================
+== NEUTER N5-new-branch-base-merge-base
+FAILED tests/test_prepush_scan_range.py::test_new_branch_excludes_commits_already_on_default
+========================= 1 failed, 9 passed in 0.94s ==========================
+== NEUTER N6-uncomputable-range-failclosed
+FAILED tests/test_prepush_scan_range.py::test_update_push_with_unknown_remote_sha_fails_closed
+========================= 1 failed, 9 passed in 0.97s ==========================
+== NEUTER N7-empty-range-skip
+FAILED tests/test_prepush_scan_range.py::test_new_branch_with_no_new_commits_scans_nothing_and_passes
+========================= 1 failed, 9 passed in 0.90s ==========================
+== RESTORED
+============================== 10 passed in 0.87s ==============================

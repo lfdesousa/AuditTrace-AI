@@ -18,8 +18,9 @@
 # see the `project_gitleaks_hooks_portable` memory) without losing that
 # protection:
 #
-#   1. gitleaks secret-scan on the content being pushed (unchanged
-#      behaviour from the old untracked hook — now tracked + portable).
+#   1. gitleaks secret-scan over exactly the commit range being pushed
+#      (new ref: merge-base with the default branch; update: remote..local;
+#      delete: nothing; range uncomputable: fail closed).
 #   2. The ADR-049 PR-body evidence gate (#397):
 #        - PR_BODY set to a path, body FAILS the gate  -> BLOCK the push
 #          (exit non-zero), printing the CI-identical `::error::` lines
@@ -47,23 +48,108 @@
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+GITLEAKS_CONFIG="${GITLEAKS_CONFIG:-$HOME/.config/gitleaks/gitleaks.toml}"
 
-# --- 1. gitleaks secret scan (unchanged from the prior untracked hook) -----
-if command -v gitleaks &> /dev/null; then
-    gitleaks protect --staged --config ~/.config/gitleaks/gitleaks.toml --verbose
-else
-    echo "gitleaks not installed — skipping leak scan"
-fi
-
-# --- 2. ADR-049 PR-body gate (#397) -----------------------------------------
 # git's pre-push protocol pipes one line per pushed ref to stdin:
 #   <local ref> <local sha1> <remote ref> <remote sha1>
-# We only need the destination remote ref off the first line (multi-ref
-# pushes are rare in this repo's single-feature-branch workflow).
-remote_ref=""
-while read -r _local_ref _local_sha remote_ref_field _remote_sha; do
-    remote_ref="$remote_ref_field"
-    break
+# (all-zero remote sha = the ref does not exist on the remote yet; all-zero
+# local sha = a delete push). Read ALL lines: the secret scan covers every
+# pushed ref (PREPUSH-NEW-BRANCH-SCAN-RANGE); the PR-body gate below only
+# needs the destination ref of the first line (multi-ref pushes are rare in
+# this repo's single-feature-branch workflow).
+lines=()
+while read -r line; do
+    lines+=("$line")
 done
+
+die() {
+    echo "pre-push: $*" >&2
+    exit 1
+}
+
+is_zero_sha() { [[ "$1" =~ ^0+$ ]]; }
+
+# --- 1. secret scan over EXACTLY the pushed commit range -----------------------
+# Pre-#PREPUSH-NEW-BRANCH-SCAN-RANGE this ran `gitleaks protect --staged`,
+# which scans the (empty) index at push time -> "0 commits scanned" on every
+# push. Now:
+#   - delete push  -> nothing to scan
+#   - update push  -> <remote sha>..<local sha>
+#   - new ref      -> <merge-base with the remote default branch>..<local sha>
+# The range is computed here; if it cannot be computed the push FAILS CLOSED.
+# The scanner is never piped: its own exit code gates the push.
+
+# Resolve the remote-tracking ref of the default branch: origin/HEAD first,
+# then main, then master. Echoes the full ref name; non-zero when none exists.
+resolve_default_ref() {
+    local remote="$1" head cand
+    if head="$(git symbolic-ref -q "refs/remotes/$remote/HEAD")" \
+        && git rev-parse -q --verify "$head^{commit}" > /dev/null; then
+        echo "$head"
+        return 0
+    fi
+    for cand in main master; do
+        if git rev-parse -q --verify "refs/remotes/$remote/$cand^{commit}" > /dev/null; then
+            echo "refs/remotes/$remote/$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# $1 is the remote name (or URL when pushing to a bare URL).
+remote_name="origin"
+if [ -n "${1:-}" ] && git config --get "remote.$1.url" > /dev/null; then
+    remote_name="$1"
+fi
+
+scan_ref() {
+    local local_sha="$1" remote_sha="$2" ref_label="$3" base range count
+    if is_zero_sha "$local_sha"; then
+        echo "pre-push: delete of $ref_label - nothing to scan"
+        return 0
+    fi
+    git rev-parse -q --verify "$local_sha^{commit}" > /dev/null \
+        || die "cannot scan $ref_label: $local_sha is not a commit (failing closed)"
+    if is_zero_sha "$remote_sha"; then
+        local default_ref
+        default_ref="$(resolve_default_ref "$remote_name")" \
+            || die "cannot scan new ref $ref_label: no default branch found under refs/remotes/$remote_name (failing closed)"
+        base="$(git merge-base "$default_ref" "$local_sha")" \
+            || die "cannot scan new ref $ref_label: no merge-base with $default_ref (failing closed)"
+    else
+        base="$remote_sha"
+    fi
+    range="$base..$local_sha"
+    count="$(git rev-list --count "$range")" \
+        || die "cannot compute $range for $ref_label (remote sha unknown locally? fetch first) - failing closed"
+    if [ "$count" -eq 0 ]; then
+        echo "pre-push: $ref_label: range $range is empty - nothing to scan"
+        return 0
+    fi
+    if ! command -v gitleaks &> /dev/null; then
+        echo "gitleaks not installed - skipping secret scan of $count commit(s) in $range"
+        return 0
+    fi
+    echo "pre-push: scanning $count commit(s) in $range ($ref_label)"
+    local rc=0
+    gitleaks detect --source "$REPO_ROOT" --config "$GITLEAKS_CONFIG" \
+        --log-opts="$range" --verbose || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "pre-push: secret scan failed (exit $rc) for $range - push blocked" >&2
+        exit "$rc"
+    fi
+}
+
+for line in "${lines[@]+"${lines[@]}"}"; do
+    read -r _lref local_sha rref remote_sha <<< "$line"
+    scan_ref "$local_sha" "$remote_sha" "$rref"
+done
+
+# --- 2. ADR-049 PR-body gate (#397) -----------------------------------------
+remote_ref=""
+if [ "${#lines[@]}" -gt 0 ]; then
+    read -r _lref _lsha remote_ref _rsha <<< "${lines[0]}"
+fi
 
 exec python3 "$REPO_ROOT/scripts/hooks/prepush_pr_body_gate.py" "$remote_ref"
