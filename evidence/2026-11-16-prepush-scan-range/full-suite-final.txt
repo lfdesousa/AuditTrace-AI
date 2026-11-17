@@ -1,3 +1,4 @@
+================ 11082 passed, 3 warnings in 3621.88s (1:00:21) ================
 Required test coverage of 90% reached. Total coverage: 98.93%
 [no-skip-check] No skipped tests in junit.xml. Good.
 🔒 Enforcing per-file coverage gate (each component >= 90%)...
