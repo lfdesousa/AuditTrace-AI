@@ -1,11 +1,12 @@
 name: E2E
 
+# Push triggers are main (+ tags in ci.yml) only: a PR branch is covered by the
+# pull_request trigger, so push to feat/** or fix/** would run everything twice.
+# Guard: tests/test_ci_no_duplicate_push_pr_runs.py
 on:
   push:
     branches:
       - main
-      - "feat/**"
-      - "fix/**"
   pull_request:
     branches:
       - main
