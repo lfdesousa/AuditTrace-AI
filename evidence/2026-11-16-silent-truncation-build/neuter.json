@@ -607,6 +607,79 @@
   "summary": "3 failed, 125 passed in 154.32s (0:02:34)",
   "what": "the BFF 413 error object drops its numeric status"
  },
+ "S16a": {
+  "failed": [
+   "tests/test_body_limit_middlewares_asgi.py::TestBodyLimitMiddlewaresAsgi::test_an_app_that_has_begun_its_answer_is_not_given_a_second_one[bff]"
+  ],
+  "failed_count": 1,
+  "files": [
+   "bff/body_limit_middleware.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 139 passed in 116.00s (0:01:56)",
+  "what": "the BFF middleware stacks a 413 on a response the app already began"
+ },
+ "S16b": {
+  "failed": [
+   "tests/test_body_limit_middlewares_asgi.py::TestBodyLimitMiddlewaresAsgi::test_an_app_that_has_begun_its_answer_is_not_given_a_second_one[memory]"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/memory_body_limit_middleware.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 139 passed in 113.62s (0:01:53)",
+  "what": "the memory middleware stacks a 413 on a response the app already began"
+ },
+ "S16c": {
+  "failed": [
+   "tests/test_body_limit_middlewares_asgi.py::TestBodyLimitMiddlewaresAsgi::test_an_app_that_swallows_the_abort_and_answers_400_still_gives_one_413[bff]"
+  ],
+  "failed_count": 1,
+  "files": [
+   "bff/body_limit_middleware.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 139 passed in 111.37s (0:01:51)",
+  "what": "the BFF middleware lets an app that swallowed the abort answer 400"
+ },
+ "S16d": {
+  "failed": [
+   "tests/test_body_limit_middlewares_asgi.py::TestBodyLimitMiddlewaresAsgi::test_an_app_that_swallows_the_abort_and_answers_400_still_gives_one_413[memory]",
+   "tests/test_memory_request_body_ceiling.py::TestMemoryRequestBodyCeiling::test_an_undeclared_streamed_body_is_cut_at_the_ceiling"
+  ],
+  "failed_count": 2,
+  "files": [
+   "src/audittrace/memory_body_limit_middleware.py"
+  ],
+  "rc": 1,
+  "summary": "2 failed, 138 passed in 116.41s (0:01:56)",
+  "what": "the memory middleware lets an app that swallowed the abort answer 400"
+ },
+ "S17a": {
+  "failed": [
+   "tests/test_memory_fold_tail_unit.py::TestStaleTailUnit::test_an_audit_that_cannot_be_written_is_a_500_after_the_removal"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory_fold_tail.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 139 passed in 113.84s (0:01:53)",
+  "what": "a fold audit that cannot be written is swallowed instead of a 500"
+ },
+ "S17b": {
+  "failed": [
+   "tests/test_memory_fold_tail_unit.py::TestStaleTailUnit::test_a_legacy_row_that_is_not_the_callers_own_private_row_is_not_in_the_tail"
+  ],
+  "failed_count": 1,
+  "files": [
+   "src/audittrace/routes/memory_fold_tail.py"
+  ],
+  "rc": 1,
+  "summary": "1 failed, 139 passed in 111.45s (0:01:51)",
+  "what": "the legacy-row walk takes a row that belongs to someone else"
+ },
  "baseline": [
   [
    "neuter-shard1.json",
@@ -627,6 +700,16 @@
    "neuter-s14b2.json",
    0,
    "128 passed in 136.24s (0:02:16)"
+  ],
+  [
+   "neuter-s16-1.json",
+   0,
+   "140 passed in 116.81s (0:01:56)"
+  ],
+  [
+   "neuter-s16-2.json",
+   0,
+   "140 passed in 116.80s (0:01:56)"
   ]
  ],
  "restored": [
@@ -649,6 +732,16 @@
    "neuter-s14b2.json",
    0,
    "128 passed in 139.93s (0:02:19)"
+  ],
+  [
+   "neuter-s16-1.json",
+   0,
+   "140 passed in 114.01s (0:01:54)"
+  ],
+  [
+   "neuter-s16-2.json",
+   0,
+   "140 passed in 114.07s (0:01:54)"
   ]
  ]
 }

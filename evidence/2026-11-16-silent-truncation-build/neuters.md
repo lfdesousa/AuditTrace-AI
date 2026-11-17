@@ -1,8 +1,8 @@
 # Neuters of the silent-truncation change
 
-Every neuter is one exact textual replacement (`neuter.py`), applied to a clean checkout of the change; the chain tests then run (128 tests); the tree is restored. Baseline and restore: 0 failed each, in every shard. A neuter that reddens 0 tests would be a vacuous guard; none does.
+Every neuter is one exact textual replacement (`neuter.py`), applied to a clean checkout of the change; the chain's tests then run; the tree is restored. A neuter that reddens 0 tests would be a vacuous guard; none does (47 neuters).
 
-Shards ran at a1902e64 (the earlier S14b result with 0 reddened, on the first version of its test, was strengthened at 5ff1e70e and re-run there: 1 reddened). Counts of the original chain neuters are compared with the spec chain figures in the PR body.
+Runs: the first 41 at a1902e64 (128 tests; S14b re-run at 5ff1e70e after its test was strengthened: its first result was 0 reddened, now 1); the last 6 (S16a-d, S17a-b, added with the ASGI-level and unit tests after the per-file coverage gate flagged three modules) at 403f304a (140 tests). Baseline and restore: 0 failed in every shard.
 
 | id | neuter | tests reddened | tests that reddened |
 |---|---|---|---|
@@ -44,6 +44,12 @@ Shards ran at a1902e64 (the earlier S14b result with 0 reddened, on the first ve
 | S14a | a blank fold leaves the previous fold's chunks in place | 6 | test_a_blank_refold_whose_tail_the_caller_may_not_remove_is_refused, test_every_chunk_manifest_row_is_tombstoned, test_the_blank_refold_is_audited_once_with_the_removed_count, test_the_old_text_is_not_readable_after_a_blank_refold |
 | S14b | a blank fold removes the tail without authorizing it | 1 | test_a_blank_refold_whose_tail_the_caller_may_not_remove_is_refused |
 | S14c | a blank fold is looked up with the old 'kept' of a non-blank fold (tail starts at 1) | 5 | test_every_chunk_manifest_row_is_tombstoned, test_the_blank_refold_is_audited_once_with_the_removed_count, test_the_old_text_is_not_readable_after_a_blank_refold |
+| S16a | the BFF middleware stacks a 413 on a response the app already began | 1 | test_an_app_that_has_begun_its_answer_is_not_given_a_second_one |
+| S16b | the memory middleware stacks a 413 on a response the app already began | 1 | test_an_app_that_has_begun_its_answer_is_not_given_a_second_one |
+| S16c | the BFF middleware lets an app that swallowed the abort answer 400 | 1 | test_an_app_that_swallows_the_abort_and_answers_400_still_gives_one_413 |
+| S16d | the memory middleware lets an app that swallowed the abort answer 400 | 2 | test_an_app_that_swallows_the_abort_and_answers_400_still_gives_one_413, test_an_undeclared_streamed_body_is_cut_at_the_ceiling |
+| S17a | a fold audit that cannot be written is swallowed instead of a 500 | 1 | test_an_audit_that_cannot_be_written_is_a_500_after_the_removal |
+| S17b | the legacy-row walk takes a row that belongs to someone else | 1 | test_a_legacy_row_that_is_not_the_callers_own_private_row_is_not_in_the_tail |
 | S15a | the BFF 413 loses the additive detail key | 3 | test_a_declared_console_upload_over_the_ceiling_is_refused_unread, test_an_undeclared_streamed_upload_is_cut_at_the_ceiling, test_any_other_route_has_the_general_ceiling |
 | S15b | the BFF 413 is the old detail-only body (no error object) | 3 | test_a_declared_console_upload_over_the_ceiling_is_refused_unread, test_an_undeclared_streamed_upload_is_cut_at_the_ceiling, test_any_other_route_has_the_general_ceiling |
 | S15c | the BFF 413 error object drops its numeric status | 3 | test_a_declared_console_upload_over_the_ceiling_is_refused_unread, test_an_undeclared_streamed_upload_is_cut_at_the_ceiling, test_any_other_route_has_the_general_ceiling |
@@ -53,7 +59,11 @@ Baseline/restore runs:
 - neuter-shard2.json: 0 failed (128 passed in 138.14s (0:02:18))
 - neuter-shard3.json: 0 failed (128 passed in 137.91s (0:02:17))
 - neuter-s14b2.json: 0 failed (128 passed in 136.24s (0:02:16))
+- neuter-s16-1.json: 0 failed (140 passed in 116.81s (0:01:56))
+- neuter-s16-2.json: 0 failed (140 passed in 116.80s (0:01:56))
 - neuter-shard1.json: 0 failed (128 passed in 127.35s (0:02:07))
 - neuter-shard2.json: 0 failed (128 passed in 134.25s (0:02:14))
 - neuter-shard3.json: 0 failed (128 passed in 141.26s (0:02:21))
 - neuter-s14b2.json: 0 failed (128 passed in 139.93s (0:02:19))
+- neuter-s16-1.json: 0 failed (140 passed in 114.01s (0:01:54))
+- neuter-s16-2.json: 0 failed (140 passed in 114.07s (0:01:54))
