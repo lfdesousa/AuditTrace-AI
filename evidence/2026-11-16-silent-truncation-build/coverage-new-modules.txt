@@ -1,6 +1,8 @@
 Coverage of the new and changed modules by the change's own tests only (chain tests, the rewritten retrieval-correctness file, ASGI and unit tests), line and branch, from a --cov-branch run at 403f304a.
 The first full run (before the ASGI and unit tests) failed the per-file gate on three of them (branch coverage 71.4% bff/body_limit_middleware.py, 78.6% memory_body_limit_middleware.py, 83.3% memory_fold_tail.py); all three are now above 90%.
 
+A file whose figure is lower here (memory_write_support.py branches, mcp_write_handlers.py) is also exercised by the rest of the suite; in the first full run the per-file gate reported exactly those three files and no other.
+
 bff/body_limit_middleware.py: lines 100.0% branches 100.0%
 bff/body_limit_refusal.py: lines 100.0% branches 0.0%
 bff/request_too_large_error.py: lines 100.0% branches 0.0%
