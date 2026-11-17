@@ -157,7 +157,7 @@ CI_TEST_JOB_GOLDEN: dict = {
 #: BOOLEAN `True` — read it under that key (never the string `"on"`,
 #: which is absent from the parsed mapping) and assert it's non-empty.
 CI_WORKFLOW_ON_GOLDEN: dict = {
-    "push": {"branches": ["main", "feat/**", "fix/**"], "tags": ["v*"]},
+    "push": {"branches": ["main"], "tags": ["v*"]},
     "pull_request": {"branches": ["main", "feat/**"]},
 }
 CI_WORKFLOW_ENV_GOLDEN: dict | None = None
