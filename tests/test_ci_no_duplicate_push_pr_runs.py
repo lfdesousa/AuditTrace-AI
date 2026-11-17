@@ -5,8 +5,9 @@ Defect (backlog CI-DUPLICATE-PUSH-AND-PR-RUNS, issue #18): ``ci.yml`` and
 ``pull_request``, so every push to a PR branch ran the whole workflow twice.
 
 Rule pinned here: in any workflow that also has a ``pull_request`` trigger,
-``push.branches`` may only be the literal ``main`` (the merge commit, which
-is not a duplicate of a PR run). Tags are unaffected. The tests also pin
+a ``push`` may only filter to the literal branch ``main`` (the merge commit,
+which is not a duplicate of a PR run) and/or tags. A bare ``push:``,
+``branches-ignore`` or a paths-only push fire for every branch and fail. The tests also pin
 what must NOT change: the main and tag triggers, and the job names that
 branch protection matches by name.
 
@@ -35,7 +36,29 @@ _JOBS = {
 def _triggers(name: str) -> dict[str, Any]:
     doc = yaml.safe_load((_WF_DIR / name).read_text(encoding="utf-8"))
     # PyYAML parses the bare key ``on`` as boolean True.
-    return doc.get("on", doc.get(True)) or {}
+    on = doc.get("on", doc.get(True)) or {}
+    if isinstance(on, str):
+        on = [on]
+    if isinstance(on, list):  # ``on: [push, pull_request]`` shorthand
+        on = {event: None for event in on}
+    return on
+
+
+def _push_hits_all_branches(push: Any) -> bool:
+    """True when a ``push`` trigger can fire for a PR head branch.
+
+    A null/empty push, any ``branches-ignore``, a push with neither a
+    ``branches`` nor a ``tags`` filter (including paths-only), and any
+    ``branches`` list wider than the literal ``main`` all fire for every
+    branch. A tags-only push is not a branch push.
+    """
+    if not push:
+        return True
+    if "branches-ignore" in push:
+        return True
+    if "branches" not in push:
+        return "tags" not in push
+    return not set(push["branches"] or []) <= {"main"}
 
 
 @pytest.mark.parametrize("name", _WORKFLOWS)
@@ -43,10 +66,27 @@ def test_push_branches_do_not_duplicate_pull_request(name: str) -> None:
     trig = _triggers(name)
     if "pull_request" not in trig or "push" not in trig:
         return
-    branches = (trig["push"] or {}).get("branches", [])
-    assert set(branches) <= {"main"}, (
-        f"{name}: push.branches {branches} duplicates the pull_request run"
+    assert not _push_hits_all_branches(trig["push"]), (
+        f"{name}: push trigger {trig['push']!r} duplicates the pull_request run"
     )
+
+
+@pytest.mark.parametrize(
+    ("push", "expected"),
+    [
+        (None, True),
+        ({}, True),
+        ({"branches-ignore": ["gh-pages"]}, True),
+        ({"paths": ["docs/**"]}, True),
+        ({"branches": ["main", "fix/**"]}, True),
+        ({"branches": ["main"]}, False),
+        ({"branches": ["main"], "paths": ["docs/**"]}, False),
+        ({"tags": ["v*"]}, False),
+        ({"branches": ["main"], "tags": ["v*"]}, False),
+    ],
+)
+def test_push_shape_classifier(push: Any, expected: bool) -> None:
+    assert _push_hits_all_branches(push) is expected
 
 
 @pytest.mark.parametrize("name", ["ci.yml", "e2e.yml"])
