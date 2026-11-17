@@ -10,6 +10,7 @@ regression that triggered ADR-024.
 import json
 import os
 from datetime import date
+from json import dumps as _json_dumps
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlsplit
 
@@ -85,7 +86,7 @@ class _FakeAsyncClient:
         resp = MagicMock()
         resp.status_code = 200
         resp.is_success = True
-        resp.text = json.dumps(self._post_json)
+        resp.text = _json_dumps(self._post_json)
         resp.headers = {}
         resp.json.return_value = self._post_json
         return resp
