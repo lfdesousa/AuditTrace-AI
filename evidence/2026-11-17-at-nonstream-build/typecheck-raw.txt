@@ -1,0 +1,4 @@
+🔎 Running type checker via .venv/bin/mypy ...
+Success: no issues found in 182 source files
+✅ Type checking passed
+make typecheck rc=0
