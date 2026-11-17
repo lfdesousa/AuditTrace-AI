@@ -40,6 +40,8 @@ TESTS = [
     "tests/bff/test_body_limit.py",
     "tests/test_memory_blank_refold_clears_the_document.py",
     "tests/test_wu1_memory_retrieval_correctness.py",
+    "tests/test_body_limit_middlewares_asgi.py",
+    "tests/test_memory_fold_tail_unit.py",
 ]
 R = "src/audittrace/routes/"
 MEMORY = R + "memory.py"
@@ -54,6 +56,7 @@ SERVER = "src/audittrace/server.py"
 MIDDLEWARE = "src/audittrace/memory_body_limit_middleware.py"
 BFF_APP = "bff/app.py"
 BFF_REFUSAL = "bff/body_limit_refusal.py"
+BFF_MIDDLEWARE = "bff/body_limit_middleware.py"
 
 Edit = tuple[str, str, str]
 Neuter = tuple[str, str, list[Edit]]
@@ -166,6 +169,18 @@ NEUTERS: list[Neuter] = [
        "            await stale.drop(\n                collection,\n                manifest_service,\n                user,\n                caller_can_write_shared=caller_can_write_shared,\n            )\n            continue\n")]),
     ("S14c", "a blank fold is looked up with the old 'kept' of a non-blank fold (tail starts at 1)",
      [(MEMORY, "collection, user, tier, col_name, obj[\"filename\"], kept=len(chunks)\n", "collection, user, tier, col_name, obj[\"filename\"], kept=max(len(chunks), 1)\n")]),
+    ("S16a", "the BFF middleware stacks a 413 on a response the app already began",
+     [(BFF_MIDDLEWARE, "            if answered:\n                raise\n", "            if False:\n                raise\n")]),
+    ("S16b", "the memory middleware stacks a 413 on a response the app already began",
+     [(MIDDLEWARE, "            if answered:\n                raise\n", "            if False:\n                raise\n")]),
+    ("S16c", "the BFF middleware lets an app that swallowed the abort answer 400",
+     [(BFF_MIDDLEWARE, "            if overflowed:\n                if not answered:\n", "            if False:\n                if not answered:\n")]),
+    ("S16d", "the memory middleware lets an app that swallowed the abort answer 400",
+     [(MIDDLEWARE, "            if overflowed:\n                if not answered:\n", "            if False:\n                if not answered:\n")]),
+    ("S17a", "a fold audit that cannot be written is swallowed instead of a 500",
+     [(TAIL, "        except Exception as exc:\n            raise HTTPException(\n", "        except ZeroDivisionError as exc:\n            raise HTTPException(\n")]),
+    ("S17b", "the legacy-row walk takes a row that belongs to someone else",
+     [(TAIL, '                if (meta or {}).get("user_id") == user.user_id and (meta or {}).get(\n                    "tier"\n                ) == "private":\n', "                if True:\n")]),
     ("S15a", "the BFF 413 loses the additive detail key",
      [(BFF_REFUSAL, '        "detail": message,\n', "")]),
     ("S15b", "the BFF 413 is the old detail-only body (no error object)",
