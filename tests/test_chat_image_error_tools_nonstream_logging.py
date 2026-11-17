@@ -4,7 +4,7 @@
 added ``logger.info`` / ``logger.error`` carrying the upstream text on this arm stayed
 GREEN. Here the capture is at DEBUG: exactly ONE audittrace record may carry the
 upstream text (the retry helper's WARNING), and ``_upstream_errors`` itself emits
-nothing on this arm (``tools_non_stream_upstream_error`` logs nothing by contract).
+nothing on this arm (``non_stream_upstream_error`` logs nothing by contract).
 
 Falsifiability: neuter R2a (``logger.info(text)`` in the image branch) and R2b
 (``logger.error(text)``) each turn the first test, and the second, RED.

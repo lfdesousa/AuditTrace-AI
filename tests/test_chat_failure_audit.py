@@ -233,7 +233,8 @@ class TestNonStreamingFailureAudit:
         """Phase A.4 regression: when the upstream returns HTTP 200 with a
         body containing an ADR-033-shaped error envelope, the local audit row
         MUST be ``status='failed'`` with a ``failure_class`` set — not
-        silently stored as success because we extracted empty choices."""
+        silently stored as success because we extracted empty choices — and the
+        client gets a 502, not a 200 for a failed turn."""
         fake = _FakeAsyncClient(
             post_json={
                 "error": {
@@ -255,15 +256,18 @@ class TestNonStreamingFailureAudit:
                 },
             )
 
-        # The proxy passes the body through unchanged (OpenAI compat).
-        assert response.status_code == 200
+        # A 2xx reply that carries an ``error`` object is not a completion: the
+        # proxy answers 502 with its own error object (never a 200 for a failed turn).
+        assert response.status_code == 502
         body = response.json()
         assert body["error"]["code"] == "upstream_error"
+        assert body["detail"] == "llama-server returned 200"
 
         row = await _latest_interaction()
         assert row is not None
         assert row.status == "failed"
         assert row.failure_class == "upstream_error"
+        assert (row.error_detail or "").startswith("status=200: ")
         assert "malformed response" in (row.error_detail or "")
         assert row.duration_ms is not None
 

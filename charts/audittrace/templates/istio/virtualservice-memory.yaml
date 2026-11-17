@@ -33,6 +33,9 @@ spec:
         - uri:
             prefix: /v1/chat/completions
       timeout: 1800s
+      retries:
+        attempts: 2
+        retryOn: connect-failure,refused-stream
       route:
         - destination:
             host: {{ .Release.Name }}-memory-server.{{ .Release.Namespace }}.svc.cluster.local

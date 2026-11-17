@@ -278,7 +278,8 @@ class TestUnrelatedUpstream400Unchanged:
         fake = _Upstream400Client(LLAMA_UNRELATED_400_BODY)
         with _patch_async_client(fake):
             response = _post(client, UPLOAD_TO_PROVIDER_MESSAGES, stream=False)
-        assert response.status_code == 200
+        # The upstream's own status and error object are relayed (not a 200).
+        assert response.status_code == 400
         assert response.json() == LLAMA_UNRELATED_400_BODY
         row = await _latest_interaction()
         assert row is not None and row.status == "failed"
@@ -289,11 +290,10 @@ class TestUnrelatedUpstream400Unchanged:
         fake = _Upstream400Client(LLAMA_UNRELATED_400_BODY)
         with _patch_async_client(fake), _patch_tool_loop_client(fake):
             response = _post(client, UPLOAD_TO_PROVIDER_MESSAGES, stream=False)
-        assert response.status_code == 200
+        assert response.status_code == 400
         assert response.json() == LLAMA_UNRELATED_400_BODY
         row = await _latest_interaction()
-        assert row is not None
-        print(f"DIAG tools-non-stream unrelated-400 row.status={row.status!r}")
+        assert row is not None and row.status == "failed"
 
 
 # ─────────────── PIN (GREEN before and after): Upload as Text passes ───────────────

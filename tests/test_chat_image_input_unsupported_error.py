@@ -313,24 +313,25 @@ class TestOtherUpstream500Unchanged:
         frame = _parse_sse_error_frame(response.content.decode())["error"]
         assert frame == GENERIC_500_FRAME
 
-    async def test_tools_non_stream_is_the_502_detail(self, client, tools_mode) -> None:  # type: ignore[no-untyped-def]
-        response, _ = _run(client, "tools", False, 500, LLAMA_OTHER_500_BODY)
-        assert response.status_code == 502
-        assert response.json() == {"detail": "llama-server returned 500"}
-
-    async def test_inject_non_stream_returns_the_upstream_body(  # type: ignore[no-untyped-def]
-        self, client, inject_mode
+    @pytest.mark.parametrize("mode", ["tools", "inject"])
+    async def test_non_stream_is_the_502_error_object(  # type: ignore[no-untyped-def]
+        self, client, request, mode
     ) -> None:
-        """TODAY'S BEHAVIOUR, NOT ENDORSED: an unmatched upstream 500 on the inject
-        non-stream arm is returned as HTTP 200 with the upstream's error object,
-        which no OpenAI client can read as a completion. Pinned only so that THIS
-        change does not move it; the defect has its own backlog item
-        (AT-INJECT-NONSTREAM-UPSTREAM-ERROR-200)."""
-        response, _ = _run(client, "inject", False, 500, LLAMA_OTHER_500_BODY)
-        assert response.status_code == 200
-        assert response.json() == LLAMA_OTHER_500_BODY
+        """An unmatched upstream 500 on EITHER non-stream arm is the proxy's own 502:
+        the OpenAI error object plus ``detail``, and one ``failed`` row. (Inject used
+        to answer HTTP 200 with the upstream's error object, which no OpenAI client
+        reads as a completion.)"""
+        request.getfixturevalue(f"{mode}_mode")
+        response, _ = _run(client, mode, False, 500, LLAMA_OTHER_500_BODY)
+        assert response.status_code == 502
+        body = response.json()
+        assert body["detail"] == "llama-server returned 500"
+        assert body["error"]["code"] == "upstream_error"
+        assert body["error"]["status"] == 502
         row = await _latest_interaction()
-        assert row is not None and row.status == "failed"
+        assert row is not None
+        assert row.status == "failed"
+        assert row.failure_class == "upstream_error"
 
     async def test_request_is_forwarded_unmodified(self, client, tools_mode) -> None:  # type: ignore[no-untyped-def]
         """ADR-024: a response-side change only."""

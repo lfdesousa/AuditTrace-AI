@@ -200,9 +200,12 @@ class TestMovedArmHelpers:
         with pytest.raises(httpx.ResponseNotRead):
             ok.text  # noqa: B018
 
-    def test_client_error_response_is_a_400_with_the_hit_body(self):
+    def test_non_stream_error_reply_of_a_recognised_hit_is_a_400_with_the_hit_body(
+        self,
+    ):
         hit = ue.classify_unsupported_content(400, _text(400), PAYLOAD)
         assert hit is not None
-        resp = ue.client_error_response(hit)
+        resp = ue.non_stream_error_reply(400, _text(400), PAYLOAD, None)
+        assert resp is not None
         assert resp.status_code == 400
         assert json.loads(resp.body) == hit.error_body
