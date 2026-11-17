@@ -33,7 +33,7 @@ jobs:
   check-contract-sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Verify vendored contract against its pin
         run: ./scripts/check-contracts-sync.sh
