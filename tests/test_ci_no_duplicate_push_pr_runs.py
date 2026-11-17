@@ -33,15 +33,24 @@ _JOBS = {
 }
 
 
+def _normalise_on(on: Any) -> dict[str, Any]:
+    """Return the ``on:`` block as an event -> filter mapping.
+
+    Handles the shorthand forms ``on: push`` and ``on: [push, pull_request]``.
+    """
+    if not on:
+        return {}
+    if isinstance(on, str):
+        on = [on]
+    if isinstance(on, list):
+        return {event: None for event in on}
+    return dict(on)
+
+
 def _triggers(name: str) -> dict[str, Any]:
     doc = yaml.safe_load((_WF_DIR / name).read_text(encoding="utf-8"))
     # PyYAML parses the bare key ``on`` as boolean True.
-    on = doc.get("on", doc.get(True)) or {}
-    if isinstance(on, str):
-        on = [on]
-    if isinstance(on, list):  # ``on: [push, pull_request]`` shorthand
-        on = {event: None for event in on}
-    return on
+    return _normalise_on(doc.get("on", doc.get(True)))
 
 
 def _push_hits_all_branches(push: Any) -> bool:
@@ -77,6 +86,7 @@ def test_push_branches_do_not_duplicate_pull_request(name: str) -> None:
         (None, True),
         ({}, True),
         ({"branches-ignore": ["gh-pages"]}, True),
+        ({"tags": ["v*"], "branches-ignore": ["gh-pages"]}, True),
         ({"paths": ["docs/**"]}, True),
         ({"branches": ["main", "fix/**"]}, True),
         ({"branches": ["main"]}, False),
@@ -87,6 +97,19 @@ def test_push_branches_do_not_duplicate_pull_request(name: str) -> None:
 )
 def test_push_shape_classifier(push: Any, expected: bool) -> None:
     assert _push_hits_all_branches(push) is expected
+
+
+@pytest.mark.parametrize(
+    ("on", "expected"),
+    [
+        (None, {}),
+        ("push", {"push": None}),
+        (["push", "pull_request"], {"push": None, "pull_request": None}),
+        ({"push": {"branches": ["main"]}}, {"push": {"branches": ["main"]}}),
+    ],
+)
+def test_normalise_on_shorthand(on: Any, expected: dict[str, Any]) -> None:
+    assert _normalise_on(on) == expected
 
 
 @pytest.mark.parametrize("name", ["ci.yml", "e2e.yml"])
