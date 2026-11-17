@@ -1,0 +1,7 @@
+Final full run: make test under the shared lock at 403f304a (src and tests identical to HEAD; later commits are evidence only):
+Required test coverage of 90% reached. Total coverage: 98.95%
+================ 11183 passed, 3 warnings in 3322.86s (0:55:22) ================
+[no-skip-check] No skipped tests in junit.xml. Good.
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (218 files checked, 239 measured files all reported, lines >= 90%, branches >= 90% on 181 file(s) with branches)
+✅ Tests passed (scripts/ci/run-tests.sh)
