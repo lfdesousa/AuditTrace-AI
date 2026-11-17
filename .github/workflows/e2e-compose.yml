@@ -50,7 +50,7 @@ jobs:
       COMPOSE_FILE: docker-compose.yml:docker-compose.ci-build.yml
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Login to GitHub Container Registry
         # Without this, the postgres + redis pulls (ghcr-frozen
