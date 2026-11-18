@@ -17,8 +17,6 @@ from bff.body_limit_refusal import (
 from bff.config import get_settings
 from bff.request_too_large_error import RequestTooLargeError
 
-_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
-
 
 class BodyLimitMiddleware:
     """413 for a request whose body is over its path's ceiling."""
@@ -27,7 +25,9 @@ class BodyLimitMiddleware:
         self.app = app
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] != "http" or scope.get("method") not in _WRITE_METHODS:
+        # Every method: the proxies read ``await request.body()`` whatever the
+        # verb, so a GET or DELETE carrying a body is buffered just the same.
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         settings = get_settings()
