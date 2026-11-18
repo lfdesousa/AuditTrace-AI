@@ -117,6 +117,49 @@ class TestBffBodyLimit:
         assert refused.json() == _detail(OTHER_CEILING)
         assert _untouched(backend)
 
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE", "GET"])
+    def test_every_method_is_bounded_a_proxy_buffers_a_body_whatever_the_verb(
+        self, bff: tuple[TestClient, _ConsoleFilesBackend], method: str
+    ) -> None:
+        client, backend = bff
+
+        refused = client.request(
+            method,
+            "/memory/x",
+            content=b"x" * (OTHER_CEILING + 1),
+            headers={"Authorization": f"Bearer {make_token(sub='alice')}"},
+        )
+
+        assert refused.status_code == 413
+        assert refused.json() == _detail(OTHER_CEILING)
+        assert _untouched(backend)  # nothing was forwarded
+
+    @pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE", "GET"])
+    def test_a_console_proxy_bounds_every_method_too(
+        self, bff: tuple[TestClient, _ConsoleFilesBackend], method: str
+    ) -> None:
+        client, backend = bff
+
+        refused = client.request(
+            method,
+            "/console/presets/x",
+            content=b"x" * (OTHER_CEILING + 1),
+            headers={"Authorization": f"Bearer {make_token(sub='alice')}"},
+        )
+
+        assert refused.status_code == 413
+        assert refused.json() == _detail(OTHER_CEILING)
+        assert _untouched(backend)
+
+    def test_control_a_get_without_a_body_is_not_refused(
+        self, bff: tuple[TestClient, _ConsoleFilesBackend]
+    ) -> None:
+        client, _backend = bff
+
+        answer = client.get("/health")
+
+        assert answer.status_code == 200
+
     def test_control_an_upload_under_the_ceiling_is_forwarded_unchanged(
         self, bff: tuple[TestClient, _ConsoleFilesBackend]
     ) -> None:

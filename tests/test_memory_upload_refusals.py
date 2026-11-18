@@ -77,6 +77,31 @@ class TestMemoryUploadRefusals:
             ("write", "note.md", "concurrent_write")
         ]
 
+    @pytest.mark.parametrize("route", ["upload", "create"])
+    def test_403_when_the_manifest_refuses_the_row_after_the_content_write(
+        self, client: TestClient, route: str
+    ) -> None:
+        """The pre-write authorization passed; a concurrent change (a corpus row
+        appearing under the name) makes the manifest refuse the row AFTER the
+        content write. The caller gets 403; the object is already stored and no
+        write audit is emitted for the refused row."""
+        from audittrace.services.memory_keys import ManifestAuthorizationError
+        from tests.memory_truncation_support_a1 import memory_audit_details
+
+        before = len(memory_audit_details())
+        refused_row = AsyncMock(side_effect=ManifestAuthorizationError("raced"))
+        with patch.object(type(manifest()), "record_create", refused_row):
+            if route == "upload":
+                answer = upload(client, "episodic", "raced.md", TEXT)
+            else:
+                answer = client.post(
+                    "/memory/episodic", json={"filename": "raced.md", "content": TEXT}
+                )
+
+        assert answer.status_code == 403
+        assert memory_audit_details()[before:] == []
+        assert client.get("/memory/episodic/raced.md").json()["content"] == TEXT
+
     def test_500_when_the_write_audit_cannot_be_written(
         self, client: TestClient
     ) -> None:

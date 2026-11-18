@@ -116,6 +116,69 @@ def _status_and_body(sent: list[dict[str, Any]]) -> tuple[int, Any]:
 
 @pytest.mark.parametrize("case", sorted(CASES))
 class TestBodyLimitMiddlewaresAsgi:
+    def test_a_declared_length_over_the_ceiling_is_refused_before_anything_is_read(
+        self, case: str
+    ) -> None:
+        build, path, body, _abort, refusal = CASES[case]
+        reads: list[str] = []
+        inner: list[str] = []
+
+        async def app(scope: dict[str, Any], receive: Receive, send: Send) -> None:
+            inner.append("called")
+
+        async def receive() -> dict[str, Any]:
+            reads.append("awaited")
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        sent: list[dict[str, Any]] = []
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": path,
+            "headers": [(b"content-length", str(len(body)).encode())],
+        }
+
+        asyncio.run(build(app)(scope, receive, send))
+
+        assert _status_and_body(sent) == (413, refusal)
+        assert inner == []  # the application never ran
+        assert reads == []  # not one byte of the body was asked for
+
+    def test_a_declared_length_at_the_ceiling_is_let_through(self, case: str) -> None:
+        build, path, body, _abort, _refusal = CASES[case]
+        at_ceiling = {"bff": BFF_CEILING, "memory": MEMORY_CEILING}[case]
+        inner: list[str] = []
+
+        async def app(scope: dict[str, Any], receive: Receive, send: Send) -> None:
+            inner.append("called")
+            await send({"type": "http.response.start", "status": 204, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        sent: list[dict[str, Any]] = []
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": path,
+            "headers": [(b"content-length", str(at_ceiling).encode())],
+        }
+
+        asyncio.run(build(app)(scope, receive, send))
+
+        assert inner == ["called"]
+        assert sent[0]["status"] == 204
+        assert len(body) > at_ceiling
+
     def test_an_app_that_swallows_the_abort_and_answers_400_still_gives_one_413(
         self, case: str
     ) -> None:

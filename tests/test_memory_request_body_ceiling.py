@@ -75,6 +75,35 @@ class TestMemoryRequestBodyCeiling:
         assert refused.json() == _detail(JSON_CEILING)
         assert client.get("/memory/episodic/big.md").status_code == 404
 
+    @pytest.mark.parametrize(
+        "path", ["/memory/episodic/big.md", "/memory/procedural/big.md"]
+    )
+    def test_a_put_over_the_ceiling_is_refused_with_the_ceiling_sentence(
+        self, client: TestClient, path: str
+    ) -> None:
+        refused = client.put(
+            path,
+            content=_json_body(JSON_CEILING + 1),
+            headers={"content-type": "application/json"},
+        )
+
+        assert refused.status_code == 413
+        assert refused.json() == _detail(JSON_CEILING)  # not the document sentence
+        assert client.get(path).status_code == 404
+
+    def test_a_put_to_a_semantic_document_over_the_ceiling_is_refused(
+        self, client: TestClient
+    ) -> None:
+        refused = client.put(
+            "/memory/semantic/decisions/big",
+            content=json.dumps({"text": "x" * (JSON_CEILING + 1)}).encode(),
+            headers={"content-type": "application/json"},
+        )
+
+        assert refused.status_code == 413
+        assert refused.json() == _detail(JSON_CEILING)
+        assert client.get("/memory/semantic/decisions/big").status_code == 404
+
     def test_an_upload_over_its_ceiling_is_refused_unspooled(
         self, client: TestClient
     ) -> None:
