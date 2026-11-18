@@ -299,9 +299,9 @@ class TestToolsNonStreamPins:
 
 class TestStreamDetailPrefersUpstreamText:
     # ADDENDUM-1 (operator Q3): the streamed error_detail carries the upstream
-    # BODY TEXT, cut at 400; str(exc) only when the body is empty. Supersedes
+    # BODY TEXT, cut at 400; (empty reply) when the body is empty (never httpx's URL sentence). Supersedes
     # the v1 pins S1/S2 (which pinned str(exc) for a non-empty body).
-    STR_EXC_START = "status=500: Server error '500 Internal Server Error' for url 'http://llama.test/xxxx"
+    EMPTY_REPLY_DETAIL = "status=500: (empty reply)"
     LONG_500 = json.dumps(
         {"error": {"code": 500, "message": LONG_MESSAGE, "type": "server_error"}}
     ).encode()
@@ -313,33 +313,35 @@ class TestStreamDetailPrefersUpstreamText:
         assert response.status_code == 200
         assert "data: [DONE]" in response.text
         row = await _failed_upstream_row(500)
-        print(f"DIAG detail[:60]={row.error_detail[:60]!r} len={len(row.error_detail)}")
-        assert len(row.error_detail) == DETAIL_PREFIX_LEN + DETAIL_CUT
         return row.error_detail
 
     async def test_tools_stream_5xx_detail_is_upstream_text_cut_at_400(
         self, client, tools_mode
     ):
         detail = await self._detail(client, self.LONG_500, tools=True)
+        assert len(detail) == DETAIL_PREFIX_LEN + DETAIL_CUT
         assert detail == "status=500: " + self.LONG_500.decode()[:DETAIL_CUT]
 
     async def test_inject_stream_5xx_detail_is_upstream_text_cut_at_400(
         self, client, inject_mode
     ):
         detail = await self._detail(client, self.LONG_500, tools=False)
+        assert len(detail) == DETAIL_PREFIX_LEN + DETAIL_CUT
         assert detail == "status=500: " + self.LONG_500.decode()[:DETAIL_CUT]
 
-    async def test_tools_stream_5xx_empty_body_falls_back_to_str_exc(
+    async def test_tools_stream_5xx_empty_body_is_empty_reply_without_url(
         self, client, tools_mode
     ):
         detail = await self._detail(client, b"", tools=True)
-        assert detail.startswith(self.STR_EXC_START)
+        assert detail == self.EMPTY_REPLY_DETAIL
+        assert "llama.test" not in detail
 
-    async def test_inject_stream_5xx_empty_body_falls_back_to_str_exc(
+    async def test_inject_stream_5xx_empty_body_is_empty_reply_without_url(
         self, client, inject_mode
     ):
         detail = await self._detail(client, b"", tools=False)
-        assert detail.startswith(self.STR_EXC_START)
+        assert detail == self.EMPTY_REPLY_DETAIL
+        assert "llama.test" not in detail
 
 
 # ───────────── ADDENDUM-1: sequenced upstream (real httpx.Response per call) ─────────────

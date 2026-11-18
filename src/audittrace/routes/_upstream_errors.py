@@ -231,8 +231,9 @@ def status_error_detail(exc: httpx.HTTPStatusError) -> str:
     text = ""
     with contextlib.suppress(httpx.ResponseNotRead):
         text = exc.response.text
-    fallback = str(exc) if exc.response.is_success else EMPTY_REPLY
-    return error_detail_from_text(exc.response.status_code, text or fallback)
+    status = exc.response.status_code
+    fallback = str(exc) if 200 <= status < 300 else EMPTY_REPLY
+    return error_detail_from_text(status, text or fallback)
 
 
 def classify_unsupported_content(
