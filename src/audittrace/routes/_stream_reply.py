@@ -40,7 +40,7 @@ _DONE = "[DONE]"
 #: memory bound only: the audit row's own cut is ``_upstream_errors._MAX_BODY_CHARS``,
 #: applied when the detail is built, so this constant is not asserted by any test.
 _HEAD_CHARS = 400
-_EMPTY = "(empty reply)"
+EMPTY_REPLY = "(empty reply)"
 _UNPARSEABLE = object()
 
 
@@ -88,7 +88,7 @@ class StreamReplyCheck:
             self._fail("no [DONE]")
 
     def _fail(self, reason: str) -> NoReturn:
-        head = self._head.strip() or _EMPTY
+        head = self._head.strip() or EMPTY_REPLY
         logger.warning(
             "llama-server stream reply HTTP %d is not a complete stream (%s) — head: %s",
             self._response.status_code,

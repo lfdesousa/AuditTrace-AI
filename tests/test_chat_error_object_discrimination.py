@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -78,7 +77,7 @@ def _error_object_frames(sse: str) -> list[Any]:
     return frames
 
 
-def _chunk_with_error_null(delta: dict[str, Any], finish: str | None) -> bytes:
+def _chunk_with_error(error: Any, delta: dict[str, Any], finish: str | None) -> bytes:
     return _data(
         {
             "id": "chatcmpl-1",
@@ -86,7 +85,7 @@ def _chunk_with_error_null(delta: dict[str, Any], finish: str | None) -> bytes:
             "created": 1,
             "model": "m",
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-            "error": None,
+            "error": error,
         }
     )
 
@@ -112,15 +111,20 @@ class TestA4xxWhoseErrorIsNotAnObjectIsTheProxys502:
         await _assert_failed_row(sid, 404, raw.decode(), response)
 
 
-class TestA2xxCompletionCarryingErrorNullIsASuccess:
-    """(b) ``"error": null`` is no error object: the completion is served."""
+class TestA2xxCompletionCarryingANonObjectErrorIsASuccess:
+    """(b) an ``error`` that is not an object (null, string, ...) is no failure: served."""
 
     @pytest.mark.parametrize("mode", MODES)
+    @pytest.mark.parametrize("kind", list(NOT_AN_OBJECT))
     async def test_success_row_and_completion_relayed(
-        self, client: TestClient, request: pytest.FixtureRequest, mode: str
+        self,
+        client: TestClient,
+        request: pytest.FixtureRequest,
+        mode: str,
+        kind: str,
     ) -> None:
         request.getfixturevalue(f"{mode}_mode")
-        body = _completion({"error": None})
+        body = _completion({"error": NOT_AN_OBJECT[kind]})
         fake, sid = _Upstream(200, json.dumps(body).encode()), _sid(request)
         response = _call(client, fake, sid)
         assert response.status_code == 200
@@ -136,17 +140,23 @@ class TestA2xxCompletionCarryingErrorNullIsASuccess:
         assert len(fake.post_calls) == 1
 
 
-class TestACompleteStreamWhoseChunksCarryErrorNullIsASuccess:
-    """(c) ``"error": null`` in a chunk is no error object: no frame, a success row."""
+class TestACompleteStreamWhoseChunksCarryANonObjectErrorIsASuccess:
+    """(c) a chunk ``error`` that is not an object: no frame, a success row."""
 
     @pytest.mark.parametrize("mode", MODES)
+    @pytest.mark.parametrize("kind", list(NOT_AN_OBJECT))
     async def test_success_row_no_error_frame(
-        self, client: TestClient, request: pytest.FixtureRequest, mode: str
+        self,
+        client: TestClient,
+        request: pytest.FixtureRequest,
+        mode: str,
+        kind: str,
     ) -> None:
         request.getfixturevalue(f"{mode}_mode")
+        error = NOT_AN_OBJECT[kind]
         raw = (
-            _chunk_with_error_null({"content": "Hel"}, None)
-            + _chunk_with_error_null({}, "stop")
+            _chunk_with_error(error, {"content": "Hel"}, None)
+            + _chunk_with_error(error, {}, "stop")
             + DONE
         )
         fake, sid = _Upstream(200, raw, headers=SSE), _sid(request)
@@ -163,23 +173,25 @@ def test_the_fixtures_are_the_shapes_they_claim() -> None:
     """Guards the guards: the chunk helper differs from the plain one only by the key."""
     plain = json.loads(CHUNK.decode()[len("data: ") :])
     nulled = json.loads(
-        _chunk_with_error_null({"content": "Hel"}, None).decode()[len("data: ") :]
+        _chunk_with_error(None, {"content": "Hel"}, None).decode()[len("data: ") :]
     )
     assert nulled == {**plain, "error": None}
 
 
-class TestEmptyBodyDetailNamesTheStatusSentence:
-    """F5: ``raise_status_error`` keeps ``raise_for_status()`` (spec ADDENDUM-1 rule 8).
+class TestEmptyBodyDetail:
+    """F5 + r3: ``raise_status_error`` keeps ``raise_for_status()`` (spec rule 8).
 
-    A non-2xx with an EMPTY body has no text to audit, so the row keeps httpx's own
-    sentence (as before this change); a 2xx that is no completion has no status to
-    raise for, so the row carries the proxy's ``Unusable reply`` sentence. Dropping
-    the ``raise_for_status()`` call turns the first cell into the second.
+    A non-2xx with an EMPTY body has no text to audit, so the row reads
+    ``status=<code>: (empty reply)`` (the streamed wording, ADDENDUM-3 2) and never
+    httpx's sentence, which names the internal upstream URL. A 2xx that is no
+    completion has no status to raise for, so the row carries the proxy's
+    ``Unusable reply`` sentence. Dropping the ``raise_for_status()`` call turns the
+    first cell into the second; restoring the ``str(exc)`` fallback names the URL.
     """
 
     @pytest.mark.parametrize("mode", MODES)
     @pytest.mark.parametrize("status", [404, 503])
-    async def test_non_2xx_empty_body_detail_is_httpxs_sentence(
+    async def test_non_2xx_empty_body_detail_is_empty_reply_without_url(
         self, client: TestClient, request: pytest.FixtureRequest, mode: str, status: int
     ) -> None:
         request.getfixturevalue(f"{mode}_mode")
@@ -188,12 +200,10 @@ class TestEmptyBodyDetailNamesTheStatusSentence:
         assert response.status_code == 502
         row = await _only_row(sid)
         assert (row.status, row.failure_class) == ("failed", "upstream_error")
-        reason = httpx.codes.get_reason_phrase(status)
-        prefix = f"status={status}: "
-        sentence = f"{'Client' if status < 500 else 'Server'} error '{status} {reason}'"
-        assert row.error_detail is not None
-        assert row.error_detail.startswith(f"{prefix}{sentence} for url '")
+        assert row.error_detail == f"status={status}: (empty reply)"
+        assert "http" not in row.error_detail and "url" not in row.error_detail
         assert "Unusable reply" not in row.error_detail
+        assert "http" not in response.text
 
     @pytest.mark.parametrize("mode", MODES)
     async def test_2xx_empty_body_detail_is_the_proxys_sentence(

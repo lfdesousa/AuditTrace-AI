@@ -47,6 +47,8 @@ from typing import Any, NoReturn
 import httpx
 from fastapi.responses import JSONResponse
 
+from audittrace.routes._stream_reply import EMPTY_REPLY
+
 logger = logging.getLogger(__name__)
 
 #: The exact message llama-server emits (``server-common.cpp``); matched by equality.
@@ -218,15 +220,19 @@ def error_detail_from_text(status_code: int, body_text: str) -> str:
 
 
 def status_error_detail(exc: httpx.HTTPStatusError) -> str:
-    """Audit detail of a raised upstream status error: body text, else ``str(exc)``.
+    """Audit detail of a raised upstream status error: body text, else a fixed sentence.
 
-    A body that was never read has no ``.text`` (``ResponseNotRead``) and an
-    empty body carries no reason: both fall back to httpx's own sentence.
+    A body that was never read has no ``.text`` (``ResponseNotRead``) and an empty
+    body carries no reason. For a non-2xx reply both read ``(empty reply)``, the
+    streamed wording: httpx's own sentence names the internal upstream URL. A 2xx
+    reply that is no completion keeps the proxy's own ``Unusable reply`` sentence
+    (``raise_status_error``), which names no URL.
     """
     text = ""
     with contextlib.suppress(httpx.ResponseNotRead):
         text = exc.response.text
-    return error_detail_from_text(exc.response.status_code, text or str(exc))
+    fallback = str(exc) if exc.response.is_success else EMPTY_REPLY
+    return error_detail_from_text(exc.response.status_code, text or fallback)
 
 
 def classify_unsupported_content(
