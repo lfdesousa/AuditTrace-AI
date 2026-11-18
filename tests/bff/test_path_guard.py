@@ -15,7 +15,10 @@ Neuters (each alone): G1 remove the middleware -> every ``refused`` cell; G2
 check the raw path only (not the decoded one) -> ``encoded_dots``; G3 drop the
 encoded-separator check -> the ``encoded_slash`` and ``encoded_backslash``
 cells; G4 refuse any segment CONTAINING a dot -> ``test_names_with_dots_are_
-relayed``.
+relayed``; G5 (round 2) drop the per-segment second decode / parameter strip
+-> the ``double_encoded_*`` dot cells and the ``parameter_*`` cells; G6 drop
+the residual-encoding check -> ``double_encoded_slash``, ``..._backslash``,
+``..._dot_inside_a_name``.
 """
 
 from __future__ import annotations
@@ -77,6 +80,54 @@ REFUSED: dict[str, tuple[str, str, bytes, str]] = {
         b"/memory/a%5C..%5Cb",
         "encoded_separator",
     ),
+    "double_encoded_dots": (
+        "GET",
+        "/memory/%2e%2e/interactions/refusals",
+        b"/memory/%252e%252e/interactions/refusals",
+        "dot_segment",
+    ),
+    "half_double_encoded_dots": (
+        "GET",
+        "/memory/.%2e/episodic",
+        b"/memory/.%252e/episodic",
+        "dot_segment",
+    ),
+    "upper_case_double_encoded_dot": (
+        "GET",
+        "/memory/%2E./episodic",
+        b"/memory/%252E./episodic",
+        "dot_segment",
+    ),
+    "parameter_after_two_dots": (
+        "GET",
+        "/memory/..;x/episodic",
+        b"/memory/..;x/episodic",
+        "dot_segment",
+    ),
+    "parameter_after_one_dot": (
+        "GET",
+        "/memory/.;x/episodic",
+        b"/memory/.;x/episodic",
+        "dot_segment",
+    ),
+    "double_encoded_slash": (
+        "GET",
+        "/memory/a%2fb",
+        b"/memory/a%252fb",
+        "encoded_separator",
+    ),
+    "double_encoded_backslash": (
+        "GET",
+        "/memory/a%5cb",
+        b"/memory/a%255cb",
+        "encoded_separator",
+    ),
+    "double_encoded_dot_inside_a_name": (
+        "GET",
+        "/memory/episodic/a%2eb",
+        b"/memory/episodic/a%252eb",
+        "encoded_dot",
+    ),
     "console_route": (
         "DELETE",
         "/console/conversation-tags/../files/x",
@@ -95,6 +146,10 @@ RELAYED: dict[str, tuple[str, bytes]] = {
     "two_dots_inside_a_name": ("/memory/episodic/a..b.md", b"/memory/episodic/a..b.md"),
     "leading_dot_name": ("/memory/episodic/.hidden", b"/memory/episodic/.hidden"),
     "three_dots": ("/memory/episodic/...", b"/memory/episodic/..."),
+    "semicolon_inside_a_name": (
+        "/memory/episodic/a;b.md",
+        b"/memory/episodic/a;b.md",
+    ),
     "encoded_space": ("/memory/episodic/a b.md", b"/memory/episodic/a%20b.md"),
 }
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
+from urllib.parse import unquote
 
 from bff.route_refusals import NOT_FOUND, respond
 
@@ -16,6 +17,9 @@ Send = Callable[[MutableMapping[str, Any]], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 _ENCODED_SEPARATORS = (b"%2f", b"%5c")
+# Still encoded AFTER the server's one decode: the mesh proxy decodes once more.
+_RESIDUAL_SEPARATORS = ("%2f", "%5c")
+_RESIDUAL_DOT = "%2e"
 
 
 class PathGuard:
@@ -28,6 +32,11 @@ class PathGuard:
     DIFFERENT memory-server route than the one the BFF route proxies. Such a
     path is answered 404 in the one shape, before any route, token check or
     upstream call. One place, so a new proxy route cannot forget it.
+
+    The guard reads the path the way the mesh proxy will: per segment, with a
+    ``;parameter`` stripped and one more percent-decode applied, and it refuses
+    a path that is still percent-encoded for a dot, slash or backslash after
+    the server's own decode.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -45,7 +54,18 @@ class PathGuard:
         raw = bytes(scope.get("raw_path") or b"").lower()
         if any(marker in raw for marker in _ENCODED_SEPARATORS):
             return "encoded_separator"
-        segments = str(scope.get("path", "")).replace("\\", "/").split("/")
-        if any(segment in (".", "..") for segment in segments):
+        path = str(scope.get("path", ""))
+        segments = path.replace("\\", "/").split("/")
+        if any(_mesh_segment(segment) in (".", "..") for segment in segments):
             return "dot_segment"
+        lowered = path.lower()
+        if any(marker in lowered for marker in _RESIDUAL_SEPARATORS):
+            return "encoded_separator"
+        if _RESIDUAL_DOT in lowered:
+            return "encoded_dot"
         return None
+
+
+def _mesh_segment(segment: str) -> str:
+    """The segment as the mesh proxy will normalise it."""
+    return unquote(segment).split(";", 1)[0]
