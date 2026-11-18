@@ -1,0 +1,5 @@
+HEAD ac59a2f9def73d170e9d885964d46bdbd37ead72 tree 6006f56b9a314dffdb47d48749d2b39fa9ea4718
+make lint: ruff check "All checks passed!"; ruff format "643 files already formatted"; security-lint passed
+make typecheck: Success: no issues found in 185 source files
+mypy on the new/changed test files and bff + the 3 new src modules: Success: no issues found in 45 source files
+make helm-lint: 1 chart(s) linted, 0 chart(s) failed; vaultSecretFileGuard present in 3 workloads
