@@ -23,12 +23,21 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from scripts.neuter import lock as lockmod
-from scripts.neuter.pytest_run import PytestRunResult, chokepoint_scope, run_pytest
+from scripts.neuter import pytest_run as pytest_run_mod
+from scripts.neuter.pytest_run import (
+    PytestRunResult,
+    chokepoint_scope,
+    is_foreign_product_container,
+    parse_start_event,
+    run_pytest,
+)
+from tests import _pg_ephemeral
 from tests._hermetic_env import hermetic_env
 
 _DOCKER_AVAILABLE = shutil.which("docker") is not None
@@ -488,3 +497,127 @@ def test_pathcheck_expect_without_pathcheck_log_raises(tmp_path, _isolated_lock)
             lock_path=_isolated_lock,
             pathcheck_expect="/some/path",
         )
+
+
+# ───────── pytest-xdist: sibling workers' own containers are not foreign ─────
+
+
+def test_run_id_constants_mirror_the_ephemeral_pg_helper():
+    """scripts/ cannot import tests/, so the env name and label are mirrored;
+    a drift would silently make every labelled sibling look foreign again."""
+    assert pytest_run_mod.RUN_ID_ENV == _pg_ephemeral.RUN_ID_ENV
+    assert pytest_run_mod.RUN_ID_LABEL == _pg_ephemeral.RUN_ID_LABEL
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("audittrace-rls-pg-42\trun-1\n", ("audittrace-rls-pg-42", "run-1")),
+        ("audittrace-rls-pg-42\t\n", ("audittrace-rls-pg-42", "")),
+        ("audittrace-rls-pg-42\n", ("audittrace-rls-pg-42", "")),
+        ("", ("", "")),
+    ],
+)
+def test_parse_start_event(line, expected):
+    assert parse_start_event(line) == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "event_run_id", "own_run_id", "foreign"),
+    [
+        # a sibling worker of THIS run: own, never foreign
+        ("audittrace-rls-pg-7", "run-1", "run-1", False),
+        # same product prefix, no label (a durable stray): foreign
+        ("audittrace-rls-pg-7", "", "run-1", True),
+        # labelled by ANOTHER run (a concurrent suite): foreign
+        ("audittrace-acl-wu2a-pg-7", "run-2", "run-1", True),
+        # outside the wrapper (no own id): nothing is exempt, even labelled
+        ("audittrace-console-store-pg-7", "run-1", "", True),
+        ("audittrace-console-store-pg-7", "", "", True),
+        # not a product Postgres prefix: never foreign
+        ("sovereign-loki", "", "run-1", False),
+        ("busybox-probe", "run-1", "run-1", False),
+    ],
+)
+def test_is_foreign_product_container(name, event_run_id, own_run_id, foreign):
+    assert is_foreign_product_container(name, event_run_id, own_run_id) is foreign
+
+
+def test_run_pytest_does_not_hand_its_run_id_to_the_child(
+    tmp_path, monkeypatch, _isolated_lock
+):
+    """The watch exempts only containers labelled with ITS run id; a nested
+    pytest that inherited RUN_TESTS_ID would label a leaked product container
+    as own and hide it. Neuter: drop RUN_ID_ENV from the cleared keys -> RED."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "test_env.py").write_text(
+        "import os\n"
+        "def test_run_id_is_not_inherited():\n"
+        '    assert "RUN_TESTS_ID" not in os.environ\n'
+    )
+    for cmd in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@test.invalid"],
+        ["git", "config", "user.name", "t"],
+        ["git", "add", "-A"],
+        ["git", "commit", "-q", "-m", "init"],
+    ):
+        subprocess.run(cmd, cwd=repo, check=True)
+    monkeypatch.setenv("RUN_TESTS_ID", "run-outer")
+
+    monkeypatch.setattr(
+        pytest_run_mod,
+        "_continuous_foreign_container_watch",
+        lambda: _fake_watch(seen=False),
+    )
+    result = run_pytest(
+        workdir=repo,
+        pytest_args=["test_env.py"],
+        python=PYTHON,
+        lock_path=_isolated_lock,
+    )
+    assert result.exit_code == 0, result.stdout
+
+
+@requires_docker
+def test_live_watch_exempts_own_run_label_but_flags_an_unlabelled_stray(monkeypatch):
+    """The REAL ``docker events`` stream and the Go ``index`` template: a
+    product-prefixed container labelled with this run's id is not foreign; the
+    same prefix with no label is. Neuter: ignore the label in
+    is_foreign_product_container -> the first assertion goes RED."""
+    run_id = f"run-live-{os.getpid()}"
+    monkeypatch.setenv("RUN_TESTS_ID", run_id)
+    # A prefix unique to this process: containers another suite starts on the
+    # same daemon (a real, shared `audittrace-rls-pg-*`) must not move the
+    # verdict of this test.
+    prefix = f"audittrace-livewatch-{os.getpid()}-"
+    monkeypatch.setattr(pytest_run_mod, "_PRODUCT_PG_CONTAINER_PREFIXES", (prefix,))
+    own = f"{prefix}own"
+    stray = f"{prefix}stray"
+
+    def start(name, *label_args):
+        subprocess.run(
+            ["docker", "run", "-d", "--rm", "--name", name, *label_args]
+            + ["busybox", "sleep", "3"],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+
+    try:
+        with pytest_run_mod._continuous_foreign_container_watch() as (seen, attached):
+            assert attached is True
+            start(own, "--label", f"{_pg_ephemeral.RUN_ID_LABEL}={run_id}")
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                assert seen() is False
+                time.sleep(0.1)
+            start(stray)
+            deadline = time.monotonic() + 10
+            while not seen() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert seen() is True
+    finally:
+        for name in (own, stray):
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)

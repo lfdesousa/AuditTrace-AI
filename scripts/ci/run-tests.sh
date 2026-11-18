@@ -17,6 +17,15 @@
 #                                             # check, but no --cov enforcement (a partial
 #                                             # run can't meaningfully satisfy the gate).
 #
+# The FULL run is parallel (pytest-xdist, SUITE-PARALLEL-XDIST): `-n <workers>`.
+# Workers: $RUN_TESTS_WORKERS if set (0 = serial, no xdist), else
+# min(nproc, 8). Cap 8: the measured trial (8 workers, 32-thread laptop) took
+# 11 min against ~58 min serial; every worker starts its own ephemeral
+# Postgres containers, so more workers cost RAM faster than they save time. A
+# 4-core Pi or hosted runner gets nproc = 4. A full run also pre-collects the
+# test ids serially and requires junit.xml to hold exactly that many testcases
+# (D6: a parallel run must never silently run fewer tests than are collected).
+#
 # `make test` (inside the local-only `hold-shared` wrapper) and the CI
 # `test` job's "Tests + ..." step both call exactly `bash scripts/ci/run-
 # tests.sh` — tests/test_ci_make_test_parity.py asserts that mechanically
@@ -53,6 +62,25 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+# ---- worker count for the full run (parallel; see the header). Resolved before
+# anything runs so a bad value fails closed instead of silently going serial. ----
+MAX_DEFAULT_WORKERS=8
+resolve_workers() {
+  local w="${RUN_TESTS_WORKERS:-}" cores
+  if [ -z "$w" ]; then
+    cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    w=$(( cores < MAX_DEFAULT_WORKERS ? cores : MAX_DEFAULT_WORKERS ))
+  fi
+  case "$w" in
+    ''|*[!0-9]*)
+      echo "❌ run-tests.sh: RUN_TESTS_WORKERS must be a non-negative integer (0 = serial), got ${w@Q}" >&2
+      exit 1
+      ;;
+  esac
+  echo "$w"
+}
+WORKERS="$(resolve_workers)"
 
 # ---- tool resolution (CI-PARITY rule: .venv/bin/X if present, else PATH,
 # else fail closed — CI has no .venv at all). ----
@@ -289,10 +317,22 @@ if [ -n "$SUBSET_EXPR" ]; then
   echo "🚫 Enforcing zero-skip policy on the subset run..."
   "$PYTHON" scripts/check-no-skipped-tests.py "$JUNIT_PATH"
 else
+  # ---- D6: collect the ids ONCE, serially, in the same shim/CI shape, so the
+  # parallel run below can be held to "ran exactly what was collected". ----
+  COLLECTED_IDS="$SHIM_DIR/collected-ids.txt"
+  echo "run-tests: D6 serial pre-collection -> $COLLECTED_IDS"
+  "$PYTEST" tests/ --collect-only -q -o addopts= -p no:cacheprovider > "$COLLECTED_IDS"
+
+  PARALLEL_ARGS=()
+  if [ "$WORKERS" -gt 0 ]; then
+    PARALLEL_ARGS=(-n "$WORKERS")
+  fi
+  echo "run-tests: workers=$WORKERS (0 = serial)"
+
   # ---- R1: THE pytest invocation — the --cov set, the reports,
   # --cov-fail-under, --junit-xml. Nothing else in this repo may hand-type
   # this line. ----
-  run_pytest tests/ -v \
+  run_pytest tests/ -v "${PARALLEL_ARGS[@]}" \
     --cov=src \
     --cov=bff \
     --cov=scripts/deploy \
@@ -324,6 +364,9 @@ else
 
   echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
   "$PYTHON" scripts/check-per-file-coverage.py
+
+  echo "🔢 Enforcing collected == run (D6) ..."
+  "$PYTHON" scripts/ci/check_collected_vs_junit.py "$COLLECTED_IDS" "$JUNIT_PATH" --workers "$WORKERS"
 fi
 
 # ---- the reject log is enforcement, not a warning — either tool. ----
