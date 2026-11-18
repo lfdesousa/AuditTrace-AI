@@ -143,6 +143,10 @@ class Settings(BaseSettings):
     orchestrator_refusal_path: str = "/interactions/refusals"
     refusal_record_enabled: bool = False
     refusal_record_timeout_seconds: float = 2.0
+    # ADDENDUM-3: at most this many records per user per minute. A refused
+    # turn costs the user nothing, so without a bound one user could fill
+    # their own audit trail; beyond it the turn is logged, not recorded.
+    refusal_record_max_per_minute: int = 12
     # M3 Sovereign-Attach WU-2 — the console file-upload route
     # (``POST /console/files``) always forwards to
     # ``/memory/upload?layer=<this value>``, regardless of any ``layer``

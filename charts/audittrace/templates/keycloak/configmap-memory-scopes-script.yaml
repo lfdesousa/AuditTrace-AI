@@ -2056,6 +2056,18 @@ data:
       -s 'attributes."access.token.lifespan"=300' >/dev/null
     echo "  ✓ audittrace-librechat access.token.lifespan=300"
 
+    # ── Step 8: reconcile the realm's SSO idle timeout ──
+    # (BFF-CHAT-ROUTE-ERRORS ADDENDUM-3)
+    #
+    # Without offline_access the LibreChat refresh token lives and dies with
+    # the SSO session. Keycloak's default idle timeout is 30 minutes; the
+    # realm sets a working day instead. Same reason as Steps 6 and 7 for
+    # doing it here.
+    ACL_E2E_STAGE="sso-idle-reconcile"
+    echo "▶ reconciling the realm's ssoSessionIdleTimeout..."
+    acl_e2e_kc update "realms/${REALM}" -s 'ssoSessionIdleTimeout=28800' >/dev/null
+    echo "  ✓ ${REALM} ssoSessionIdleTimeout=28800"
+
     # ── Istio sidecar shutdown ────────────────────────────────────
     # Same intent as the summariser-role Job (Phase C.8 root cause):
     # without telling Envoy to quit, istio-proxy keeps the Pod 2/3

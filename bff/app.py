@@ -194,6 +194,7 @@ from bff.exchange import TokenExchangeError, exchange_token
 from bff.logging_setup import configure_logging
 from bff.memory_proxy import MemoryProxyError, proxy_memory_request
 from bff.memory_scopes import MEMORY_SCOPE_STRING
+from bff.path_guard import PathGuard
 from bff.proxy import ProxyError, proxy_chat_completions
 from bff.route_refusals import framework_error, refuse_route, route_last_resort
 
@@ -265,6 +266,7 @@ def create_app() -> FastAPI:
     )
 
     app.add_exception_handler(StarletteHTTPException, framework_error)
+    app.add_middleware(PathGuard)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -291,7 +293,7 @@ def create_app() -> FastAPI:
         assert token is not None
         inbound_sub = claims["sub"]
         request.state.verified_sub = inbound_sub  # for the last resort's event
-        refusal_record.arm(request, http_client, settings, token)
+        refusal_record.arm(request, http_client, settings, token, inbound_sub)
         inbound_scopes = frozenset(str(claims.get("scope", "")).split())
         missing = missing_chat_scopes(inbound_scopes)
         if missing:

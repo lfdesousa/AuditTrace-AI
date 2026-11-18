@@ -23,15 +23,22 @@ COMMENT = (
 def main() -> None:
     measurement, run_record, fixture = (Path(arg) for arg in sys.argv[1:4])
     measured = json.loads(measurement.read_text(encoding="utf-8"))
-    image_id = next(
-        line.split("=", 1)[1]
+    record = dict(
+        line.split("=", 1)
         for line in run_record.read_text(encoding="utf-8").splitlines()
-        if line.startswith("image_id=")
+        if "=" in line
+    )
+    image_id = record["image_id"]
+    # Every digest docker knows this image by (sha256:... only, no repository).
+    digests = sorted(
+        {entry.rsplit("@", 1)[1] for entry in record.get("repo_digests", "").split()}
+        | {image_id}
     )
     out = {
         "_comment": COMMENT,
         "image": IMAGE,
         "image_id": image_id,
+        "image_digests": digests,
         "keycloak_version": measured["keycloak_version"],
         "cases": {
             name: {

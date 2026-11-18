@@ -836,7 +836,10 @@ def create_app() -> FastAPI:
     app.include_router(chat.router, prefix="/v1", tags=["chat"])
     app.include_router(context.router, tags=["context"])
     app.include_router(audit.router, tags=["audit"])
-    app.include_router(refusals.router, tags=["audit"])
+    if _settings.refusal_ingest_writer:
+        # Mounted only with its writer named: otherwise the route does not
+        # exist (404, absent from the OpenAPI document).
+        app.include_router(refusals.router, tags=["audit"])
     app.include_router(session.router, prefix="/session", tags=["session"])
     app.include_router(memory.router, prefix="/memory", tags=["memory"])
     # ADR-048 PR-B3 — GET /memory/upload/status?scan_id=...

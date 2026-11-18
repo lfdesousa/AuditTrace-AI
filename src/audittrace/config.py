@@ -154,11 +154,13 @@ class Settings(BaseSettings):
     # sentinel UserContext with admin scopes for backwards compatibility.
     # Phase 5 will flip this to True after cross-user isolation tests land.
     auth_required: bool = False
-    # BFF-CHAT-ROUTE-ERRORS ADDENDUM-2: ``POST /interactions/refusals`` exists
-    # only when this is set. The route carries no JWT of its writer: the mesh
-    # admits only the LibreChat BFF to it, so it is on only where a mesh
-    # policy guards it (the chart sets it together with that policy).
-    refusal_ingest_enabled: bool = False
+    # BFF-CHAT-ROUTE-ERRORS ADDENDUM-3: ``POST /interactions/refusals`` is
+    # mounted only when this names the SPIFFE identity of its one writer (the
+    # LibreChat BFF's service account), and admits only that mesh peer. Empty
+    # (the default, and every deployment without a STRICT mesh): no route.
+    refusal_ingest_writer: str = ""
+    # The client a subject token must have been issued to (its ``azp``).
+    refusal_ingest_subject_client: str = "audittrace-librechat"
 
     # Redis-backed token cache (DESIGN §15.4 / §15.4a). The cache holds
     # validated JWT claims keyed on sha256(token) so the hot path skips
@@ -173,6 +175,9 @@ class Settings(BaseSettings):
     # default key rotation interval (~12 h) by 144x — fast enough for
     # rotation pickup, slow enough to absorb startup races.
     jwks_cache_ttl_seconds: int = 300
+    # A token naming a kid the cache does not hold triggers at most ONE JWKS
+    # fetch per this many seconds (BFF-CHAT-ROUTE-ERRORS ADDENDUM-3).
+    jwks_refresh_min_interval_seconds: int = 30
 
     # Memory tiering configuration
     memory_cache_ttl: int = 3600  # seconds

@@ -25,6 +25,7 @@ except Exception: print(0)")" = 200 ] && break
   "${py}" -c "import time; time.sleep(2)"
 done
 { echo "image_id=$(docker image inspect quay.io/keycloak/keycloak:24.0 --format '{{.Id}}')"
+  echo "repo_digests=$(docker image inspect quay.io/keycloak/keycloak:24.0 --format '{{join .RepoDigests " "}}')"
   echo "command=start-dev --import-realm --features=token-exchange,admin-fine-grained-authz"
   echo "realm_file=keycloak/realm-audittrace.json of the export"
   echo "memory_cap=1500m"; } >> "${record}"

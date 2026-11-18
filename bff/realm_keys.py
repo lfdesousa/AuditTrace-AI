@@ -1,10 +1,15 @@
-"""Which of the realm's published keys may verify a token (ADDENDUM-2 items 4, 5).
+"""Which of the realm's published keys may verify a token.
 
 Functions only. A JWKS lists every key of the realm: signing keys, encryption
 keys, keys of other algorithms, in an order that is not stable across boots.
-The BFF verifies RS256 signatures only, so it selects by what the entry SAYS it
-is (``kty``, ``use``, ``alg``) and by the ``kid`` the token names, never by
-position.
+RS256 signatures are verified here, so a key is selected by what its entry
+SAYS it is (``kty``, ``use``, ``alg``) and by the ``kid`` the token names,
+never by position.
+
+This file exists twice, byte for byte: ``bff/realm_keys.py`` and
+``src/audittrace/realm_keys.py``. The BFF and the memory server ship in
+separate images and share no package, and they must not disagree about which
+key verifies a token. ``tests/test_realm_keys_twin.py`` holds them equal.
 """
 
 from __future__ import annotations
@@ -46,20 +51,20 @@ def token_kid(token: str) -> str | None:
     return kid
 
 
-def decode(token: str, keys: list[dict[str, Any]]) -> dict[str, Any]:
+def decode(
+    token: str, keys: list[dict[str, Any]], *, audience: str | None = None
+) -> dict[str, Any]:
     """Verify signature and expiry against the selected keys.
 
-    ``exp`` is REQUIRED: a token without an expiry is refused. Audience is
-    not checked here (see ``bff/auth.py``). No key selected means no key of
-    the realm can verify this token.
+    ``exp`` is REQUIRED: a token without an expiry is refused. ``audience`` is
+    verified when given and not looked at otherwise. No key selected means no
+    key of the realm can verify this token.
     """
     if not keys:
         raise JWTError("no realm signing key matches the token's kid")
+    options = {"require_exp": True, "verify_aud": audience is not None}
     claims = jwt.decode(
-        token,
-        keys,
-        algorithms=[ALGORITHM],
-        options={"verify_aud": False, "require_exp": True},
+        token, keys, algorithms=[ALGORITHM], audience=audience, options=options
     )
     assert isinstance(claims, dict), "jwt.decode returned a non-dict payload"
     return claims

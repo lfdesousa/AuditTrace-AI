@@ -74,9 +74,11 @@ spec:
             # ── the frozen /v1 upstream — in-cluster memory-server Service ──
             - name: AUDITTRACE_BFF_ORCHESTRATOR_BASE_URL
               value: "http://{{ .Release.Name }}-memory-server:{{ .Values.memoryServer.port }}"
-            {{- if .Values.istio.enabled }}
-            # BFF-CHAT-ROUTE-ERRORS ADDENDUM-2: record refused chat turns
-            # (only where the mesh rule admits this workload to the route).
+            {{- if and .Values.istio.enabled (eq .Values.istio.mtls.mode "STRICT") }}
+            # BFF-CHAT-ROUTE-ERRORS ADDENDUM-2/-3: record refused chat turns, only
+            # where the memory server names this workload as the route's writer:
+            # under the same condition as that switch (STRICT mutual TLS), else
+            # every refused turn would be posted to a route that is not there.
             - name: AUDITTRACE_BFF_REFUSAL_RECORD_ENABLED
               value: "true"
             {{- end }}
