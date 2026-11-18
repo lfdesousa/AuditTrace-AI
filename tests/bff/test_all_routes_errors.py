@@ -42,6 +42,7 @@ from typing import Any
 from urllib.parse import parse_qs
 
 import httpx
+import httpx2
 import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
@@ -49,6 +50,7 @@ from jose import jwt
 
 from bff import chat_refusals
 from bff.app import create_app, get_http_client
+from bff.chat_refusal import ChatRefusal
 from bff.config import get_settings
 from tests.bff.conftest import (
     TEST_ISSUER,
@@ -162,7 +164,8 @@ def _proxy_routes() -> dict[str, tuple[str, str, str]]:
             for prefix, label in LABELS.items()
             if route.path == prefix or route.path.startswith(prefix + "/")
         )
-        method = "POST" if "POST" in route.methods else sorted(route.methods)[0]
+        methods = route.methods or set()
+        method = "POST" if "POST" in methods else sorted(methods)[0]
         path = route.path.replace("{path:path}", "x").replace("{filename}", "n.txt")
         found[f"{method} {route.path}"] = (method, path, label)
     return found
@@ -376,7 +379,7 @@ def _expected(code: str) -> tuple[int, str | None, dict[str, Any]]:
 
 
 def _assert_refusal(
-    response: httpx.Response,
+    response: httpx2.Response,
     caplog: pytest.LogCaptureFixture,
     *,
     label: str,
@@ -485,7 +488,7 @@ def test_route_set_is_the_chat_set() -> None:
     chat = shape(
         refusal
         for refusal in vars(chat_refusals).values()
-        if isinstance(refusal, chat_refusals.ChatRefusal)
+        if isinstance(refusal, ChatRefusal)
     )
     assert shape(ROUTE_REFUSALS.values()) == chat
     assert chat == {

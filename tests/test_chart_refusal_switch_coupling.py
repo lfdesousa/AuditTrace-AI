@@ -16,7 +16,8 @@ from typing import Any
 
 import pytest
 
-from tests.test_chart_refused_turn_and_session_end import RELEASE, _env, _render
+from tests.test_chart_refused_turn_and_session_end import _env, _render
+from tests.test_console_k3s_guards import RELEASE
 
 BFF_SWITCH = "AUDITTRACE_BFF_REFUSAL_RECORD_ENABLED"
 WRITER = "AUDITTRACE_REFUSAL_INGEST_WRITER"

@@ -100,13 +100,14 @@ def _token(
     payload.update(claims)
     payload = {name: value for name, value in payload.items() if value is not None}
     headers = {"kid": kid} if kid is not None else None
-    return jwt.encode(payload, private, algorithm="RS256", headers=headers)
+    return str(jwt.encode(payload, private, algorithm="RS256", headers=headers))
 
 
 def _decode(token: str, keys: list[Any]) -> dict[str, Any]:
-    return auth._decode_jwt_with_allowed_issuers(
+    claims: dict[str, Any] = auth._decode_jwt_with_allowed_issuers(
         token, keys, audience=AUDIENCE, primary_issuer=ISSUER, extra_issuers=[]
     )
+    return claims
 
 
 def test_an_unusable_key_listed_first_does_not_matter() -> None:

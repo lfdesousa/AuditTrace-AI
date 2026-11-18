@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import httpx
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 
@@ -320,7 +321,7 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     return now
 
 
-def _refuse_as(client: TestClient, sub: str) -> httpx.Response:
+def _refuse_as(client: TestClient, sub: str) -> httpx2.Response:
     token = make_token(sub=sub, extra_claims={"scope": CHAT_SCOPE_STRING})
     return _post(client, "Bearer " + token)
 

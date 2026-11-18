@@ -58,7 +58,9 @@ def _token_with(claims_without: tuple[str, ...] = (), **claims: Any) -> str:
     }
     for name in claims_without:
         payload.pop(name)
-    return jwt.encode(payload, REALM_PRIVATE, algorithm="RS256", headers={"kid": KID})
+    return str(
+        jwt.encode(payload, REALM_PRIVATE, algorithm="RS256", headers={"kid": KID})
+    )
 
 
 OPEN_QUOTE_HEADERS: dict[str, dict[str, str]] = {

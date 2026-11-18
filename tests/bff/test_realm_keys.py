@@ -25,6 +25,7 @@ import time
 from typing import Any
 
 import httpx
+import httpx2
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -92,7 +93,7 @@ def _serve(upstreams: _Upstreams, *keys: Any) -> None:
     upstreams.jwks = lambda _request: httpx.Response(200, json={"keys": list(keys)})
 
 
-def _assert(response: httpx.Response, refusal: Any) -> None:
+def _assert(response: httpx2.Response, refusal: Any) -> None:
     assert response.status_code == refusal[0]
     assert response.headers.get("www-authenticate") == refusal[4]
     assert response.json() == _expected_body(refusal)
@@ -173,8 +174,10 @@ def test_a_realm_without_any_rs256_signing_key_is_unusable(
 
 def _without_exp(**claims: Any) -> str:
     payload = {"iss": TEST_ISSUER, "sub": "alice", "iat": int(time.time()), **claims}
-    return jwt.encode(
-        payload, TEST_PRIVATE_PEM, algorithm="RS256", headers={"kid": TEST_KID}
+    return str(
+        jwt.encode(
+            payload, TEST_PRIVATE_PEM, algorithm="RS256", headers={"kid": TEST_KID}
+        )
     )
 
 

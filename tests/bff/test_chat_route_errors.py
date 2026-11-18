@@ -56,6 +56,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import httpx
+import httpx2
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
@@ -226,7 +227,7 @@ def _unsigned_claims_token(algorithm: str, key: str, **claims: Any) -> str:
     now = int(time.time())
     payload = {"iss": TEST_ISSUER, "iat": now, "exp": now + 300}
     payload.update({"scope": CHAT_SCOPE_STRING, **claims})
-    return jwt.encode(payload, key, algorithm=algorithm)
+    return str(jwt.encode(payload, key, algorithm=algorithm))
 
 
 Arrange = Callable[[_Upstreams], None]
@@ -689,7 +690,7 @@ def chat() -> Iterator[tuple[TestClient, _Upstreams]]:
 
 def _post(
     client: TestClient, authorization: str | None, **extra: str
-) -> httpx.Response:
+) -> httpx2.Response:
     headers = {
         "Content-Type": "application/json",
         "traceparent": TRACEPARENT,
@@ -703,7 +704,7 @@ def _post(
 
 def _run(
     chat: tuple[TestClient, _Upstreams], case_id: str, **extra: str
-) -> tuple[httpx.Response, _Upstreams, str | None]:
+) -> tuple[httpx2.Response, _Upstreams, str | None]:
     client, upstreams = chat
     authorization, arrange, _refusal, _sub, _kc, _ms = CASES[case_id]
     if arrange is not None:
@@ -714,7 +715,10 @@ def _run(
 
 def _expected_body(refusal: Refusal) -> dict[str, Any]:
     status, error_type, code, message, _challenge = refusal
-    return _openai_error_body(message, code, type_=error_type, status=status)
+    body: dict[str, Any] = _openai_error_body(
+        message, code, type_=error_type, status=status
+    )
+    return body
 
 
 _EVENT = re.compile(

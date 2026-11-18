@@ -95,7 +95,7 @@ def _token(
     if exp_offset is not None:
         payload["exp"] = now + exp_offset
     payload.update(claims)
-    return jwt.encode(payload, key, algorithm="RS256", headers={"kid": KID})
+    return str(jwt.encode(payload, key, algorithm="RS256", headers={"kid": KID}))
 
 
 def _body(**override: Any) -> dict[str, Any]:

@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import MutableMapping
 from typing import Any
 
 import httpx
@@ -167,7 +168,7 @@ def _call(
         return httpx.Response(200, json={"ok": True})
 
     upstreams.memory_server = memory_server
-    sent: list[dict[str, Any]] = []
+    sent: list[MutableMapping[str, Any]] = []
 
     async def run() -> None:
         async with httpx.AsyncClient(
@@ -200,7 +201,7 @@ def _call(
                 body_sent = True
                 return {"type": "http.request", "body": b"{}", "more_body": False}
 
-            async def send(message: dict[str, Any]) -> None:
+            async def send(message: MutableMapping[str, Any]) -> None:
                 sent.append(message)
 
             await app(scope, receive, send)
