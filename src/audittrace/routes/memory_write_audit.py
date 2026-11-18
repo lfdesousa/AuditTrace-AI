@@ -63,14 +63,14 @@ async def emit_write_audit(
     read=fail-open / write=fail-closed rationale. This wrapper converts an
     audit-store failure into an explicit ``HTTPException(500)`` rather than
     letting a bare exception fall through to the app-wide catch-all
-    handler — the caller gets a precise, on-brand error (matching every
-    other 5xx in this file) instead of a generic unhandled-exception
+    handler — the caller gets a precise, on-brand error (matching the
+    other 5xx the memory routes raise) instead of a generic unhandled-exception
     envelope, and the failure is deterministically visible to
     ``TestClient`` (Starlette's ``ServerErrorMiddleware`` always re-raises
     after an unhandled exception, which ``TestClient`` in turn re-raises
     into the caller's test — an explicit ``HTTPException`` is the
-    established pattern this file already uses everywhere else a service
-    call can fail, e.g. ``_require_admin``'s 403, the 502s below)."""
+    established pattern the memory routes use wherever a service call can
+    fail, e.g. ``_require_admin``'s 403 and the 502s in ``routes/memory.py``)."""
     try:
         await emit_memory_audit_event(
             user=user,

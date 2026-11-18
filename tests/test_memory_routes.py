@@ -1487,7 +1487,7 @@ class TestIndexZeroChunksLoud:
         objects, so a procedural key resolves to zero) yields 0 chunks ->
         422, and the detail names both the file and the target
         collections. Neuter: drop the loud-fail block added after
-        ``_emit_write_audit`` (reverting to the unconditional
+        ``emit_write_audit`` (reverting to the unconditional
         ``"status": "indexed"`` 200) -> this test goes RED (expects 422,
         gets 200)."""
         mock_minio = MagicMock()

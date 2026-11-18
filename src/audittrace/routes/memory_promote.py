@@ -237,7 +237,7 @@ async def _emit_promote_audit(
     op: Literal["write", "delete"] = "write",
 ) -> None:
     """Fail-closed audit-row emission for the promote write — mirrors
-    ``routes.memory._emit_write_audit``'s wrapper shape exactly (an
+    ``routes.memory_write_audit.emit_write_audit``'s wrapper shape exactly (an
     audit-store failure becomes an explicit 500, never a silently
     unaudited 200 — feedback_traceability_requirement). Duplicated
     rather than imported for the same "avoid a circular import back into

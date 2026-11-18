@@ -257,7 +257,7 @@ async def _write_semantic_document(
                 detail_extra={"reason": "copy_forward"},
             )
     except Exception as exc:
-        # Fail-closed like routes/memory.py::_emit_write_audit — the
+        # Fail-closed like routes/memory_write_audit.py::emit_write_audit — the
         # mutation above already landed (same known limitation that
         # wrapper accepts: the audit-write failure is reported, not the
         # mutation undone), but the caller is told plainly rather than

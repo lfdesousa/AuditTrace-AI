@@ -549,7 +549,7 @@ class TestCollectionFilteredList:
 
 
 class TestCopyForwardAudit:
-    """ADDENDUM-1 S2 (the audit half WP2b owns): one ``_emit_write_audit`` per
+    """ADDENDUM-1 S2 (the audit half WP2b owns): one ``emit_write_audit`` per
     manifest mutation -- the write with ``copied_from``, the legacy tombstone
     with ``reason=copy_forward``; a plain write has neither."""
 
