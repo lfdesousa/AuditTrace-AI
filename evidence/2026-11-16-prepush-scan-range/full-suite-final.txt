@@ -1,0 +1,6 @@
+================ 11082 passed, 3 warnings in 3621.88s (1:00:21) ================
+Required test coverage of 90% reached. Total coverage: 98.93%
+[no-skip-check] No skipped tests in junit.xml. Good.
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (204 files checked, 225 measured files all reported, lines >= 90%, branches >= 90% on 174 file(s) with branches)
+✅ Tests passed (scripts/ci/run-tests.sh)

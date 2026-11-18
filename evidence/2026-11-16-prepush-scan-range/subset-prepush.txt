@@ -1,0 +1,3 @@
+==================== 46 passed, 11036 deselected in 21.63s =====================
+[no-skip-check] No skipped tests in /home/lfdesousa/work/xdgcache-prepush/sub2.xml. Good.
+✅ Tests passed (scripts/ci/run-tests.sh)

@@ -1,0 +1,6 @@
+All checks passed!
+ruff check rc=0
+1 file already formatted
+ruff format --check rc=0
+Success: no issues found in 1 source file
+mypy rc=0

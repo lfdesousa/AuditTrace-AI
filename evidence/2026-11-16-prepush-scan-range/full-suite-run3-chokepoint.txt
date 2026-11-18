@@ -1,0 +1,2 @@
+========== 183 failed, 10899 passed, 3 warnings in 2894.16s (0:48:14) ==========
+(run 3: all 183 failures were tests/test_dep_lock_g4_chokepoint.py rejecting a lock-file token in an evidence file; file trimmed, that test file then passes: 199 passed)

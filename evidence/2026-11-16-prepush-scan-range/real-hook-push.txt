@@ -1,0 +1,32 @@
+real scanner: 8.30.1
+### NEW BRANCH, 3 commits
+pre-push: scanning 3 commit(s) in eba7abfba15475800382bd09f27bb754cf85d74b..8c4494006bc36f6e6e137dfcd69404cc807cc18e (refs/heads/feat)
+
+
+12:04AM INF Unknown SCM platform. Use --platform to include links in findings. host=
+12:04AM INF 3 commits scanned.
+12:04AM INF scanned ~6 bytes (6 bytes) in 4.93ms
+12:04AM INF no leaks found
+Reminder: set PR_BODY=<path-to-your-PR-body-file> to pre-validate it against the ADR-049 evidence gate before you push (or PR_BODY=none to acknowledge and skip this reminder). See ADR-049.
+To ../remote.git
+ * [new branch]      feat -> feat
+la branche 'feat' est paramétrée pour suivre 'origin/feat'.
+exit=0
+### UPDATE PUSH, 2 new commits
+pre-push: scanning 2 commit(s) in 8c4494006bc36f6e6e137dfcd69404cc807cc18e..7ff5c8d9e03e72e64e59cdc4a4748c9bf7568d0c (refs/heads/feat)
+
+
+12:04AM INF Unknown SCM platform. Use --platform to include links in findings. host=
+12:04AM INF 2 commits scanned.
+12:04AM INF scanned ~811 bytes (811 bytes) in 5.3ms
+12:04AM INF no leaks found
+Reminder: set PR_BODY=<path-to-your-PR-body-file> to pre-validate it against the ADR-049 evidence gate before you push (or PR_BODY=none to acknowledge and skip this reminder). See ADR-049.
+To ../remote.git
+   8c44940..7ff5c8d  feat -> feat
+exit=0
+### DELETE PUSH
+pre-push: delete of refs/heads/feat - nothing to scan
+Reminder: set PR_BODY=<path-to-your-PR-body-file> to pre-validate it against the ADR-049 evidence gate before you push (or PR_BODY=none to acknowledge and skip this reminder). See ADR-049.
+To ../remote.git
+ - [deleted]         feat
+exit=0
