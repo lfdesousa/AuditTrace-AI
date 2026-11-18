@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from audittrace.routes import memory as m
+from audittrace.routes import memory_write_audit as write_audit
 from tests.memory_truncation_support import memory_client, upload
 from tests.memory_truncation_support_a1 import manifest
 
@@ -108,7 +108,7 @@ class TestMemoryUploadRefusals:
         async def down(**_: Any) -> None:
             raise RuntimeError("audit store down")
 
-        with patch.object(m, "emit_memory_audit_event", down):
+        with patch.object(write_audit, "emit_memory_audit_event", down):
             answer = upload(client, "episodic", "note.md", TEXT)
 
         assert answer.status_code == 500

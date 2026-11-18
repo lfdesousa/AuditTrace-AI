@@ -10294,7 +10294,7 @@ class TestMemoryAuditWriteFailsClosed:
     def test_create_episodic_returns_500_when_audit_emit_fails(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from audittrace.routes import memory as m
+        from audittrace.routes import memory_write_audit as m
 
         monkeypatch.setattr(m, "emit_memory_audit_event", self._boom)
         r = client.post(
@@ -10311,7 +10311,7 @@ class TestMemoryAuditWriteFailsClosed:
         deliberately excludes distributed-transaction/saga machinery (ADR-
         062 §9); the manifest soft-delete has already committed by the
         time the audit emit runs."""
-        from audittrace.routes import memory as m
+        from audittrace.routes import memory_write_audit as m
 
         client.post("/memory/episodic", json={"filename": "ADR-fc2.md", "content": "x"})
 

@@ -193,7 +193,7 @@ def audits() -> Iterator[AsyncMock]:
     """Capture every audit event the routes emit (memory + promote)."""
     mock = AsyncMock()
     with (
-        patch("audittrace.routes.memory.emit_memory_audit_event", mock),
+        patch("audittrace.routes.memory_write_audit.emit_memory_audit_event", mock),
         patch("audittrace.routes.memory_promote.emit_memory_audit_event", mock),
     ):
         yield mock

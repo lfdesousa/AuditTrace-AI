@@ -201,7 +201,9 @@ async def _env(
     audits = AsyncMock()
     try:
         with (
-            patch("audittrace.routes.memory.emit_memory_audit_event", audits),
+            patch(
+                "audittrace.routes.memory_write_audit.emit_memory_audit_event", audits
+            ),
             patch(
                 "audittrace.tools.mcp_write_handlers.emit_memory_audit_event", audits
             ),
@@ -263,7 +265,7 @@ class TestRt22FaultInjection:
         its own item, the list has ONE item, and the retry is a plain update."""
         async with _env(pgs, monkeypatch, legacy=(("x", A),)) as env:
             with patch(
-                "audittrace.routes.memory.emit_memory_audit_event",
+                "audittrace.routes.memory_write_audit.emit_memory_audit_event",
                 AsyncMock(side_effect=RuntimeError("audit store down")),
             ):
                 r = await env.put(A, "x", "A-new")

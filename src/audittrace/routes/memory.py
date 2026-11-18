@@ -113,6 +113,7 @@ from audittrace.routes.memory_whole_document import (
     gather_whole_document,
     reassemble_chunk_sequence,
 )
+from audittrace.routes.memory_write_audit import emit_write_audit, emit_write_audits
 from audittrace.routes.memory_write_refusal import (
     read_upload_bounded,
     refuse_oversize_or_413,
@@ -129,11 +130,7 @@ from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.episodic import EpisodicService
 from audittrace.services.index_routing import collection_for_key
 from audittrace.services.layer_listing import list_layer_objects
-from audittrace.services.memory_audit import (
-    MemoryOp,
-    emit_memory_audit_event,
-    schedule_read_audit,
-)
+from audittrace.services.memory_audit import schedule_read_audit
 from audittrace.services.memory_keys import (
     ID_FORM_LC9,
     ChromaIdConflictError,
@@ -420,37 +417,6 @@ def _require_corpus_scope(user: UserContext, collection: str, action: str) -> No
     )
 
 
-async def _emit_write_audits(
-    *,
-    user: UserContext,
-    layer: str,
-    filename: str,
-    copied_from: str | None,
-    collection: str | None = None,
-) -> None:
-    """One ``_emit_write_audit`` per manifest mutation (ADDENDUM-1 S2): the
-    create/update row, and -- on a copy-forward -- the legacy tombstone.
-    The write carries ``copied_from``; the tombstone ``reason``. Both keys
-    are additive ``detail`` fields."""
-    await _emit_write_audit(
-        user=user,
-        op="write",
-        layer=layer,
-        collection=collection,
-        key=filename,
-        detail_extra={"copied_from": copied_from} if copied_from else None,
-    )
-    if copied_from:
-        await _emit_write_audit(
-            user=user,
-            op="delete",
-            layer=layer,
-            collection=collection,
-            key=filename,
-            detail_extra={"reason": "copy_forward"},
-        )
-
-
 def _resolve_requested_tier(payload: dict[str, Any] | None, promote: str | None) -> str:
     """Resolve the caller's requested write tier from an optional JSON
     body ``"tier"`` field and/or an optional ``?promote=`` query param
@@ -555,48 +521,6 @@ def _reject_corpus_promotion_for(layer: str, tier: str) -> None:
                 "(ADR-062 Phase B, WU-B5)"
             ),
         )
-
-
-async def _emit_write_audit(
-    *,
-    user: UserContext,
-    op: MemoryOp,
-    layer: str,
-    collection: str | None = None,
-    key: str | None = None,
-    detail_extra: dict[str, Any] | None = None,
-) -> None:
-    """Fail-closed wrapper around :func:`emit_memory_audit_event` for every
-    WRITE/DELETE call site (ADR-062 §5, WU-A4).
-
-    See ``services/memory_audit.py``'s module docstring for the full
-    read=fail-open / write=fail-closed rationale. This wrapper converts an
-    audit-store failure into an explicit ``HTTPException(500)`` rather than
-    letting a bare exception fall through to the app-wide catch-all
-    handler — the caller gets a precise, on-brand error (matching every
-    other 5xx in this file) instead of a generic unhandled-exception
-    envelope, and the failure is deterministically visible to
-    ``TestClient`` (Starlette's ``ServerErrorMiddleware`` always re-raises
-    after an unhandled exception, which ``TestClient`` in turn re-raises
-    into the caller's test — an explicit ``HTTPException`` is the
-    established pattern this file already uses everywhere else a service
-    call can fail, e.g. ``_require_admin``'s 403, the 502s below)."""
-    try:
-        await emit_memory_audit_event(
-            user=user,
-            op=op,
-            layer=layer,
-            collection=collection,
-            key=key,
-            detail_extra=detail_extra,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"memory audit-write failed — mutation not confirmed audited: {exc}"
-            ),
-        ) from exc
 
 
 async def _write_layer_private(
@@ -813,7 +737,7 @@ async def upload_memory_file(
         # invariant (traceability, feedback_traceability_requirement):
         # write the usual audit row, token-derived identity, awaited
         # inline (fail-closed — see services/memory_audit.py).
-        await _emit_write_audit(
+        await emit_write_audit(
             user=user,
             op="write",
             layer=MemoryLayer.session.value,
@@ -1604,7 +1528,7 @@ async def index_memory(
     # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
     # closed). One event per /memory/index call, naming every target
     # collection touched; single-file mode additionally names the key.
-    await _emit_write_audit(
+    await emit_write_audit(
         user=user,
         op="write",
         layer="semantic",
@@ -2061,7 +1985,7 @@ async def update_episodic(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audits(
+    await emit_write_audits(
         user=user, layer="episodic", filename=filename, copied_from=copied_from
     )
     return entry.to_dict()
@@ -2119,7 +2043,7 @@ async def delete_episodic(
             await service.delete(user, filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-    await _emit_write_audit(
+    await emit_write_audit(
         user=user,
         op="delete",
         layer="episodic",
@@ -2313,7 +2237,7 @@ async def update_procedural(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audits(
+    await emit_write_audits(
         user=user, layer="procedural", filename=filename, copied_from=copied_from
     )
     return entry.to_dict()
@@ -2358,7 +2282,7 @@ async def delete_procedural(
             await service.delete(user, filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-    await _emit_write_audit(
+    await emit_write_audit(
         user=user,
         op="delete",
         layer="procedural",
@@ -2458,7 +2382,7 @@ async def create_semantic(
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
     await drop_copied_forward_chunk(service, user, collection, document_id, copied_from)
-    await _emit_write_audits(
+    await emit_write_audits(
         user=user,
         layer="semantic",
         collection=collection,
@@ -2999,7 +2923,7 @@ async def update_semantic(
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
     await drop_copied_forward_chunk(service, user, collection, document_id, copied_from)
-    await _emit_write_audits(
+    await emit_write_audits(
         user=user,
         layer="semantic",
         collection=collection,
@@ -3054,7 +2978,7 @@ async def delete_semantic(
             await service.delete_document(user, collection, document_id)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-    await _emit_write_audit(
+    await emit_write_audit(
         user=user,
         op="delete",
         layer="semantic",
