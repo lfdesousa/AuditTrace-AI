@@ -1,9 +1,6 @@
 Result lines of the real full-suite log of the previous round (code head ac59a2f9, tree 6006f56b9a31); the in-repo full-suite-final.txt of the first build holds the summary only.
 Required test coverage of 90% reached. Total coverage: 98.95%
 ================ 11698 passed, 3 warnings in 3904.16s (1:05:04) ================
-check-venv-matches-lock: environment == requirements-dev.txt (195 pins)
-check-venv-matches-lock: environment == requirements-dev.txt (195 pins)
-check-freeze-matches-lock: gate venv == requirements-gate.txt (67 pins)
 🚫 Enforcing zero-skip policy...
 [no-skip-check] No skipped tests in junit.xml. Good.
 🔒 Enforcing per-file coverage gate (each component >= 90%)...
