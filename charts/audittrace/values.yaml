@@ -1152,10 +1152,12 @@ console:
       limits:
         cpu: 1000m
         memory: 1Gi
-    # D2 — OIDC token-forwarding config. `openidScope` MUST carry
-    # `offline_access` (refresh token — the #1 stale-token risk mitigation)
-    # alongside the standard `profile`/`email` scopes the D3 realm reconcile
-    # adds to `audittrace-librechat`.
+    # D2 — OIDC token-forwarding config. `openidScope` carries the standard
+    # `profile`/`email` scopes the D3 realm reconcile adds to
+    # `audittrace-librechat`. It MUST NOT carry `offline_access`
+    # (BFF-CHAT-ROUTE-ERRORS ADDENDUM-2, measured on Keycloak 24.0.5): with it,
+    # a token of a signed-out user keeps exchanging until it expires. Without
+    # it the refresh token lives and dies with the SSO session.
     #
     # LC-10a (operator ruling "A: all BFF write scopes", 2026-11-08):
     # Keycloak 24's legacy token exchange keeps only the requested scopes the
@@ -1167,7 +1169,7 @@ console:
     # from those modules and fails when this value stops covering it. Users
     # must log in again after a change.
     openidScope: >-
-      openid profile email offline_access
+      openid profile email
       memory:agents:read-own
       memory:agents:write
       memory:chat_projects:read-own

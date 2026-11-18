@@ -24,4 +24,21 @@ spec:
       to:
         - operation:
             ports: ["{{ .Values.memoryServer.port }}"]
+            {{- if .Values.console.enabled }}
+            # BFF-CHAT-ROUTE-ERRORS ADDENDUM-2: the refused-turn record has no
+            # JWT of its writer. The gateway (and so every outside caller) is
+            # kept off its path here; the rule below admits the BFF alone.
+            notPaths: ["/interactions/refusals"]
+            {{- end }}
+    {{- if .Values.console.enabled }}
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.console.bff.serviceAccount.name }}"
+      to:
+        - operation:
+            ports: ["{{ .Values.memoryServer.port }}"]
+            methods: ["POST"]
+            paths: ["/interactions/refusals"]
+    {{- end }}
 {{- end }}

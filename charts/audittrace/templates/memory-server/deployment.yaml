@@ -145,6 +145,12 @@ spec:
               value: {{ .Values.objectStorage.aws.secretAccessKey | quote }}
             {{- end }}
             {{- end }}
+            {{- if and .Values.istio.enabled .Values.console.enabled }}
+            # BFF-CHAT-ROUTE-ERRORS ADDENDUM-2: on ONLY together with the mesh
+            # rule that admits the BFF alone to /interactions/refusals.
+            - name: AUDITTRACE_REFUSAL_INGEST_ENABLED
+              value: "true"
+            {{- end }}
             - name: AUDITTRACE_KEYCLOAK_ISSUER
               value: {{ include "audittrace.keycloakIssuer" . | quote }}
             - name: AUDITTRACE_KEYCLOAK_JWKS_URL

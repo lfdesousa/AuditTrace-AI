@@ -42,14 +42,21 @@ import logging
 from typing import Any
 
 import httpx
-from jose import JWTError, jwt
+from jose import JWTError
 from jose.exceptions import JWKError
 
-from bff.auth import InboundTokenError, get_jwks_keys
+from bff.auth import InboundTokenError, get_signing_keys
 from bff.config import Settings
 from bff.exchange_failure import ExchangeFailure
+from bff.realm_keys import decode, token_kid
 
 logger = logging.getLogger(__name__)
+
+# What Keycloak answers when it refuses the SUBJECT token. Measured, not
+# specified by an RFC: tests/test_keycloak_exchange_measurement_pin.py holds
+# these two names to the recorded measurement and to the pinned Keycloak.
+SUBJECT_REFUSAL_STATUS = 400
+SUBJECT_REFUSAL_ERROR = "invalid_token"
 
 
 class TokenExchangeError(Exception):
@@ -201,13 +208,8 @@ async def _revalidate_minted_token(
     protocol-mapper test (``tests/test_chart_drift_guards.py``).
     """
     try:
-        keys = await get_jwks_keys(http_client, settings)
-        claims = jwt.decode(
-            minted_token,
-            keys,
-            algorithms=["RS256"],
-            options={"verify_aud": False},
-        )
+        keys = await get_signing_keys(http_client, settings, token_kid(minted_token))
+        claims = decode(minted_token, keys)
     except InboundTokenError as exc:
         # The second JWKS fetch failed (the key cache had expired between the
         # inbound check and here): the sign-in service, not the caller's token.
@@ -224,7 +226,6 @@ async def _revalidate_minted_token(
             f"realm keys or claims unusable: {type(exc).__name__}: {exc}",
             ExchangeFailure.UNAVAILABLE,
         ) from exc
-    assert isinstance(claims, dict), "jwt.decode returned a non-dict payload"
     return claims
 
 
@@ -244,12 +245,12 @@ def _refusal_class(response: httpx.Response) -> ExchangeFailure:
     """
     if response.status_code >= 500:
         return ExchangeFailure.UNAVAILABLE
-    if response.status_code == 400:
+    if response.status_code == SUBJECT_REFUSAL_STATUS:
         try:
             answer = response.json()
         except ValueError:
             return ExchangeFailure.REFUSED
-        if isinstance(answer, dict) and answer.get("error") == "invalid_token":
+        if isinstance(answer, dict) and answer.get("error") == SUBJECT_REFUSAL_ERROR:
             return ExchangeFailure.SUBJECT_REFUSED
     return ExchangeFailure.REFUSED
 

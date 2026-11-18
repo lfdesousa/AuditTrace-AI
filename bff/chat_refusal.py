@@ -37,6 +37,8 @@ class ChatRefusal:
 
     def response(self) -> JSONResponse:
         headers = {"WWW-Authenticate": self.challenge} if self.challenge else None
-        return JSONResponse(
+        response = JSONResponse(
             status_code=self.status, content=self.body(), headers=headers
         )
+        response.refusal_code = self.code  # type: ignore[attr-defined]
+        return response

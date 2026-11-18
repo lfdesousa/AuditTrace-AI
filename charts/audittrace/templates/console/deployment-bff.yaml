@@ -74,6 +74,12 @@ spec:
             # ── the frozen /v1 upstream — in-cluster memory-server Service ──
             - name: AUDITTRACE_BFF_ORCHESTRATOR_BASE_URL
               value: "http://{{ .Release.Name }}-memory-server:{{ .Values.memoryServer.port }}"
+            {{- if .Values.istio.enabled }}
+            # BFF-CHAT-ROUTE-ERRORS ADDENDUM-2: record refused chat turns
+            # (only where the mesh rule admits this workload to the route).
+            - name: AUDITTRACE_BFF_REFUSAL_RECORD_ENABLED
+              value: "true"
+            {{- end }}
             # ── inbound-token validation — in-cluster Keycloak JWKS ─────────
             - name: AUDITTRACE_BFF_KEYCLOAK_ISSUER
               value: {{ include "audittrace.keycloakIssuer" . | quote }}

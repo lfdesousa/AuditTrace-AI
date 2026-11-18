@@ -24,6 +24,7 @@ from typing import Any
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response
 
+from bff import refusal_record
 from bff.chat_refusals import INTERNAL_ERROR, refuse
 
 Handler = Callable[..., Awaitable[Response]]
@@ -60,11 +61,14 @@ def last_resort(handler: Handler) -> Handler:
         except ClientDisconnect:
             raise
         except Exception as exc:  # noqa: BLE001 - the last resort, by design
-            return refuse(
-                INTERNAL_ERROR,
-                request.headers,
-                sub=getattr(request.state, "verified_sub", None),
-                cause=frame_chain(exc),
+            return refusal_record.attach(
+                refuse(
+                    INTERNAL_ERROR,
+                    request.headers,
+                    sub=getattr(request.state, "verified_sub", None),
+                    cause=frame_chain(exc),
+                ),
+                request,
             )
 
     return guarded

@@ -17,16 +17,18 @@ downstream.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
 
 import httpx
-from jose import JWTError, jwt
+from jose import JWTError
 from jose.exceptions import JWKError
 
 from bff.config import Settings
 from bff.inbound_token_failure import InboundTokenFailure
+from bff.realm_keys import decode, eligible, select, token_kid
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +66,29 @@ class InboundTokenError(Exception):
 _jwks_cache: dict[str, Any] = {}
 
 
+# The bounded refresh on an unknown kid (ADDENDUM-2 item 6). One lock per
+# event loop (never created at import time); ``_monotonic`` is the clock the
+# bound is measured on, a module name so a test can step it.
+_refresh_lock: asyncio.Lock | None = None
+_refresh_lock_loop: asyncio.AbstractEventLoop | None = None
+_monotonic = time.monotonic
+
+
 def reset_jwks_state_for_tests() -> None:
     """Test-only reset of the module-level JWKS cache."""
+    global _refresh_lock, _refresh_lock_loop
     _jwks_cache.clear()
+    _refresh_lock = None
+    _refresh_lock_loop = None
+
+
+def _get_refresh_lock() -> asyncio.Lock:
+    global _refresh_lock, _refresh_lock_loop
+    loop = asyncio.get_running_loop()
+    if _refresh_lock is None or _refresh_lock_loop is not loop:
+        _refresh_lock = asyncio.Lock()
+        _refresh_lock_loop = loop
+    return _refresh_lock
 
 
 def _jwks_cache_fresh(now: float, ttl_seconds: int) -> bool:
@@ -107,9 +129,61 @@ async def get_jwks_keys(client: httpx.AsyncClient, settings: Settings) -> list[A
     if _jwks_cache_fresh(now, settings.jwks_cache_ttl_seconds):
         return list(_jwks_cache["keys"])
     keys = await _fetch_jwks_keys(client, settings.keycloak_jwks_url)
+    _store_keys(keys, now)
+    return list(keys)
+
+
+def _store_keys(keys: list[Any], now: float) -> None:
     _jwks_cache["keys"] = keys
     _jwks_cache["fetched_at"] = now
-    return list(keys)
+    _jwks_cache["fetched_monotonic"] = _monotonic()
+    _jwks_cache["refresh_failed"] = False
+
+
+async def get_signing_keys(
+    client: httpx.AsyncClient, settings: Settings, kid: str | None
+) -> list[dict[str, Any]]:
+    """The realm keys that may verify a token naming ``kid``.
+
+    Selection is by ``kty``/``use``/``alg`` and ``kid``, never by position. A
+    JWKS without any eligible key is the realm's fault (``UNVERIFIABLE``). A
+    ``kid`` the cache does not hold triggers ONE refresh, single-flight and
+    at most once per ``jwks_refresh_min_interval_seconds`` counted from the
+    last fetch of any kind; an empty result means no realm key has that kid.
+    """
+    keys = await get_jwks_keys(client, settings)
+    chosen = _selected(keys, kid)
+    if chosen or kid is None:
+        return chosen
+    async with _get_refresh_lock():
+        keys = list(_jwks_cache.get("keys", keys))  # a waiter ahead may have refreshed
+        chosen = select(keys, kid)
+        if chosen:
+            return chosen
+        age = _monotonic() - _jwks_cache.get("fetched_monotonic", float("-inf"))
+        if age < settings.jwks_refresh_min_interval_seconds:
+            if _jwks_cache.get("refresh_failed"):
+                # The one allowed refresh failed: within the bound nobody
+                # knows whether the realm has this kid. Not the caller's fault.
+                raise InboundTokenError(
+                    "JWKS refresh failed; not retried within the bound",
+                    InboundTokenFailure.UNVERIFIABLE,
+                )
+            return []
+        # Stamp BEFORE the fetch: a failing refresh is bounded like a good one.
+        _jwks_cache["fetched_monotonic"] = _monotonic()
+        _jwks_cache["refresh_failed"] = True
+        keys = await _fetch_jwks_keys(client, settings.keycloak_jwks_url)
+        _store_keys(keys, time.time())
+    return _selected(keys, kid)
+
+
+def _selected(keys: list[Any], kid: str | None) -> list[dict[str, Any]]:
+    if not any(eligible(entry) for entry in keys):
+        raise InboundTokenError(
+            "JWKS publishes no RS256 signing key", InboundTokenFailure.UNVERIFIABLE
+        )
+    return select(keys, kid)
 
 
 def _decode_with_allowed_issuers(
@@ -125,12 +199,7 @@ def _decode_with_allowed_issuers(
     docstring. python-jose therefore needs ``verify_aud=False`` and no
     ``audience=`` kwarg, or it raises regardless of the token's shape.
     """
-    payload = jwt.decode(
-        token,
-        keys,
-        algorithms=["RS256"],
-        options={"verify_aud": False},
-    )
+    payload = decode(token, keys)
     token_iss = payload.get("iss")
     allowed = {primary_issuer, *(extra_issuers or [])}
     if not isinstance(token_iss, str) or token_iss not in allowed:
@@ -158,7 +227,7 @@ async def validate_inbound_token(
     if not token or not token.strip():
         raise InboundTokenError("missing bearer token", InboundTokenFailure.MISSING)
     try:
-        keys = await get_jwks_keys(http_client, settings)
+        keys = await get_signing_keys(http_client, settings, token_kid(token))
         claims = _decode_with_allowed_issuers(
             token,
             keys,

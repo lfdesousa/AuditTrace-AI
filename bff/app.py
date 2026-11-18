@@ -127,8 +127,10 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import StreamingResponse
 
+from bff import refusal_record
 from bff.auth import InboundTokenError, validate_inbound_token
 from bff.chat_caller_scope import insufficient_scope_response, missing_chat_scopes
 from bff.chat_last_resort import last_resort
@@ -193,6 +195,7 @@ from bff.logging_setup import configure_logging
 from bff.memory_proxy import MemoryProxyError, proxy_memory_request
 from bff.memory_scopes import MEMORY_SCOPE_STRING
 from bff.proxy import ProxyError, proxy_chat_completions
+from bff.route_refusals import framework_error, refuse_route, route_last_resort
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +264,8 @@ def create_app() -> FastAPI:
         },
     )
 
+    app.add_exception_handler(StarletteHTTPException, framework_error)
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "component": "audittrace-librechat-bff"}
@@ -286,10 +291,13 @@ def create_app() -> FastAPI:
         assert token is not None
         inbound_sub = claims["sub"]
         request.state.verified_sub = inbound_sub  # for the last resort's event
+        refusal_record.arm(request, http_client, settings, token)
         inbound_scopes = frozenset(str(claims.get("scope", "")).split())
         missing = missing_chat_scopes(inbound_scopes)
         if missing:
-            return insufficient_scope_response(inbound_sub, missing)
+            return refusal_record.attach(
+                insufficient_scope_response(inbound_sub, missing), request
+            )
         try:
             minted_token = await exchange_token(
                 token,
@@ -302,11 +310,14 @@ def create_app() -> FastAPI:
                 & (inbound_scopes | OIDC_PROTOCOL_SCOPES),
             )
         except TokenExchangeError as exc:
-            return refuse(
-                for_exchange_failure(exc.failure),
-                request.headers,
-                sub=inbound_sub,
-                cause=exc,
+            return refusal_record.attach(
+                refuse(
+                    for_exchange_failure(exc.failure),
+                    request.headers,
+                    sub=inbound_sub,
+                    cause=exc,
+                ),
+                request,
             )
 
         raw_body = await request.body()
@@ -321,8 +332,11 @@ def create_app() -> FastAPI:
                 session_id=request.headers.get("x-session-id"),
             )
         except ProxyError as exc:
-            return refuse(
-                UPSTREAM_UNAVAILABLE, request.headers, sub=inbound_sub, cause=exc
+            return refusal_record.attach(
+                refuse(
+                    UPSTREAM_UNAVAILABLE, request.headers, sub=inbound_sub, cause=exc
+                ),
+                request,
             )
 
     @app.api_route(
@@ -330,6 +344,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST", "PUT", "DELETE"],
         response_model=None,
     )
+    @route_last_resort("memory")
     async def memory_proxy(
         path: str,
         request: Request,
@@ -340,13 +355,19 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning("rejecting /memory request — inbound token invalid: %s", exc)
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+            return refuse_route(
+                "memory",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
+            )
 
         # Same narrowing as chat_completions — validate_inbound_token raises
         # for a falsy token, so reaching here means it is non-None.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
         try:
             minted_token = await exchange_token(
                 token,
@@ -356,12 +377,12 @@ def create_app() -> FastAPI:
                 requested_scope=MEMORY_SCOPE_STRING,
             )
         except TokenExchangeError as exc:
-            logger.error(
-                "memory token exchange failed for sub=%s: %s", inbound_sub, exc
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse_route(
+                "memory",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         raw_body = await request.body()
@@ -378,12 +399,16 @@ def create_app() -> FastAPI:
                 http_client,
             )
         except MemoryProxyError as exc:
-            logger.error("orchestrator /memory unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse_route(
+                "memory",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
     @app.post("/console/files", response_model=None)
+    @route_last_resort("console_files")
     async def console_files(
         request: Request,
         settings: Settings = Depends(get_settings),
@@ -402,16 +427,20 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning(
-                "rejecting /console/files request — inbound token invalid: %s", exc
+            return refuse_route(
+                "console_files",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
             )
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # Same narrowing as chat_completions/memory_proxy —
         # validate_inbound_token raises for a falsy token, so reaching
         # here means it is non-None.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
         try:
             minted_token = await exchange_token(
                 token,
@@ -421,14 +450,12 @@ def create_app() -> FastAPI:
                 requested_scope=INGEST_SCOPE_STRING,
             )
         except TokenExchangeError as exc:
-            logger.error(
-                "console-files token exchange failed for sub=%s: %s",
-                inbound_sub,
-                exc,
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse_route(
+                "console_files",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         raw_body = await request.body()
@@ -454,12 +481,16 @@ def create_app() -> FastAPI:
                 session_id=request.headers.get("x-session-id"),
             )
         except MemoryProxyError as exc:
-            logger.error("orchestrator /memory/upload unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse_route(
+                "console_files",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
     @app.post("/console/files/{filename}/promote", response_model=None)
+    @route_last_resort("console_files_promote")
     async def console_files_promote(
         filename: str,
         request: Request,
@@ -481,16 +512,19 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning(
-                "rejecting /console/files promote request — inbound token invalid: %s",
-                exc,
+            return refuse_route(
+                "console_files_promote",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
             )
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # Same narrowing as every other route above — validate_inbound_token
         # raises for a falsy token, so reaching here means it is non-None.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
         requested_scope = promote_scope_string_for_layer(
             settings.console_promote_default_layer
         )
@@ -503,14 +537,12 @@ def create_app() -> FastAPI:
                 requested_scope=requested_scope,
             )
         except TokenExchangeError as exc:
-            logger.error(
-                "console-files-promote token exchange failed for sub=%s: %s",
-                inbound_sub,
-                exc,
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse_route(
+                "console_files_promote",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         # Body is server-CONSTRUCTED, not forwarded from the caller's own
@@ -536,9 +568,12 @@ def create_app() -> FastAPI:
                 http_client,
             )
         except MemoryProxyError as exc:
-            logger.error("orchestrator /memory/promote unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse_route(
+                "console_files_promote",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
     async def _console_conversations_proxy_impl(
@@ -557,16 +592,19 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning(
-                "rejecting /console/conversations request — inbound token invalid: %s",
-                exc,
+            return refuse_route(
+                "console_conversations",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
             )
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # Same narrowing as every other route above — validate_inbound_token
         # raises for a falsy token, so reaching here means it is non-None.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
         try:
             minted_token = await exchange_token(
                 token,
@@ -576,14 +614,12 @@ def create_app() -> FastAPI:
                 requested_scope=CONSOLE_CONVERSATIONS_SCOPE_STRING,
             )
         except TokenExchangeError as exc:
-            logger.error(
-                "console-conversations token exchange failed for sub=%s: %s",
-                inbound_sub,
-                exc,
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse_route(
+                "console_conversations",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         raw_body = await request.body()
@@ -600,9 +636,12 @@ def create_app() -> FastAPI:
                 http_client,
             )
         except ConsoleConversationsProxyError as exc:
-            logger.error("orchestrator /console/conversations unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse_route(
+                "console_conversations",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
     @app.api_route(
@@ -610,6 +649,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST"],
         response_model=None,
     )
+    @route_last_resort("console_conversations")
     async def console_conversations_base(
         request: Request,
         settings: Settings = Depends(get_settings),
@@ -627,6 +667,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST", "PATCH", "DELETE"],
         response_model=None,
     )
+    @route_last_resort("console_conversations")
     async def console_conversations_proxy(
         path: str,
         request: Request,
@@ -658,16 +699,19 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning(
-                "rejecting /console/presets request — inbound token invalid: %s",
-                exc,
+            return refuse_route(
+                "console_presets",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
             )
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # Same narrowing as every other route above — validate_inbound_token
         # raises for a falsy token, so reaching here means it is non-None.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
         try:
             minted_token = await exchange_token(
                 token,
@@ -677,14 +721,12 @@ def create_app() -> FastAPI:
                 requested_scope=CONSOLE_PRESETS_SCOPE_STRING,
             )
         except TokenExchangeError as exc:
-            logger.error(
-                "console-presets token exchange failed for sub=%s: %s",
-                inbound_sub,
-                exc,
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse_route(
+                "console_presets",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         raw_body = await request.body()
@@ -701,9 +743,12 @@ def create_app() -> FastAPI:
                 http_client,
             )
         except ConsolePresetsProxyError as exc:
-            logger.error("orchestrator /console/presets unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse_route(
+                "console_presets",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
     @app.api_route(
@@ -711,6 +756,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST"],
         response_model=None,
     )
+    @route_last_resort("console_presets")
     async def console_presets_base(
         request: Request,
         settings: Settings = Depends(get_settings),
@@ -726,6 +772,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST", "DELETE"],
         response_model=None,
     )
+    @route_last_resort("console_presets")
     async def console_presets_proxy(
         path: str,
         request: Request,
@@ -753,16 +800,19 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning(
-                "rejecting /console/prompts request — inbound token invalid: %s",
-                exc,
+            return refuse_route(
+                "console_prompts",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
             )
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # Same narrowing as every other route above — validate_inbound_token
         # raises for a falsy token, so reaching here means it is non-None.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
         try:
             minted_token = await exchange_token(
                 token,
@@ -772,14 +822,12 @@ def create_app() -> FastAPI:
                 requested_scope=CONSOLE_PROMPTS_SCOPE_STRING,
             )
         except TokenExchangeError as exc:
-            logger.error(
-                "console-prompts token exchange failed for sub=%s: %s",
-                inbound_sub,
-                exc,
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse_route(
+                "console_prompts",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         raw_body = await request.body()
@@ -796,9 +844,12 @@ def create_app() -> FastAPI:
                 http_client,
             )
         except ConsolePromptsProxyError as exc:
-            logger.error("orchestrator /console/prompts unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse_route(
+                "console_prompts",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
     @app.api_route(
@@ -806,6 +857,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST"],
         response_model=None,
     )
+    @route_last_resort("console_prompts")
     async def console_prompts_base(
         request: Request,
         settings: Settings = Depends(get_settings),
@@ -821,6 +873,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST", "PATCH", "DELETE"],
         response_model=None,
     )
+    @route_last_resort("console_prompts")
     async def console_prompts_proxy(
         path: str,
         request: Request,
@@ -849,16 +902,19 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning(
-                "rejecting /console/chat-projects request — inbound token invalid: %s",
-                exc,
+            return refuse_route(
+                "console_chat_projects",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
             )
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # Same narrowing as every other route above — validate_inbound_token
         # raises for a falsy token, so reaching here means it is non-None.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
         try:
             minted_token = await exchange_token(
                 token,
@@ -868,14 +924,12 @@ def create_app() -> FastAPI:
                 requested_scope=CONSOLE_CHAT_PROJECTS_SCOPE_STRING,
             )
         except TokenExchangeError as exc:
-            logger.error(
-                "console-chat-projects token exchange failed for sub=%s: %s",
-                inbound_sub,
-                exc,
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse_route(
+                "console_chat_projects",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         raw_body = await request.body()
@@ -892,9 +946,12 @@ def create_app() -> FastAPI:
                 http_client,
             )
         except ConsoleChatProjectsProxyError as exc:
-            logger.error("orchestrator /console/chat-projects unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse_route(
+                "console_chat_projects",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
     @app.api_route(
@@ -902,6 +959,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST"],
         response_model=None,
     )
+    @route_last_resort("console_chat_projects")
     async def console_chat_projects_base(
         request: Request,
         settings: Settings = Depends(get_settings),
@@ -919,6 +977,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST", "DELETE"],
         response_model=None,
     )
+    @route_last_resort("console_chat_projects")
     async def console_chat_projects_proxy(
         path: str,
         request: Request,
@@ -951,16 +1010,19 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning(
-                "rejecting /console/file-records request — inbound token invalid: %s",
-                exc,
+            return refuse_route(
+                "console_file_records",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
             )
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # Same narrowing as every other route above — validate_inbound_token
         # raises for a falsy token, so reaching here means it is non-None.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
         try:
             minted_token = await exchange_token(
                 token,
@@ -970,14 +1032,12 @@ def create_app() -> FastAPI:
                 requested_scope=CONSOLE_FILE_RECORDS_SCOPE_STRING,
             )
         except TokenExchangeError as exc:
-            logger.error(
-                "console-file-records token exchange failed for sub=%s: %s",
-                inbound_sub,
-                exc,
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse_route(
+                "console_file_records",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         raw_body = await request.body()
@@ -994,9 +1054,12 @@ def create_app() -> FastAPI:
                 http_client,
             )
         except ConsoleFileRecordsProxyError as exc:
-            logger.error("orchestrator /console/files unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse_route(
+                "console_file_records",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
     @app.api_route(
@@ -1004,6 +1067,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST"],
         response_model=None,
     )
+    @route_last_resort("console_file_records")
     async def console_file_records_base(
         request: Request,
         settings: Settings = Depends(get_settings),
@@ -1021,6 +1085,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST", "DELETE"],
         response_model=None,
     )
+    @route_last_resort("console_file_records")
     async def console_file_records_proxy(
         path: str,
         request: Request,
@@ -1051,16 +1116,19 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning(
-                "rejecting /console/agents request — inbound token invalid: %s",
-                exc,
+            return refuse_route(
+                "console_agents",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
             )
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # Same narrowing as every other route above — validate_inbound_token
         # raises for a falsy token, so reaching here means it is non-None.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
         try:
             minted_token = await exchange_token(
                 token,
@@ -1070,14 +1138,12 @@ def create_app() -> FastAPI:
                 requested_scope=CONSOLE_AGENTS_SCOPE_STRING,
             )
         except TokenExchangeError as exc:
-            logger.error(
-                "console-agents token exchange failed for sub=%s: %s",
-                inbound_sub,
-                exc,
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse_route(
+                "console_agents",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         raw_body = await request.body()
@@ -1094,9 +1160,12 @@ def create_app() -> FastAPI:
                 http_client,
             )
         except ConsoleAgentsProxyError as exc:
-            logger.error("orchestrator /console/agents unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse_route(
+                "console_agents",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
     @app.api_route(
@@ -1104,6 +1173,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST"],
         response_model=None,
     )
+    @route_last_resort("console_agents")
     async def console_agents_base(
         request: Request,
         settings: Settings = Depends(get_settings),
@@ -1119,6 +1189,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST", "DELETE"],
         response_model=None,
     )
+    @route_last_resort("console_agents")
     async def console_agents_proxy(
         path: str,
         request: Request,
@@ -1146,17 +1217,19 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning(
-                "rejecting /console/conversation-tags request — inbound "
-                "token invalid: %s",
-                exc,
+            return refuse_route(
+                "console_conversation_tags",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
             )
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # Same narrowing as every other route above — validate_inbound_token
         # raises for a falsy token, so reaching here means it is non-None.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
         try:
             minted_token = await exchange_token(
                 token,
@@ -1166,14 +1239,12 @@ def create_app() -> FastAPI:
                 requested_scope=CONSOLE_CONVERSATION_TAGS_SCOPE_STRING,
             )
         except TokenExchangeError as exc:
-            logger.error(
-                "console-conversation-tags token exchange failed for sub=%s: %s",
-                inbound_sub,
-                exc,
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse_route(
+                "console_conversation_tags",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         raw_body = await request.body()
@@ -1190,9 +1261,12 @@ def create_app() -> FastAPI:
                 http_client,
             )
         except ConsoleConversationTagsProxyError as exc:
-            logger.error("orchestrator /console/conversation-tags unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse_route(
+                "console_conversation_tags",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
     @app.api_route(
@@ -1200,6 +1274,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST"],
         response_model=None,
     )
+    @route_last_resort("console_conversation_tags")
     async def console_conversation_tags_base(
         request: Request,
         settings: Settings = Depends(get_settings),
@@ -1218,6 +1293,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST", "DELETE"],
         response_model=None,
     )
+    @route_last_resort("console_conversation_tags")
     async def console_conversation_tags_proxy(
         path: str,
         request: Request,
@@ -1248,16 +1324,19 @@ def create_app() -> FastAPI:
         try:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
-            logger.warning(
-                "rejecting /console/tool-favorites request — inbound token invalid: %s",
-                exc,
+            return refuse_route(
+                "console_tool_favorites",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
             )
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # Same narrowing as every other route above — validate_inbound_token
         # raises for a falsy token, so reaching here means it is non-None.
         assert token is not None
         inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
         try:
             minted_token = await exchange_token(
                 token,
@@ -1267,14 +1346,12 @@ def create_app() -> FastAPI:
                 requested_scope=CONSOLE_TOOL_FAVORITES_SCOPE_STRING,
             )
         except TokenExchangeError as exc:
-            logger.error(
-                "console-tool-favorites token exchange failed for sub=%s: %s",
-                inbound_sub,
-                exc,
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"detail": "Upstream authentication service error"},
+            return refuse_route(
+                "console_tool_favorites",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
         raw_body = await request.body()
@@ -1291,9 +1368,12 @@ def create_app() -> FastAPI:
                 http_client,
             )
         except ConsoleToolFavoritesProxyError as exc:
-            logger.error("orchestrator /console/tool-favorites unreachable: %s", exc)
-            return JSONResponse(
-                status_code=502, content={"detail": "Upstream service unavailable"}
+            return refuse_route(
+                "console_tool_favorites",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
             )
 
     @app.api_route(
@@ -1301,6 +1381,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST"],
         response_model=None,
     )
+    @route_last_resort("console_tool_favorites")
     async def console_tool_favorites_base(
         request: Request,
         settings: Settings = Depends(get_settings),
@@ -1318,6 +1399,7 @@ def create_app() -> FastAPI:
         methods=["GET", "POST", "DELETE"],
         response_model=None,
     )
+    @route_last_resort("console_tool_favorites")
     async def console_tool_favorites_proxy(
         path: str,
         request: Request,

@@ -154,6 +154,11 @@ class Settings(BaseSettings):
     # sentinel UserContext with admin scopes for backwards compatibility.
     # Phase 5 will flip this to True after cross-user isolation tests land.
     auth_required: bool = False
+    # BFF-CHAT-ROUTE-ERRORS ADDENDUM-2: ``POST /interactions/refusals`` exists
+    # only when this is set. The route carries no JWT of its writer: the mesh
+    # admits only the LibreChat BFF to it, so it is on only where a mesh
+    # policy guards it (the chart sets it together with that policy).
+    refusal_ingest_enabled: bool = False
 
     # Redis-backed token cache (DESIGN §15.4 / §15.4a). The cache holds
     # validated JWT claims keyed on sha256(token) so the hot path skips
