@@ -13,8 +13,14 @@ existing realm by the hook).
 
 Neuters (each alone): C1 let the gateway rule cover every path -> ``test_the
 _gateway_is_kept_off_the_refusal_path``; C2 admit the gateway to the refusal
-rule -> ``test_only_the_bff_may_write_a_refusal``; C3 enable the server route
-without the console -> ``test_the_switches_follow_the_mesh_rule``; C4 put
+rule -> ``test_only_the_bff_may_write_a_refusal``; C3 name the writer
+without the console -> ``test_the_switches_follow_the_mesh_rule``; C7
+(ADDENDUM-3) name another identity than the mesh rule's -> ``test_the_route_
+names_its_one_writer``; C8 name the writer under PERMISSIVE mutual TLS ->
+``test_no_writer_is_named_without_strict_mutual_tls``; C9 drop the realm's SSO
+idle timeout from one source -> ``test_the_realm_sets_its_sso_idle_timeout``;
+C10 drop Step 8 -> ``test_the_hook_reconciles_the_idle_timeout_on_an_existing_
+realm``; C4 put
 ``offline_access`` back -> ``test_the_login_scope_has_no_offline_access``; C5
 drop the lifetime from one realm file -> ``test_the_login_client_token_lives
 _five_minutes``; C6 drop Step 7 from the hook -> ``test_the_hook_reconciles_the
@@ -37,6 +43,8 @@ from tests.test_console_k3s_guards import _LINT_SECRETS, CHART_DIR, NAMESPACE, R
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GATEWAY = "cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
 REFUSAL_PATH = "/interactions/refusals"
+# The operator's number (Q13); 28800 s = 8 h is the recommendation.
+SSO_IDLE_SECONDS = 28800
 
 
 def _render(*extra: str) -> list[dict[str, Any]]:
@@ -140,24 +148,47 @@ def test_the_gateway_is_kept_off_the_refusal_path(
             assert op["operation"].get("notPaths") == [REFUSAL_PATH]
 
 
+def _peer_authentication_modes(docs: list[dict[str, Any]]) -> list[str]:
+    return [
+        d["spec"]["mtls"]["mode"] for d in docs if d["kind"] == "PeerAuthentication"
+    ]
+
+
+def test_the_route_names_its_one_writer(console: list[dict[str, Any]]) -> None:
+    """ADDENDUM-3: the memory server is told the BFF's SPIFFE identity, the
+    SAME identity the mesh rule admits, and only under STRICT mutual TLS (over
+    plaintext the sidecar's statement of the peer would be the caller's own)."""
+    writer = _env(console, f"{RELEASE}-memory-server").get(
+        "AUDITTRACE_REFUSAL_INGEST_WRITER"
+    )
+    assert writer == "spiffe://" + _bff_principal(console)
+    assert _peer_authentication_modes(console) == ["STRICT"]
+    assert "AUDITTRACE_REFUSAL_INGEST_ENABLED" not in _env(
+        console, f"{RELEASE}-memory-server"
+    )
+
+
+def test_no_writer_is_named_without_strict_mutual_tls() -> None:
+    permissive = _render(
+        "--set", "console.enabled=true", "--set", "istio.mtls.mode=PERMISSIVE"
+    )
+    assert "AUDITTRACE_REFUSAL_INGEST_WRITER" not in _env(
+        permissive, f"{RELEASE}-memory-server"
+    )
+
+
 def test_the_switches_follow_the_mesh_rule(
     console: list[dict[str, Any]], plain: list[dict[str, Any]]
 ) -> None:
-    """Server route and BFF sender are on with the console (whose render
-    carries the rule) and absent without it."""
-    assert (
-        _env(console, f"{RELEASE}-memory-server").get(
-            "AUDITTRACE_REFUSAL_INGEST_ENABLED"
-        )
-        == "true"
-    )
+    """The BFF sender is on with the console (whose render carries the rule);
+    without the console no writer is named and the rule is the old one."""
     assert (
         _env(console, f"{RELEASE}-librechat-bff").get(
             "AUDITTRACE_BFF_REFUSAL_RECORD_ENABLED"
         )
         == "true"
     )
-    assert "AUDITTRACE_REFUSAL_INGEST_ENABLED" not in _env(
+    assert "AUDITTRACE_REFUSAL_INGEST_WRITER" not in _env(
         plain, f"{RELEASE}-memory-server"
     )
     assert len(_rules(plain)) == 1
@@ -223,4 +254,36 @@ def test_the_hook_reconciles_the_lifetime_on_an_existing_realm(
     assert (
         'acl_e2e_kc update "clients/${LIBRECHAT_CLIENT_UUID}" -r "${REALM}" \\ '
         "-s 'attributes.\"access.token.lifespan\"=300' >/dev/null"
+    ) in " ".join(body.split())
+
+
+@pytest.mark.parametrize("which", ["repository file", "chart"])
+def test_the_realm_sets_its_sso_idle_timeout(
+    console: list[dict[str, Any]], which: str
+) -> None:
+    """ADDENDUM-3 (Q13): without ``offline_access`` the LibreChat refresh token
+    lives and dies with the SSO session, and Keycloak's default idle timeout is
+    1800 s (measured). The realm sets it."""
+    realm = _realms(console)[which]
+    assert realm["ssoSessionIdleTimeout"] == SSO_IDLE_SECONDS
+    assert realm["ssoSessionMaxLifespan"] >= SSO_IDLE_SECONDS
+
+
+def test_the_hook_reconciles_the_idle_timeout_on_an_existing_realm(
+    console: list[dict[str, Any]],
+) -> None:
+    scripts = [
+        text
+        for doc in console
+        if doc["kind"] == "ConfigMap"
+        for text in (doc.get("data") or {}).values()
+        if "reconciling audittrace-librechat redirectUris" in text
+    ]
+    assert len(scripts) == 1
+    step = scripts[0].split("── Step 8:", 1)
+    assert len(step) == 2, "the hook has no Step 8"
+    body = step[1].split("── Istio sidecar shutdown", 1)[0]
+    assert (
+        'acl_e2e_kc update "realms/${REALM}" '
+        f"-s 'ssoSessionIdleTimeout={SSO_IDLE_SECONDS}' >/dev/null"
     ) in " ".join(body.split())

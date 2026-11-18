@@ -12,7 +12,10 @@ record unverified callers too -> the two ``not_recorded`` cells; A3 send a
 ``sub`` field -> ``test_the_record_asserts_no_user``; A4 let a failing record
 change the answer -> ``test_a_failing_record_never_changes_the_answer``; A5 log
 the subject token on failure -> the same test; A6 ignore the setting ->
-``test_nothing_is_sent_unless_the_deployment_enables_it``. Recording refusals
+``test_nothing_is_sent_unless_the_deployment_enables_it``; A8 (ADDENDUM-3)
+remove the per-user bound -> ``test_one_user_cannot_fill_their_own_audit_trail``;
+A9 key the bound on nothing (one bucket for everyone) ->
+``test_the_bound_is_per_user``. Recording refusals
 of other routes: a control, no single-edit neuter exists.
 """
 
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib
 import json
 import logging
 from collections.abc import Callable, Iterator
@@ -43,6 +47,15 @@ from tests.bff.test_chat_route_errors import (  # noqa: F401  (chat is a fixture
 )
 
 RECORD_URL = f"{ORCHESTRATOR_BASE}/interactions/refusals"
+PER_MINUTE = 12
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rate_state() -> None:
+    """The bound's table is process-wide; every test starts with it empty.
+    (At the commit this test is red on, the module does not exist yet.)"""
+    with contextlib.suppress(ImportError):
+        importlib.import_module("bff.refusal_record").reset_rate_state_for_tests()
 
 
 def _enabled() -> Settings:
@@ -295,3 +308,63 @@ def test_other_routes_are_not_recorded(
 
     assert response.status_code == 502
     assert recorder.requests == []
+
+
+# ── ADDENDUM-3 (gate A5): a rate bound on records ───────────────────────────
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    now = [5000.0]
+    monkeypatch.setattr("bff.refusal_record._monotonic", lambda: now[0], raising=False)
+    return now
+
+
+def _refuse_as(client: TestClient, sub: str) -> httpx.Response:
+    token = make_token(sub=sub, extra_claims={"scope": CHAT_SCOPE_STRING})
+    return _post(client, "Bearer " + token)
+
+
+def test_one_user_cannot_fill_their_own_audit_trail(
+    recording: tuple[TestClient, _Upstreams, _Recorder],
+    clock: list[float],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refused turn costs the user nothing. Beyond the bound a turn is still
+    answered and logged, but not recorded, until the minute has passed."""
+    client, upstreams, recorder = recording
+    upstreams.exchange = _kc(403, "access_denied")
+    with caplog.at_level(logging.INFO, logger="bff"):
+        statuses = {
+            _refuse_as(client, "alice").status_code for _ in range(PER_MINUTE + 3)
+        }
+
+    assert statuses == {502}
+    assert len(recorder.requests) == PER_MINUTE
+    skipped = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("chat.refusal_record_skipped")
+    ]
+    assert (
+        skipped
+        == ["chat.refusal_record_skipped code=token_exchange_refused reason=rate"] * 3
+    )
+    clock[0] += 60
+    _refuse_as(client, "alice")
+    assert len(recorder.requests) == PER_MINUTE + 1
+
+
+def test_the_bound_is_per_user(
+    recording: tuple[TestClient, _Upstreams, _Recorder], clock: list[float]
+) -> None:
+    client, upstreams, recorder = recording
+    upstreams.exchange = _kc(403, "access_denied")
+    for _ in range(PER_MINUTE + 1):
+        _refuse_as(client, "alice")
+    _refuse_as(client, "bob")
+
+    assert len(recorder.requests) == PER_MINUTE + 1
+    assert (
+        Settings(exchange_client_secret="x").refusal_record_max_per_minute == PER_MINUTE
+    )

@@ -16,12 +16,15 @@ Neuters (each alone): U1 bump the chart's Keycloak tag -> ``test_every_pinned
 _keycloak_is_the_measured_one``; U2 change the BFF's status or error constant ->
 ``test_the_bff_pair_is_the_measured_pair``; U3 make a configuration cause in the
 fixture answer the pair -> ``test_the_pair_tells_the_two_causes_apart``; U4
-delete the instrument -> ``test_the_instrument_is_in_the_repository``.
+delete the instrument -> ``test_the_instrument_is_in_the_repository``; U5
+(ADDENDUM-3) accept any digest -> ``test_the_measurement_records_what_it_ran_
+on``.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -113,6 +116,29 @@ def test_every_pinned_keycloak_is_the_measured_one() -> None:
     assert compose, "no compose file pins a Keycloak image"
     for image in compose:
         assert _tag(image).split("-")[0] == series, (image, series)
+
+
+def digest_is_the_measured_one(image: str, measured: dict[str, Any]) -> bool:
+    """A Keycloak image pinned by digest must be one the measurement ran on; an
+    image pinned by tag only cannot be told apart from a re-push (stated)."""
+    if "@" not in image:
+        return True
+    return image.rsplit("@", 1)[1] in measured["image_digests"]
+
+
+def test_the_measurement_records_what_it_ran_on() -> None:
+    """ADDENDUM-3 (gate A3): the fixture names the image by digest, so the
+    guard compares digests the day the chart pins one."""
+    measured = _measured()
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", measured["image_id"])
+    assert measured["image_id"] in measured["image_digests"]
+    assert all(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", d) for d in measured["image_digests"]
+    )
+    for image in _chart_keycloak_images() | _compose_keycloak_images():
+        assert digest_is_the_measured_one(image, measured), image
+    assert digest_is_the_measured_one(f"quay.io/k/k@{measured['image_id']}", measured)
+    assert not digest_is_the_measured_one("quay.io/k/k@sha256:" + "0" * 64, measured)
 
 
 def test_the_bff_pair_is_the_measured_pair() -> None:

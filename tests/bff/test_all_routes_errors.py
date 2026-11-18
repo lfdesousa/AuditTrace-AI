@@ -17,6 +17,17 @@ route's ``unforeseen`` cell; R5 give one route twin another status than its
 chat twin -> ``test_route_set_is_the_chat_set``; R6 remove the framework error
 handler -> ``test_framework_answers_are_in_the_one_shape``; R7 add ``detail`` to
 a relayed answer -> ``test_relayed_answers_are_untouched_on_a_proxy_route``.
+
+ADDENDUM-3 (gate S2): the malformed-JWKS shapes are pinned on EVERY proxy
+route again (ADDENDUM-2's harness had left them on the chat route only):
+``jwks_not_an_object``, ``jwks_no_signing_key``, ``jwks_key_malformed`` and the
+three shapes of the SECOND fetch (the minted-token re-validation). Neuters,
+each alone, in the shared path: R8 drop the JWKS object guard of
+``bff/auth.py`` -> the ``jwks_not_an_object`` and ``jwks_second_not_an_object``
+cells of all 19 routes; R9 drop ``ValueError`` from the inbound decode's arm ->
+``jwks_key_malformed`` x 19; R10 drop the re-validation's JWKS arm ->
+``jwks_second_fetch`` x 19; R11 treat a JWKS without a signing key as "no key
+for this kid" -> ``jwks_no_signing_key`` x 19.
 """
 
 from __future__ import annotations
@@ -39,7 +50,13 @@ from jose import jwt
 from bff import chat_refusals
 from bff.app import create_app, get_http_client
 from bff.config import get_settings
-from tests.bff.conftest import TEST_ISSUER, TEST_JWK, TEST_PRIVATE_PEM, make_token
+from tests.bff.conftest import (
+    TEST_ISSUER,
+    TEST_JWK,
+    TEST_KID,
+    TEST_PRIVATE_PEM,
+    make_token,
+)
 from tests.bff.test_app import (
     KEYCLOAK_JWKS_URL,
     KEYCLOAK_TOKEN_URL,
@@ -167,10 +184,12 @@ class _Upstreams:
         self.jwks: Respond | None = None
         self.exchange: Respond | None = None
         self.memory_server: Respond | None = None
+        self.jwks_calls = 0
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url == KEYCLOAK_JWKS_URL:
+            self.jwks_calls += 1
             if self.jwks is not None:
                 return self.jwks(request)
             return httpx.Response(200, json={"keys": [TEST_JWK]})
@@ -259,6 +278,64 @@ FAILURES: dict[str, tuple[Callable[[], str] | None, str, Respond | None, str, st
     ),
 }
 
+# ── ADDENDUM-3 (gate S2): malformed JWKS, per route ─────────────────────────
+# A realm key python-jose cannot build for RS256 (an Ed25519 key), and an RSA
+# entry that names the token's kid but carries no key material.
+_OKP_ONLY = {"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "okp-1", "x": "AA"}]}
+_MALFORMED = {"keys": [{"kty": "RSA", "kid": TEST_KID}]}
+
+
+def _jwks_answers(body: Any) -> Respond:
+    return lambda _request: httpx.Response(200, json=body)
+
+
+class _FromSecondFetch:
+    """Answers the first JWKS fetch well and the later ones with ``respond``."""
+
+    def __init__(self, respond: Respond) -> None:
+        self._respond = respond
+        self._calls = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self._calls += 1
+        if self._calls >= 2:
+            return self._respond(request)
+        return httpx.Response(200, json={"keys": [TEST_JWK]})
+
+
+FAILURES.update(
+    {
+        "jwks_not_an_object": (
+            _good,
+            "jwks",
+            _jwks_answers([]),
+            "auth_service_unavailable",
+            "-",
+        ),
+        "jwks_no_signing_key": (
+            _good,
+            "jwks",
+            _jwks_answers(_OKP_ONLY),
+            "auth_service_unavailable",
+            "-",
+        ),
+        "jwks_key_malformed": (
+            _good,
+            "jwks",
+            _jwks_answers(_MALFORMED),
+            "auth_service_unavailable",
+            "-",
+        ),
+    }
+)
+# The second fetch happens in the minted-token re-validation: the caller is
+# verified by then, so the event carries the user.
+SECOND_FETCH: dict[str, Respond] = {
+    "jwks_second_fetch": _raises(httpx.ConnectError("refused")),
+    "jwks_second_not_an_object": _jwks_answers([]),
+    "jwks_second_no_signing_key": _jwks_answers(_OKP_ONLY),
+}
+
 _EVENT = re.compile(
     r"^route\.refused route=(?P<route>\S+) code=(?P<code>\S+) "
     r"status=(?P<status>\d{3}) sub=(?P<sub>\S+) session_id=(?P<session_id>\S+) "
@@ -276,7 +353,11 @@ def bff() -> Iterator[tuple[TestClient, _Upstreams]]:
         )
         stack.callback(lambda: asyncio.run(mock_client.aclose()))
         app = create_app()
-        app.dependency_overrides[get_settings] = _settings
+        # TTL 0: every key lookup fetches, so the second fetch (the
+        # minted-token re-validation) is reachable.
+        app.dependency_overrides[get_settings] = lambda: _settings().model_copy(
+            update={"jwks_cache_ttl_seconds": 0}
+        )
         app.dependency_overrides[get_http_client] = lambda: mock_client
         client = stack.enter_context(TestClient(app, raise_server_exceptions=False))
         yield client, upstreams
@@ -344,6 +425,30 @@ def test_route_refusal(
         response = client.request(method, path, headers=headers, content=b"{}")
 
     _assert_refusal(response, caplog, label=label, code=code, sub=sub)
+
+
+@pytest.mark.parametrize("shape", sorted(SECOND_FETCH))
+@pytest.mark.parametrize("route", sorted(ROUTES))
+def test_route_second_jwks_fetch(
+    bff: tuple[TestClient, _Upstreams],
+    route: str,
+    shape: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The key set goes bad between the inbound check and the minted-token
+    re-validation: 502 in the one shape on every route, never an escape."""
+    client, upstreams = bff
+    method, path, label = ROUTES[route]
+    upstreams.jwks = _FromSecondFetch(SECOND_FETCH[shape])
+    with caplog.at_level(logging.INFO, logger="bff"):
+        response = client.request(
+            method, path, headers={**HEADERS, "Authorization": _good()}, content=b"{}"
+        )
+
+    _assert_refusal(
+        response, caplog, label=label, code="auth_service_unavailable", sub="alice"
+    )
+    assert upstreams.jwks_calls >= 2
 
 
 @pytest.mark.parametrize("route", sorted(ROUTES))
