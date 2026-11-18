@@ -1,0 +1,10 @@
+Red on the unfixed guard (new cells added, bff/path_guard.py unchanged): pytest tests/bff/test_path_guard.py
+FAILED tests/bff/test_path_guard.py::test_a_path_that_means_something_else_is_refused[double_encoded_backslash]
+FAILED tests/bff/test_path_guard.py::test_a_path_that_means_something_else_is_refused[double_encoded_dot_inside_a_name]
+FAILED tests/bff/test_path_guard.py::test_a_path_that_means_something_else_is_refused[double_encoded_dots]
+FAILED tests/bff/test_path_guard.py::test_a_path_that_means_something_else_is_refused[double_encoded_slash]
+FAILED tests/bff/test_path_guard.py::test_a_path_that_means_something_else_is_refused[half_double_encoded_dots]
+FAILED tests/bff/test_path_guard.py::test_a_path_that_means_something_else_is_refused[parameter_after_one_dot]
+FAILED tests/bff/test_path_guard.py::test_a_path_that_means_something_else_is_refused[parameter_after_two_dots]
+FAILED tests/bff/test_path_guard.py::test_a_path_that_means_something_else_is_refused[upper_case_double_encoded_dot]
+========================= 8 failed, 15 passed in 1.48s =========================

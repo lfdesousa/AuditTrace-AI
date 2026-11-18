@@ -1,0 +1,11 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.7.0
+rootdir: /home/lfdesousa/work/AuditTrace-AI-bff-chat-errors
+configfile: pyproject.toml
+plugins: anyio-4.15.1, mock-3.17.0, cov-7.1.0, langsmith-0.14.11, asyncio-1.4.0, platformdirs-4.13.5, audittrace-ai-1.33.1
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 23 items
+
+tests/bff/test_path_guard.py .......................                     [100%]
+
+============================== 23 passed in 1.08s ==============================
