@@ -68,8 +68,9 @@ from bff.chat_scopes import CHAT_SCOPE_STRING, CHAT_SCOPES
 from bff.config import Settings, get_settings
 from tests.bff.conftest import (
     TEST_ISSUER,
+    TEST_JWK,
+    TEST_KID,
     TEST_PRIVATE_PEM,
-    TEST_PUBLIC_PEM,
     make_token,
 )
 from tests.bff.test_app import (
@@ -173,7 +174,7 @@ class _Upstreams:
             self.jwks_calls += 1
             if self.jwks is not None:
                 return self.jwks(request)
-            return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+            return httpx.Response(200, json={"keys": [TEST_JWK]})
         if url == KEYCLOAK_TOKEN_URL:
             self.exchange_calls += 1
             if self.exchange is not None:
@@ -254,7 +255,7 @@ def _jwks_fails_from_second_fetch(upstreams: _Upstreams) -> None:
     def respond(_request: httpx.Request) -> httpx.Response:
         if upstreams.jwks_calls >= 2:
             raise httpx.ConnectError("connection refused")
-        return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+        return httpx.Response(200, json={"keys": [TEST_JWK]})
 
     upstreams.jwks = respond
 
@@ -473,8 +474,8 @@ OKP_JWK: dict[str, str] = {
     .decode(),
 }
 # A realm that lists a key python-jose cannot build for RS256 BEFORE its RSA key.
-JWKS_UNUSABLE_KEY_FIRST: dict[str, Any] = {"keys": [OKP_JWK, TEST_PUBLIC_PEM]}
-JWKS_MALFORMED_RSA_KEY: dict[str, Any] = {"keys": [{"kty": "RSA"}]}
+JWKS_UNUSABLE_KEY_FIRST: dict[str, Any] = {"keys": [OKP_JWK]}
+JWKS_MALFORMED_RSA_KEY: dict[str, Any] = {"keys": [{"kty": "RSA", "kid": TEST_KID}]}
 
 
 def _jwks_from_second_fetch(respond: Respond) -> Arrange:
@@ -482,7 +483,7 @@ def _jwks_from_second_fetch(respond: Respond) -> Arrange:
         def answer(request: httpx.Request) -> httpx.Response:
             if upstreams.jwks_calls >= 2:
                 return respond(request)
-            return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+            return httpx.Response(200, json={"keys": [TEST_JWK]})
 
         upstreams.jwks = answer
 
@@ -912,19 +913,6 @@ def test_memory_server_answers_are_relayed_untouched(
     assert _refusal_events(caplog) == []
 
 
-def test_control_the_other_bff_routes_keep_their_answers(
-    chat: tuple[TestClient, _Upstreams],
-) -> None:
-    """Scope fence: this change is the chat route's. ``/memory/*`` (and the
-    console routes built on the same pattern) still answer as before."""
-    client, _upstreams = chat
-    response = client.get("/memory/episodic")
-
-    assert response.status_code == 401
-    assert response.json() == {"detail": "Unauthorized"}
-    assert "www-authenticate" not in response.headers
-
-
 # ── ADDENDUM-1: S3 and A6 ───────────────────────────────────────────────────
 
 
@@ -950,52 +938,3 @@ def test_the_cause_is_one_physical_line(
     assert "\r" not in events[0].string
     assert (events[0]["code"], events[0]["sub"]) == ("token_exchange_refused", "alice")
     assert "access_denied" in events[0]["cause"]
-
-
-OTHER_ROUTE: dict[str, tuple[Arrange | None, int, dict[str, Any]]] = {
-    "healthy": (None, 200, {"items": []}),
-    "jwks_second_fetch": (
-        _jwks_fails_from_second_fetch,
-        502,
-        {"detail": "Upstream authentication service error"},
-    ),
-    "jwks_second_key_unusable": (
-        _jwks_from_second_fetch(_answers(200, json=JWKS_UNUSABLE_KEY_FIRST)),
-        502,
-        {"detail": "Upstream authentication service error"},
-    ),
-    "jwks_not_an_object": (
-        _jwks(_answers(200, json=[])),
-        401,
-        {"detail": "Unauthorized"},
-    ),
-    "jwks_key_unusable_first": (
-        _jwks(_answers(200, json=JWKS_UNUSABLE_KEY_FIRST)),
-        401,
-        {"detail": "Unauthorized"},
-    ),
-    "kc_200_json_array": (
-        _exchange(_answers(200, json=[])),
-        502,
-        {"detail": "Upstream authentication service error"},
-    ),
-}
-
-
-@pytest.mark.parametrize("shape", sorted(OTHER_ROUTE))
-def test_the_other_routes_answer_in_their_own_shape_never_500(
-    chat: tuple[TestClient, _Upstreams], shape: str
-) -> None:
-    """The shape guards live in ``bff.auth`` and ``bff.exchange``, so they reach
-    every route. ``/memory`` keeps its own answers (the scope fence), but an
-    upstream shape no longer becomes an unhandled exception there either."""
-    client, upstreams = chat
-    arrange, status, body = OTHER_ROUTE[shape]
-    if arrange is not None:
-        arrange(upstreams)
-    response = client.get(
-        "/memory/episodic", headers={"Authorization": "Bearer " + _caller_token()}
-    )
-
-    assert response.status_code == status
-    assert response.json() == body

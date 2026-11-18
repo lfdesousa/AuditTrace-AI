@@ -15,8 +15,8 @@ from jose import jwt
 from bff.exchange import exchange_token
 from tests.bff.conftest import (
     TEST_ISSUER,
+    TEST_JWK,
     TEST_PRIVATE_PEM,
-    TEST_PUBLIC_PEM,
     make_token,
 )
 from tests.bff.test_exchange import _settings
@@ -44,7 +44,7 @@ async def _exchange(minted_scope: str, requested: str | None) -> str:
 
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url).endswith("/certs"):
-            return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+            return httpx.Response(200, json={"keys": [TEST_JWK]})
         return httpx.Response(200, json={"access_token": minted})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:

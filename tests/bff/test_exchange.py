@@ -21,8 +21,8 @@ from bff.config import Settings
 from bff.exchange import TokenExchangeError, exchange_token
 from tests.bff.conftest import (
     TEST_ISSUER,
+    TEST_JWK,
     TEST_PRIVATE_PEM,
-    TEST_PUBLIC_PEM,
     make_token,
 )
 
@@ -68,7 +68,7 @@ class TestExchangeTokenSuccess:
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/certs"):
-                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                return httpx.Response(200, json={"keys": [TEST_JWK]})
             # /token endpoint
             body = request.read().decode()
             assert (
@@ -103,7 +103,7 @@ class TestRequestedScopeParameter:
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/certs"):
-                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                return httpx.Response(200, json={"keys": [TEST_JWK]})
             captured["body"] = request.read().decode()
             return httpx.Response(
                 200, json={"access_token": minted, "token_type": "Bearer"}
@@ -127,7 +127,7 @@ class TestRequestedScopeParameter:
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/certs"):
-                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                return httpx.Response(200, json={"keys": [TEST_JWK]})
             captured["body"] = request.read().decode()
             return httpx.Response(
                 200, json={"access_token": minted, "token_type": "Bearer"}
@@ -153,7 +153,7 @@ class TestRequestedScopeParameter:
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/certs"):
-                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                return httpx.Response(200, json={"keys": [TEST_JWK]})
             captured["body"] = request.read().decode()
             return httpx.Response(
                 200, json={"access_token": minted, "token_type": "Bearer"}
@@ -210,7 +210,7 @@ class TestExchangeTokenFailureModes:
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/certs"):
-                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                return httpx.Response(200, json={"keys": [TEST_JWK]})
             return httpx.Response(
                 200, json={"access_token": "not.a.validjwt", "token_type": "Bearer"}
             )
@@ -230,7 +230,7 @@ class TestIdentityGuard:
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/certs"):
-                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                return httpx.Response(200, json={"keys": [TEST_JWK]})
             return httpx.Response(
                 200,
                 json={"access_token": minted_for_wrong_sub, "token_type": "Bearer"},
@@ -247,7 +247,7 @@ class TestIdentityGuard:
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/certs"):
-                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                return httpx.Response(200, json={"keys": [TEST_JWK]})
             return httpx.Response(
                 200, json={"access_token": minted, "token_type": "Bearer"}
             )
@@ -267,7 +267,7 @@ class TestIdentityGuard:
 
             def _h(request: httpx.Request) -> httpx.Response:
                 if str(request.url).endswith("/certs"):
-                    return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                    return httpx.Response(200, json={"keys": [TEST_JWK]})
                 return httpx.Response(
                     200, json={"access_token": minted, "token_type": "Bearer"}
                 )
