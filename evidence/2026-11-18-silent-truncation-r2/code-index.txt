@@ -1,0 +1,37 @@
+✅ build: 1e3cc66 -> /home/lfdesousa/.cache/audittrace-code-index/AuditTrace-AI/1e3cc6654b3a94fa99bde71eb4dc946c073bd6a9.sqlite (content_sha256=f390f89a9e497ace…)
+## SELECT path, lineno, qualname FROM nodes WHERE name IN ('_emit_write_audit','_emit_write_audits') AND kind IN ('py:function','py:call','py:import')
+path	lineno	qualname
+## SELECT path, lineno, json_extract(attrs,'$.module') m, name FROM nodes WHERE kind='py:import' AND json_extract(attrs,'$.module')='audittrace.routes.memory' AND path LIKE 'src/%'
+path	lineno	m	name
+src/audittrace/routes/memory_pdf/pipeline.py	153	audittrace.routes.memory	audittrace.routes.memory._chroma_ids
+src/audittrace/routes/memory_pdf/pipeline.py	153	audittrace.routes.memory	audittrace.routes.memory._chunk_text
+src/audittrace/routes/memory_promote.py	313	audittrace.routes.memory	audittrace.routes.memory._corpus_write_authorized
+src/audittrace/routes/memory_promote.py	417	audittrace.routes.memory	audittrace.routes.memory._corpus_write_authorized
+src/audittrace/services/memory_manifest.py	425	audittrace.routes.memory	audittrace.routes.memory._corpus_write_authorized
+src/audittrace/routes/memory_pdf/pipeline.py	153	audittrace.routes.memory	audittrace.routes.memory._doc_id
+src/audittrace/services/index_worker.py	103	audittrace.routes.memory	audittrace.routes.memory._get_minio_client
+src/audittrace/routes/admin.py	38	audittrace.routes.memory	audittrace.routes.memory._invalidate_validation_context
+src/audittrace/routes/memory_promote.py	313	audittrace.routes.memory	audittrace.routes.memory._legacy_copy_forward_source
+src/audittrace/routes/memory_promote.py	417	audittrace.routes.memory	audittrace.routes.memory._legacy_copy_forward_source
+src/audittrace/tools/mcp_write_handlers.py	198	audittrace.routes.memory	audittrace.routes.memory._legacy_copy_forward_source
+src/audittrace/services/index_worker.py	103	audittrace.routes.memory	audittrace.routes.memory._physical_collection
+src/audittrace/routes/memory_promote.py	313	audittrace.routes.memory	audittrace.routes.memory._raise_concurrent_write_as_409
+src/audittrace/routes/memory_pdf/pipeline.py	153	audittrace.routes.memory	audittrace.routes.memory._read_minio_object
+src/audittrace/routes/memory_pdf/pipeline.py	153	audittrace.routes.memory	audittrace.routes.memory._upsert_in_batches
+## SELECT path, lineno, qualname FROM nodes WHERE name IN ('emit_write_audit','emit_write_audits') AND kind='py:function'
+path	lineno	qualname
+src/audittrace/routes/memory_write_audit.py	50	emit_write_audit
+src/audittrace/routes/memory_write_audit.py	19	emit_write_audits
+## SELECT path, lineno FROM nodes WHERE kind='py:call' AND name IN ('request.body') AND path LIKE 'bff/%'
+path	lineno
+bff/app.py	298
+bff/app.py	354
+bff/app.py	421
+bff/app.py	576
+bff/app.py	677
+bff/app.py	772
+bff/app.py	868
+bff/app.py	970
+bff/app.py	1070
+bff/app.py	1166
+bff/app.py	1267

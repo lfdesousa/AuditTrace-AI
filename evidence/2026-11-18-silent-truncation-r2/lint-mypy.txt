@@ -1,0 +1,917 @@
+All checks passed!
+unformatted: File would be reformatted
+   --> docs/ADR-014.2-logging-dependency-injection.md:30:44
+    |
+29  |     @abstractmethod
+    -     def get_client(self) -> ChromaDBClient: pass
+30  +     def get_client(self) -> ChromaDBClient:
+31  +         pass
+32  +
+33  |
+--------------------------------------------------------------------------------
+37  |
+38  +
+39  | class HTTPChromaDBFactory(ChromaDBFactory):  # Phase 1+
+40  |     def get_client(self) -> ChromaDBClient:
+41  |         return chromadb.HttpClient(host=host, port=port)
+42  |
+43  +
+44  | class MockChromaDBFactory(ChromaDBFactory):  # Testing
+--------------------------------------------------------------------------------
+102 |
+103 +
+104 | @router.post("/context")
+--------------------------------------------------------------------------------
+237 |     """Test context endpoint with mocked memory service."""
+    -     response = client.post("/context", json={
+    -         "query": "test query",
+    -         "project": "test-project",
+    -         "limit": 10,
+    -     })
+238 +     response = client.post(
+239 +         "/context",
+240 +         json={
+241 +             "query": "test query",
+242 +             "project": "test-project",
+243 +             "limit": 10,
+244 +         },
+245 +     )
+246 |
+    |
+
+unformatted: File would be reformatted
+  --> docs/ADR-023-jwt-validation-jwks-caching.md:23:16
+   |
+22 | @router.post("/v1/chat/completions")
+   - async def chat(request: ChatRequest,
+   -                _auth: dict = Depends(require_scope("sovereign-ai:query"))):
+   -     ...
+23 + async def chat(
+24 +     request: ChatRequest, _auth: dict = Depends(require_scope("sovereign-ai:query"))
+25 + ): ...
+26 | ```
+   |
+
+unformatted: File would be reformatted
+   --> docs/ADR-025-memory-as-tools.md:123:1
+    |
+122 |
+123 +
+124 | @register_memory_tool(
+    |
+
+unformatted: File would be reformatted
+    --> docs/ADR-026-multi-user-identity.md:261:24
+     |
+260  | ```python
+     - async def require_user(
+     -     authorization: str = Header(...)
+     - ) -> UserContext:
+261  + async def require_user(authorization: str = Header(...)) -> UserContext:
+262  |     token = _extract_bearer(authorization)
+--------------------------------------------------------------------------------
+405  |         return True
+     -     parent = ":".join(required.split(":")[:-1])  # "memory:read-decisions" -> "memory:read"
+406  +     parent = ":".join(
+407  +         required.split(":")[:-1]
+408  +     )  # "memory:read-decisions" -> "memory:read"
+409  |     return parent in granted
+--------------------------------------------------------------------------------
+1059 |     """
+1060 +
+1061 |     KEY_PREFIX = "sovereign:token:"
+--------------------------------------------------------------------------------
+1065 |     def get(self, token_hash: str) -> UserContext | None: ...
+     -     def put(self, token_hash: str, ctx: UserContext, ttl_seconds: int | None = None) -> None: ...
+1066 +     def put(
+1067 +         self, token_hash: str, ctx: UserContext, ttl_seconds: int | None = None
+1068 +     ) -> None: ...
+1069 |     def invalidate(self, token_hash: str) -> None: ...
+1070 |     def clear(self) -> None: ...  # tests — uses SCAN, not KEYS *
+     -     def size(self) -> int: ...    # observability — approximate via SCAN
+1071 +     def size(self) -> int: ...  # observability — approximate via SCAN
+1072 | ```
+     |
+
+unformatted: File would be reformatted
+   --> docs/ADR-029-audit-trail-completeness.md:164:1
+    |
+163 |
+164 +
+165 | URLLib3Instrumentor().instrument(
+    |
+
+unformatted: File would be reformatted
+   --> docs/ADR-030-session-summarizer.md:184:67
+    |
+183 | async with session_factory() as db:
+    -     await db.execute(text("SET LOCAL app.current_user_id = :uid"),
+    -                      {"uid": row.user_id})
+184 +     await db.execute(text("SET LOCAL app.current_user_id = :uid"), {"uid": row.user_id})
+185 |     # ... fetch interactions, call LLM, insert SessionRecord, commit
+    |
+
+unformatted: File would be reformatted
+  --> docs/ADR-047-server-side-embedding.md:72:45
+   |
+71 | ```python
+   - vectors = await embed_via_nomic(documents)        # external HTTP call
+72 + vectors = await embed_via_nomic(documents)  # external HTTP call
+73 | collection.upsert(
+74 |     ids=[...],
+   -     embeddings=vectors,                            # pre-computed
+75 +     embeddings=vectors,  # pre-computed
+76 |     documents=[...],
+   |
+
+unformatted: File would be reformatted
+  --> docs/ADR-052-pades-trust-store-and-taxonomy.md:55:1
+   |
+54 |     """Where the PEM bundle lives. Pluggable: S3, Vault, File, ..."""
+55 +
+56 |     async def load(self) -> TrustStoreBundle: ...
+57 |     async def store(self, bundle: TrustStoreBundle) -> None: ...
+58 |     async def metadata(self) -> TrustStoreMetadata: ...
+59 |
+60 +
+61 | class TrustStoreBuilder(ABC):
+62 |     """Where the PEM bundle comes from. Pluggable: EU LOTL, AATL, Static, ..."""
+63 +
+64 |     async def build(self) -> TrustStoreBundle: ...
+   |
+
+unformatted: File would be reformatted
+   --> docs/ADR-054-pades-as-of-signing-time-validation.md:123:39
+    |
+122 | )
+    - retry_status = validate_pdf_signature(
+    -     embedded_sig, signer_validation_context=retry_vc
+    - )
+123 + retry_status = validate_pdf_signature(embedded_sig, signer_validation_context=retry_vc)
+124 | if retry_status.trusted:
+--------------------------------------------------------------------------------
+132 | ```python
+    - if any_tampered: return ("signed_tampered", count)
+    - if any_invalid: return ("signed_invalid", count)
+    - if any_untrusted: return ("signed_untrusted", count)
+    - if any_expired: return ("signed_expired", count)
+133 + if any_tampered:
+134 +     return ("signed_tampered", count)
+135 + if any_invalid:
+136 +     return ("signed_invalid", count)
+137 + if any_untrusted:
+138 +     return ("signed_untrusted", count)
+139 + if any_expired:
+140 +     return ("signed_expired", count)
+141 | return ("signed_valid", count)
+    |
+
+unformatted: File would be reformatted
+   --> docs/ADR-062-five-layer-memory-model.md:100:1
+    |
+99  | # src/audittrace/routes/memory.py:519-525
+    -                 # Before 2026-07-21 this path set NO ownership key at all and
+    -                 # the PDF path set ``ingested_by_user_id``, so the filter
+    -                 # matched nothing and EVERY non-admin recall returned zero
+    -                 # results for EVERY collection. ...
+100 + # Before 2026-07-21 this path set NO ownership key at all and
+101 + # the PDF path set ``ingested_by_user_id``, so the filter
+102 + # matched nothing and EVERY non-admin recall returned zero
+103 + # results for EVERY collection. ...
+104 | ```
+    |
+
+unformatted: File would be reformatted
+   --> docs/architecture/BRAINSTORM-memory-as-tools.md:657:28
+    |
+656 | ```python
+    - _persist_interaction(...)              # sync Postgres write
+    - await _record_langfuse_output(...)     # async, but still in-line
+657 + _persist_interaction(...)  # sync Postgres write
+658 + await _record_langfuse_output(...)  # async, but still in-line
+659 | ```
+    |
+
+unformatted: File would be reformatted
+  --> docs/backlog/02-langgraph-step-counter-process-global.md:40:1
+   |
+39 |
+40 +
+41 | def _next_step() -> int:
+   |
+
+unformatted: File would be reformatted
+  --> docs/backlog/14-scope-redesign-memory-upload-index.md:14:25
+   |
+13 | ```python
+   - _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:admin"]),
+14 + _auth: dict[str, Any] = (Security(validate_jwt, scopes=["audittrace:admin"]),)
+15 | ```
+   |
+
+unformatted: File would be reformatted
+   --> evidence/2026-11-16-silent-truncation-build/neuter.py:64:15
+    |
+63  |
+    - _COUNT_ONLY = '        if read_stamp(candidate.metadata) != head:\n'
+    - _COUNT_ONLY_NEW = '        if (read_stamp(candidate.metadata) or (0, ""))[0] != head[0]:\n'
+    - _HASH = "    if text_sha256(reassemble_chunk_sequence(chunk_docs, overlap)) != head[1]:\n"
+64  + _COUNT_ONLY = "        if read_stamp(candidate.metadata) != head:\n"
+65  + _COUNT_ONLY_NEW = (
+66  +     '        if (read_stamp(candidate.metadata) or (0, ""))[0] != head[0]:\n'
+67  + )
+68  + _HASH = (
+69  +     "    if text_sha256(reassemble_chunk_sequence(chunk_docs, overlap)) != head[1]:\n"
+70  + )
+71  | _HASH_NEW = "    if False and text_sha256(reassemble_chunk_sequence(chunk_docs, overlap)) != head[1]:\n"
+    - _AUTH_LINE = '        await authorize_layer_write(manifest, user, layer.value, target_filename, tier)\n'
+72  + _AUTH_LINE = "        await authorize_layer_write(manifest, user, layer.value, target_filename, tier)\n"
+73  |
+74  | NEUTERS: list[Neuter] = [
+75  |     # -- the stamp, the read, the stale tail (M) --
+    -     ("M1", "a stamped document without chunk 0 falls back to one chunk",
+    -      [(WHOLE, "        if stamped:\n", "        if False and stamped:\n")]),
+    -     ("M2", "chunks are matched on the chunk COUNT only, not the fold identity",
+    -      [(WHOLE, _COUNT_ONLY, _COUNT_ONLY_NEW)]),
+    -     ("M3", "the reassembled text is not hashed against the fold", [(WHOLE, _HASH, _HASH_NEW)]),
+    -     ("M4", "count only AND no hash", [(WHOLE, _COUNT_ONLY, _COUNT_ONLY_NEW), (WHOLE, _HASH, _HASH_NEW)]),
+    -     ("M5", "the tail walk ignores chunks stored at the pre-LC-9 id",
+    -      [(TAIL, '            legacy = await collection.get(ids=logical, include=["metadatas"])\n',
+    -        '            legacy = {"ids": [], "metadatas": []}\n')]),
+    -     ("M6", "an unstamped document is reported verified",
+    -      [(WHOLE, "        return chunk_ids, chunk_docs, False\n", "        return chunk_ids, chunk_docs, True\n")]),
+    -     ("M7", "the stale tail is removed without authorization",
+    -      [(TAIL, '            await authorize_write(\n                manifest_service, user, "semantic", key, requested_tier=tier\n            )\n',
+    -        "            continue\n")]),
+    -     ("M8", "the tail removal writes no audit event",
+    -      [(TAIL, "            await emit_memory_audit_event(\n", "            await _no_audit(\n"),
+    -       (TAIL, "logger = logging.getLogger(__name__)\n",
+    -        "logger = logging.getLogger(__name__)\n\n\nasync def _no_audit(**_: Any) -> None:\n    return None\n")]),
+    -     ("M9", "the first window is sized by the stamp the caller supplied",
+    -      [(WHOLE, "        stop = start + CHUNK_READ_WINDOW\n",
+    -        "        stop = start + (requested[0] if requested else CHUNK_READ_WINDOW)\n")]),
+    -     ("M10", "a PDF is not bounded at upload",
+    -      [(REFUSAL, "    refuse_oversize_or_413(content, pdf=pdf)\n", "    if not pdf:\n        refuse_oversize_or_413(content)\n")]),
+    -     ("M11", "the claimed content type alone makes an upload a PDF",
+    -      [(REFUSAL, '    pdf = is_pdf_upload(claimed_content_type=file.content_type or "", content=head)\n',
+    -        '    pdf = (file.content_type or "").startswith("application/pdf")\n')]),
+    -     ("M12", "the request-body ceiling is not installed",
+    -      [(SERVER, "    app.add_middleware(MemoryBodyLimitMiddleware)\n", "")]),
+    -     ("M13", "only a declared Content-Length is checked, a stream is not counted",
+    -      [(MIDDLEWARE, "                if received > ceiling:\n", "                if False and received > ceiling:\n")]),
+    -     ("M14", "a third MCP write tool is registered with no over-limit case",
+    -      [(MCP, "async def write_skill(\n",
+    -        "async def write_skill_extra(user_context: UserContext, args: dict[str, Any]) -> dict[str, Any]:\n"
+    -        "    return {}\n\n\n"
+    -        'register_mcp_write_tool(name="write_note", description="x", parameters_schema={},\n'
+    -        '                        required_scope="memory:skills:write")(write_skill_extra)\n\n\n'
+    -        "async def write_skill(\n")]),
+    -     ("M15", "the upload does not record what it stored",
+    -      [(MEMORY, "    if layer != MemoryLayer.session:\n        await record_layer_write(\n",
+    -        "    if False:\n        await record_layer_write(\n")]),
+    -     ("M16", "the upload is not authorized before it writes",
+    -      [(MEMORY, "    if layer != MemoryLayer.session:\n" + _AUTH_LINE,
+    -        "    if False:\n" + _AUTH_LINE)]),
+    -     # -- the first round's guards (N) --
+    -     ("N1", "the read stops after the first window (the cap of the base)",
+    -      [(WHOLE, "        if head is not None and len(chunk_ids) >= head[0]:\n            complete = True\n",
+    -        "        complete = True\n")]),
+    -     ("N2", "the fold no longer stamps its chunks", [(MEMORY, "                **stamp,\n", "")]),
+    -     ("N3", "a short read is returned instead of refused",
+    -      [(WHOLE, "    if same_fold != head[0]:\n", "    if False and same_fold != head[0]:\n")]),
+    -     ("N4", "the size check accepts everything", [(LIMIT, "    if size > limit:\n", "    if False and size > limit:\n")]),
+    -     ("N5", "the bound counts characters, not bytes",
+    -      [(LIMIT, '    size = len(document if isinstance(document, bytes) else document.encode("utf-8"))\n',
+    -        "    size = len(document)\n")]),
+    -     ("N6", "ONE route loses its check (PUT /memory/episodic)",
+    -      [(MEMORY, '    refuse_oversize_or_413(content)\n    title = payload.get("title")\n    service = get_episodic_service()\n',
+    -        '    title = payload.get("title")\n    service = get_episodic_service()\n')]),
+    -     ("N7", "the upload read does not refuse (the document is stored)",
+    -      [(REFUSAL, "    refuse_oversize_or_413(content, pdf=pdf)\n", "")]),
+    -     ("N8", "the MCP write tools lose their check", [(MCP, "        check_document_size(text)\n", "        pass\n")]),
+    -     ("N9", "a shorter re-fold keeps its stale tail chunks",
+    -      [(TAIL, "        if not found:\n            return StaleTail(col_name, filename, tuple(stale))\n",
+    -        "        if True:\n            return StaleTail(col_name, filename, tuple(stale))\n")]),
+    -     ("N10", "a NEW memory write route is added with no test case",
+    -      [(MEMORY, '@router.post("/promote")\n',
+    -        '@router.post("/episodic-import")\nasync def _unbounded_new_route() -> dict[str, str]:\n'
+    -        '    return {}\n\n\n@router.post("/promote")\n')]),
+    -     # -- the second round's guards (K) --
+    -     ("K1", "the REST semantic writes keep a caller's stamp",
+    -      [(MEMORY, '    {"tier", "user_id", "id_form", STAMP_TOTAL, STAMP_FOLD}\n', '    {"tier", "user_id", "id_form"}\n')]),
+    -     ("K2", "the MCP write tools keep a caller's stamp",
+    -      [(MCP, '    {"tier", "user_id", "id_form", "chunk_total", "fold_sha256"}\n', '    {"tier", "user_id", "id_form"}\n')]),
+    -     ("K3", "the fold chunks with _chunk_text again (a whitespace window is dropped)",
+    -      [(MEMORY, "        chunks = chunk_document(content, CHUNK_SIZE, CHUNK_OVERLAP)\n", "        chunks = _chunk_text(content)\n")]),
+    -     ("K4", "chunk_document drops a whitespace window instead of attaching it",
+    -      [(CHUNKING, "        elif spans:\n            spans[-1][1] = end\n", "        elif spans:\n            pass\n")]),
+    -     ("K5", "the upload is read in two pieces and joined (a second copy)",
+    -      [(REFUSAL, "    content = await file.read(bound + 1)\n",
+    -        "    content = await file.read(4097)\n    content += await file.read(bound + 1 - len(content))\n")]),
+    -     ("K6", "the PDF upload cap is ignored (only the fold's bound applies)",
+    -      [(LIMIT, "    return min(settings.pdf_upload_max_size_mb, settings.pdf_max_size_mb) * 1024 * 1024\n",
+    -        "    return settings.pdf_max_size_mb * 1024 * 1024\n")]),
+    -     ("K7", "the BFF body ceiling is not installed", [(BFF_APP, "    app.add_middleware(BodyLimitMiddleware)\n", "")]),
+    -     ("K8", "a write that lost the manifest race is not audited",
+    -      [(LAYER, '            detail_extra={"manifest": "concurrent_write"},\n        )\n        raise',
+    -        '            detail_extra={"manifest": "concurrent_write"},\n        ) if False else None\n        raise')]),
+    -     ("K9", "POST /memory/episodic refuses an over-limit document only after it has stored and audited it",
+    -      [(MEMORY, '    _validate_filename_or_400(filename, "episodic")\n    refuse_oversize_or_413(content)\n',
+    -        '    _validate_filename_or_400(filename, "episodic")\n'),
+    -       (MEMORY, '    entry = await record_layer_write(\n        manifest, user, "episodic", filename, content, title=title, tier=tier\n    )\n',
+    -        '    entry = await record_layer_write(\n        manifest, user, "episodic", filename, content, title=title, tier=tier\n    )\n    refuse_oversize_or_413(content)\n')]),
+76  +     (
+77  +         "M1",
+78  +         "a stamped document without chunk 0 falls back to one chunk",
+79  +         [(WHOLE, "        if stamped:\n", "        if False and stamped:\n")],
+80  +     ),
+81  +     (
+82  +         "M2",
+83  +         "chunks are matched on the chunk COUNT only, not the fold identity",
+84  +         [(WHOLE, _COUNT_ONLY, _COUNT_ONLY_NEW)],
+85  +     ),
+86  +     (
+87  +         "M3",
+88  +         "the reassembled text is not hashed against the fold",
+89  +         [(WHOLE, _HASH, _HASH_NEW)],
+90  +     ),
+91  +     (
+92  +         "M4",
+93  +         "count only AND no hash",
+94  +         [(WHOLE, _COUNT_ONLY, _COUNT_ONLY_NEW), (WHOLE, _HASH, _HASH_NEW)],
+95  +     ),
+96  +     (
+97  +         "M5",
+98  +         "the tail walk ignores chunks stored at the pre-LC-9 id",
+99  +         [
+100 +             (
+101 +                 TAIL,
+102 +                 '            legacy = await collection.get(ids=logical, include=["metadatas"])\n',
+103 +                 '            legacy = {"ids": [], "metadatas": []}\n',
+104 +             )
+105 +         ],
+106 +     ),
+107 +     (
+108 +         "M6",
+109 +         "an unstamped document is reported verified",
+110 +         [
+111 +             (
+112 +                 WHOLE,
+113 +                 "        return chunk_ids, chunk_docs, False\n",
+114 +                 "        return chunk_ids, chunk_docs, True\n",
+115 +             )
+116 +         ],
+117 +     ),
+118 +     (
+119 +         "M7",
+120 +         "the stale tail is removed without authorization",
+121 +         [
+122 +             (
+123 +                 TAIL,
+124 +                 '            await authorize_write(\n                manifest_service, user, "semantic", key, requested_tier=tier\n            )\n',
+125 +                 "            continue\n",
+126 +             )
+127 +         ],
+128 +     ),
+129 +     (
+130 +         "M8",
+131 +         "the tail removal writes no audit event",
+132 +         [
+133 +             (
+134 +                 TAIL,
+135 +                 "            await emit_memory_audit_event(\n",
+136 +                 "            await _no_audit(\n",
+137 +             ),
+138 +             (
+139 +                 TAIL,
+140 +                 "logger = logging.getLogger(__name__)\n",
+141 +                 "logger = logging.getLogger(__name__)\n\n\nasync def _no_audit(**_: Any) -> None:\n    return None\n",
+142 +             ),
+143 +         ],
+144 +     ),
+145 +     (
+146 +         "M9",
+147 +         "the first window is sized by the stamp the caller supplied",
+148 +         [
+149 +             (
+150 +                 WHOLE,
+151 +                 "        stop = start + CHUNK_READ_WINDOW\n",
+152 +                 "        stop = start + (requested[0] if requested else CHUNK_READ_WINDOW)\n",
+153 +             )
+154 +         ],
+155 +     ),
+156 +     (
+157 +         "M10",
+158 +         "a PDF is not bounded at upload",
+159 +         [
+160 +             (
+161 +                 REFUSAL,
+162 +                 "    refuse_oversize_or_413(content, pdf=pdf)\n",
+163 +                 "    if not pdf:\n        refuse_oversize_or_413(content)\n",
+164 +             )
+165 +         ],
+166 +     ),
+167 +     (
+168 +         "M11",
+169 +         "the claimed content type alone makes an upload a PDF",
+170 +         [
+171 +             (
+172 +                 REFUSAL,
+173 +                 '    pdf = is_pdf_upload(claimed_content_type=file.content_type or "", content=head)\n',
+174 +                 '    pdf = (file.content_type or "").startswith("application/pdf")\n',
+175 +             )
+176 +         ],
+177 +     ),
+178 +     (
+179 +         "M12",
+180 +         "the request-body ceiling is not installed",
+181 +         [(SERVER, "    app.add_middleware(MemoryBodyLimitMiddleware)\n", "")],
+182 +     ),
+183 +     (
+184 +         "M13",
+185 +         "only a declared Content-Length is checked, a stream is not counted",
+186 +         [
+187 +             (
+188 +                 MIDDLEWARE,
+189 +                 "                if received > ceiling:\n",
+190 +                 "                if False and received > ceiling:\n",
+191 +             )
+192 +         ],
+193 +     ),
+194 +     (
+195 +         "M14",
+196 +         "a third MCP write tool is registered with no over-limit case",
+197 +         [
+198 +             (
+199 +                 MCP,
+200 +                 "async def write_skill(\n",
+201 +                 "async def write_skill_extra(user_context: UserContext, args: dict[str, Any]) -> dict[str, Any]:\n"
+202 +                 "    return {}\n\n\n"
+203 +                 'register_mcp_write_tool(name="write_note", description="x", parameters_schema={},\n'
+204 +                 '                        required_scope="memory:skills:write")(write_skill_extra)\n\n\n'
+205 +                 "async def write_skill(\n",
+206 +             )
+207 +         ],
+208 +     ),
+209 +     (
+210 +         "M15",
+211 +         "the upload does not record what it stored",
+212 +         [
+213 +             (
+214 +                 MEMORY,
+215 +                 "    if layer != MemoryLayer.session:\n        await record_layer_write(\n",
+216 +                 "    if False:\n        await record_layer_write(\n",
+217 +             )
+218 +         ],
+219 +     ),
+220 +     (
+221 +         "M16",
+222 +         "the upload is not authorized before it writes",
+223 +         [
+224 +             (
+225 +                 MEMORY,
+226 +                 "    if layer != MemoryLayer.session:\n" + _AUTH_LINE,
+227 +                 "    if False:\n" + _AUTH_LINE,
+228 +             )
+229 +         ],
+230 +     ),
+231 +     # -- the first round's guards (N) --
+232 +     (
+233 +         "N1",
+234 +         "the read stops after the first window (the cap of the base)",
+235 +         [
+236 +             (
+237 +                 WHOLE,
+238 +                 "        if head is not None and len(chunk_ids) >= head[0]:\n            complete = True\n",
+239 +                 "        complete = True\n",
+240 +             )
+241 +         ],
+242 +     ),
+243 +     (
+244 +         "N2",
+245 +         "the fold no longer stamps its chunks",
+246 +         [(MEMORY, "                **stamp,\n", "")],
+247 +     ),
+248 +     (
+249 +         "N3",
+250 +         "a short read is returned instead of refused",
+251 +         [
+252 +             (
+253 +                 WHOLE,
+254 +                 "    if same_fold != head[0]:\n",
+255 +                 "    if False and same_fold != head[0]:\n",
+256 +             )
+257 +         ],
+258 +     ),
+259 +     (
+260 +         "N4",
+261 +         "the size check accepts everything",
+262 +         [(LIMIT, "    if size > limit:\n", "    if False and size > limit:\n")],
+263 +     ),
+264 +     (
+265 +         "N5",
+266 +         "the bound counts characters, not bytes",
+267 +         [
+268 +             (
+269 +                 LIMIT,
+270 +                 '    size = len(document if isinstance(document, bytes) else document.encode("utf-8"))\n',
+271 +                 "    size = len(document)\n",
+272 +             )
+273 +         ],
+274 +     ),
+275 +     (
+276 +         "N6",
+277 +         "ONE route loses its check (PUT /memory/episodic)",
+278 +         [
+279 +             (
+280 +                 MEMORY,
+281 +                 '    refuse_oversize_or_413(content)\n    title = payload.get("title")\n    service = get_episodic_service()\n',
+282 +                 '    title = payload.get("title")\n    service = get_episodic_service()\n',
+283 +             )
+284 +         ],
+285 +     ),
+286 +     (
+287 +         "N7",
+288 +         "the upload read does not refuse (the document is stored)",
+289 +         [(REFUSAL, "    refuse_oversize_or_413(content, pdf=pdf)\n", "")],
+290 +     ),
+291 +     (
+292 +         "N8",
+293 +         "the MCP write tools lose their check",
+294 +         [(MCP, "        check_document_size(text)\n", "        pass\n")],
+295 +     ),
+296 +     (
+297 +         "N9",
+298 +         "a shorter re-fold keeps its stale tail chunks",
+299 +         [
+300 +             (
+301 +                 TAIL,
+302 +                 "        if not found:\n            return StaleTail(col_name, filename, tuple(stale))\n",
+303 +                 "        if True:\n            return StaleTail(col_name, filename, tuple(stale))\n",
+304 +             )
+305 +         ],
+306 +     ),
+307 +     (
+308 +         "N10",
+309 +         "a NEW memory write route is added with no test case",
+310 +         [
+311 +             (
+312 +                 MEMORY,
+313 +                 '@router.post("/promote")\n',
+314 +                 '@router.post("/episodic-import")\nasync def _unbounded_new_route() -> dict[str, str]:\n'
+315 +                 '    return {}\n\n\n@router.post("/promote")\n',
+316 +             )
+317 +         ],
+318 +     ),
+319 +     # -- the second round's guards (K) --
+320 +     (
+321 +         "K1",
+322 +         "the REST semantic writes keep a caller's stamp",
+323 +         [
+324 +             (
+325 +                 MEMORY,
+326 +                 '    {"tier", "user_id", "id_form", STAMP_TOTAL, STAMP_FOLD}\n',
+327 +                 '    {"tier", "user_id", "id_form"}\n',
+328 +             )
+329 +         ],
+330 +     ),
+331 +     (
+332 +         "K2",
+333 +         "the MCP write tools keep a caller's stamp",
+334 +         [
+335 +             (
+336 +                 MCP,
+337 +                 '    {"tier", "user_id", "id_form", "chunk_total", "fold_sha256"}\n',
+338 +                 '    {"tier", "user_id", "id_form"}\n',
+339 +             )
+340 +         ],
+341 +     ),
+342 +     (
+343 +         "K3",
+344 +         "the fold chunks with _chunk_text again (a whitespace window is dropped)",
+345 +         [
+346 +             (
+347 +                 MEMORY,
+348 +                 "        chunks = chunk_document(content, CHUNK_SIZE, CHUNK_OVERLAP)\n",
+349 +                 "        chunks = _chunk_text(content)\n",
+350 +             )
+351 +         ],
+352 +     ),
+353 +     (
+354 +         "K4",
+355 +         "chunk_document drops a whitespace window instead of attaching it",
+356 +         [
+357 +             (
+358 +                 CHUNKING,
+359 +                 "        elif spans:\n            spans[-1][1] = end\n",
+360 +                 "        elif spans:\n            pass\n",
+361 +             )
+362 +         ],
+363 +     ),
+364 +     (
+365 +         "K5",
+366 +         "the upload is read in two pieces and joined (a second copy)",
+367 +         [
+368 +             (
+369 +                 REFUSAL,
+370 +                 "    content = await file.read(bound + 1)\n",
+371 +                 "    content = await file.read(4097)\n    content += await file.read(bound + 1 - len(content))\n",
+372 +             )
+373 +         ],
+374 +     ),
+375 +     (
+376 +         "K6",
+377 +         "the PDF upload cap is ignored (only the fold's bound applies)",
+378 +         [
+379 +             (
+380 +                 LIMIT,
+381 +                 "    return min(settings.pdf_upload_max_size_mb, settings.pdf_max_size_mb) * 1024 * 1024\n",
+382 +                 "    return settings.pdf_max_size_mb * 1024 * 1024\n",
+383 +             )
+384 +         ],
+385 +     ),
+386 +     (
+387 +         "K7",
+388 +         "the BFF body ceiling is not installed",
+389 +         [(BFF_APP, "    app.add_middleware(BodyLimitMiddleware)\n", "")],
+390 +     ),
+391 +     (
+392 +         "K8",
+393 +         "a write that lost the manifest race is not audited",
+394 +         [
+395 +             (
+396 +                 LAYER,
+397 +                 '            detail_extra={"manifest": "concurrent_write"},\n        )\n        raise',
+398 +                 '            detail_extra={"manifest": "concurrent_write"},\n        ) if False else None\n        raise',
+399 +             )
+400 +         ],
+401 +     ),
+402 +     (
+403 +         "K9",
+404 +         "POST /memory/episodic refuses an over-limit document only after it has stored and audited it",
+405 +         [
+406 +             (
+407 +                 MEMORY,
+408 +                 '    _validate_filename_or_400(filename, "episodic")\n    refuse_oversize_or_413(content)\n',
+409 +                 '    _validate_filename_or_400(filename, "episodic")\n',
+410 +             ),
+411 +             (
+412 +                 MEMORY,
+413 +                 '    entry = await record_layer_write(\n        manifest, user, "episodic", filename, content, title=title, tier=tier\n    )\n',
+414 +                 '    entry = await record_layer_write(\n        manifest, user, "episodic", filename, content, title=title, tier=tier\n    )\n    refuse_oversize_or_413(content)\n',
+415 +             ),
+416 +         ],
+417 +     ),
+418 |     # -- this build's conditions: S14 (blank re-fold) and S15 (BFF 413 shape) --
+    -     ("S14a", "a blank fold leaves the previous fold's chunks in place",
+    -      [(MEMORY, "            await stale.authorize(manifest_service, user, tier)\n            await stale.drop(\n                collection,\n                manifest_service,\n                user,\n                caller_can_write_shared=caller_can_write_shared,\n            )\n            continue\n",
+    -        "            continue\n")]),
+    -     ("S14b", "a blank fold removes the tail without authorizing it",
+    -      [(MEMORY, "            await stale.authorize(manifest_service, user, tier)\n            await stale.drop(\n                collection,\n                manifest_service,\n                user,\n                caller_can_write_shared=caller_can_write_shared,\n            )\n            continue\n",
+    -        "            await stale.drop(\n                collection,\n                manifest_service,\n                user,\n                caller_can_write_shared=caller_can_write_shared,\n            )\n            continue\n")]),
+    -     ("S14c", "a blank fold is looked up with the old 'kept' of a non-blank fold (tail starts at 1)",
+    -      [(MEMORY, "collection, user, tier, col_name, obj[\"filename\"], kept=len(chunks)\n", "collection, user, tier, col_name, obj[\"filename\"], kept=max(len(chunks), 1)\n")]),
+    -     ("S16a", "the BFF middleware stacks a 413 on a response the app already began",
+    -      [(BFF_MIDDLEWARE, "            if answered:\n                raise\n", "            if False:\n                raise\n")]),
+    -     ("S16b", "the memory middleware stacks a 413 on a response the app already began",
+    -      [(MIDDLEWARE, "            if answered:\n                raise\n", "            if False:\n                raise\n")]),
+    -     ("S16c", "the BFF middleware lets an app that swallowed the abort answer 400",
+    -      [(BFF_MIDDLEWARE, "            if overflowed:\n                if not answered:\n", "            if False:\n                if not answered:\n")]),
+    -     ("S16d", "the memory middleware lets an app that swallowed the abort answer 400",
+    -      [(MIDDLEWARE, "            if overflowed:\n                if not answered:\n", "            if False:\n                if not answered:\n")]),
+    -     ("S17a", "a fold audit that cannot be written is swallowed instead of a 500",
+    -      [(TAIL, "        except Exception as exc:\n            raise HTTPException(\n", "        except ZeroDivisionError as exc:\n            raise HTTPException(\n")]),
+    -     ("S17b", "the legacy-row walk takes a row that belongs to someone else",
+    -      [(TAIL, '                if (meta or {}).get("user_id") == user.user_id and (meta or {}).get(\n                    "tier"\n                ) == "private":\n', "                if True:\n")]),
+    -     ("S15a", "the BFF 413 loses the additive detail key",
+    -      [(BFF_REFUSAL, '        "detail": message,\n', "")]),
+    -     ("S15b", "the BFF 413 is the old detail-only body (no error object)",
+    -      [(BFF_REFUSAL, '        "error": {\n            "message": message,\n            "type": REQUEST_TOO_LARGE_TYPE,\n            "param": None,\n            "code": REQUEST_TOO_LARGE_CODE,\n            "status": REQUEST_TOO_LARGE_STATUS,\n        },\n', "")]),
+    -     ("S15c", "the BFF 413 error object drops its numeric status",
+    -      [(BFF_REFUSAL, '            "status": REQUEST_TOO_LARGE_STATUS,\n', "")]),
+419 +     (
+420 +         "S14a",
+421 +         "a blank fold leaves the previous fold's chunks in place",
+422 +         [
+423 +             (
+424 +                 MEMORY,
+425 +                 "            await stale.authorize(manifest_service, user, tier)\n            await stale.drop(\n                collection,\n                manifest_service,\n                user,\n                caller_can_write_shared=caller_can_write_shared,\n            )\n            continue\n",
+426 +                 "            continue\n",
+427 +             )
+428 +         ],
+429 +     ),
+430 +     (
+431 +         "S14b",
+432 +         "a blank fold removes the tail without authorizing it",
+433 +         [
+434 +             (
+435 +                 MEMORY,
+436 +                 "            await stale.authorize(manifest_service, user, tier)\n            await stale.drop(\n                collection,\n                manifest_service,\n                user,\n                caller_can_write_shared=caller_can_write_shared,\n            )\n            continue\n",
+437 +                 "            await stale.drop(\n                collection,\n                manifest_service,\n                user,\n                caller_can_write_shared=caller_can_write_shared,\n            )\n            continue\n",
+438 +             )
+439 +         ],
+440 +     ),
+441 +     (
+442 +         "S14c",
+443 +         "a blank fold is looked up with the old 'kept' of a non-blank fold (tail starts at 1)",
+444 +         [
+445 +             (
+446 +                 MEMORY,
+447 +                 'collection, user, tier, col_name, obj["filename"], kept=len(chunks)\n',
+448 +                 'collection, user, tier, col_name, obj["filename"], kept=max(len(chunks), 1)\n',
+449 +             )
+450 +         ],
+451 +     ),
+452 +     (
+453 +         "S16a",
+454 +         "the BFF middleware stacks a 413 on a response the app already began",
+455 +         [
+456 +             (
+457 +                 BFF_MIDDLEWARE,
+458 +                 "            if answered:\n                raise\n",
+459 +                 "            if False:\n                raise\n",
+460 +             )
+461 +         ],
+462 +     ),
+463 +     (
+464 +         "S16b",
+465 +         "the memory middleware stacks a 413 on a response the app already began",
+466 +         [
+467 +             (
+468 +                 MIDDLEWARE,
+469 +                 "            if answered:\n                raise\n",
+470 +                 "            if False:\n                raise\n",
+471 +             )
+472 +         ],
+473 +     ),
+474 +     (
+475 +         "S16c",
+476 +         "the BFF middleware lets an app that swallowed the abort answer 400",
+477 +         [
+478 +             (
+479 +                 BFF_MIDDLEWARE,
+480 +                 "            if overflowed:\n                if not answered:\n",
+481 +                 "            if False:\n                if not answered:\n",
+482 +             )
+483 +         ],
+484 +     ),
+485 +     (
+486 +         "S16d",
+487 +         "the memory middleware lets an app that swallowed the abort answer 400",
+488 +         [
+489 +             (
+490 +                 MIDDLEWARE,
+491 +                 "            if overflowed:\n                if not answered:\n",
+492 +                 "            if False:\n                if not answered:\n",
+493 +             )
+494 +         ],
+495 +     ),
+496 +     (
+497 +         "S17a",
+498 +         "a fold audit that cannot be written is swallowed instead of a 500",
+499 +         [
+500 +             (
+501 +                 TAIL,
+502 +                 "        except Exception as exc:\n            raise HTTPException(\n",
+503 +                 "        except ZeroDivisionError as exc:\n            raise HTTPException(\n",
+504 +             )
+505 +         ],
+506 +     ),
+507 +     (
+508 +         "S17b",
+509 +         "the legacy-row walk takes a row that belongs to someone else",
+510 +         [
+511 +             (
+512 +                 TAIL,
+513 +                 '                if (meta or {}).get("user_id") == user.user_id and (meta or {}).get(\n                    "tier"\n                ) == "private":\n',
+514 +                 "                if True:\n",
+515 +             )
+516 +         ],
+517 +     ),
+518 +     (
+519 +         "S15a",
+520 +         "the BFF 413 loses the additive detail key",
+521 +         [(BFF_REFUSAL, '        "detail": message,\n', "")],
+522 +     ),
+523 +     (
+524 +         "S15b",
+525 +         "the BFF 413 is the old detail-only body (no error object)",
+526 +         [
+527 +             (
+528 +                 BFF_REFUSAL,
+529 +                 '        "error": {\n            "message": message,\n            "type": REQUEST_TOO_LARGE_TYPE,\n            "param": None,\n            "code": REQUEST_TOO_LARGE_CODE,\n            "status": REQUEST_TOO_LARGE_STATUS,\n        },\n',
+530 +                 "",
+531 +             )
+532 +         ],
+533 +     ),
+534 +     (
+535 +         "S15c",
+536 +         "the BFF 413 error object drops its numeric status",
+537 +         [(BFF_REFUSAL, '            "status": REQUEST_TOO_LARGE_STATUS,\n', "")],
+538 +     ),
+539 | ]
+--------------------------------------------------------------------------------
+545 |     if text.count(old) != 1:
+    -         raise SystemExit(f"neuter anchor matches {text.count(old)} times in {path}: {old!r}")
+546 +         raise SystemExit(
+547 +             f"neuter anchor matches {text.count(old)} times in {path}: {old!r}"
+548 +         )
+549 |     file.write_text(text.replace(old, new))
+--------------------------------------------------------------------------------
+553 |     proc = subprocess.run(
+    -         [sys.executable, "-m", "pytest", *TESTS, "-p", "no:cacheprovider", "--no-cov", "-q", "-rf", "--tb=no"],
+    -         capture_output=True, text=True, check=False,
+554 +         [
+555 +             sys.executable,
+556 +             "-m",
+557 +             "pytest",
+558 +             *TESTS,
+559 +             "-p",
+560 +             "no:cacheprovider",
+561 +             "--no-cov",
+562 +             "-q",
+563 +             "-rf",
+564 +             "--tb=no",
+565 +         ],
+566 +         capture_output=True,
+567 +         text=True,
+568 +         check=False,
+569 |     )
+570 |     failed = sorted(re.findall(r"^FAILED (\S+)", proc.stdout, flags=re.M))
+    -     tail = [line for line in proc.stdout.splitlines() if re.search(r"\d+ (passed|failed)", line)]
+    -     return {"rc": proc.returncode, "failed": failed, "failed_count": len(failed),
+    -             "summary": tail[-1].strip("= ") if tail else proc.stdout[-300:]}
+571 +     tail = [
+572 +         line
+573 +         for line in proc.stdout.splitlines()
+574 +         if re.search(r"\d+ (passed|failed)", line)
+575 +     ]
+576 +     return {
+577 +         "rc": proc.returncode,
+578 +         "failed": failed,
+579 +         "failed_count": len(failed),
+580 +         "summary": tail[-1].strip("= ") if tail else proc.stdout[-300:],
+581 +     }
+582 |
+--------------------------------------------------------------------------------
+587 |     ap.add_argument("--only", default="")
+    -     ap.add_argument("--check-anchors", action="store_true", help="apply and restore each neuter without running tests")
+588 +     ap.add_argument(
+589 +         "--check-anchors",
+590 +         action="store_true",
+591 +         help="apply and restore each neuter without running tests",
+592 +     )
+593 |     args = ap.parse_args()
+--------------------------------------------------------------------------------
+606 |                 continue
+    -             results[ident] = {"what": what, "files": sorted({e[0] for e in edits}), **run_tests()}
+607 +             results[ident] = {
+608 +                 "what": what,
+609 +                 "files": sorted({e[0] for e in edits}),
+610 +                 **run_tests(),
+611 +             }
+612 |         finally:
+    |
+
+unformatted: File would be reformatted
+   --> evidence/fix-round-1-consolestorebase-seal-descriptor-complete-2026-09-17.md:150:1
+    |
+149 | """
+150 +
+151 | from __future__ import annotations
+--------------------------------------------------------------------------------
+193 |     outcome = f"raised {type(exc).__name__}: {exc}"
+    - print(f"RealDomainNoSlots(FrozenBaseNoSlots) instance: "
+    -       f"inst.value_columns = (...) -> {outcome}")
+194 + print(
+195 +     f"RealDomainNoSlots(FrozenBaseNoSlots) instance: "
+196 +     f"inst.value_columns = (...) -> {outcome}"
+197 + )
+198 |
+--------------------------------------------------------------------------------
+207 |     outcome = f"raised {type(exc).__name__}: {exc}"
+    - print(f"RealDomainWithSlots(FrozenBaseWithSlots) instance: "
+    -       f"inst2.value_columns = (...) -> {outcome}")
+208 + print(
+209 +     f"RealDomainWithSlots(FrozenBaseWithSlots) instance: "
+210 +     f"inst2.value_columns = (...) -> {outcome}"
+211 + )
+212 | ```
+    |
+
+unformatted: File would be reformatted
+   --> evidence/wu-agents-console-agents-store-local-capture-2026-09-12.md:311:32
+    |
+310 | ```python
+    - assert "user_sub" not in body   # tautology — ConsoleAgentItem has no such field
+    - assert "user_id" not in body    # tautology
+311 + assert "user_sub" not in body  # tautology — ConsoleAgentItem has no such field
+312 + assert "user_id" not in body  # tautology
+313 | ```
+    |
+
+16 files would be reformatted, 853 files already formatted
+Success: no issues found in 45 source files
+🔎 Running type checker via .venv/bin/mypy ...
+Success: no issues found in 193 source files
+✅ Type checking passed

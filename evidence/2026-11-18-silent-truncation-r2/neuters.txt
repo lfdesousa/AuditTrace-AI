@@ -1,0 +1,18 @@
+BASE 0 55 passed in 28.79s
+R2-1 bff declared-length check off RED 1 failed in 0.11s
+R2-2 memory declared-length check off RED 1 failed, 1 passed in 0.13s
+R2-3 memory PUT not bounded RED 1 failed, 2 passed in 3.06s
+R2-4 memory PATCH+PUT not bounded RED 1 failed, 2 passed in 2.96s
+R2-5 bff method filter restored (POST/PUT/PATCH) RED 1 failed, 6 passed in 0.74s
+R2-6 bff PUT not bounded RED 1 failed, 4 passed in 0.67s
+R2-7 bff PATCH not bounded RED 1 failed, 5 passed in 0.36s
+R2-8 stamp: bool total accepted RED 1 failed in 1.22s
+R2-9 stamp: zero/negative total accepted RED 1 failed, 1 passed in 2.47s
+R2-10 stamp: non-int total accepted RED 1 failed, 3 passed in 4.44s
+R2-11 stamp: empty/non-str fold accepted RED 1 failed, 7 passed in 7.78s
+R2-12 stamp: half stamp read as unstamped RED 1 failed, 5 passed in 6.38s
+R2-13 trim to stamped total removed RED 1 failed, 9 passed in 9.77s
+R2-14 post-write 403 mapped to nothing RED 1 failed, 3 passed in 4.26s
+R2-15 post-write 403 emits a write audit RED 1 failed, 3 passed in 4.15s
+R2-16 write audit not fail-closed (moved emitter) RED 1 failed, 5 passed in 5.97s
+RESTORED 0 53 passed in 26.68s
