@@ -535,13 +535,15 @@ def test_a2_9_pytest_argument_set_matches_golden(tmp_path: Path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     recorded = argv_dump.read_text().split()
-    # SUITE-PARALLEL-XDIST: `-n 3` is the one deliberate addition to the golden
+    # SUITE-PARALLEL-XDIST: `-n 3 --dist loadgroup` is the one deliberate addition to the golden
     # set (the worker count pinned here through RUN_TESTS_WORKERS).
     golden = [
         "tests/",
         "-v",
         "-n",
         "3",
+        "--dist",
+        "loadgroup",
         "--cov=src",
         "--cov=bff",
         "--cov=scripts/deploy",
@@ -962,16 +964,30 @@ def _full_run_argv(
     return _run_script(root, bin_dir, subset=False, extra_env=env), argv_dump
 
 
-def test_workers_default_to_min_of_cores_and_eight(tmp_path: Path):
-    """No RUN_TESTS_WORKERS: `-n min(nproc, 8)`. Neuter: hard-code the count or
-    drop the cap -> RED on a machine whose core count differs from the pin."""
-    cores = int(subprocess.run(["nproc"], capture_output=True, text=True).stdout)
-    result, argv_dump = _full_run_argv(tmp_path, {}, coverage_report=PASSING_REPORT)
+@pytest.mark.parametrize(
+    ("cores", "expected"), [(1, 1), (2, 2), (4, 4), (8, 8), (9, 8), (32, 8)]
+)
+def test_workers_default_to_min_of_cores_and_eight(
+    tmp_path: Path, cores: int, expected: int
+):
+    """No RUN_TESTS_WORKERS: `-n min(nproc, 8)`. `nproc` is faked on the PATH, so
+    the cap and the min() are pinned whatever the host has. Neuter: hard-code the
+    count or drop the cap -> RED on the rows that differ from the neutered value."""
+    root = _scratch_script_root(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    argv_dump = tmp_path / "argv.txt"
+    _fake_pytest(bin_dir, record_argv_to=argv_dump, coverage_report=PASSING_REPORT)
+    _fake_python_passthrough(bin_dir)
+    _fake_real_helm(bin_dir)
+    _write_exec(bin_dir / "nproc", f"#!/usr/bin/env bash\necho {cores}\n")
+
+    result = _run_script(root, bin_dir, subset=False)
 
     assert result.returncode == 0, result.stdout + result.stderr
     recorded = argv_dump.read_text().split()
-    assert recorded[recorded.index("-n") + 1] == str(min(cores, 8))
-    assert f"workers={min(cores, 8)}" in result.stdout
+    assert recorded[recorded.index("-n") + 1] == str(expected)
+    assert f"workers={expected}" in result.stdout
 
 
 def test_workers_zero_is_serial_without_xdist(tmp_path: Path):

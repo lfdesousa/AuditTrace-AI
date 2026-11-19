@@ -49,6 +49,22 @@ def pytest_configure(config: pytest.Config) -> None:
         _cleanup_neuter_test_evidence()
 
 
+def pytest_itemcollected(item: pytest.Item) -> None:
+    """Put every test of a module that uses the shared Postgres into one xdist
+    group (``--dist loadgroup`` runs a group on a single worker). Done here, not
+    in ``pytest_collection_modifyitems``: xdist reads the marker in its own
+    modifyitems hook, which runs before one defined here."""
+    from tests._shared_postgres import SHARED_POSTGRES_MODULES, XDIST_GROUP
+
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        relative = Path(str(item.path)).resolve().relative_to(repo_root).as_posix()
+    except ValueError:
+        return
+    if relative in SHARED_POSTGRES_MODULES:
+        item.add_marker(pytest.mark.xdist_group(XDIST_GROUP))
+
+
 @pytest.fixture
 def isolated_product_container_watch(monkeypatch: pytest.MonkeyPatch) -> None:
     """Scope the neuter pool's foreign-container watch to this process.

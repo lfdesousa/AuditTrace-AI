@@ -327,7 +327,10 @@ else
 
   PARALLEL_ARGS=()
   if [ "$WORKERS" -gt 0 ]; then
-    PARALLEL_ARGS=(-n "$WORKERS")
+    # loadgroup: the tests of the modules that share ONE Postgres server (CI's
+    # service; roles are cluster-global) run on a single worker; everything else
+    # is scheduled as plain `load`. See tests/_shared_postgres.py.
+    PARALLEL_ARGS=(-n "$WORKERS" --dist loadgroup)
   fi
   echo "run-tests: workers=$WORKERS (0 = serial)"
 

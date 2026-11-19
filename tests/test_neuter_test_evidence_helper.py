@@ -64,3 +64,24 @@ def test_importing_conftest_outside_a_pytest_session_does_not_wipe_the_evidence_
         assert marker.exists()
     finally:
         shutil.rmtree(marker_dir, ignore_errors=True)
+
+
+def test_only_the_controller_or_serial_process_cleans_the_evidence_root(monkeypatch):
+    """An xdist worker's config has ``workerinput``; a worker must never wipe the
+    evidence the other workers are using. The cleanup is replaced by a recorder
+    so the real evidence root is never touched.
+    Neuter: ``if not hasattr(...)`` -> ``if True`` -> the worker row is RED."""
+    from types import SimpleNamespace
+
+    from tests import conftest
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        conftest, "_cleanup_neuter_test_evidence", lambda: calls.append(1)
+    )
+
+    conftest.pytest_configure(SimpleNamespace(workerinput={"workerid": "gw0"}))  # type: ignore[arg-type]
+    assert calls == []
+
+    conftest.pytest_configure(SimpleNamespace())  # type: ignore[arg-type]
+    assert calls == [1]
