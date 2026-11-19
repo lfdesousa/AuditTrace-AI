@@ -394,7 +394,7 @@
     },
     {
       "name": "offline_access",
-      "description": "M3-WU-3b (D3) — standard OIDC offline_access scope. Bound only to audittrace-librechat but NOT requested at login (BFF-CHAT-ROUTE-ERRORS): without it LibreChat's OPENID_REUSE_TOKENS refresh uses a non-offline refresh token that lives and dies with the SSO session (refresh_expires_in 28800 > 0, measured on Keycloak 24.0.5), so ending a session stops the token exchange; with it a signed-out user's token kept exchanging.",
+      "description": "M3-WU-3b (D3): standard OIDC offline_access scope. Bound only to audittrace-librechat and NOT requested at login (BFF-CHAT-ROUTE-ERRORS): the refresh token then dies with the SSO session, so ending a session stops the token exchange.",
       "protocol": "openid-connect",
       "attributes": {
         "display.on.consent.screen": "true"
