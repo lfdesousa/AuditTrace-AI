@@ -25,6 +25,17 @@ realm``; C4 put
 drop the lifetime from one realm file -> ``test_the_login_client_token_lives
 _five_minutes``; C6 drop Step 7 from the hook -> ``test_the_hook_reconciles_the
 _lifetime_on_an_existing_realm``.
+
+LibreChat logout ends the Keycloak session (ADDENDUM-2 finding 1, Q15; measured
+E13 on v1.33.2-rc1: a LibreChat logout left the SSO session alive and Login
+signed the user straight back in). The fork redirects to the realm's
+``end_session_endpoint`` only when ``OPENID_USE_END_SESSION_ENDPOINT`` is
+enabled (api/server/controllers/auth/LogoutController.js:54, ``isEnabled``),
+and returns to ``OPENID_POST_LOGOUT_REDIRECT_URI`` or ``DOMAIN_CLIENT`` +
+``/login`` (same file, 67-68), which the realm client must allow. Neuters
+(each alone): C11 drop the env var -> ``test_librechat_logout_ends_the_sso_
+session``; C12 drop the client's post-logout URI from one realm file -> ``test_
+the_logout_return_page_is_allowed_by_the_realm``.
 """
 
 from __future__ import annotations
@@ -287,3 +298,38 @@ def test_the_hook_reconciles_the_idle_timeout_on_an_existing_realm(
         'acl_e2e_kc update "realms/${REALM}" '
         f"-s 'ssoSessionIdleTimeout={SSO_IDLE_SECONDS}' >/dev/null"
     ) in " ".join(body.split())
+
+
+# ── logout ends the SSO session (ADDENDUM-2 finding 1, Q15) ─────────────────
+
+
+def test_librechat_logout_ends_the_sso_session(console: list[dict[str, Any]]) -> None:
+    """The fork's ``isEnabled`` reads ``true``; any other value leaves the
+    Keycloak session alive after a LibreChat logout (measured, E13)."""
+    env = _env(console, f"{RELEASE}-librechat")
+    assert env.get("OPENID_USE_END_SESSION_ENDPOINT") == "true"
+    # The id_token_hint the end-session request carries comes from the session
+    # tokens that OPENID_REUSE_TOKENS keeps.
+    assert env.get("OPENID_REUSE_TOKENS") == "true"
+
+
+def _logout_return_page(console: list[dict[str, Any]]) -> str:
+    """Where the fork sends the browser after the end-session call."""
+    env = _env(console, f"{RELEASE}-librechat")
+    return str(
+        env.get("OPENID_POST_LOGOUT_REDIRECT_URI") or f"{env['DOMAIN_CLIENT']}/login"
+    )
+
+
+@pytest.mark.parametrize("which", ["repository file", "chart"])
+def test_the_logout_return_page_is_allowed_by_the_realm(
+    console: list[dict[str, Any]], which: str
+) -> None:
+    realm = _realms(console)[which]
+    client = next(
+        c for c in realm["clients"] if c["clientId"] == "audittrace-librechat"
+    )
+    allowed = client["attributes"].get("post.logout.redirect.uris")
+    assert allowed == _logout_return_page(console)
+    assert allowed.startswith("https://")
+    assert "*" not in allowed  # exact match only (RFC 9700)

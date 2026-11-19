@@ -842,7 +842,8 @@
       "attributes": {
         "pkce.code.challenge.method": "S256",
         "token-exchange.authorized-source-client": "audittrace-librechat-bff",
-        "access.token.lifespan": "300"
+        "access.token.lifespan": "300",
+        "post.logout.redirect.uris": "https://{{ .Values.console.librechat.host }}/login"
       },
       "defaultClientScopes": [
         "audittrace:query",
