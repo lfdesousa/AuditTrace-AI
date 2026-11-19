@@ -333,3 +333,31 @@ def test_the_logout_return_page_is_allowed_by_the_realm(
     assert allowed == _logout_return_page(console)
     assert allowed.startswith("https://")
     assert "*" not in allowed  # exact match only (RFC 9700)
+
+
+def test_the_hook_reconciles_the_post_logout_uri_on_an_existing_realm(
+    console: list[dict[str, Any]],
+) -> None:
+    """``--import-realm`` never updates a realm that exists; without this step
+    the running realm refuses the end-session redirect."""
+    scripts = [
+        text
+        for doc in console
+        if doc["kind"] == "ConfigMap"
+        for text in (doc.get("data") or {}).values()
+        if "reconciling audittrace-librechat redirectUris" in text
+    ]
+    assert len(scripts) == 1
+    step = scripts[0].split("── Step 9:", 1)
+    assert len(step) == 2, "the hook has no Step 9"
+    body = " ".join(step[1].split("── Istio sidecar shutdown", 1)[0].split())
+    uri = _logout_return_page(console)
+    write = (
+        'acl_e2e_kc update "clients/${LIBRECHAT_CLIENT_UUID}" -r "${REALM}" \\ '
+        f"-s 'attributes.\"post.logout.redirect.uris\"={uri}' >/dev/null"
+    )
+    assert write in body
+    # the confirmation line comes only after the write
+    assert body.index(write) < body.index(
+        f"✓ audittrace-librechat post.logout.redirect.uris={uri}"
+    )

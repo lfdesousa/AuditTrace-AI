@@ -2068,6 +2068,23 @@ data:
     acl_e2e_kc update "realms/${REALM}" -s 'ssoSessionIdleTimeout=28800' >/dev/null
     echo "  ✓ ${REALM} ssoSessionIdleTimeout=28800"
 
+    # ── Step 9: reconcile the login client's post-logout redirect ──
+    # (BFF-CHAT-ROUTE-ERRORS ADDENDUM-2 finding 1, Q15)
+    #
+    # A LibreChat logout redirects to the realm's end_session_endpoint
+    # (OPENID_USE_END_SESSION_ENDPOINT) with post_logout_redirect_uri =
+    # DOMAIN_CLIENT/login. Keycloak refuses a post-logout URI the client
+    # does not list, and --import-realm never updates an existing realm,
+    # so the running realm needs it set here. SETS the attribute to one
+    # exact HTTPS URI (no wildcard), driven by console.librechat.host like
+    # Step 6. Idempotent. The confirmation line prints only after the write
+    # succeeds (set -e exits first on failure).
+    ACL_E2E_STAGE="post-logout-redirect-reconcile"
+    echo "▶ reconciling audittrace-librechat post.logout.redirect.uris..."
+    acl_e2e_kc update "clients/${LIBRECHAT_CLIENT_UUID}" -r "${REALM}" \
+      -s 'attributes."post.logout.redirect.uris"=https://{{ .Values.console.librechat.host }}/login' >/dev/null
+    echo "  ✓ audittrace-librechat post.logout.redirect.uris=https://{{ .Values.console.librechat.host }}/login"
+
     # ── Istio sidecar shutdown ────────────────────────────────────
     # Same intent as the summariser-role Job (Phase C.8 root cause):
     # without telling Envoy to quit, istio-proxy keeps the Pod 2/3
