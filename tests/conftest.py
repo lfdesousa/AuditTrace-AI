@@ -879,6 +879,38 @@ def _reset_global_container():
 
 
 @pytest.fixture(autouse=True)
+def _restore_tool_registries():
+    """Give every test back the tool registries it found.
+
+    ``MEMORY_TOOL_REGISTRY``, its visible-name alias map and
+    ``MCP_WRITE_TOOL_REGISTRY`` are process-global dicts filled once at import
+    time. A dozen fixtures (``test_lc9_wp2b_pg``, ``test_mcp_routes``, ...) empty
+    them with ``reset_registry_for_tests()`` + a handler reload and on teardown
+    only empty them again, leaving every LATER test on the same process with no
+    memory tools (the chat-audience chart guard saw 0 tools; the tools-mode chat
+    tests saw one upstream call too few). Serially the alphabetical order hid
+    it; under xdist the worker's order is arbitrary (CI run 44540571356, gw0).
+    One autouse snapshot/restore here covers every current and future resetter;
+    the dicts are restored IN PLACE (other modules hold references to them).
+    """
+    from audittrace import tools as tools_mod
+    from audittrace.tools.mcp_write_registry import MCP_WRITE_TOOL_REGISTRY
+
+    saved = [
+        (reg, dict(reg))
+        for reg in (
+            tools_mod.MEMORY_TOOL_REGISTRY,
+            tools_mod._BY_VISIBLE_NAME,
+            MCP_WRITE_TOOL_REGISTRY,
+        )
+    ]
+    yield
+    for reg, snapshot in saved:
+        reg.clear()
+        reg.update(snapshot)
+
+
+@pytest.fixture(autouse=True)
 def _propagate_logs(caplog):
     """Make caplog see records from our module loggers at DEBUG level."""
     caplog.set_level(logging.DEBUG)
