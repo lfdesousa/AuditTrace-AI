@@ -287,7 +287,9 @@ def test_assert_lock_held_enforced_for_a_standalone_caller(tmp_path):
 
 
 @requires_docker
-def test_continuous_watch_catches_a_container_removed_via_atexit_live(tmp_path):
+def test_continuous_watch_catches_a_container_removed_via_atexit_live(
+    tmp_path, monkeypatch
+):
     """The ONE test in this module that exercises the REAL, unmocked
     :func:`scripts.neuter.pytest_run._continuous_foreign_container_watch`
     against an ACTUAL docker daemon -- the reviewer's exact round-3
@@ -300,12 +302,20 @@ def test_continuous_watch_catches_a_container_removed_via_atexit_live(tmp_path):
     breaks JUST those internals (e.g. hard-coding its reported verdict) --
     this is the guard test SPEC v3 §11's self-neuter NE-6 (round 3) maps
     to, precisely so that neuter goes RED."""
+    # pytest-xdist: this test deliberately starts an UNLABELLED, durable,
+    # product-shaped container. Under the real prefix every concurrent neuter
+    # pool test on another worker would (correctly) see it as foreign and fail.
+    # A prefix unique to this process, patched in only for this process's own
+    # watch, keeps the deliberate container visible to THIS test and to no one
+    # else.
+    prefix = f"audittrace-neuterfix-atexit-{os.getpid()}-"
+    monkeypatch.setattr(pytest_run_mod, "_PRODUCT_PG_CONTAINER_PREFIXES", (prefix,))
     repo = tmp_path / "repo"
     repo.mkdir()
     fixture = repo / "test_atexit_container.py"
     fixture.write_text(
         "import atexit, os, subprocess, time\n"
-        '_NAME = f"audittrace-acl-wu2a-pg-rev{os.getpid()}"\n'
+        f'_NAME = "{prefix}" + str(os.getpid())\n'
         "def test_starts_a_durable_container_removed_at_atexit():\n"
         "    subprocess.run(\n"
         '        ["docker", "run", "-d", "--rm", "--name", _NAME, "postgres:18.3"],\n'
@@ -343,20 +353,27 @@ def test_continuous_watch_catches_a_container_removed_via_atexit_live(tmp_path):
     # that neuter went completely unnoticed (10/10 still GREEN).
     assert result.watch_attached is True
     # ...and the container really is gone -- proving the snapshot-style
-    # before/after check this replaced would have missed it entirely.
-    ps = subprocess.run(
-        [
-            "docker",
-            "ps",
-            "-a",
-            "--filter",
-            "name=audittrace-acl-wu2a-pg-rev",
-            "--format",
-            "{{.Names}}",
-        ],
-        capture_output=True,
-        text=True,
-    )
+    # before/after check this replaced would have missed it entirely. `docker
+    # rm -f` can still be finishing on a loaded daemon (pytest-xdist), so wait
+    # for the listing to empty (bounded; the bound is not the assertion).
+    deadline = time.monotonic() + 60
+    while True:
+        ps = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"name={prefix}",
+                "--format",
+                "{{.Names}}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if ps.stdout.strip() == "" or time.monotonic() > deadline:
+            break
+        time.sleep(0.2)
     assert ps.stdout.strip() == ""
 
 
@@ -395,7 +412,12 @@ def test_slow_docker_events_attach_yields_watch_unproven_not_silent_clean(
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    name = f"audittrace-acl-wu2a-pg-rev6slow{os.getpid()}"
+    # Unique prefix, patched into this process's own watch only (see the
+    # atexit test above): a real product prefix would trip every concurrent
+    # neuter pool test under pytest-xdist.
+    prefix = f"audittrace-neuterfix-slow-{os.getpid()}-"
+    monkeypatch.setattr(pytest_run_mod, "_PRODUCT_PG_CONTAINER_PREFIXES", (prefix,))
+    name = f"{prefix}x"
     fixture = repo / "test_slow_durable.py"
     fixture.write_text(
         "import atexit, os, subprocess, time\n"
