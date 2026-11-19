@@ -18,7 +18,10 @@ cells; G4 refuse any segment CONTAINING a dot -> ``test_names_with_dots_are_
 relayed``; G5 (round 2) drop the per-segment second decode / parameter strip
 -> the ``double_encoded_*`` dot cells and the ``parameter_*`` cells; G6 drop
 the residual-encoding check -> ``double_encoded_slash``, ``..._backslash``,
-``..._dot_inside_a_name``.
+``..._dot_inside_a_name``; G7 (round 3) make the residual check case-sensitive
+(``lowered = path``) -> the three ``*_upper_case`` cells; G8 drop the control-
+character refusal -> the three ``control_character_*`` cells (without it the
+route answered 500 because the HTTP client refuses such a URL).
 """
 
 from __future__ import annotations
@@ -128,6 +131,42 @@ REFUSED: dict[str, tuple[str, str, bytes, str]] = {
         "/memory/episodic/a%2eb",
         b"/memory/episodic/a%252eb",
         "encoded_dot",
+    ),
+    "double_encoded_slash_upper_case": (
+        "GET",
+        "/memory/a%2Fb",
+        b"/memory/a%252Fb",
+        "encoded_separator",
+    ),
+    "double_encoded_backslash_upper_case": (
+        "GET",
+        "/memory/a%5Cb",
+        b"/memory/a%255Cb",
+        "encoded_separator",
+    ),
+    "double_encoded_dot_upper_case": (
+        "GET",
+        "/memory/episodic/a%2Eb",
+        b"/memory/episodic/a%252Eb",
+        "encoded_dot",
+    ),
+    "control_character_tab": (
+        "GET",
+        "/memory/episodic/a\tb",
+        b"/memory/episodic/a%09b",
+        "control_character",
+    ),
+    "control_character_nul": (
+        "GET",
+        "/memory/episodic/a\x00b",
+        b"/memory/episodic/a%00b",
+        "control_character",
+    ),
+    "control_character_delete": (
+        "GET",
+        "/memory/episodic/a\x7fb",
+        b"/memory/episodic/a%7fb",
+        "control_character",
     ),
     "console_route": (
         "DELETE",

@@ -36,7 +36,8 @@ class PathGuard:
     The guard reads the path the way the mesh proxy will: per segment, with a
     ``;parameter`` stripped and one more percent-decode applied, and it refuses
     a path that is still percent-encoded for a dot, slash or backslash after
-    the server's own decode.
+    the server's own decode, and one with a control character (the HTTP client
+    refuses to build such a URL, so it would surface as a gateway failure).
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -55,6 +56,8 @@ class PathGuard:
         if any(marker in raw for marker in _ENCODED_SEPARATORS):
             return "encoded_separator"
         path = str(scope.get("path", ""))
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in path):
+            return "control_character"
         segments = path.replace("\\", "/").split("/")
         if any(_mesh_segment(segment) in (".", "..") for segment in segments):
             return "dot_segment"
