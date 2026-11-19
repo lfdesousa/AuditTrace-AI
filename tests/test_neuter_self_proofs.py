@@ -1108,3 +1108,20 @@ def test_proof_src_layout_arbitrate_gives_drift_not_a_blind_green(tmp_path):
     assert arb_rows[0]["harness_verdict"] == "GREEN"
     assert arb_rows[0]["authoritative_verdict"] == "DRIFT"
     assert any("test_b" in u for u in arb_rows[0]["unmapped_red"])
+
+
+# Scoped to this process: the foreign-container watch must not see product
+# containers started by OTHER processes on a shared docker daemon (see the
+# fixture in tests/conftest.py). Neuter: delete this line -> the test below is RED.
+pytestmark = pytest.mark.usefixtures("isolated_product_container_watch")
+
+
+def test_watch_is_not_tripped_by_a_product_container_from_another_process():
+    from scripts.neuter.pytest_run import is_foreign_product_container
+
+    for name in (
+        "audittrace-rls-pg-1",
+        "audittrace-acl-wu2a-pg-2",
+        "audittrace-console-store-pg-3",
+    ):
+        assert is_foreign_product_container(name, "", "run-x") is False

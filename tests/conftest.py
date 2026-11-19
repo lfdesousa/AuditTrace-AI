@@ -35,11 +35,40 @@ collect_ignore = ["neuter_fixture", "neuter_fixture_src"]
 # Clear stale evidence from a PRIOR session's neuter-harness tests
 # (tests/_neuter_test_evidence.py) at the start of every session -- it's
 # gitignored scratch space, not evidence anyone reads back later.
+# It runs from pytest_configure, on the controller / serial process only, NOT at
+# import: tests start fresh interpreters that import this module, and under
+# pytest-xdist an import-time wipe by one of them (or by a late worker) deletes
+# the evidence directories other tests are using right now.
 from tests._neuter_test_evidence import (  # noqa: E402
     cleanup_root as _cleanup_neuter_test_evidence,
 )
 
-_cleanup_neuter_test_evidence()
+
+def pytest_configure(config: pytest.Config) -> None:
+    if not hasattr(config, "workerinput"):  # an xdist worker never cleans
+        _cleanup_neuter_test_evidence()
+
+
+@pytest.fixture
+def isolated_product_container_watch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scope the neuter pool's foreign-container watch to this process.
+
+    The watch treats ANY product-prefixed Postgres container that starts while a
+    neuter runs as foreign. The harness self-proofs use a fake DB and are not
+    about that watch (tests/test_neuter_pytest_run.py covers it with its own
+    prefixes), yet on a shared daemon any other process that starts such a
+    container (a scoped run outside the lock, another worker's helper) turned
+    them into ERROR foreign_pg_container. The prefix list is replaced by one
+    that only this process uses.
+    """
+    from scripts.neuter import pytest_run
+
+    monkeypatch.setattr(
+        pytest_run,
+        "_PRODUCT_PG_CONTAINER_PREFIXES",
+        (f"audittrace-neuter-selfproof-{os.getpid()}-",),
+    )
+
 
 # ─────────── Chart-rendering subprocess injection (FQDN-only chart) ───────────
 # ADR-045 (amended 2026-05-19) made the chart FQDN-only — `externalLLM.host`
