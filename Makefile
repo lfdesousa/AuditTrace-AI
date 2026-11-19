@@ -122,7 +122,7 @@ test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgre
 	# an ERROR by Postgres unconditionally, which would pollute production
 	# logs. An ephemeral container keeps the noise scoped.
 	@echo "🐳 Spinning up ephemeral test Postgres on :15432 ..."
-	@docker rm -f audittrace-test-pg >/dev/null 2>&1 || true
+	@docker rm -fv audittrace-test-pg >/dev/null 2>&1 || true
 	@docker run -d --rm --name audittrace-test-pg \
 	  -e POSTGRES_USER=postgres \
 	  -e POSTGRES_PASSWORD=test \
@@ -138,7 +138,7 @@ test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgre
 	  .venv/bin/pytest tests/test_rls_isolation.py -v --no-cov ; \
 	  status=$$? ; \
 	  echo "🧹 Tearing down ephemeral test Postgres ..." ; \
-	  docker rm -f audittrace-test-pg >/dev/null 2>&1 ; \
+	  docker rm -fv audittrace-test-pg >/dev/null 2>&1 ; \
 	  [ $$status -eq 0 ] || exit $$status
 	@echo "✅ RLS integration tests passed (ephemeral Postgres, no production pollution)"
 

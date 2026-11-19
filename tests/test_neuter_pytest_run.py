@@ -322,7 +322,7 @@ def test_continuous_watch_catches_a_container_removed_via_atexit_live(
         "        check=True, capture_output=True, timeout=120,\n"
         "    )\n"
         "    atexit.register(\n"
-        '        lambda: subprocess.run(["docker", "rm", "-f", _NAME], capture_output=True)\n'
+        '        lambda: subprocess.run(["docker", "rm", "-fv", _NAME], capture_output=True)\n'
         "    )\n"
         "    time.sleep(0.5)\n"
         "    assert True\n"
@@ -428,7 +428,7 @@ def test_slow_docker_events_attach_yields_watch_unproven_not_silent_clean(
         "        check=True, capture_output=True, timeout=120,\n"
         "    )\n"
         "    atexit.register(\n"
-        '        lambda: subprocess.run(["docker", "rm", "-f", _NAME], capture_output=True)\n'
+        '        lambda: subprocess.run(["docker", "rm", "-fv", _NAME], capture_output=True)\n'
         "    )\n"
         "    time.sleep(0.5)\n"
         "    assert True\n"
@@ -459,7 +459,7 @@ def test_slow_docker_events_attach_yields_watch_unproven_not_silent_clean(
         assert result.watch_attached is False
         assert result.foreign_pg_container is False
     finally:
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=10)
+        subprocess.run(["docker", "rm", "-fv", name], capture_output=True, timeout=10)
 
 
 def test_chokepoint_scope_restores_prior_values_that_were_already_set(monkeypatch):

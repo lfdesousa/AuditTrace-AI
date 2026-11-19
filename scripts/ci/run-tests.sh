@@ -262,7 +262,9 @@ reap_containers() {
   ids="$(docker ps -aq --filter "label=audittrace.run-tests-id=$RUN_ID" 2>/dev/null || true)"
   if [ -n "$ids" ]; then
     # shellcheck disable=SC2086
-    docker rm -f $ids >/dev/null 2>&1 || true
+    # -v: also remove each container's anonymous data volume (the postgres
+    # image declares one); without it every run leaks a volume per container.
+    docker rm -fv $ids >/dev/null 2>&1 || true
   fi
 }
 

@@ -709,7 +709,7 @@ def test_a_missing_gate_venv_is_refused_not_skipped(tmp_path: Path):
 
 
 def _fake_docker(bin_dir: Path, log: Path) -> None:
-    """A docker that lists two containers for the run label and logs `rm -f`."""
+    """A docker that lists two containers for the run label and logs `rm -fv`."""
     _write_exec(
         bin_dir / "docker",
         "#!/usr/bin/env bash\n"
@@ -783,7 +783,7 @@ def test_sigterm_to_the_wrapper_stops_pytest_its_children_and_the_containers(
     assert not _alive(child_pid), "a grandchild of pytest was orphaned"
     log = docker_log.read_text()
     assert "label=audittrace.run-tests-id=run-tests-" in log
-    assert "rm -f cid-one cid-two" in log
+    assert "rm -fv cid-one cid-two" in log
 
 
 def test_sigint_is_handled_the_same_way(tmp_path: Path):
@@ -820,7 +820,7 @@ def test_sigint_is_handled_the_same_way(tmp_path: Path):
 
     assert proc.returncode == 130, out + err
     assert not _alive(pytest_pid)
-    assert "rm -f cid-one cid-two" in docker_log.read_text()
+    assert "rm -fv cid-one cid-two" in docker_log.read_text()
 
 
 def test_a_normal_run_removes_its_labelled_containers_too(tmp_path: Path):
@@ -833,7 +833,7 @@ def test_a_normal_run_removes_its_labelled_containers_too(tmp_path: Path):
     result = _run_script(root, bin_dir)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "rm -f cid-one cid-two" in docker_log.read_text()
+    assert "rm -fv cid-one cid-two" in docker_log.read_text()
 
 
 def test_ephemeral_postgres_is_labelled_with_the_run_id_only_when_one_is_set():
