@@ -1,0 +1,40 @@
+meta {
+  name: POST /interactions%2frefusals — encoded slash, lower case (not the route)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/interactions%2frefusals
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "route": "chat",
+    "code": "invalid_token",
+    "http_status": 401,
+    "subject_token": "not-a-token",
+    "session_id": "e8-refusal-path-check"
+  }
+}
+
+tests {
+  test("answers exactly 404", function() {
+    expect(res.getStatus()).to.equal(404);
+  });
+}
+
+docs {
+  BFF-CHAT-ROUTE-ERRORS E8. The refused-turn ingest route admits only the
+  LibreChat BFF as the immediate mesh peer, and only on the exact path.
+  Through the front door with an ordinary user token: the %2f spelling answers 404 (not this route).
+  A 201 or 422 here fails the gate. The body carries no real token
+  ("not-a-token"); the request must be refused before any validation.
+  Afterwards, the session "e8-refusal-path-check" must hold no row.
+}
