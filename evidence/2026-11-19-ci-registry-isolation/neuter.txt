@@ -1,0 +1,10 @@
+# NEUTER: autouse removed from _restore_tool_registries (fixture left defined, not autouse)
+## minimal bisect set
+FAILED tests/test_chart_drift_guards_chat_audience.py::TestChatAudienceClient::test_scope_arrays_are_exactly_the_chat_set[chart-off]
+FAILED tests/test_chat_proxy.py::TestToolsModeIntegration::test_tools_mode_streaming_repeated_signature_exits_early
+FAILED tests/test_chat_tools_nonstream_upstream_audit.py::TestFailedTurnKeepsToolCallRows::test_stream_fallback_recall_then_400_keeps_tool_call_row
+3 failed, 1 passed, 9 warnings in 19.29s
+## guard tests/test_tool_registry_isolation.py
+FAILED tests/test_tool_registry_isolation.py::test_next_test_sees_the_registries_the_run_started_with
+1 failed, 2 passed in 0.10s
+# restored -> green: see green.txt

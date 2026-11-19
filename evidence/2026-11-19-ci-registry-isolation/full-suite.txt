@@ -1,0 +1,9 @@
+# full suite, make test with RUN_TESTS_WORKERS=4 (under hold-shared lock), code commit f96cb6be tree 26ddaea6779208933f3a347664841e9931b1327f (the run was made on this content, uncommitted at the time)
+================ 11168 passed, 6 warnings in 1218.00s (0:20:17) ================
+run-tests: workers=4 (0 = serial)
+Required test coverage of 90% reached. Total coverage: 98.94%
+[no-skip-check] No skipped tests in junit.xml. Good.
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (205 files checked, 226 measured files all reported, lines >= 90%, branches >= 90% on 175 file(s) with branches)
+[collected-vs-junit] collected=11168 junit_testcases=11168 workers=4
+✅ Tests passed (scripts/ci/run-tests.sh)
