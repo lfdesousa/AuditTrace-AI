@@ -1,0 +1,8 @@
+caller	caller_kind	path	lineno	callee
+stream_detail	py:function	src/audittrace/routes/_upstream_errors.py	294	status_error_detail
+non_stream_upstream_error	py:function	src/audittrace/routes/_upstream_errors.py	446	status_error_detail
+path	lineno
+src/audittrace/routes/_upstream_errors.py	234
+path	lineno	qualname
+src/audittrace/routes/chat.py	1629	_handle_tools_mode._iter_tools_stream_and_capture|upstream_errors.stream_detail@1629:33
+src/audittrace/routes/chat.py	2166	_chat_completions_impl._iter_and_capture|upstream_errors.stream_detail@2166:33

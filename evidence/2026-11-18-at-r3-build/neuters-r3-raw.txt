@@ -1,0 +1,27 @@
+R3 NEUTERED: ======================== 6 failed, 75 passed in 25.47s =========================
+  failing cells: 6
+    TestACompleteStreamWhoseChunksCarryANonObjectErrorIsASuccess::test_success_row_no_error_frame[string-tools]
+    TestACompleteStreamWhoseChunksCarryANonObjectErrorIsASuccess::test_success_row_no_error_frame[string-inject]
+    TestACompleteStreamWhoseChunksCarryANonObjectErrorIsASuccess::test_success_row_no_error_frame[number-tools]
+    TestACompleteStreamWhoseChunksCarryANonObjectErrorIsASuccess::test_success_row_no_error_frame[number-inject]
+    TestACompleteStreamWhoseChunksCarryANonObjectErrorIsASuccess::test_success_row_no_error_frame[list-tools]
+    TestACompleteStreamWhoseChunksCarryANonObjectErrorIsASuccess::test_success_row_no_error_frame[list-inject]
+R4 NEUTERED: ======================== 6 failed, 75 passed in 26.94s =========================
+  failing cells: 6
+    TestA2xxCompletionCarryingANonObjectErrorIsASuccess::test_success_row_and_completion_relayed[string-tools]
+    TestA2xxCompletionCarryingANonObjectErrorIsASuccess::test_success_row_and_completion_relayed[string-inject]
+    TestA2xxCompletionCarryingANonObjectErrorIsASuccess::test_success_row_and_completion_relayed[number-tools]
+    TestA2xxCompletionCarryingANonObjectErrorIsASuccess::test_success_row_and_completion_relayed[number-inject]
+    TestA2xxCompletionCarryingANonObjectErrorIsASuccess::test_success_row_and_completion_relayed[list-tools]
+    TestA2xxCompletionCarryingANonObjectErrorIsASuccess::test_success_row_and_completion_relayed[list-inject]
+URL NEUTERED: ======================== 9 failed, 72 passed in 26.65s =========================
+  failing cells: 9
+    TestEmptyBodyDetail::test_non_2xx_empty_body_detail_is_empty_reply_without_url[404-tools]
+    TestEmptyBodyDetail::test_non_2xx_empty_body_detail_is_empty_reply_without_url[404-inject]
+    TestEmptyBodyDetail::test_non_2xx_empty_body_detail_is_empty_reply_without_url[503-tools]
+    TestEmptyBodyDetail::test_non_2xx_empty_body_detail_is_empty_reply_without_url[503-inject]
+    TestStatusErrorDetail::test_unread_streamed_500_falls_back_to_empty_reply_without_raising
+    TestStatusErrorDetail::test_empty_body_is_empty_reply_and_names_no_url
+    TestMovedArmHelpers::test_stream_detail_empty_body_is_empty_reply
+    TestStreamDetailPrefersUpstreamText::test_tools_stream_5xx_empty_body_is_empty_reply_without_url
+    TestStreamDetailPrefersUpstreamText::test_inject_stream_5xx_empty_body_is_empty_reply_without_url

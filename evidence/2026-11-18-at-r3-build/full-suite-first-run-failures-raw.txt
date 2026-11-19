@@ -1,0 +1,8 @@
+FAILED tests/test_chat_proxy.py::TestToolsModeIntegration::test_tools_mode_streaming_non_parse_500_emits_502 - AttributeError: '_SeqStreamResponse' object has no attribute 'is_success'
+FAILED tests/test_chat_proxy.py::TestStreamingQuietPeriodsAndTermination::test_cut_off_stream_is_an_error_frame_not_a_clean_completion - AttributeError: '_FakeStreamResponse' object has no attribute '
+FAILED tests/test_chat_proxy.py::TestUpstreamResponseClosedOnAllExitPaths::test_inject_mode_error_response_closes_upstream_response - AttributeError: '_AcloseSpyResponse' object has no attribute 'is_s
+FAILED tests/test_chat_proxy.py::TestUpstreamResponseClosedOnAllExitPaths::test_tools_mode_non_parse_500_closes_upstream_response - AttributeError: '_AcloseSpyStreamResponse' object has no attribute '
+FAILED tests/test_chat_tools_nonstream_upstream_audit.py::TestStreamDetailPrefersUpstreamText::test_tools_stream_5xx_empty_body_falls_back_to_str_exc - AssertionError: assert 25 == (12 + 400)
+FAILED tests/test_chat_tools_nonstream_upstream_audit.py::TestStreamDetailPrefersUpstreamText::test_inject_stream_5xx_empty_body_falls_back_to_str_exc - AssertionError: assert 25 == (12 + 400)
+FAILED tests/test_routes.py::test_streaming_parameter - AttributeError: '_FakeStreamResponse' object has no attribute 'is_success'
+=========== 7 failed, 11270 passed, 3 warnings in 3247.87s (0:54:07) ===========
