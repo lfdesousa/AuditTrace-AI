@@ -7,11 +7,14 @@ into the system entry. These tests assert that pass-through holds for
 regression that triggered ADR-024.
 """
 
+import json
 import os
 from datetime import date
+from json import dumps as _json_dumps
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlsplit
 
+import httpx
 import pytest
 from sqlalchemy import select
 
@@ -82,6 +85,9 @@ class _FakeAsyncClient:
             raise self._post_exc
         resp = MagicMock()
         resp.status_code = 200
+        resp.is_success = True
+        resp.text = _json_dumps(self._post_json)
+        resp.headers = {}
         resp.json.return_value = self._post_json
         return resp
 
@@ -141,6 +147,9 @@ class _FakeStreamResponse:
     # (on >= 400) ``aread()``s the body before ``raise_for_status()``.
     status_code = 200
     text = ""
+    # A real request object: ``StreamReplyCheck`` builds an ``httpx.HTTPStatusError``
+    # from it when the stream it watched is not a complete one.
+    request = httpx.Request("POST", "http://llama.test/v1/chat/completions")
 
     def __init__(self, lines: list[str]) -> None:
         self._lines = lines
@@ -3563,13 +3572,17 @@ class TestStreamingQuietPeriodsAndTermination:
         assert "data: : keep-alive" not in raw
         assert "done" in raw
 
-    def test_done_is_echoed_not_synthesised(self, client):
-        """``[DONE]`` is upstream's end-of-stream marker and the proxy only
-        re-emits it AFTER the synthetic usage chunk. When llama-server dies
-        mid-generation the socket closes without ``[DONE]``, and the proxy
-        must not manufacture one: a fabricated terminator makes a truncated
-        answer look like a clean completion to the client. This is the same
-        failure shape as the ``finish_reason="length"`` truncation bug."""
+    def test_cut_off_stream_is_an_error_frame_not_a_clean_completion(self, client):
+        """A stream that stops without ``[DONE]`` is a failed turn. When llama-server
+        dies mid-generation the socket closes without ``[DONE]``; a truncated answer
+        must never look like a clean completion to the client (the same failure
+        shape as the ``finish_reason="length"`` truncation bug). It used to be told
+        only by a missing terminator; now the client gets one explicit error frame
+        after whatever content already streamed, then ``[DONE]`` (the error-frame
+        helper always closes the stream), and the audit row is ``failed``.
+
+        Supersedes ``test_done_is_echoed_not_synthesised``, which pinned the cut-off
+        stream as a bare 200 without ``[DONE]`` and with the synthetic usage chunk."""
         fake = _FakeAsyncClient(
             stream_lines=[
                 'data: {"id":"cmpl-t","created":5,"model":"qwen3.5-35b",'
@@ -3590,14 +3603,24 @@ class TestStreamingQuietPeriodsAndTermination:
 
         assert response.status_code == 200
         raw = response.content.decode()
+        # Content already streamed stays streamed; the error frame follows it.
         assert "half an ans" in raw
-        assert "[DONE]" not in raw
-        # The usage chunk is still emitted so the token accounting the audit
-        # row and the client both rely on is not lost with the connection.
-        chunks = _parse_sse_deltas(raw)
-        usage_chunks = [c for c in chunks if c.get("usage")]
-        assert usage_chunks, chunks
-        assert usage_chunks[-1]["usage"]["prompt_tokens"] == 9
+        frames = [
+            json.loads(line[len("data: ") :])
+            for line in raw.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        errors = [f["error"] for f in frames if "error" in f]
+        assert len(errors) == 1
+        assert errors[0]["code"] == "upstream_error"
+        assert errors[0]["status"] == 502
+        # The terminator now follows the error frame and closes the stream.
+        assert raw.rstrip().endswith("data: [DONE]")
+        # No synthetic usage chunk on the failed path: the only chunk carrying usage
+        # is the upstream's own, which has content.
+        usage_chunks = [f for f in frames if "error" not in f and f.get("usage")]
+        assert len(usage_chunks) == 1
+        assert usage_chunks[0]["choices"][0]["delta"]["content"] == "half an ans"
 
 
 class TestToolsModeMetadataOnlyTurn:

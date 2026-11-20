@@ -46,6 +46,7 @@ import httpx
 from opentelemetry import trace
 
 from audittrace.identity import UserContext
+from audittrace.routes import _upstream_errors as upstream_errors
 from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS, llama_auth_headers
 from audittrace.routes._model_route import upstream_host
 from audittrace.tools import get_tool_by_name, invoke_tool
@@ -376,7 +377,7 @@ async def _post_with_tool_parse_retry(
     those are real upstream errors and retrying could amplify the damage.
     """
     response = await client.post(url, json=payload)
-    if response.is_success:
+    if upstream_errors.completion_body(response) is not None:
         return response
     if response.status_code < 500:
         # Only a 2xx is returned. Any other reply below 500 is logged once
@@ -387,7 +388,7 @@ async def _post_with_tool_parse_retry(
             response.status_code,
             response.text[:500],
         )
-        response.raise_for_status()
+        upstream_errors.raise_status_error(response)
 
     if _is_tool_parse_error_500(response):
         # Phase 1: same-payload retries (model rolls fresh tokens each time).
@@ -400,7 +401,7 @@ async def _post_with_tool_parse_retry(
                 _TOOL_PARSE_ERROR_RETRIES,
             )
             response = await client.post(url, json=payload)
-            if response.is_success:
+            if upstream_errors.completion_body(response) is not None:
                 return response
             if not _is_tool_parse_error_500(response):
                 break  # different failure class — don't keep retrying
@@ -421,7 +422,7 @@ async def _post_with_tool_parse_retry(
             )
             fallback_payload = _strip_tools_for_fallback(payload)
             response = await client.post(url, json=fallback_payload)
-            if response.is_success:
+            if upstream_errors.completion_body(response) is not None:
                 return response
 
     # Persistent failure even after fallback — genuinely broken upstream.
@@ -434,8 +435,7 @@ async def _post_with_tool_parse_retry(
         response.status_code,
         response.text[:500],
     )
-    response.raise_for_status()
-    return response  # unreachable, raise_for_status raised
+    upstream_errors.raise_status_error(response)
 
 
 # ───────────────────────────── The loop ─────────────────────────────────────

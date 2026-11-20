@@ -1,0 +1,8 @@
+branch head 1ce52dd5e3775b64258106e6204246fe24097183 tree caa31f491146793d42eb84d6699085aaa5fdeb84 (clean tree), rebased on origin/main 978ca3ba
+tests/test_neuter_classify.py::test_green_when_all_passed PASSED         [ 80%]
+Required test coverage of 90% reached. Total coverage: 98.97%
+================ 11250 passed, 3 warnings in 3534.58s (0:58:54) ================
+[no-skip-check] No skipped tests in junit.xml. Good.
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (205 files checked, 226 measured files all reported, lines >= 90%, branches >= 90% on 175 file(s) with branches)
+✅ Tests passed (scripts/ci/run-tests.sh)

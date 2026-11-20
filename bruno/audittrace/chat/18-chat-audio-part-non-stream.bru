@@ -1,0 +1,76 @@
+meta {
+  name: POST /v1/chat/completions (audio part, non-stream; the one-request-one-row detector)
+  type: http
+  seq: 18
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": [
+        { "type": "text", "text": "{{contentPartPrompt}}" },
+        { "type": "input_audio", "input_audio": { "data": "{{audioPartData}}", "format": "{{audioPartFormat}}" } }
+      ] }
+    ],
+    "stream": false,
+    "max_tokens": 64
+  }
+}
+
+script:pre-request {
+  // Body rebuilt here so values containing quotes cannot break the JSON.
+  req.setBody({
+    model: "audittrace-default",
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: bru.getEnvVar("contentPartPrompt") },
+        { type: "input_audio", input_audio: { data: bru.getEnvVar("audioPartData"), format: bru.getEnvVar("audioPartFormat") } }
+      ]
+    }],
+    stream: false,
+    max_tokens: 64
+  });
+  // X-Session-Id: the caller's `audioTurnSessionId`, else a generated one;
+  // stashed so chat/19 can read the audit rows of THIS turn.
+  const given = bru.getEnvVar("audioTurnSessionId");
+  const sid = given ? given : "bru-audio-turn-ns-" + Date.now();
+  req.setHeader("X-Session-Id", sid);
+  bru.setVar("audioTurnSessionId", sid);
+}
+
+tests {
+  test("the turn is answered as an error, never as HTTP 200", function() {
+    expect(res.getStatus()).to.not.equal(200);
+    bru.setVar("audioTurnReplyStatus", res.getStatus());
+  });
+  test("the reply carries X-Trace-Id (stashed as audioTurnTraceId)", function() {
+    expect(res.getHeader("x-trace-id")).to.match(/^[0-9a-f]{32}$/);
+    bru.setVar("audioTurnTraceId", res.getHeader("x-trace-id"));
+  });
+}
+
+docs {
+  AT-NONSTREAM-UPSTREAM-STATUS (E-F). One non-stream turn that the model server
+  rejects with a server error: an `input_audio` content part sent to a model
+  server without audio support. Which status the model server answers is
+  recorded, not asserted (chat/19 stashes it from the audit row). The pair
+  chat/18 + chat/19 shows that ONE front-door request produced exactly ONE
+  audit row: a retry by any proxy on the path would show as two or three.
+
+  Inputs (env vars, defaults in environments/*.bru): `contentPartPrompt`,
+  `audioPartData` (base64 of a 60-byte WAV), `audioPartFormat` (wav),
+  `audioTurnSessionId` (empty = generated; stashed for chat/19).
+  Needs scope audittrace:query.
+}

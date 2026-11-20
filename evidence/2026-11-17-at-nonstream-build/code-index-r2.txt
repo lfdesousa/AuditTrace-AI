@@ -1,0 +1,3 @@
+defs StreamReplyCheck rows 1 rows_sha256 a8fc58f02660c187 [('src/audittrace/routes/_stream_reply.py', 47)]
+calls non_stream_upstream_error rows 0 rows_sha256 4f53cda18c2baa0c []
+q SELECT path, lineno FROM nodes WHERE kind='py:call' AND name rows 3 rows_sha256 5522f126f93dc2f5 [('src/audittrace/routes/chat.py', 1224), ('src/audittrace/routes/chat.py', 2059), ('src/audittrace/routes/_upstream_errors.py', 319)]

@@ -1,0 +1,21 @@
+##### pytest tests/test_chat_nonstream_upstream_status.py
+
+tests/test_chat_nonstream_upstream_status.py ........................... [ 22%]
+........................................................................ [ 83%]
+...................                                                      [100%]
+
+======================== 118 passed in 98.72s (0:01:38) ========================
+##### pytest tests/test_chart_chat_route_retry_policy.py
+tests/test_chart_chat_route_retry_policy.py::test_chat_route_retry_policy_is_exactly_the_ruled_one
+  /home/lfdesousa/work/wt-at-nonstream/tests/conftest.py:479: UserWarning: hermetic guard: HERMETIC_SHIM_DIR/HERMETIC_KUBECONFIG are not set — this run is not CI-shaped (scripts/ci/run-tests.sh sets them). The kubectl/helm word check still applies; the child-environment equality check does not.
+    _enforce_hermetic(args, executable=executable, shell=shell, env=env)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+========================= 4 passed, 1 warning in 1.10s =========================
+##### pytest tests/test_bruno_chat_unmatched_upstream_status.py
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 10 items
+
+tests/test_bruno_chat_unmatched_upstream_status.py ..........            [100%]
+
+============================== 10 passed in 0.06s ==============================

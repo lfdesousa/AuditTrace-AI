@@ -1,0 +1,15 @@
+--------------------------- Captured stdout teardown ---------------------------
+{"timestamp": "2026-11-18 21:35:58,938", "level": "WARNING", "logger": "opentelemetry.sdk.trace.export", "message": "Processor is already shutdown, ignoring call"}
+---------------------------- Captured log teardown -----------------------------
+DEBUG    audittrace.dependencies:logging_config.py:1383 INPUT audittrace.dependencies.reset_container
+DEBUG    audittrace.dependencies:logging_config.py:1397 OUTPUT audittrace.dependencies.reset_container
+DEBUG    audittrace.dependencies:logging_config.py:1411 DURATION audittrace.dependencies.reset_container: 0.0001s
+WARNING  opentelemetry.sdk.trace.export:__init__.py:120 Processor is already shutdown, ignoring call
+=========================== short test summary info ============================
+FAILED tests/test_chat_error_object_discrimination.py::TestEmptyBodyDetail::test_non_2xx_empty_body_detail_is_empty_reply_without_url[404-tools]
+FAILED tests/test_chat_error_object_discrimination.py::TestEmptyBodyDetail::test_non_2xx_empty_body_detail_is_empty_reply_without_url[404-inject]
+FAILED tests/test_chat_error_object_discrimination.py::TestEmptyBodyDetail::test_non_2xx_empty_body_detail_is_empty_reply_without_url[503-tools]
+FAILED tests/test_chat_error_object_discrimination.py::TestEmptyBodyDetail::test_non_2xx_empty_body_detail_is_empty_reply_without_url[503-inject]
+FAILED tests/test_upstream_errors.py::TestStatusErrorDetail::test_unread_streamed_500_falls_back_to_empty_reply_without_raising
+FAILED tests/test_upstream_errors.py::TestStatusErrorDetail::test_empty_body_is_empty_reply_and_names_no_url
+======================== 6 failed, 54 passed in 30.16s =========================

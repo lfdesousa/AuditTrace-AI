@@ -1,0 +1,44 @@
+meta {
+  name: GET /interactions?session_id= (audit rows of the audio turn: exactly one)
+  type: http
+  seq: 19
+}
+
+get {
+  url: {{baseUrl}}/interactions?session_id={{audioTurnSessionId}}&limit=5
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("exactly one row for the session (one request, one audited turn)", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().interactions).to.be.an("array").with.lengthOf(1);
+  });
+  test("the row is failed / upstream_error", function() {
+    const r = res.getBody().interactions[0];
+    expect(r.status).to.equal("failed");
+    expect(r.failure_class).to.equal("upstream_error");
+  });
+  test("the upstream status is recorded from the row (stashed as audioTurnUpstreamStatus)", function() {
+    const r = res.getBody().interactions[0];
+    const m = /^status=(\d{3}): /.exec(r.error_detail);
+    expect(m).to.not.equal(null);
+    bru.setVar("audioTurnUpstreamStatus", m[1]);
+    console.log("audio turn: upstream status " + m[1] + ", trace " + r.trace_id);
+  });
+  test("the row's trace_id is the reply's X-Trace-Id", function() {
+    expect(res.getBody().interactions[0].trace_id).to.equal(bru.getVar("audioTurnTraceId"));
+  });
+}
+
+docs {
+  Run right after chat/18 (same collection run, so the stashed
+  `audioTurnSessionId` and `audioTurnTraceId` are set). Reads the audit rows
+  through the public API (scope audittrace:audit). The upstream status is
+  whatever the model server answered; it is recorded, not asserted.
+}
