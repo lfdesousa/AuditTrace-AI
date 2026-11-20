@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
-from jose import jwt
+from jose import jwk, jwt
 
 from audittrace.auth import (
     _fetch_jwks_keys,
@@ -38,6 +38,13 @@ TEST_PUBLIC_PEM = _test_public_key.public_bytes(
     encoding=serialization.Encoding.PEM,
     format=serialization.PublicFormat.SubjectPublicKeyInfo,
 ).decode()
+
+# The realm's JWKS entry for the test key, as Keycloak publishes one.
+TEST_JWK: dict[str, str] = {
+    **jwk.construct(TEST_PUBLIC_PEM, "RS256").to_dict(),
+    "kid": "test-rs256-1",
+    "use": "sig",
+}
 
 TEST_ISSUER = "http://keycloak:8080/realms/audittrace"
 TEST_AUDIENCE = "audittrace-server"
@@ -124,7 +131,7 @@ def mock_jwks():
     ``AsyncMock`` — ``_get_jwks_keys`` awaits it.
     """
     with patch("audittrace.auth._fetch_jwks_keys", new_callable=AsyncMock) as mock:
-        mock.return_value = [TEST_PUBLIC_PEM]
+        mock.return_value = [TEST_JWK]
         yield mock
 
 
@@ -257,7 +264,7 @@ class TestAsyncJWKSHotPath:
 
         async def slow_fetch(_url):
             await asyncio.sleep(fetch_delay)
-            return [TEST_PUBLIC_PEM]
+            return [TEST_JWK]
 
         # ``t0`` is captured BEFORE gather so ``trivial`` measures wall time
         # since the concurrent work was scheduled — NOT just its own internal
@@ -280,7 +287,7 @@ class TestAsyncJWKSHotPath:
                 trivial(),
             )
 
-        assert keys == [TEST_PUBLIC_PEM]
+        assert keys == [TEST_JWK]
         # If the loop were blocked by the fetch, trivial() could not finish
         # until the full fetch_delay elapsed. It must finish an order of
         # magnitude faster because the fetch yields.
@@ -293,7 +300,7 @@ class TestAsyncJWKSHotPath:
         async def counting_fetch(_url):
             counter["n"] += 1
             await asyncio.sleep(0.05)  # widen the race window
-            return [TEST_PUBLIC_PEM]
+            return [TEST_JWK]
 
         with (
             patch("audittrace.auth._fetch_jwks_keys", counting_fetch),
@@ -304,7 +311,7 @@ class TestAsyncJWKSHotPath:
             )
 
         assert counter["n"] == 1, f"expected single-flight, got {counter['n']} fetches"
-        assert all(r == [TEST_PUBLIC_PEM] for r in results)
+        assert all(r == [TEST_JWK] for r in results)
 
     async def test_jwks_client_singleton_is_pooled_and_reused(self):
         """The module-level httpx.AsyncClient is created lazily and reused
@@ -323,7 +330,7 @@ class TestAsyncJWKSHotPath:
 
     async def test_cache_hit_skips_fetch_entirely(self):
         """A warm, in-TTL cache returns without awaiting the fetch at all."""
-        fetch = AsyncMock(return_value=[TEST_PUBLIC_PEM])
+        fetch = AsyncMock(return_value=[TEST_JWK])
         with (
             patch("audittrace.auth._fetch_jwks_keys", fetch),
             patch("audittrace.auth.get_settings", return_value=_mock_settings()),
@@ -331,7 +338,7 @@ class TestAsyncJWKSHotPath:
             first = await _get_jwks_keys("http://keycloak:8080/jwks")
             second = await _get_jwks_keys("http://keycloak:8080/jwks")
 
-        assert first == second == [TEST_PUBLIC_PEM]
+        assert first == second == [TEST_JWK]
         fetch.assert_awaited_once()
 
 

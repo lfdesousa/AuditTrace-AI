@@ -1,0 +1,52 @@
+tests/bff/test_chat_caller_scope_backstop.py repeat1: 1 passed in 0.20s
+tests/bff/test_chat_caller_scope_backstop.py repeat2: 1 passed in 0.21s
+tests/bff/test_chat_caller_scope_backstop.py repeat3: 1 passed in 0.17s
+tests/bff/test_chat_caller_scope_backstop.py reversed (1 ids): 1 passed in 0.19s
+tests/bff/test_chat_last_resort_frames.py repeat1: 3 passed in 0.05s
+tests/bff/test_chat_last_resort_frames.py repeat2: 3 passed in 0.05s
+tests/bff/test_chat_last_resort_frames.py repeat3: 3 passed in 0.05s
+tests/bff/test_chat_last_resort_frames.py reversed (3 ids): 3 passed in 0.05s
+tests/bff/test_chat_route_last_resort.py repeat1: 5 passed in 0.33s
+tests/bff/test_chat_route_last_resort.py repeat2: 5 passed in 0.36s
+tests/bff/test_chat_route_last_resort.py repeat3: 5 passed in 0.39s
+tests/bff/test_chat_route_last_resort.py reversed (5 ids): 5 passed in 0.33s
+tests/test_chart_librechat_retry_bound.py repeat1: 2 passed, 1 warning in 0.64s
+tests/test_chart_librechat_retry_bound.py repeat2: 2 passed, 1 warning in 0.63s
+tests/test_chart_librechat_retry_bound.py repeat3: 2 passed, 1 warning in 0.67s
+tests/test_chart_librechat_retry_bound.py reversed (2 ids): 2 passed, 1 warning in 0.69s
+tests/bff/test_all_routes_errors.py repeat1: 290 passed in 12.17s
+tests/bff/test_all_routes_errors.py repeat2: 290 passed in 12.35s
+tests/bff/test_all_routes_errors.py repeat3: 290 passed in 12.23s
+tests/bff/test_all_routes_errors.py reversed (290 ids): 290 passed in 12.65s
+tests/bff/test_chat_route_errors.py repeat1: 135 passed in 5.93s
+tests/bff/test_chat_route_errors.py repeat2: 135 passed in 5.83s
+tests/bff/test_chat_route_errors.py repeat3: 135 passed in 5.90s
+tests/bff/test_chat_route_errors.py reversed (135 ids): 135 passed in 5.89s
+tests/bff/test_path_guard.py repeat1: 23 passed in 1.12s
+tests/bff/test_path_guard.py repeat2: 23 passed in 1.18s
+tests/bff/test_path_guard.py repeat3: 23 passed in 1.13s
+tests/bff/test_path_guard.py reversed (23 ids): 23 passed in 1.13s
+tests/bff/test_realm_keys.py repeat1: 14 passed in 1.54s
+tests/bff/test_realm_keys.py repeat2: 14 passed in 1.46s
+tests/bff/test_realm_keys.py repeat3: 14 passed in 1.43s
+tests/bff/test_realm_keys.py reversed (14 ids): 14 passed in 1.54s
+tests/bff/test_refusal_record.py repeat1: 16 passed in 1.65s
+tests/bff/test_refusal_record.py repeat2: 16 passed in 1.65s
+tests/bff/test_refusal_record.py repeat3: 16 passed in 1.66s
+tests/bff/test_refusal_record.py reversed (16 ids): 16 passed in 1.61s
+tests/test_auth_realm_keys.py repeat1: 14 passed in 0.37s
+tests/test_auth_realm_keys.py repeat2: 14 passed in 0.41s
+tests/test_auth_realm_keys.py repeat3: 14 passed in 0.37s
+tests/test_auth_realm_keys.py reversed (14 ids): 14 passed in 0.38s
+tests/test_chart_refusal_switch_coupling.py repeat1: 2 passed, 1 warning in 0.57s
+tests/test_chart_refusal_switch_coupling.py repeat2: 2 passed, 1 warning in 0.62s
+tests/test_chart_refusal_switch_coupling.py repeat3: 2 passed, 1 warning in 0.68s
+tests/test_chart_refusal_switch_coupling.py reversed (2 ids): 2 passed, 1 warning in 0.61s
+tests/test_refusal_ingest.py repeat1: 32 passed in 21.24s
+tests/test_refusal_ingest.py repeat2: 32 passed in 21.13s
+tests/test_refusal_ingest.py repeat3: 32 passed in 21.84s
+tests/test_refusal_ingest.py reversed (32 ids): 32 passed in 19.27s
+tests/test_refusal_ingest_gate_conditions.py repeat1: 4 passed in 2.64s
+tests/test_refusal_ingest_gate_conditions.py repeat2: 4 passed in 2.69s
+tests/test_refusal_ingest_gate_conditions.py repeat3: 4 passed in 2.35s
+tests/test_refusal_ingest_gate_conditions.py reversed (4 ids): 4 passed in 3.20s

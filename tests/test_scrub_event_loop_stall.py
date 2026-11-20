@@ -35,6 +35,7 @@ from typing import Any
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from jose import jwk as _jose_jwk
 from jose import jwt
 
 from audittrace import identity as identity_mod
@@ -1366,7 +1367,11 @@ def _build_gp4_app_and_manifest(monkeypatch):
     from audittrace import dependencies
 
     monkeypatch.setattr(
-        auth_mod, "_fetch_jwks_keys", AsyncMock(return_value=[_GP4_PUBLIC_PEM])
+        auth_mod,
+        "_fetch_jwks_keys",
+        AsyncMock(
+            return_value=[_jose_jwk.construct(_GP4_PUBLIC_PEM, "RS256").to_dict()]
+        ),
     )
     auth_mod._jwks_cache.clear()
 

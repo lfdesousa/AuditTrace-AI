@@ -101,7 +101,8 @@ class TestLoginRequestCoversEveryExchange:
 
     def test_the_login_baseline_is_kept(self) -> None:
         rendered = set(_rendered_openid_scope())
-        assert {"openid", "profile", "email", "offline_access"} <= rendered
+        assert {"openid", "profile", "email"} <= rendered
+        assert "offline_access" not in rendered  # BFF-CHAT-ROUTE-ERRORS Q12(a)
 
     def test_every_login_scope_beyond_the_baseline_is_an_exchange_scope(self) -> None:
         """No stray extra scope (least privilege): the login request is the
@@ -114,7 +115,6 @@ class TestLoginRequestCoversEveryExchange:
                 "openid",
                 "profile",
                 "email",
-                "offline_access",
             }
         )
         assert not extra, f"unexpected scopes in OPENID_SCOPE: {sorted(extra)}"

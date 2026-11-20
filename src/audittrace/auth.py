@@ -31,7 +31,8 @@ from fastapi.security import (
     OAuth2AuthorizationCodeBearer,
     SecurityScopes,
 )
-from jose import JWTError, jwt
+from jose import JWTError
+from jose.exceptions import JWKError
 from starlette.requests import HTTPConnection
 
 from audittrace.config import get_settings
@@ -45,6 +46,7 @@ from audittrace.identity import (
     sentinel_user_context,
 )
 from audittrace.logging_config import log_call
+from audittrace.realm_keys import decode, select, token_kid
 
 logger = logging.getLogger(__name__)
 
@@ -382,22 +384,32 @@ def _decode_jwt_with_allowed_issuers(
     enforcing ``issuer`` and then cross-checking against the union
     set keeps both flows working from one validation path.
     """
-    payload = jwt.decode(
-        token,
-        keys,
-        algorithms=["RS256"],
-        audience=audience,
-        # issuer check handled below against the union set
-    )
+    # Only the realm key the token names, and only a key published for RS256
+    # signing, may verify it; ``exp`` is required (audittrace.realm_keys).
+    # The issuer check is handled below against the union set.
+    try:
+        payload = decode(token, select(list(keys), token_kid(token)), audience=audience)
+    except (JWKError, ValueError, TypeError) as exc:
+        # python-jose does not wrap these (measured): a realm key it cannot
+        # build, or a claim of a type it cannot compare. The token was not
+        # verified, so it is refused like any other; never an escape (500).
+        raise JWTError(f"realm keys or claims unusable: {type(exc).__name__}") from exc
     token_iss = payload.get("iss")
     allowed = {primary_issuer, *(extra_issuers or [])}
-    if token_iss not in allowed:
+    if not isinstance(token_iss, str) or token_iss not in allowed:
         raise JWTError(
             f"Invalid issuer {token_iss!r}; expected one of {sorted(allowed)!r}"
         )
-    # python-jose's jwt.decode returns Any; the dict cast is for mypy.
-    assert isinstance(payload, dict), "jwt.decode returned non-dict payload"
     return payload
+
+
+def _unverified_kid(token: str) -> str | None:
+    """The kid a token names, or ``None`` (also for a token that cannot be
+    read: the decode that follows refuses it)."""
+    try:
+        return token_kid(token)
+    except JWTError:
+        return None
 
 
 _JWKS_FETCH_RETRIES = 3
@@ -475,8 +487,15 @@ def _jwks_cache_fresh(now: float) -> bool:
     )
 
 
-async def _get_jwks_keys(jwks_url: str) -> list[Any]:
+async def _get_jwks_keys(jwks_url: str, kid: str | None = None) -> list[Any]:
     """Get JWKS keys with caching + single-flight.
+
+    ``kid`` is the key a token names. When the cached set holds no signing key
+    of that kid (the realm rotated), the set is fetched ONCE more: under the
+    same single-flight lock, and at most once per
+    ``jwks_refresh_min_interval_seconds`` counted from the last fetch of any
+    kind, however many tokens ask. A refresh that fails leaves the cache as it
+    was; the token is then refused like any token no realm key verifies.
 
     On a cache hit returns the cached keys without touching the network. On a
     miss, a single-flight lock collapses concurrent misses into ONE fetch: the
@@ -484,6 +503,36 @@ async def _get_jwks_keys(jwks_url: str) -> list[Any]:
     read the freshly-populated cache (double-checked locking) rather than each
     firing their own fetch (avoids the thundering herd against Keycloak).
     """
+    keys = await _cached_or_fetched(jwks_url)
+    if kid is None or select(keys, kid):
+        return keys
+    async with _get_jwks_fetch_lock():
+        keys = list(_jwks_cache.get("keys", keys))  # a waiter ahead may have refreshed
+        age = _monotonic() - _jwks_cache.get("fetched_monotonic", float("-inf"))
+        if select(keys, kid) or age < get_settings().jwks_refresh_min_interval_seconds:
+            return keys
+        # Stamp before the fetch: a refresh that fails is bounded too.
+        _jwks_cache["fetched_monotonic"] = _monotonic()
+        try:
+            keys = await _fetch_jwks_keys(jwks_url)
+        except httpx.HTTPError as exc:
+            logger.warning("JWKS refresh for an unknown kid failed: %s", exc)
+            return list(_jwks_cache.get("keys", []))
+        _store_jwks(keys)
+        return list(keys)
+
+
+# The clock the refresh bound is measured on; a module name so a test can step it.
+_monotonic = time.monotonic
+
+
+def _store_jwks(keys: list[Any]) -> None:
+    _jwks_cache["keys"] = keys
+    _jwks_cache["fetched_at"] = time.time()
+    _jwks_cache["fetched_monotonic"] = _monotonic()
+
+
+async def _cached_or_fetched(jwks_url: str) -> list[Any]:
     now = time.time()
     if _jwks_cache_fresh(now):
         return list(_jwks_cache["keys"])
@@ -496,8 +545,7 @@ async def _get_jwks_keys(jwks_url: str) -> list[Any]:
             return list(_jwks_cache["keys"])
 
         keys = await _fetch_jwks_keys(jwks_url)
-        _jwks_cache["keys"] = keys
-        _jwks_cache["fetched_at"] = now
+        _store_jwks(keys)
         return list(keys)
 
 
@@ -536,7 +584,9 @@ async def validate_jwt(
         raise HTTPException(status_code=401, detail="Missing authentication token")
 
     try:
-        keys = await _get_jwks_keys(settings.keycloak_jwks_url)
+        keys = await _get_jwks_keys(
+            settings.keycloak_jwks_url, kid=_unverified_kid(token)
+        )
         payload = _decode_jwt_with_allowed_issuers(
             token,
             keys,
@@ -679,7 +729,9 @@ async def require_user(
 
     # Cold path: validate JWT against Keycloak JWKS
     try:
-        keys = await _get_jwks_keys(settings.keycloak_jwks_url)
+        keys = await _get_jwks_keys(
+            settings.keycloak_jwks_url, kid=_unverified_kid(raw_token)
+        )
         payload = _decode_jwt_with_allowed_issuers(
             raw_token,
             keys,

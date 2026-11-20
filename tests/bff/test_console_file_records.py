@@ -49,8 +49,8 @@ from bff.console_files_scopes import INGEST_SCOPE_STRING
 from bff.memory_scopes import MEMORY_SCOPE_STRING
 from tests.bff.conftest import (
     TEST_ISSUER,
+    TEST_JWK,
     TEST_PRIVATE_PEM,
-    TEST_PUBLIC_PEM,
     make_token,
 )
 
@@ -117,7 +117,7 @@ class _ConsoleFileRecordsBackend:
     def handler(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url == KEYCLOAK_JWKS_URL:
-            return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+            return httpx.Response(200, json={"keys": [TEST_JWK]})
         if url == KEYCLOAK_TOKEN_URL:
             body = request.read().decode()
             self.exchange_request_bodies.append(body)
@@ -330,7 +330,7 @@ class TestFailClosed:
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if url == KEYCLOAK_JWKS_URL:
-                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                return httpx.Response(200, json={"keys": [TEST_JWK]})
             if url == KEYCLOAK_TOKEN_URL:
                 minted = _minted_token_for("alice")
                 return httpx.Response(200, json={"access_token": minted})
@@ -394,7 +394,7 @@ class TestIngestRouteUntouched:
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if url == KEYCLOAK_JWKS_URL:
-                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                return httpx.Response(200, json={"keys": [TEST_JWK]})
             if url == KEYCLOAK_TOKEN_URL:
                 minted = _minted_token_for("alice")
                 return httpx.Response(200, json={"access_token": minted})

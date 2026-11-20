@@ -1,0 +1,7 @@
+Full run on 8fc64cf8 (tree 4e158ee5), the round-2 head; superseded by the round-3 run for the round-3 code.
+Required test coverage of 90% reached. Total coverage: 98.95%
+================ 11707 passed, 3 warnings in 4132.63s (1:08:52) ================
+[no-skip-check] No skipped tests in junit.xml. Good.
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (217 files checked, 238 measured files all reported, lines >= 90%, branches >= 90% on 182 file(s) with branches)
+✅ Tests passed (scripts/ci/run-tests.sh)

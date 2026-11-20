@@ -1,0 +1,7 @@
+======================== 15 passed, 1 warning in 0.98s =========================
+======================== 15 passed, 1 warning in 1.01s =========================
+======================== 15 passed, 1 warning in 1.09s =========================
+## reversed order (explicit node ids, -p no:randomly)
+..................................................## reversed order (plugin reverses collected items)
+tests/test_chart_refused_turn_and_session_end.py::test_the_logout_return_page_is_allowed_by_the_realm[chart] PASSED [  6%]
+======================== 15 passed, 1 warning in 0.99s =========================

@@ -145,6 +145,14 @@ spec:
               value: {{ .Values.objectStorage.aws.secretAccessKey | quote }}
             {{- end }}
             {{- end }}
+            {{- if and .Values.istio.enabled .Values.console.enabled (eq .Values.istio.mtls.mode "STRICT") }}
+            # BFF-CHAT-ROUTE-ERRORS ADDENDUM-3: the one mesh identity the
+            # refused-turn route admits. Set ONLY under STRICT mutual TLS (the
+            # sidecar's statement of the peer is the writer check) and together
+            # with the mesh rule that admits the BFF alone to the path.
+            - name: AUDITTRACE_REFUSAL_INGEST_WRITER
+              value: "spiffe://cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.console.bff.serviceAccount.name }}"
+            {{- end }}
             - name: AUDITTRACE_KEYCLOAK_ISSUER
               value: {{ include "audittrace.keycloakIssuer" . | quote }}
             - name: AUDITTRACE_KEYCLOAK_JWKS_URL
