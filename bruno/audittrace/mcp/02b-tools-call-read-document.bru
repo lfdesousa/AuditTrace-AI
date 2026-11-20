@@ -1,0 +1,77 @@
+meta {
+  name: MCP — tools/call read_decision / read_skill (read one document by file)
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{baseUrl}}/mcp
+  body: json
+  auth: bearer
+}
+
+headers {
+  X-Session-Id: {{mcpSessionId}}
+}
+
+script:pre-request {
+  // One session id per run: a fresh value unless the caller pins one with
+  // --env-var mcpSessionId=... Repeated calls within a run share it (runtime
+  // variable), so a same-session check across two calls is meaningful and
+  // rows from earlier runs never share it.
+  if (!bru.getEnvVar("mcpSessionId") && !bru.getVar("mcpSessionId")) {
+    bru.setVar(
+      "mcpSessionId",
+      "run-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10)
+    );
+  }
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 6,
+    "method": "tools/call",
+    "params": {
+      "name": "{{mcpReadTool}}",
+      "arguments": { "file": "{{mcpReadFile}}" }
+    }
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("JSON-RPC 2.0 result envelope", function() {
+    const body = res.getBody();
+    expect(body.jsonrpc).to.equal("2.0");
+    expect(body.id).to.equal(6);
+    expect(body.result).to.be.an("object");
+  });
+  test("a read of a document the caller deleted is not_found, with no content", function() {
+    const result = res.getBody().result;
+    const parsed = JSON.parse(result.content[0].text);
+    if (result.isError === true) {
+      expect(parsed.error).to.equal("not_found");
+      expect(parsed).to.not.have.property("content");
+    } else {
+      expect(parsed.content).to.be.a("string");
+    }
+  });
+}
+
+docs {
+  `read_decision` (an ADR, episodic memory) or `read_skill` (a SKILL, procedural memory),
+  chosen by `mcpReadTool`; `mcpReadFile` is the exact filename. A document the caller
+  soft-deleted answers `not_found`, the same result as a file that never existed, in the
+  same session as an earlier read and in any other; an admin reads it.
+
+  `X-Session-Id: {{mcpSessionId}}` pins the session id, as in `02-tools-call-read.bru`:
+  without it MCP derives the session id from the user id, so a same-session check across
+  two calls would hold trivially. Pin your own with `--env-var mcpSessionId=...`.
+}

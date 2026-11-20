@@ -138,12 +138,19 @@ class TestWholeDocumentReadIsComplete:
             )
         assert removed.status_code == 200, removed.text
 
-        back = read_whole(client, "decisions", "holed.md")
+        # SOFTDELETE-DIRECT-READ ADDENDUM-2 C1: the delete tombstones the whole
+        # document, so the 409 is what the reader who still sees it gets.
+        with _as_admin(client):
+            back = read_whole(client, "decisions", "holed.md")
+        owner = read_whole(client, "decisions", "holed.md")
+        never = client.get("/memory/semantic/decisions/0000000000000000")
 
         assert back.status_code == 409
         assert back.json() == {
             "detail": f"semantic document incomplete: 4 of {indexed} chunks readable"
         }
+        assert owner.status_code == never.status_code == 404
+        assert owner.content == never.content
 
     def test_a_shorter_reindex_leaves_no_stale_tail_in_the_read(
         self, client: TestClient

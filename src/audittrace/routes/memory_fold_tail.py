@@ -21,12 +21,9 @@ from typing import Any
 from fastapi import HTTPException
 
 from audittrace.identity import UserContext
-from audittrace.routes.memory_whole_document import (
-    CHUNK_READ_WINDOW,
-    document_chunk_ids,
-)
 from audittrace.routes.memory_write_support import semantic_key
 from audittrace.services.memory_audit import emit_memory_audit_event
+from audittrace.services.memory_chunk_ids import CHUNK_READ_WINDOW, document_chunk_ids
 from audittrace.services.memory_keys import private_physical_id
 from audittrace.services.memory_manifest import authorize_write
 

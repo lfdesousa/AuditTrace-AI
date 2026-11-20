@@ -598,6 +598,88 @@ class MemoryManifestService:
             row = await self._read_row(session, layer, logical_key, user.user_id)
             return ManifestEntry.from_row(row) if row is not None else None
 
+    @log_call(logger=logger)
+    async def resolve_read_many(
+        self, layer: str, logical_keys: Sequence[str], user: UserContext
+    ) -> dict[str, ManifestEntry | None]:
+        """:meth:`resolve_read` for many logical keys over ONE query.
+
+        The decision per key is the same pure :func:`resolve_read` the single
+        lookup applies (owner key, own legacy row, corpus row), so a key that
+        resolves here resolves identically there. A tombstoned row IS returned
+        (the caller decides what a tombstone means). One ``IN`` over the union
+        of the owner and bare keys, however many keys there are.
+        """
+        _validate_layer(layer)
+        async with self._session_factory() as session:
+            rows = await self._read_rows(session, layer, logical_keys, user.user_id)
+        return {
+            key: ManifestEntry.from_row(row) if row is not None else None
+            for key, row in rows.items()
+        }
+
+    @log_call(logger=logger)
+    async def record_delete_many(
+        self,
+        layer: str,
+        logical_keys: Sequence[str],
+        user_id: str,
+        *,
+        caller_can_write_shared: bool = False,
+    ) -> None:
+        """Soft-delete every row *logical_keys* resolve to, in ONE transaction.
+
+        Keys that resolve to nothing are skipped, an already-deleted row keeps
+        its tombstone (idempotent, as :meth:`record_delete`). A corpus-tier row
+        with ``caller_can_write_shared`` false raises
+        :class:`ManifestAuthorizationError` BEFORE any row is touched, so the
+        set is tombstoned whole or not at all.
+        """
+        _validate_layer(layer)
+        async with self._session_factory() as session:
+            rows = await self._read_rows(session, layer, logical_keys, user_id)
+            found = [row for row in rows.values() if row is not None]
+            for row in found:
+                if _tier_write_unauthorized(row.tier, caller_can_write_shared):
+                    raise ManifestAuthorizationError(
+                        f"caller lacks shared-write authorization to delete "
+                        f"existing corpus-tier manifest row layer={layer!r} "
+                        f"key={row.key!r}"
+                    )
+            now = _now_ms()
+            for row in found:
+                if row.deleted_at_ms is None:
+                    row.deleted_at_ms = now
+                    row.deleted_by_user_id = user_id
+            await session.commit()
+
+    async def _read_rows(
+        self,
+        session: AsyncSession,
+        layer: str,
+        logical_keys: Sequence[str],
+        owner: str,
+    ) -> dict[str, MemoryItem | None]:
+        """:meth:`_read_row` for many keys: ONE fetch, the same decision."""
+        keys: set[str] = set(logical_keys)
+        for logical in logical_keys:
+            with contextlib.suppress(
+                InvalidPrivateSubjectError, LogicalKeyTooLongError
+            ):
+                keys.add(physical_key(owner, logical))
+        stored = await self._fetch_rows(session, layer, keys) if keys else {}
+        out: dict[str, MemoryItem | None] = {}
+        for logical in logical_keys:
+            res = resolve_read(
+                owner,
+                target=_facts(stored.get(f"{owner}/{logical}")),
+                bare=_facts(stored.get(logical)),
+            )
+            out[logical] = (
+                stored.get(res.row.key) if res is not None and res.row else None
+            )
+        return out
+
     async def _read_row(
         self, session: AsyncSession, layer: str, logical: str, owner: str
     ) -> MemoryItem | None:
@@ -1237,6 +1319,45 @@ class MockMemoryManifestService(MemoryManifestService):
         _validate_layer(layer)
         row = self._mock_read_row(layer, logical_key, user.user_id)
         return self._to_entry(row) if row is not None else None
+
+    async def resolve_read_many(
+        self, layer: str, logical_keys: Sequence[str], user: UserContext
+    ) -> dict[str, ManifestEntry | None]:
+        _validate_layer(layer)
+        out: dict[str, ManifestEntry | None] = {}
+        for logical in logical_keys:
+            row = self._mock_read_row(layer, logical, user.user_id)
+            out[logical] = self._to_entry(row) if row is not None else None
+        return out
+
+    async def record_delete_many(
+        self,
+        layer: str,
+        logical_keys: Sequence[str],
+        user_id: str,
+        *,
+        caller_can_write_shared: bool = False,
+    ) -> None:
+        _validate_layer(layer)
+        found = [
+            row
+            for logical in logical_keys
+            if (row := self._mock_read_row(layer, logical, user_id)) is not None
+        ]
+        for row in found:
+            if _tier_write_unauthorized(
+                row.get("tier", "corpus"), caller_can_write_shared
+            ):
+                raise ManifestAuthorizationError(
+                    f"caller lacks shared-write authorization to delete "
+                    f"existing corpus-tier manifest row layer={layer!r} "
+                    f"key={row['key']!r}"
+                )
+        now = _now_ms()
+        for row in found:
+            if row.get("deleted_at_ms") is None:
+                row["deleted_at_ms"] = now
+                row["deleted_by_user_id"] = user_id
 
     async def record_create(
         self,

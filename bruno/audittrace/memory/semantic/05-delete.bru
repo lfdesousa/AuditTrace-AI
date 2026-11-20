@@ -5,13 +5,17 @@ meta {
 }
 
 delete {
-  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{exampleDocId}}
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{exampleDocId}}?hard={{deleteHard}}
   body: none
   auth: bearer
 }
 
 auth:bearer {
   token: {{accessToken}}
+}
+
+query {
+  hard: {{deleteHard}}
 }
 
 tests {
@@ -25,7 +29,10 @@ tests {
 }
 
 docs {
-  Soft-delete (default). Add `?hard=true` to also delete the
+  `deleteHard` (default false) sets `?hard=`. Soft-delete (default). Add `?hard=true` to also delete the
   ChromaDB doc; that flag requires `audittrace:admin` in addition
   to `memory:semantic:write`.
+
+  Deleting one chunk of a folded document soft-deletes the whole document (every
+  chunk): the response is the addressed chunk's manifest entry.
 }

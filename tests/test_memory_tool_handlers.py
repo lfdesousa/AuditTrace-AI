@@ -34,6 +34,7 @@ from audittrace.identity import UserContext, sentinel_user_context
 from audittrace.services.semantic import ChromaSemanticService, SemanticService
 from audittrace.tools import (
     MEMORY_TOOL_REGISTRY,
+    MemoryTool,
     get_tool_by_name,
     invoke_tool,
     reset_registry_for_tests,
@@ -408,6 +409,20 @@ class TestErrorHandling:
         assert _fakeredis_cache.size() == 0  # errors never cached
 
 
+def _cacheable_tool(name: str) -> MemoryTool:
+    """The registered tool, flagged cacheable for the cache MECHANICS below.
+
+    SOFTDELETE-DIRECT-READ B13/B22: the recall and read tools serve manifest-
+    tracked content and are registered ``cacheable=False`` (a cached result
+    would outlive the delete); only ``recall_recent_sessions`` stays cached.
+    These tests pin what ``invoke_tool`` does with a cacheable tool (key,
+    hit, miss, telemetry, TTL), so they build one from the real registration
+    instead of weakening an assertion."""
+    tool = get_tool_by_name(name)
+    assert tool is not None
+    return replace(tool, cacheable=True)
+
+
 # ──────────────────────── Cache hit / miss semantics ────────────────────────
 
 
@@ -415,7 +430,7 @@ class TestCacheSemantics:
     @pytest.mark.asyncio
     async def test_cache_miss_then_hit(self, _populated_container, _fakeredis_cache):
         user = sentinel_user_context()
-        tool = get_tool_by_name("recall_decisions")
+        tool = _cacheable_tool("recall_decisions")
 
         # First call — cache miss
         result1, hit1 = await invoke_tool(
@@ -436,7 +451,7 @@ class TestCacheSemantics:
 
         result2, hit2 = await invoke_tool(
             user,
-            get_tool_by_name("recall_decisions"),
+            _cacheable_tool("recall_decisions"),
             {"query": "cache compression"},
             session_id="sess-1",
         )
@@ -451,7 +466,7 @@ class TestCacheSemantics:
         """The cache key includes session_id so two users in two sessions
         asking the same thing do not share a cached result."""
         user = sentinel_user_context()
-        tool = get_tool_by_name("recall_decisions")
+        tool = _cacheable_tool("recall_decisions")
 
         await invoke_tool(user, tool, {"query": "cache"}, session_id="sess-1")
         # Second call — different session
@@ -466,7 +481,7 @@ class TestCacheSemantics:
         """TTL=0 means: always execute, never store. Successive calls are
         both misses and nothing lands in Redis."""
         user = sentinel_user_context()
-        tool = get_tool_by_name("recall_decisions")
+        tool = _cacheable_tool("recall_decisions")
 
         _, hit1 = await invoke_tool(user, tool, {"query": "cache"}, session_id="sess-1")
         _, hit2 = await invoke_tool(user, tool, {"query": "cache"}, session_id="sess-1")
@@ -482,7 +497,7 @@ class TestCacheSemantics:
         calling with {'query': 'x', 'k': 4} and {'k': 4, 'query': 'x'}
         hits the same cache entry."""
         user = sentinel_user_context()
-        tool = get_tool_by_name("recall_semantic")
+        tool = _cacheable_tool("recall_semantic")
 
         _, hit1 = await invoke_tool(
             user, tool, {"query": "cache", "k": 4}, session_id="sess-1"
@@ -1275,7 +1290,7 @@ class TestRecallTelemetry:
         derived from the tool name."""
         counter, histogram = _recall_telemetry_spy
         user = sentinel_user_context()
-        tool = get_tool_by_name("recall_decisions")
+        tool = _cacheable_tool("recall_decisions")
 
         # First call — cache miss, handler runs, emits cache="miss"
         result1, hit1 = await invoke_tool(
@@ -1309,7 +1324,7 @@ class TestRecallTelemetry:
         entries so the panel query (cache=~"hit|miss") has data to work with."""
         counter, _ = _recall_telemetry_spy
         user = sentinel_user_context()
-        tool = get_tool_by_name("recall_decisions")
+        tool = _cacheable_tool("recall_decisions")
 
         # Two cache-miss calls (different args → different cache keys)
         await invoke_tool(user, tool, {"query": "cache compression"}, "sess-1")
