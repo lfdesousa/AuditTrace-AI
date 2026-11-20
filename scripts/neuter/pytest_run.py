@@ -90,6 +90,12 @@ _PLUGIN_DIR = Path(__file__).resolve().parent
 #: (mirrors ``pg.PRODUCT_PG_CONTAINER_PREFIXES`` -- kept here too so the
 #: continuous watch thread has no import-time dependency on anything that
 #: could itself be neutered out from under it).
+#: The run-tests.sh run id (env) and the container label tests/_pg_ephemeral.py
+#: stamps it with. Mirrored here (scripts/ must not import tests/); a test pins
+#: both to the _pg_ephemeral values.
+RUN_ID_ENV = "RUN_TESTS_ID"
+RUN_ID_LABEL = "audittrace.run-tests-id"
+
 _PRODUCT_PG_CONTAINER_PREFIXES = (
     "audittrace-acl-wu2a-pg-",
     "audittrace-rls-pg-",
@@ -209,6 +215,28 @@ def build_pythonpath(src_root: str) -> str:
     return f"{src_root}:{_PLUGIN_DIR}"
 
 
+#: ``docker events`` line: container name, a tab, the run-tests.sh run-id label
+#: (empty when the container carries none).
+_EVENT_FORMAT = (
+    '{{.Actor.Attributes.name}}\t{{index .Actor.Attributes "' + RUN_ID_LABEL + '"}}'
+)
+
+
+def parse_start_event(line: str) -> tuple[str, str]:
+    """Split one ``_EVENT_FORMAT`` line into ``(name, run_id_label)``."""
+    name, _, run_id = line.rstrip("\n").partition("\t")
+    return name.strip(), run_id.strip()
+
+
+def is_foreign_product_container(name: str, event_run_id: str, own_run_id: str) -> bool:
+    """A product-prefixed container is foreign unless it carries THIS
+    run-tests.sh run's id. An empty ``own_run_id`` (a pool run outside the
+    wrapper) never exempts anything, so the pre-xdist behaviour is unchanged."""
+    if not any(name.startswith(p) for p in _PRODUCT_PG_CONTAINER_PREFIXES):
+        return False
+    return not (own_run_id and event_run_id == own_run_id)
+
+
 @contextlib.contextmanager
 def _continuous_foreign_container_watch():
     """Streams ``docker events --filter event=start`` for the DURATION of
@@ -248,7 +276,7 @@ def _continuous_foreign_container_watch():
                 "--filter",
                 "event=start",
                 "--format",
-                "{{.Actor.Attributes.name}}",
+                _EVENT_FORMAT,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -273,16 +301,22 @@ def _continuous_foreign_container_watch():
     attached = threading.Event()
     probe_name = f"neuter-watch-probe-{uuid.uuid4().hex[:8]}"
 
+    # Under pytest-xdist the sibling workers of THIS run start product-prefixed
+    # ephemeral Postgres containers (tests/_pg_ephemeral.py), labelled with the
+    # wrapper's run id. Those are this run's own, reaped by run-tests.sh -- not
+    # a foreign durable container. Read once, before the stream starts.
+    own_run_id = os.environ.get(RUN_ID_ENV, "")
+
     def _watch() -> None:
         if proc is None or proc.stdout is None:
             return
         for line in proc.stdout:
             if stop.is_set():
                 break
-            name = line.strip()
+            name, event_run_id = parse_start_event(line)
             if name == probe_name:
                 attached.set()
-            elif any(name.startswith(p) for p in _PRODUCT_PG_CONTAINER_PREFIXES):
+            elif is_foreign_product_container(name, event_run_id, own_run_id):
                 seen.set()
 
     thread = threading.Thread(target=_watch, daemon=True)
@@ -458,6 +492,10 @@ def run_pytest(
                 "AUDITTRACE_TEST_POSTGRES_URL",
                 "NEUTER_FAKE_PG_STATE",
                 "NEUTER_CHOKEPOINT_SKIP",
+                # The watch exempts only containers labelled with ITS OWN
+                # run id; a nested pytest that inherited it would label a
+                # leaked product container as "own" and hide it.
+                RUN_ID_ENV,
             ):
                 env.pop(_stale_key, None)
             resolved_src_root = src_root or f"{workdir}/src"

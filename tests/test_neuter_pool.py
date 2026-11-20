@@ -1594,3 +1594,20 @@ def test_sample_full_scope_drift_is_seeded_from_run_id(tmp_path, monkeypatch):
     third = sampled_ids("run-beta")
     assert first == second, "same run_id must select the SAME sample"
     assert first != third, "a different run_id should (with high probability) differ"
+
+
+# Scoped to this process: the foreign-container watch must not see product
+# containers started by OTHER processes on a shared docker daemon (see the
+# fixture in tests/conftest.py). Neuter: delete this line -> the test below is RED.
+pytestmark = pytest.mark.usefixtures("isolated_product_container_watch")
+
+
+def test_watch_is_not_tripped_by_a_product_container_from_another_process():
+    from scripts.neuter.pytest_run import is_foreign_product_container
+
+    for name in (
+        "audittrace-rls-pg-1",
+        "audittrace-acl-wu2a-pg-2",
+        "audittrace-console-store-pg-3",
+    ):
+        assert is_foreign_product_container(name, "", "run-x") is False

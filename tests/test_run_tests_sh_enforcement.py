@@ -23,10 +23,13 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from tests._hermetic_env import override_sentinel
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_SCRIPT = REPO_ROOT / "scripts" / "ci" / "run-tests.sh"
+REAL_COLLECTED_CHECK = REPO_ROOT / "scripts" / "ci" / "check_collected_vs_junit.py"
 REAL_SKIP_CHECK = REPO_ROOT / "scripts" / "check-no-skipped-tests.py"
 REAL_COVERAGE_CHECK = REPO_ROOT / "scripts" / "check-per-file-coverage.py"
 REAL_VENV_LOCK_CHECK = REPO_ROOT / "scripts" / "ci" / "check_venv_matches_lock.py"
@@ -42,6 +45,11 @@ def _scratch_script_root(tmp_path: Path) -> Path:
     "$REPO_ROOT"` + the script's own relative references resolve."""
     root = tmp_path / "scratch-repo"
     (root / "scripts" / "ci").mkdir(parents=True)
+    # D6 (SUITE-PARALLEL-XDIST): the full run checks junit against the serial
+    # pre-collection with the REAL checker.
+    shutil.copy(
+        REAL_COLLECTED_CHECK, root / "scripts" / "ci" / "check_collected_vs_junit.py"
+    )
     shutil.copy(REAL_SCRIPT, root / "scripts" / "ci" / "run-tests.sh")
     shutil.copy(REAL_SKIP_CHECK, root / "scripts" / "check-no-skipped-tests.py")
     shutil.copy(REAL_COVERAGE_CHECK, root / "scripts" / "check-per-file-coverage.py")
@@ -99,6 +107,7 @@ def _fake_pytest(
     junit_skipped_attr: str = "0",
     record_argv_to: Path | None = None,
     coverage_report: dict[str, tuple[int, int]] | None = None,
+    collected_ids: tuple[str, ...] = ("tests/test_fake.py::test_fake",),
 ) -> Path:
     """Stands in for the real `pytest` binary resolve_tool() finds on
     PATH. `body` is extra shell to run before writing the junit.xml
@@ -109,6 +118,7 @@ def _fake_pytest(
     while doing whatever `body` says (e.g. leaking to a real cluster
     tool, or reporting a skip / a low-coverage file)."""
     tool = bin_dir / "pytest"
+    collect_lines = "".join(f"echo {i!r}\n" for i in collected_ids)
     record_line = f'echo "$@" > "{record_argv_to}"\n' if record_argv_to else ""
     coverage_line = (
         f"python - <<'COVPY'\n{_coverage_writer_source(coverage_report)}\nCOVPY\n"
@@ -122,6 +132,8 @@ def _fake_pytest(
         'for arg in "$@"; do\n'
         '  case "$arg" in\n'
         '    --junit-xml=*) junit_path="${arg#--junit-xml=}" ;;\n'
+        '    --collect-only) echo "$@" >> "$0.collect.argv"; '
+        f"{collect_lines.replace(chr(10), '; ')}exit 0 ;;\n"
         "  esac\n"
         "done\n"
         f"{record_line}"
@@ -517,13 +529,21 @@ def test_a2_9_pytest_argument_set_matches_golden(tmp_path: Path):
     _fake_python_passthrough(bin_dir)
     _fake_real_helm(bin_dir)
 
-    result = _run_script(root, bin_dir, subset=False)
+    result = _run_script(
+        root, bin_dir, subset=False, extra_env={"RUN_TESTS_WORKERS": "3"}
+    )
 
     assert result.returncode == 0, result.stdout + result.stderr
     recorded = argv_dump.read_text().split()
+    # SUITE-PARALLEL-XDIST: `-n 3 --dist loadgroup` is the one deliberate addition to the golden
+    # set (the worker count pinned here through RUN_TESTS_WORKERS).
     golden = [
         "tests/",
         "-v",
+        "-n",
+        "3",
+        "--dist",
+        "loadgroup",
         "--cov=src",
         "--cov=bff",
         "--cov=scripts/deploy",
@@ -691,7 +711,7 @@ def test_a_missing_gate_venv_is_refused_not_skipped(tmp_path: Path):
 
 
 def _fake_docker(bin_dir: Path, log: Path) -> None:
-    """A docker that lists two containers for the run label and logs `rm -f`."""
+    """A docker that lists two containers for the run label and logs `rm -fv`."""
     _write_exec(
         bin_dir / "docker",
         "#!/usr/bin/env bash\n"
@@ -765,7 +785,7 @@ def test_sigterm_to_the_wrapper_stops_pytest_its_children_and_the_containers(
     assert not _alive(child_pid), "a grandchild of pytest was orphaned"
     log = docker_log.read_text()
     assert "label=audittrace.run-tests-id=run-tests-" in log
-    assert "rm -f cid-one cid-two" in log
+    assert "rm -fv cid-one cid-two" in log
 
 
 def test_sigint_is_handled_the_same_way(tmp_path: Path):
@@ -802,7 +822,7 @@ def test_sigint_is_handled_the_same_way(tmp_path: Path):
 
     assert proc.returncode == 130, out + err
     assert not _alive(pytest_pid)
-    assert "rm -f cid-one cid-two" in docker_log.read_text()
+    assert "rm -fv cid-one cid-two" in docker_log.read_text()
 
 
 def test_a_normal_run_removes_its_labelled_containers_too(tmp_path: Path):
@@ -815,7 +835,7 @@ def test_a_normal_run_removes_its_labelled_containers_too(tmp_path: Path):
     result = _run_script(root, bin_dir)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "rm -f cid-one cid-two" in docker_log.read_text()
+    assert "rm -fv cid-one cid-two" in docker_log.read_text()
 
 
 def test_ephemeral_postgres_is_labelled_with_the_run_id_only_when_one_is_set():
@@ -926,3 +946,114 @@ def test_inside_a_real_wrapped_run_the_label_variable_reaches_the_suite():
     if os.environ.get("HERMETIC_REQUIRED") == "1":
         args = run_label_args()
         assert args and args[1].startswith("audittrace.run-tests-id=run-tests-")
+
+
+# ───────── SUITE-PARALLEL-XDIST: worker count and the D6 collected==run gate ──
+
+
+def _full_run_argv(
+    tmp_path: Path, env: dict[str, str], **fake: object
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    root = _scratch_script_root(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    argv_dump = tmp_path / "argv.txt"
+    _fake_pytest(bin_dir, record_argv_to=argv_dump, **fake)  # type: ignore[arg-type]
+    _fake_python_passthrough(bin_dir)
+    _fake_real_helm(bin_dir)
+    return _run_script(root, bin_dir, subset=False, extra_env=env), argv_dump
+
+
+@pytest.mark.parametrize(
+    ("cores", "expected"), [(1, 1), (2, 2), (4, 4), (8, 8), (9, 8), (32, 8)]
+)
+def test_workers_default_to_min_of_cores_and_eight(
+    tmp_path: Path, cores: int, expected: int
+):
+    """No RUN_TESTS_WORKERS: `-n min(nproc, 8)`. `nproc` is faked on the PATH, so
+    the cap and the min() are pinned whatever the host has. Neuter: hard-code the
+    count or drop the cap -> RED on the rows that differ from the neutered value."""
+    root = _scratch_script_root(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    argv_dump = tmp_path / "argv.txt"
+    _fake_pytest(bin_dir, record_argv_to=argv_dump, coverage_report=PASSING_REPORT)
+    _fake_python_passthrough(bin_dir)
+    _fake_real_helm(bin_dir)
+    _write_exec(bin_dir / "nproc", f"#!/usr/bin/env bash\necho {cores}\n")
+
+    result = _run_script(root, bin_dir, subset=False)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    recorded = argv_dump.read_text().split()
+    assert recorded[recorded.index("-n") + 1] == str(expected)
+    assert f"workers={expected}" in result.stdout
+
+
+def test_workers_zero_is_serial_without_xdist(tmp_path: Path):
+    """RUN_TESTS_WORKERS=0 is the serial run: no `-n` at all. Neuter: always
+    pass -n -> RED."""
+    result, argv_dump = _full_run_argv(
+        tmp_path, {"RUN_TESTS_WORKERS": "0"}, coverage_report=PASSING_REPORT
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "-n" not in argv_dump.read_text().split()
+
+
+@pytest.mark.parametrize("bad", ["abc", "-2", "1.5", "4 "])
+def test_a_bad_worker_count_is_refused_before_pytest(tmp_path: Path, bad: str):
+    """Fail closed: a malformed RUN_TESTS_WORKERS never silently runs serial."""
+    result, argv_dump = _full_run_argv(
+        tmp_path, {"RUN_TESTS_WORKERS": bad}, coverage_report=PASSING_REPORT
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "RUN_TESTS_WORKERS must be a non-negative integer" in result.stderr
+    assert not argv_dump.exists(), "pytest ran despite a bad worker count"
+
+
+def test_the_full_run_pre_collects_serially_and_the_subset_does_not(tmp_path: Path):
+    """The pre-collection is one `--collect-only` call WITHOUT -n (serial)."""
+    result, _ = _full_run_argv(
+        tmp_path, {"RUN_TESTS_WORKERS": "2"}, coverage_report=PASSING_REPORT
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    collect_log = tmp_path / "fakebin" / "pytest.collect.argv"
+    lines = collect_log.read_text().splitlines()
+    assert len(lines) == 1
+    assert "--collect-only" in lines[0].split()
+    assert "-n" not in lines[0].split()
+    assert "collected=1 junit_testcases=1 workers=2" in result.stdout
+
+
+def test_d6_fewer_tests_run_than_collected_fails_the_full_run(tmp_path: Path):
+    """D6: three ids collected, the (fake, parallel) run reports one testcase.
+    Neuter: delete the check_collected_vs_junit call -> exit 0, RED."""
+    result, _ = _full_run_argv(
+        tmp_path,
+        {"RUN_TESTS_WORKERS": "2"},
+        coverage_report=PASSING_REPORT,
+        collected_ids=(
+            "tests/a.py::t1",
+            "tests/a.py::t2",
+            "tests/b.py::t3",
+        ),
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "collected 3 ids but junit holds 1 testcases" in result.stderr
+
+
+def test_d6_zero_collected_ids_fails_the_full_run(tmp_path: Path):
+    """A gate that ran on zero items is a failure, never a pass."""
+    result, _ = _full_run_argv(
+        tmp_path,
+        {"RUN_TESTS_WORKERS": "2"},
+        coverage_report=PASSING_REPORT,
+        collected_ids=(),
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "no test ids were collected" in result.stderr

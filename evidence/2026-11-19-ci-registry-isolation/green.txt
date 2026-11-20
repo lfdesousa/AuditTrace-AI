@@ -1,0 +1,5 @@
+# GREEN: same 639-id gw0 prefix, fix applied
+639 passed, 9 warnings in 197.86s (0:03:17)
+
+# GREEN: minimal bisect set (leaker + 3 victims), fix applied
+4 passed, 8 warnings in 15.97s
