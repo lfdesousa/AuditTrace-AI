@@ -45,3 +45,13 @@ class TestSemanticListTierOwnership:
         assert [i["tier"] for i in listing.json()["items"]] == ["corpus"]
         assert read.status_code == 403
         assert audit_rows(op="list") == [("list", "private", None)]
+
+    def test_a_write_only_caller_listing_every_collection_records_private(
+        self, client: TestClient
+    ) -> None:
+        """The all-collections branch of the clearance helper counts a corpus
+        READ scope only: a write scope on one collection clears nothing."""
+        with as_caller(client, USER, "memory:corpus:decisions:write"):
+            listing = client.get("/memory/semantic")
+        assert listing.status_code == 200, listing.text
+        assert audit_rows(op="list") == [("list", "private", None)]

@@ -17,7 +17,9 @@ from unittest.mock import patch
 
 import pytest
 from fastapi import BackgroundTasks
+from fastapi.testclient import TestClient
 
+from audittrace.identity import UserContext
 from audittrace.services.memory_audit import (
     MEMORY_AUDIT_EVENT_CLASS,
     MEMORY_AUDIT_PROJECT,
@@ -31,7 +33,9 @@ from audittrace.services.memory_audit import (
 class TestBuildRowNullOwnerGuard:
     """ADR-058 invariant — never persist an audit row with a NULL owner."""
 
-    async def test_missing_user_id_raises(self, client, user_context) -> None:
+    async def test_missing_user_id_raises(
+        self, client: TestClient, user_context: UserContext
+    ) -> None:
         empty_user = replace(user_context, user_id="")
         with pytest.raises(ValueError, match="refusing to persist"):
             await emit_memory_audit_event(
@@ -45,7 +49,7 @@ class TestBuildRowNullOwnerGuard:
 
 class TestEmitMemoryAuditEvent:
     async def test_persists_row_queryable_via_interactions(
-        self, client, user_context
+        self, client: TestClient, user_context: UserContext
     ) -> None:
         await emit_memory_audit_event(
             user=user_context,
@@ -81,7 +85,7 @@ class TestEmitMemoryAuditEvent:
         }
 
     async def test_collection_and_detail_extra_are_recorded(
-        self, client, user_context
+        self, client: TestClient, user_context: UserContext
     ) -> None:
         await emit_memory_audit_event(
             user=user_context,
@@ -102,7 +106,7 @@ class TestEmitMemoryAuditEvent:
         assert detail["hard"] is True
 
     async def test_outcome_failed_sets_failure_class(
-        self, client, user_context
+        self, client: TestClient, user_context: UserContext
     ) -> None:
         await emit_memory_audit_event(
             user=user_context,
@@ -120,7 +124,9 @@ class TestEmitMemoryAuditEvent:
         row = next(row for row in rows if row["question"].startswith("op=write"))
         assert row["failure_class"] == "memory_access_failed"
 
-    async def test_trace_id_passthrough(self, client, user_context) -> None:
+    async def test_trace_id_passthrough(
+        self, client: TestClient, user_context: UserContext
+    ) -> None:
         await emit_memory_audit_event(
             user=user_context,
             op="read",
@@ -144,7 +150,7 @@ class TestEmitMemoryAuditEventBackground:
     """The fail-open wrapper used for the READ path."""
 
     async def test_success_persists_like_the_foreground_call(
-        self, client, user_context
+        self, client: TestClient, user_context: UserContext
     ) -> None:
         await emit_memory_audit_event_background(
             user=user_context, op="list", layer="procedural", tier="private+corpus"
@@ -156,7 +162,10 @@ class TestEmitMemoryAuditEventBackground:
         assert any(row["question"] == "op=list layer=procedural key=-" for row in rows)
 
     async def test_failure_is_swallowed_and_logged(
-        self, client, user_context, monkeypatch
+        self,
+        client: TestClient,
+        user_context: UserContext,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A read must never fail because its audit-store write failed —
         the exception is caught here, not propagated.
@@ -191,7 +200,9 @@ class TestEmitMemoryAuditEventBackground:
 
 
 class TestScheduleReadAudit:
-    async def test_schedules_the_background_wrapper(self, user_context) -> None:
+    async def test_schedules_the_background_wrapper(
+        self, user_context: UserContext
+    ) -> None:
         bg = BackgroundTasks()
         schedule_read_audit(
             bg,
@@ -209,7 +220,9 @@ class TestScheduleReadAudit:
         assert task.kwargs["key"] == "k.md"
         assert task.kwargs["tier"] == "private"
 
-    async def test_runs_and_persists_when_invoked(self, client, user_context) -> None:
+    async def test_runs_and_persists_when_invoked(
+        self, client: TestClient, user_context: UserContext
+    ) -> None:
         bg = BackgroundTasks()
         schedule_read_audit(
             bg,
