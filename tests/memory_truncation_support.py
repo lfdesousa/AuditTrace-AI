@@ -138,3 +138,22 @@ def chunk_total(client: TestClient, collection: str) -> int:
     assert listing.status_code == 200, listing.text
     total: int = listing.json()["total_chunks"]
     return total
+
+
+def corpus_fold(client: TestClient, text: str) -> Any:
+    """Fold *text* through the legacy corpus-tier key ``{layer}/{filename}``
+    (no caller-sub prefix), the shape that resolves to the corpus tier, as an
+    admin (the only caller who may write a corpus-tier episodic fold)."""
+    from audittrace.auth import require_user
+    from audittrace.identity import UserContext
+
+    app: Any = client.app
+    app.dependency_overrides[require_user] = lambda: UserContext(
+        user_id=USER, username=USER, agent_type="test", scopes=SCOPES, is_admin=True
+    )
+    store = _object_store({"episodic/doc.md": text.encode("utf-8")})
+    with patch.object(m, "_get_minio_client", return_value=store):
+        return client.post(
+            "/memory/index",
+            params={"file": "episodic/doc.md", "collections": "decisions"},
+        )

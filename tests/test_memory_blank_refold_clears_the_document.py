@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from audittrace.routes import memory as m
 from tests.memory_truncation_support import (
     USER,
+    corpus_fold,
     distinct_body,
     fold,
     memory_client,
@@ -116,6 +117,19 @@ class TestBlankRefoldClearsTheDocument:
         assert removals[0]["op"] == "delete"
         assert removals[0]["key"] == "doc.md"
         assert removals[0]["removed"] == count
+        assert removals[0]["tier"] == "private"
+
+    def test_a_corpus_blank_refold_is_audited_with_the_corpus_tier(
+        self, client: TestClient
+    ) -> None:
+        assert corpus_fold(client, OLD).status_code == 200
+
+        assert corpus_fold(client, "   \n").status_code == 200
+
+        removals = [
+            d for d in memory_audit_details() if d.get("reason") == "refold_stale_tail"
+        ]
+        assert [d["tier"] for d in removals] == ["corpus"]
 
     def test_a_blank_document_that_was_never_folded_removes_and_audits_nothing(
         self, client: TestClient
