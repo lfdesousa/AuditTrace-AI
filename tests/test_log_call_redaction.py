@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from jose import jwk as _jose_jwk
 from jose import jwt
 
 from audittrace import telemetry
@@ -900,7 +901,11 @@ def test_g3_require_user_span_redacts_the_bearer(monkeypatch, _g3_env):
     from audittrace import auth as auth_mod
 
     monkeypatch.setattr(
-        auth_mod, "_fetch_jwks_keys", AsyncMock(return_value=[TEST_PUBLIC_PEM])
+        auth_mod,
+        "_fetch_jwks_keys",
+        AsyncMock(
+            return_value=[_jose_jwk.construct(TEST_PUBLIC_PEM, "RS256").to_dict()]
+        ),
     )
     auth_mod._jwks_cache.clear()
 
@@ -2319,7 +2324,11 @@ def _g8_route_env(monkeypatch, test_container):
     from unittest.mock import AsyncMock
 
     monkeypatch.setattr(
-        auth_mod, "_fetch_jwks_keys", AsyncMock(return_value=[TEST_PUBLIC_PEM])
+        auth_mod,
+        "_fetch_jwks_keys",
+        AsyncMock(
+            return_value=[_jose_jwk.construct(TEST_PUBLIC_PEM, "RS256").to_dict()]
+        ),
     )
     auth_mod._jwks_cache.clear()
     dependencies.container = test_container

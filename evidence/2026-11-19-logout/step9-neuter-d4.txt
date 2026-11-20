@@ -1,0 +1,13 @@
+== C13 neuter Step 9
+E        +  where 1 = len(['#!/usr/bin/env bash\n# Ensure the three `memory:<layer>:write` Keycloak scopes exist on\n# the audittrace realm and ...cho "istio quitquitquit: socket open failed (sidecar may already be gone)"\n  fi\n) || true\necho "Job completing."\n'])
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_hook_reconciles_the_post_logout_uri_on_an_existing_realm
+=================== 1 failed, 15 passed, 1 warning in 1.04s ====================
+== restored
+======================== 16 passed, 1 warning in 1.07s =========================
+======================== 16 passed, 1 warning in 1.12s =========================
+======================== 16 passed, 1 warning in 1.00s =========================
+======================== 16 passed, 1 warning in 1.01s =========================
+16
+(eval):35: command not found: mapfile
+ids=16
+======================== 16 passed, 1 warning in 1.06s =========================

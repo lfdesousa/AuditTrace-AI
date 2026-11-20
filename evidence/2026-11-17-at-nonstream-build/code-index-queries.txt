@@ -1,0 +1,37 @@
+### SELECT path, lineno, qualname FROM nodes WHERE kind='py:call' AND name LIKE '%tools_non_stream_upstream_error%'
+rows_sha256 4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945 n 0
+[]
+### SELECT path, lineno, qualname FROM nodes WHERE kind='py:call' AND name LIKE '%.non_stream_upstream_error%'
+rows_sha256 a5a53e7b08e390d3113e514b23ee302c17ade0c762f507d46a8ad97cdda7a91b n 2
+[{"lineno": 1740, "path": "src/audittrace/routes/chat.py", "qualname": "_handle_tools_mode|upstream_errors.non_stream_upstream_error@1740:21"}, {"lineno": 2348, "path": "src/audittrace/routes/chat.py", "qualname": "_chat_completions_impl|upstream_errors.non_stream_upstream_error@2348:21"}]
+### SELECT path, lineno, qualname FROM nodes WHERE kind='py:call' AND name LIKE '%client_error_response%'
+rows_sha256 4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945 n 0
+[]
+### SELECT path, lineno, qualname FROM nodes WHERE kind='py:call' AND name LIKE '%_map_error_code_to_failure_class%'
+rows_sha256 4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945 n 0
+[]
+### SELECT path, count(*) AS classes FROM nodes WHERE kind='py:class' AND path='src/audittrace/routes/_upstream_errors.py' GROUP BY path
+rows_sha256 cdf633ab30ae2838955807b217084f1e8792f43585ec39fb9c01aeb5864fff28 n 1
+[{"classes": 1, "path": "src/audittrace/routes/_upstream_errors.py"}]
+### SELECT path, lineno, qualname FROM nodes WHERE kind='py:call' AND name='StreamReplyCheck'
+rows_sha256 83f9b50904e47095293be3e6ca41c74bbf0c3092d405a5629b98fb52726e719d n 2
+[{"lineno": 1226, "path": "src/audittrace/routes/chat.py", "qualname": "_stream_memory_tool_loop|StreamReplyCheck@1226:24"}, {"lineno": 2060, "path": "src/audittrace/routes/chat.py", "qualname": "_chat_completions_impl._iter_and_capture|StreamReplyCheck@2060:32"}]
+### SELECT name FROM nodes WHERE kind='py:class' AND path='src/audittrace/routes/_stream_reply.py'
+rows_sha256 c73e94151352573c5cbc71cbab1287f16e93d698cda2fd579134353c15aa428c n 1
+[{"name": "StreamReplyCheck"}]
+### SELECT path, lineno, qualname FROM nodes WHERE kind='py:call' AND name LIKE '%.completion_body' AND path LIKE 'src/%'
+rows_sha256 9a04792c419a6aca2efea4635c00848587955f0d328a8e12715913f0cbc0222a n 3
+[{"lineno": 380, "path": "src/audittrace/routes/_memory_tool_loop.py", "qualname": "_post_with_tool_parse_retry|upstream_errors.completion_body@380:7"}, {"lineno": 404, "path": "src/audittrace/routes/_memory_tool_loop.py", "qualname": "_post_with_tool_parse_retry|upstream_errors.completion_body@404:15"}, {"lineno": 425, "path": "src/audittrace/routes/_memory_tool_loop.py", "qualname": "_post_with_tool_parse_retry|upstream_errors.completion_body@425:15"}]
+### manifest
+{
+ "commit": "010fd74e0b99f46f894b9965978bb5769a0490f2",
+ "content_sha256": "7279dce3a775cf12d3d4ee926f4103830ca5d8845e706221d0ebd4e42bd61c94",
+ "counts": {
+  "helm:cell": 5,
+  "k8s:container": 97,
+  "k8s:object": 529,
+  "k8s:serviceaccount": 72,
+  "py:alembic_revision": 35,
+  "py:assert": 17608,
+  "py:assign": 958,
+  "py:call": 65354,

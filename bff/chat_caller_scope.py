@@ -39,7 +39,7 @@ def insufficient_scope_response(inbound_sub: str, missing: list[str]) -> JSONRes
         ",".join(missing),
     )
     named = ", ".join(f"'{scope}'" for scope in missing)
-    return JSONResponse(
+    response = JSONResponse(
         status_code=403,
         content={
             "error": {
@@ -58,3 +58,5 @@ def insufficient_scope_response(inbound_sub: str, missing: list[str]) -> JSONRes
         },
         headers={"WWW-Authenticate": _CHALLENGE},
     )
+    response.refusal_code = "insufficient_scope"  # type: ignore[attr-defined]
+    return response

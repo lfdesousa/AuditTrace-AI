@@ -19,7 +19,7 @@ os.environ.setdefault("AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET", "test-secret-neve
 import pytest  # noqa: E402
 from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
-from jose import jwt  # noqa: E402
+from jose import jwk, jwt  # noqa: E402
 
 from bff import auth as bff_auth  # noqa: E402
 from bff.config import get_settings  # noqa: E402
@@ -42,6 +42,15 @@ TEST_PUBLIC_PEM = _test_public_key.public_bytes(
 
 TEST_ISSUER = "http://keycloak:8080/realms/audittrace"
 
+# The realm's JWKS entry for the test key, as Keycloak publishes one (a JSON
+# Web Key with kid, use and alg), and the kid a token signed by it names.
+TEST_KID = "test-rs256-1"
+TEST_JWK: dict[str, str] = {
+    **jwk.construct(TEST_PUBLIC_PEM, "RS256").to_dict(),
+    "kid": TEST_KID,
+    "use": "sig",
+}
+
 
 def make_token(
     sub: str = "alice",
@@ -49,6 +58,7 @@ def make_token(
     exp_offset: int = 3600,
     extra_claims: dict | None = None,
     private_pem: str = TEST_PRIVATE_PEM,
+    kid: str | None = TEST_KID,
 ) -> str:
     """Sign a test JWT. No ``aud`` claim by default — the BFF's inbound-
     token validation deliberately does not enforce one (see
@@ -63,7 +73,8 @@ def make_token(
     }
     if extra_claims:
         claims.update(extra_claims)
-    return jwt.encode(claims, private_pem, algorithm="RS256")
+    headers = {"kid": kid} if kid is not None else None
+    return jwt.encode(claims, private_pem, algorithm="RS256", headers=headers)
 
 
 @pytest.fixture(autouse=True)

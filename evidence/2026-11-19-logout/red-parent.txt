@@ -1,0 +1,11 @@
+E       AssertionError: assert None == 'true'
+E        +  where None = <built-in method get of dict object at 0x7e4babe75d40>('OPENID_USE_END_SESSION_ENDPOINT')
+E        +    where <built-in method get of dict object at 0x7e4babe75d40> = {'HOST': '0.0.0.0', 'PORT': '3080', 'MONGO_URI': 'mongodb://audittrace-librechat-mongodb:27017/LibreChat', 'DOMAIN_CLIENT': 'https://librechat.audittrace.local', ...}.get
+E       AssertionError: assert None == 'https://librechat.audittrace.local/login'
+E        +  where 'https://librechat.audittrace.local/login' = _logout_return_page([{'kind': 'NetworkPolicy', 'apiVersion': 'networking.k8s.io/v1', 'metadata': {'name': 'audittrace-postgresql', 'namesp...rnetes.io/instance': 'audittrace', 'app.kubernetes.io/name': 'redis', 'app.kubernetes.io/component': 'master'}}}}, ...])
+E       AssertionError: assert None == 'https://librechat.audittrace.local/login'
+E        +  where 'https://librechat.audittrace.local/login' = _logout_return_page([{'kind': 'NetworkPolicy', 'apiVersion': 'networking.k8s.io/v1', 'metadata': {'name': 'audittrace-postgresql', 'namesp...rnetes.io/instance': 'audittrace', 'app.kubernetes.io/name': 'redis', 'app.kubernetes.io/component': 'master'}}}}, ...])
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_librechat_logout_ends_the_sso_session
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_logout_return_page_is_allowed_by_the_realm[repository file]
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_logout_return_page_is_allowed_by_the_realm[chart]
+================= 3 failed, 12 deselected, 1 warning in 0.37s ==================

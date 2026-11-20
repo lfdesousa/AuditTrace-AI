@@ -3122,6 +3122,39 @@ class TestPdfRedactions:
             config_mod.get_settings.cache_clear()
 
 
+@pytest.fixture
+def pyhanko_imported() -> None:
+    """Import the pyhanko modules BEFORE a cell patches ``PdfFileReader``.
+
+    On a cold interpreter ``incremental_writer`` would otherwise be imported for
+    the first time while the class is a mock and fail evaluating
+    ``PdfFileReader | None`` (the cell then only passed when an earlier test in
+    the same process had imported it: order dependence, seen under pytest-xdist)."""
+    import pyhanko.pdf_utils.incremental_writer  # noqa: F401
+    import pyhanko.sign.validation  # noqa: F401
+
+
+@pytest.fixture
+def primed_trust_roots(monkeypatch: pytest.MonkeyPatch, pyhanko_imported: None) -> None:
+    """Deterministic state for the as-of-signing-time retry cells.
+
+    The retry path needs ``_VC_TRUST_ROOTS`` to be non-empty AFTER
+    ``_get_validation_context`` has run. These cells used to set the module
+    global by hand and rely on a PREVIOUS test having left a cached
+    ``ValidationContext`` under the same key (the lock-free fast path); on a cold
+    or different cache the slow path reset the roots to ``[]`` and the cell read
+    ``signed_untrusted`` (order dependence, seen under pytest-xdist). The
+    context lookup is replaced and the roots primed through ``monkeypatch``, so
+    nothing leaks into the next test either."""
+    from audittrace.routes.memory_pdf import signature as _sig
+
+    monkeypatch.setattr(
+        _sig, "_get_validation_context", lambda trust_store_path: MagicMock(name="vc")
+    )
+    monkeypatch.setattr(_sig, "_VC_TRUST_ROOTS", [MagicMock(name="trust-root-cert")])
+
+
+@pytest.mark.usefixtures("pyhanko_imported")
 class TestPdfSignatureValidation:
     """PDF signature validation (gap-inventory item #12).
 
@@ -3266,6 +3299,7 @@ class TestPdfSignatureValidation:
         assert status == "signed_untrusted"
         assert count == 1
 
+    @pytest.mark.usefixtures("primed_trust_roots")
     async def test_signed_expired_returns_signed_expired(self) -> None:
         """ADR-054 §1 — chain doesn't validate at present (e.g. cert
         expired) but DOES validate as-of the self-reported signing
@@ -3276,13 +3310,10 @@ class TestPdfSignatureValidation:
         from datetime import UTC, datetime
 
         from audittrace.routes.memory import _pdf_signature_status
-        from audittrace.routes.memory_pdf import signature as _sig
 
-        # Prime the trust-roots cache so the retry path can build a
-        # second ValidationContext. Sentinel value — pyhanko's ctor
-        # is mocked below, so the contents don't need to be a real
-        # cert list.
-        _sig._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
+        # The trust roots the retry path needs are primed by the
+        # ``primed_trust_roots`` fixture (sentinel values; pyhanko's ctor is
+        # mocked below, so they need not be real certs).
 
         fake_emb = MagicMock()
         fake_emb.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
@@ -3312,6 +3343,7 @@ class TestPdfSignatureValidation:
         assert status == "signed_expired"
         assert count == 1
 
+    @pytest.mark.usefixtures("primed_trust_roots")
     async def test_signed_untrusted_when_retry_also_fails(self) -> None:
         """ADR-054 §2 — retry path: when the as-of-signing-time
         re-validation ALSO returns trusted=False (the chain doesn't
@@ -3321,9 +3353,6 @@ class TestPdfSignatureValidation:
         from datetime import UTC, datetime
 
         from audittrace.routes.memory import _pdf_signature_status
-        from audittrace.routes.memory_pdf import signature as _sig
-
-        _sig._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
 
         fake_emb = MagicMock()
         fake_emb.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
@@ -3352,6 +3381,7 @@ class TestPdfSignatureValidation:
         assert status == "signed_untrusted"
         assert count == 1
 
+    @pytest.mark.usefixtures("primed_trust_roots")
     async def test_signed_untrusted_when_retry_rejects_the_document(self) -> None:
         """ADR-054 §2 + spec #460 S5 — if the as-of-signing-time retry
         validation raises a DOCUMENT failure type (the cert does not
@@ -3367,9 +3397,6 @@ class TestPdfSignatureValidation:
         from pyhanko_certvalidator.errors import PathError
 
         from audittrace.routes.memory import _pdf_signature_status
-        from audittrace.routes.memory_pdf import signature as _sig
-
-        _sig._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
 
         fake_emb = MagicMock()
         fake_emb.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
@@ -3396,6 +3423,7 @@ class TestPdfSignatureValidation:
         assert status == "signed_untrusted"
         assert count == 1
 
+    @pytest.mark.usefixtures("primed_trust_roots")
     async def test_retry_context_construction_crash_is_check_error(self) -> None:
         """Spec #460 S5 / B-1 — our own retry ``ValidationContext``
         construction crashing is NOT a document failure: ``check_error``
@@ -3405,9 +3433,6 @@ class TestPdfSignatureValidation:
         from datetime import UTC, datetime
 
         from audittrace.routes.memory import _pdf_signature_status
-        from audittrace.routes.memory_pdf import signature as _sig
-
-        _sig._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
 
         fake_emb = MagicMock()
         fake_emb.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
@@ -3438,6 +3463,7 @@ class TestPdfSignatureValidation:
         assert status == "check_error"
         assert count == 0
 
+    @pytest.mark.usefixtures("primed_trust_roots")
     async def test_signed_untrusted_takes_precedence_over_signed_expired(self) -> None:
         """ADR-054 §4 — multi-sig document with one expired sig and
         one untrusted sig flags as ``signed_untrusted``. ``untrusted``
@@ -3447,9 +3473,6 @@ class TestPdfSignatureValidation:
         from datetime import UTC, datetime
 
         from audittrace.routes.memory import _pdf_signature_status
-        from audittrace.routes.memory_pdf import signature as _sig
-
-        _sig._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
 
         sig_a = MagicMock()
         sig_a.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)

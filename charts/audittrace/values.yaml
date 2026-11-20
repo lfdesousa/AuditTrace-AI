@@ -1131,6 +1131,13 @@ console:
     # var below (never coerced to "sovereign"), so an operator can flip it
     # back to "mongo" and the fork reverts, no chart-code change needed.
     memoryBackend: "sovereign"
+    # BFF-CHAT-ROUTE-ERRORS R9 (operator ruling Q2) -- the retry bound of the
+    # fork's model client for the AuditTrace custom endpoint, rendered as
+    # `addParams: {maxRetries: N}` in librechat.yaml. The client retries every
+    # 5xx; absent, one refused turn is 7 requests and about 70-120 s of silence
+    # (measured on the fork's built getOpenAIConfig). 1 = one quick retry that
+    # rides out a pod restart; 0 = none. Applies to every failure of the endpoint.
+    endpointMaxRetries: 1
     # M3-WU-D2-4 — timeout for the panel's memory CRUD calls to the BFF
     # (milliseconds). Panel memory CRUD via the BFF is fast; the observed
     # ~150-180s latency belongs to the CHAT recall-tool-loop over `/v1`,
@@ -1145,10 +1152,12 @@ console:
       limits:
         cpu: 1000m
         memory: 1Gi
-    # D2 — OIDC token-forwarding config. `openidScope` MUST carry
-    # `offline_access` (refresh token — the #1 stale-token risk mitigation)
-    # alongside the standard `profile`/`email` scopes the D3 realm reconcile
-    # adds to `audittrace-librechat`.
+    # D2 — OIDC token-forwarding config. `openidScope` carries the standard
+    # `profile`/`email` scopes the D3 realm reconcile adds to
+    # `audittrace-librechat`. It MUST NOT carry `offline_access`
+    # (BFF-CHAT-ROUTE-ERRORS ADDENDUM-2, measured on Keycloak 24.0.5): with it,
+    # a token of a signed-out user keeps exchanging until it expires. Without
+    # it the refresh token lives and dies with the SSO session.
     #
     # LC-10a (operator ruling "A: all BFF write scopes", 2026-11-08):
     # Keycloak 24's legacy token exchange keeps only the requested scopes the
@@ -1160,7 +1169,7 @@ console:
     # from those modules and fails when this value stops covering it. Users
     # must log in again after a change.
     openidScope: >-
-      openid profile email offline_access
+      openid profile email
       memory:agents:read-own
       memory:agents:write
       memory:chat_projects:read-own

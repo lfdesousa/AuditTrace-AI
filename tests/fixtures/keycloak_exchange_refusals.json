@@ -1,0 +1,96 @@
+{
+ "_comment": "Written by scripts/keycloak/run-exchange-refusals-measurement.sh. Do not edit by hand: re-run the measurement when the pinned Keycloak changes.",
+ "cases": {
+  "C0 control: valid session, permission granted": {
+   "cause_class": "none",
+   "error": null,
+   "status": 200
+  },
+  "C0b control after the sequence: valid session": {
+   "cause_class": "none",
+   "error": null,
+   "status": 200
+  },
+  "C0c control: login without offline_access, valid session": {
+   "cause_class": "none",
+   "error": null,
+   "status": 200
+  },
+  "C1 audience client present, exchange permission not yet granted (the rc1 state)": {
+   "cause_class": "bff-configuration",
+   "error": "access_denied",
+   "status": 403
+  },
+  "C2 wrong client secret": {
+   "cause_class": "bff-configuration",
+   "error": "unauthorized_client",
+   "status": 401
+  },
+  "C3 audience that does not exist": {
+   "cause_class": "bff-configuration",
+   "error": "invalid_client",
+   "status": 400
+  },
+  "C4 audience client without an exchange permission": {
+   "cause_class": "bff-configuration",
+   "error": "access_denied",
+   "status": 403
+  },
+  "C5 the BFF client is disabled": {
+   "cause_class": "bff-configuration",
+   "error": "invalid_client",
+   "status": 401
+  },
+  "S1 subject token is not a JWT": {
+   "cause_class": "subject-token",
+   "error": "invalid_token",
+   "status": 400
+  },
+  "S2 subject token signed by a foreign key": {
+   "cause_class": "subject-token",
+   "error": "invalid_token",
+   "status": 400
+  },
+  "S3 subject token absent": {
+   "cause_class": "bff-configuration",
+   "error": "unknown_error",
+   "status": 500
+  },
+  "S4a session ended by an administrator; login scope as deployed (with offline_access); same unexpired token": {
+   "cause_class": "subject-token",
+   "error": null,
+   "status": 200
+  },
+  "S4b the same token again, 2 s later": {
+   "cause_class": "subject-token",
+   "error": null,
+   "status": 200
+  },
+  "S4c session ended by an administrator; login WITHOUT offline_access; same unexpired token": {
+   "cause_class": "subject-token",
+   "error": "invalid_token",
+   "status": 400
+  },
+  "S4d the user's online session deleted by id (admin console 'Sign out' on one session); login scope as deployed": {
+   "cause_class": "subject-token",
+   "error": null,
+   "status": 200
+  },
+  "S5 the user was disabled": {
+   "cause_class": "subject-token",
+   "error": "invalid_token",
+   "status": 400
+  },
+  "S6 subject token expired": {
+   "cause_class": "subject-token",
+   "error": "invalid_token",
+   "status": 400
+  }
+ },
+ "image": "quay.io/keycloak/keycloak:24.0",
+ "image_digests": [
+  "sha256:f8ade94c1d0ad2f2fa7734a455fee5392764f402c43ca35e9af6bf63a2541dc9"
+ ],
+ "image_id": "sha256:f8ade94c1d0ad2f2fa7734a455fee5392764f402c43ca35e9af6bf63a2541dc9",
+ "keycloak_version": "24.0.5"
+}

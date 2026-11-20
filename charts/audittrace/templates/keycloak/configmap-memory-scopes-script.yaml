@@ -2042,6 +2042,49 @@ data:
     echo "  ✓ audittrace-librechat redirectUris=[\"${CONSOLE_REDIRECT_URI}\"] webOrigins=[\"${CONSOLE_WEB_ORIGIN}\"]"
     echo "✅ audittrace-librechat redirect reconcile complete."
 
+    # ── Step 7: reconcile the login client's access-token lifetime ──
+    # (BFF-CHAT-ROUTE-ERRORS ADDENDUM-2)
+    #
+    # The realm default is a day. A token the LibreChat login client was
+    # issued must not outlive a sign-out by more than five minutes; LibreChat
+    # refreshes it (OPENID_REUSE_TOKENS). Same reason as Step 6 for doing it
+    # here: --import-realm never updates an existing realm. This ONE client
+    # only: the CLI clients keep their own lifetimes.
+    ACL_E2E_STAGE="login-token-lifetime-reconcile"
+    echo "▶ reconciling audittrace-librechat access.token.lifespan..."
+    acl_e2e_kc update "clients/${LIBRECHAT_CLIENT_UUID}" -r "${REALM}" \
+      -s 'attributes."access.token.lifespan"=300' >/dev/null
+    echo "  ✓ audittrace-librechat access.token.lifespan=300"
+
+    # ── Step 8: reconcile the realm's SSO idle timeout ──
+    # (BFF-CHAT-ROUTE-ERRORS ADDENDUM-3)
+    #
+    # Without offline_access the LibreChat refresh token lives and dies with
+    # the SSO session. Keycloak's default idle timeout is 30 minutes; the
+    # realm sets a working day instead. Same reason as Steps 6 and 7 for
+    # doing it here.
+    ACL_E2E_STAGE="sso-idle-reconcile"
+    echo "▶ reconciling the realm's ssoSessionIdleTimeout..."
+    acl_e2e_kc update "realms/${REALM}" -s 'ssoSessionIdleTimeout=28800' >/dev/null
+    echo "  ✓ ${REALM} ssoSessionIdleTimeout=28800"
+
+    # ── Step 9: reconcile the login client's post-logout redirect ──
+    # (BFF-CHAT-ROUTE-ERRORS ADDENDUM-2 finding 1, Q15)
+    #
+    # A LibreChat logout redirects to the realm's end_session_endpoint
+    # (OPENID_USE_END_SESSION_ENDPOINT) with post_logout_redirect_uri =
+    # DOMAIN_CLIENT/login. Keycloak refuses a post-logout URI the client
+    # does not list, and --import-realm never updates an existing realm,
+    # so the running realm needs it set here. SETS the attribute to one
+    # exact HTTPS URI (no wildcard), driven by console.librechat.host like
+    # Step 6. Idempotent. The confirmation line prints only after the write
+    # succeeds (set -e exits first on failure).
+    ACL_E2E_STAGE="post-logout-redirect-reconcile"
+    echo "▶ reconciling audittrace-librechat post.logout.redirect.uris..."
+    acl_e2e_kc update "clients/${LIBRECHAT_CLIENT_UUID}" -r "${REALM}" \
+      -s 'attributes."post.logout.redirect.uris"=https://{{ .Values.console.librechat.host }}/login' >/dev/null
+    echo "  ✓ audittrace-librechat post.logout.redirect.uris=https://{{ .Values.console.librechat.host }}/login"
+
     # ── Istio sidecar shutdown ────────────────────────────────────
     # Same intent as the summariser-role Job (Phase C.8 root cause):
     # without telling Envoy to quit, istio-proxy keeps the Pod 2/3

@@ -1,0 +1,4 @@
+FAILED tests/bff/test_path_guard.py::test_a_path_that_means_something_else_is_refused[control_character_delete]
+FAILED tests/bff/test_path_guard.py::test_a_path_that_means_something_else_is_refused[control_character_nul]
+FAILED tests/bff/test_path_guard.py::test_a_path_that_means_something_else_is_refused[control_character_tab]
+========================= 3 failed, 26 passed in 1.73s =========================

@@ -1,0 +1,3 @@
+Required test coverage of 90% reached. Total coverage: 98.95%
+========== 183 failed, 11524 passed, 3 warnings in 2938.21s (0:48:58) ==========
+all 183 failures are in tests/test_dep_lock_g4_chokepoint.py: it scanned the A1 evidence file's lines naming the requirements files. Fixed by removing those two lines (evidence-only); scoped rerun: 237 passed (test_dep_lock_g4_chokepoint.py + test_adr049_evidence_check.py).

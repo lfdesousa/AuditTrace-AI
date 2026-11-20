@@ -17,8 +17,8 @@ from bff.auth import InboundTokenError, get_jwks_keys, validate_inbound_token
 from bff.config import Settings
 from tests.bff.conftest import (
     TEST_ISSUER,
+    TEST_JWK,
     TEST_PRIVATE_PEM,
-    TEST_PUBLIC_PEM,
     make_token,
 )
 
@@ -49,29 +49,29 @@ def _client_returning_keys(
 class TestValidateInboundToken:
     async def test_valid_token_returns_claims(self) -> None:
         token = make_token(sub="alice")
-        client = _client_returning_keys([TEST_PUBLIC_PEM])
+        client = _client_returning_keys([TEST_JWK])
         claims = await validate_inbound_token(token, _settings(), client)
         assert claims["sub"] == "alice"
 
     async def test_missing_token_rejected(self) -> None:
-        client = _client_returning_keys([TEST_PUBLIC_PEM])
+        client = _client_returning_keys([TEST_JWK])
         with pytest.raises(InboundTokenError, match="missing bearer token"):
             await validate_inbound_token(None, _settings(), client)
 
     async def test_blank_token_rejected(self) -> None:
-        client = _client_returning_keys([TEST_PUBLIC_PEM])
+        client = _client_returning_keys([TEST_JWK])
         with pytest.raises(InboundTokenError, match="missing bearer token"):
             await validate_inbound_token("   ", _settings(), client)
 
     async def test_expired_token_rejected(self) -> None:
         token = make_token(sub="alice", exp_offset=-3600)
-        client = _client_returning_keys([TEST_PUBLIC_PEM])
+        client = _client_returning_keys([TEST_JWK])
         with pytest.raises(InboundTokenError, match="invalid or expired"):
             await validate_inbound_token(token, _settings(), client)
 
     async def test_wrong_issuer_rejected(self) -> None:
         token = make_token(sub="alice", issuer="http://evil/realms/other")
-        client = _client_returning_keys([TEST_PUBLIC_PEM])
+        client = _client_returning_keys([TEST_JWK])
         with pytest.raises(InboundTokenError, match="invalid or expired"):
             await validate_inbound_token(token, _settings(), client)
 
@@ -79,7 +79,7 @@ class TestValidateInboundToken:
         """ADR-032-style multi-issuer: a token from an EXTRA allowed
         issuer validates the same as the primary."""
         token = make_token(sub="alice", issuer="http://gateway/realms/audittrace")
-        client = _client_returning_keys([TEST_PUBLIC_PEM])
+        client = _client_returning_keys([TEST_JWK])
         settings = _settings(
             keycloak_issuer_extras=["http://gateway/realms/audittrace"]
         )
@@ -94,7 +94,7 @@ class TestValidateInboundToken:
             TEST_PRIVATE_PEM,
             algorithm="RS256",
         )
-        client = _client_returning_keys([TEST_PUBLIC_PEM])
+        client = _client_returning_keys([TEST_JWK])
         with pytest.raises(InboundTokenError, match="no usable 'sub'"):
             await validate_inbound_token(bad_token, _settings(), client)
 
@@ -113,7 +113,7 @@ class TestValidateInboundToken:
             other_pem,
             algorithm="RS256",
         )
-        client = _client_returning_keys([TEST_PUBLIC_PEM])
+        client = _client_returning_keys([TEST_JWK])
         with pytest.raises(InboundTokenError, match="invalid or expired"):
             await validate_inbound_token(forged, _settings(), client)
 
@@ -139,7 +139,7 @@ class TestValidateInboundToken:
 class TestJwksCache:
     async def test_cache_hit_skips_refetch(self) -> None:
         calls: list[int] = []
-        client = _client_returning_keys([TEST_PUBLIC_PEM], call_counter=calls)
+        client = _client_returning_keys([TEST_JWK], call_counter=calls)
         settings = _settings(jwks_cache_ttl_seconds=300)
 
         await get_jwks_keys(client, settings)
@@ -149,7 +149,7 @@ class TestJwksCache:
 
     async def test_cache_expiry_triggers_refetch(self) -> None:
         calls: list[int] = []
-        client = _client_returning_keys([TEST_PUBLIC_PEM], call_counter=calls)
+        client = _client_returning_keys([TEST_JWK], call_counter=calls)
         settings = _settings(jwks_cache_ttl_seconds=0)
 
         await get_jwks_keys(client, settings)

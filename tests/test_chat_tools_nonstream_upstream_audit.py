@@ -182,8 +182,8 @@ class TestToolsNonStreamUnmatchedUpstreamErrorIsAudited:
         fake = _json_client(400, LLAMA_CONTEXT_EXCEEDED_BODY)
         with _patch_async_client(fake), _patch_tool_loop_client(fake):
             response = _post(client, PLAIN_MESSAGES, stream=False)
-        # Client-visible behaviour KEPT: HTTP 200 + the upstream body verbatim.
-        assert response.status_code == 200
+        # An upstream 4xx with an ``error`` object is relayed: its own status and body.
+        assert response.status_code == 400
         assert response.json() == LLAMA_CONTEXT_EXCEEDED_BODY
         row = await _failed_upstream_row(400)
         assert "exceeds the available context size" in row.error_detail
@@ -195,7 +195,7 @@ class TestToolsNonStreamUnmatchedUpstreamErrorIsAudited:
         fake = _json_client(400, LLAMA_UNRELATED_400_BODY)
         with _patch_async_client(fake), _patch_tool_loop_client(fake):
             response = _post(client, UPLOAD_TO_PROVIDER_MESSAGES, stream=False)
-        assert response.status_code == 200
+        assert response.status_code == 400
         assert response.json() == LLAMA_UNRELATED_400_BODY
         row = await _failed_upstream_row(400)
         assert LLAMA_UNRELATED_400_BODY["error"]["message"] in row.error_detail
@@ -211,16 +211,18 @@ class TestToolsNonStreamUnmatchedUpstreamErrorIsAudited:
         row = await _failed_upstream_row(404)
         assert "upstream not found" in row.error_detail
         _assert_identity(row, PROMPT)
-        # A body that is not JSON cannot be returned as a completion: same
-        # class as the 5xx arm (502), no longer the ADR-033 500 envelope.
+        # A body that is not JSON cannot be relayed: the proxy's own 502 (the OpenAI
+        # error object plus ``detail``), never the ADR-033 500 envelope.
         assert response.status_code == 502
-        assert response.json() == {"detail": "llama-server returned 404"}
+        reply = response.json()
+        assert reply["detail"] == "llama-server returned 404"
+        assert reply["error"]["code"] == "upstream_error"
 
     async def test_unmatched_400_detail_is_cut_at_400_chars(self, client, tools_mode):
         fake = _json_client(400, LLAMA_LONG_400_BODY)
         with _patch_async_client(fake), _patch_tool_loop_client(fake):
             response = _post(client, PLAIN_MESSAGES, stream=False)
-        assert response.status_code == 200
+        assert response.status_code == 400
         row = await _failed_upstream_row(400)
         assert len(row.error_detail) == DETAIL_PREFIX_LEN + DETAIL_CUT
 
@@ -276,7 +278,9 @@ class TestToolsNonStreamPins:
         with _patch_async_client(fake), _patch_tool_loop_client(fake):
             response = _post(client, PLAIN_MESSAGES, stream=False)
         assert response.status_code == 502
-        assert response.json() == {"detail": "llama-server returned 500"}
+        reply = response.json()
+        assert reply["detail"] == "llama-server returned 500"
+        assert reply["error"]["code"] == "upstream_error"
         row = await _failed_upstream_row(500)
         assert "out of memory" in row.error_detail
         _assert_identity(row, PROMPT)
@@ -295,9 +299,9 @@ class TestToolsNonStreamPins:
 
 class TestStreamDetailPrefersUpstreamText:
     # ADDENDUM-1 (operator Q3): the streamed error_detail carries the upstream
-    # BODY TEXT, cut at 400; str(exc) only when the body is empty. Supersedes
+    # BODY TEXT, cut at 400; (empty reply) when the body is empty (never httpx's URL sentence). Supersedes
     # the v1 pins S1/S2 (which pinned str(exc) for a non-empty body).
-    STR_EXC_START = "status=500: Server error '500 Internal Server Error' for url 'http://llama.test/xxxx"
+    EMPTY_REPLY_DETAIL = "status=500: (empty reply)"
     LONG_500 = json.dumps(
         {"error": {"code": 500, "message": LONG_MESSAGE, "type": "server_error"}}
     ).encode()
@@ -309,33 +313,35 @@ class TestStreamDetailPrefersUpstreamText:
         assert response.status_code == 200
         assert "data: [DONE]" in response.text
         row = await _failed_upstream_row(500)
-        print(f"DIAG detail[:60]={row.error_detail[:60]!r} len={len(row.error_detail)}")
-        assert len(row.error_detail) == DETAIL_PREFIX_LEN + DETAIL_CUT
         return row.error_detail
 
     async def test_tools_stream_5xx_detail_is_upstream_text_cut_at_400(
         self, client, tools_mode
     ):
         detail = await self._detail(client, self.LONG_500, tools=True)
+        assert len(detail) == DETAIL_PREFIX_LEN + DETAIL_CUT
         assert detail == "status=500: " + self.LONG_500.decode()[:DETAIL_CUT]
 
     async def test_inject_stream_5xx_detail_is_upstream_text_cut_at_400(
         self, client, inject_mode
     ):
         detail = await self._detail(client, self.LONG_500, tools=False)
+        assert len(detail) == DETAIL_PREFIX_LEN + DETAIL_CUT
         assert detail == "status=500: " + self.LONG_500.decode()[:DETAIL_CUT]
 
-    async def test_tools_stream_5xx_empty_body_falls_back_to_str_exc(
+    async def test_tools_stream_5xx_empty_body_is_empty_reply_without_url(
         self, client, tools_mode
     ):
         detail = await self._detail(client, b"", tools=True)
-        assert detail.startswith(self.STR_EXC_START)
+        assert detail == self.EMPTY_REPLY_DETAIL
+        assert "llama.test" not in detail
 
-    async def test_inject_stream_5xx_empty_body_falls_back_to_str_exc(
+    async def test_inject_stream_5xx_empty_body_is_empty_reply_without_url(
         self, client, inject_mode
     ):
         detail = await self._detail(client, b"", tools=False)
-        assert detail.startswith(self.STR_EXC_START)
+        assert detail == self.EMPTY_REPLY_DETAIL
+        assert "llama.test" not in detail
 
 
 # ───────────── ADDENDUM-1: sequenced upstream (real httpx.Response per call) ─────────────
@@ -430,7 +436,7 @@ class TestFailedTurnKeepsToolCallRows:
         with _patch_async_client(fake), _patch_tool_loop_client(fake):
             response = _post(client, PLAIN_MESSAGES, stream=False)
         assert len(fake.post_calls) == 2
-        assert response.status_code == 200
+        assert response.status_code == 400
         assert response.json() == LLAMA_CONTEXT_EXCEEDED_BODY
         await _assert_one_recall_row_on_failed_turn(400)
 

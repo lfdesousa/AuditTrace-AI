@@ -1,0 +1,6 @@
+##### ac2 head
+{"head": {"lines": 2423, "_handle_tools_mode": 9, "_chat_completions_impl": 18}, "bounds": {"_chat_completions_impl": 18, "_handle_tools_mode": 9, "lines": 2423}, "missing": [], "broken": [], "holds": true}
+rc=0
+##### ac2 self-test
+{"head": {"lines": 2423, "_handle_tools_mode": 9, "_chat_completions_impl": 19}, "bounds": {"_chat_completions_impl": 18, "_handle_tools_mode": 9, "lines": 2423}, "missing": [], "broken": ["_chat_completions_impl"], "holds": false, "self_test": {"lines_before": 2423, "lines_after": 2423, "impl_before": 18, "impl_after": 19}}
+rc=1

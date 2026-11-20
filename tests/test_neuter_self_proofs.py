@@ -725,15 +725,41 @@ def test_proof_l_collection_error_precedence(tmp_path):
 # ───────────────────────────── m. heavy cap (BL-1) ───────────────────────
 
 
+def _wait_for_file(path: Path, timeout_s: float = 60.0) -> None:
+    """Block until ``path`` exists. Bounded only so a broken child fails the
+    test instead of hanging it; the bound is never what the test asserts on."""
+    deadline = time.monotonic() + timeout_s
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"{path} never appeared within {timeout_s}s")
+        time.sleep(0.05)
+
+
 def test_proof_m_pool_refuses_while_hold_shared_running(tmp_path):
     repo = _init_repo(tmp_path)
     lock_path = tmp_path / "pool.lock"
+    # hold-shared takes LOCK_SH, THEN runs the command: the command touches
+    # `ready` (so the lock is provably held) and keeps running until this test
+    # removes `hold`. No guessed sleep: a loaded machine (pytest-xdist) starts
+    # the child later than any fixed delay.
+    hold = tmp_path / "hold"
+    ready = tmp_path / "ready"
+    hold.touch()
     child = subprocess.Popen(
-        [PYTHON, "-m", "scripts.neuter.runner", "hold-shared", "--", "sleep", "2"],
+        [
+            PYTHON,
+            "-m",
+            "scripts.neuter.runner",
+            "hold-shared",
+            "--",
+            "sh",
+            "-c",
+            f'touch "{ready}"; while [ -e "{hold}" ]; do sleep 0.05; done',
+        ],
         env={**os.environ, "AUDITTRACE_NEUTER_LOCK": str(lock_path)},
     )
     try:
-        time.sleep(0.4)  # let the child acquire LOCK_SH
+        _wait_for_file(ready)
         spec_path = tmp_path / "neuters.json"
         spec_path.write_text(
             json.dumps(
@@ -775,7 +801,8 @@ def test_proof_m_pool_refuses_while_hold_shared_running(tmp_path):
             _run_git(repo, "worktree", "list").stdout.count("\n") == 1
         )  # no worker worktree created
     finally:
-        child.wait(timeout=10)
+        hold.unlink(missing_ok=True)
+        child.wait(timeout=30)
 
     # after the child exits, the pool starts.
     spec = load_neuter_spec(
@@ -1081,3 +1108,20 @@ def test_proof_src_layout_arbitrate_gives_drift_not_a_blind_green(tmp_path):
     assert arb_rows[0]["harness_verdict"] == "GREEN"
     assert arb_rows[0]["authoritative_verdict"] == "DRIFT"
     assert any("test_b" in u for u in arb_rows[0]["unmapped_red"])
+
+
+# Scoped to this process: the foreign-container watch must not see product
+# containers started by OTHER processes on a shared docker daemon (see the
+# fixture in tests/conftest.py). Neuter: delete this line -> the test below is RED.
+pytestmark = pytest.mark.usefixtures("isolated_product_container_watch")
+
+
+def test_watch_is_not_tripped_by_a_product_container_from_another_process():
+    from scripts.neuter.pytest_run import is_foreign_product_container
+
+    for name in (
+        "audittrace-rls-pg-1",
+        "audittrace-acl-wu2a-pg-2",
+        "audittrace-console-store-pg-3",
+    ):
+        assert is_foreign_product_container(name, "", "run-x") is False

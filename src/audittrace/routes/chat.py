@@ -63,6 +63,7 @@ from audittrace.routes._session_bind import (
     stream_with_bound_session,
 )
 from audittrace.routes._sources_trailer import build_sources_trailer
+from audittrace.routes._stream_reply import StreamReplyCheck
 from audittrace.services.console_store._context import bound_session_id
 from audittrace.services.context_builder import (
     ContextBuilderService,
@@ -85,24 +86,6 @@ FAILURE_PROXY_TIMEOUT = "proxy_timeout"
 FAILURE_UPSTREAM_ERROR = "upstream_error"
 FAILURE_UPSTREAM_UNREACHABLE = "upstream_unreachable"
 FAILURE_INTERNAL_ERROR = "internal_error"
-
-# Map an ADR-033 error envelope's ``code`` field to one of the canonical
-# FAILURE_* constants so a body-level error envelope produces the right
-# audit-row failure_class. Anything not in the map falls back to
-# upstream_error — the most common origin of body-shaped errors.
-_ERROR_CODE_TO_FAILURE_CLASS = {
-    FAILURE_PROXY_TIMEOUT: FAILURE_PROXY_TIMEOUT,
-    FAILURE_UPSTREAM_ERROR: FAILURE_UPSTREAM_ERROR,
-    FAILURE_UPSTREAM_UNREACHABLE: FAILURE_UPSTREAM_UNREACHABLE,
-    FAILURE_INTERNAL_ERROR: FAILURE_INTERNAL_ERROR,
-}
-
-
-def _map_error_code_to_failure_class(code: object) -> str:
-    """Coerce an ADR-033 envelope ``error.code`` to a canonical FAILURE_*."""
-    if isinstance(code, str) and code in _ERROR_CODE_TO_FAILURE_CLASS:
-        return _ERROR_CODE_TO_FAILURE_CLASS[code]
-    return FAILURE_UPSTREAM_ERROR
 
 
 def _openai_error_body(
@@ -1240,12 +1223,14 @@ async def _stream_memory_tool_loop(
                     # SSE error frame + failed audit row.
                     resp.raise_for_status()
 
+                check = StreamReplyCheck(resp)
                 async for line in _iter_with_idle_timeout(
                     resp, chunk_timeout, keepalive
                 ):
                     if line is None:
                         yield b": keep-alive\n\n"
                         continue
+                    check.feed(line)
                     stripped = line.strip()
                     if not stripped.startswith("data: "):
                         continue
@@ -1274,6 +1259,7 @@ async def _stream_memory_tool_loop(
                                 turn.model or model_hint,
                                 piece,
                             )
+                check.raise_unless_complete()
 
             # ── turn complete: accumulate usage + answer, decide disposition ──
             if turn.prompt_tokens:
@@ -1372,16 +1358,14 @@ async def list_models(
         ) as client:
             response = await client.get(models_url)
             return response.json()
-    except httpx.ConnectError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"llama-server unreachable at {models_url}",
-        ) from exc
-    except httpx.TimeoutException as exc:
-        raise HTTPException(
-            status_code=504,
-            detail=f"llama-server timeout at {models_url}",
-        ) from exc
+    except httpx.ConnectError:
+        return upstream_errors.gateway_error_response(
+            502, FAILURE_UPSTREAM_UNREACHABLE, "llama-server unreachable"
+        )
+    except httpx.TimeoutException:
+        return upstream_errors.gateway_error_response(
+            504, FAILURE_PROXY_TIMEOUT, "llama-server timeout"
+        )
 
 
 @_lf_observe(name="sovereign-chat-request")
@@ -1601,7 +1585,7 @@ async def _handle_tools_mode(
             except httpx.ConnectError as exc:
                 yield _emit_sse_error_frame(
                     FAILURE_UPSTREAM_UNREACHABLE,
-                    f"llama-server unreachable at {llama_url}",
+                    "llama-server unreachable",
                     502,
                 )
                 await _persist_interaction(
@@ -1716,7 +1700,7 @@ async def _handle_tools_mode(
     # request that times out mid-loop still has a forensic DB trail.
     # ``pending`` is caller-owned and passed into the loop, so it survives a
     # raise. An upstream STATUS error flushes it onto the failed interaction
-    # row (tools_non_stream_upstream_error); the timeout, connect and internal
+    # row (non_stream_upstream_error); the timeout, connect and internal
     # arms below still drop it (AT-FAILED-TURN-TOOLCALLS-NON-STATUS-ARMS).
     perf_start = time.perf_counter()
     pending: list[PendingToolCall] = []
@@ -1747,12 +1731,13 @@ async def _handle_tools_mode(
             error_detail=str(exc)[:500],
             duration_ms=int((time.perf_counter() - perf_start) * 1000),
         )
-        raise HTTPException(
-            status_code=504,
-            detail=(f"llama-server timeout after {settings.llama_chunk_timeout}s"),
-        ) from exc
+        return upstream_errors.gateway_error_response(
+            504,
+            FAILURE_PROXY_TIMEOUT,
+            f"llama-server timeout after {settings.llama_chunk_timeout}s",
+        )
     except httpx.HTTPStatusError as exc:
-        return await upstream_errors.tools_non_stream_upstream_error(
+        return await upstream_errors.non_stream_upstream_error(
             exc,
             loop_payload,
             pending,
@@ -1780,10 +1765,9 @@ async def _handle_tools_mode(
             error_detail=str(exc)[:500],
             duration_ms=int((time.perf_counter() - perf_start) * 1000),
         )
-        raise HTTPException(
-            status_code=502,
-            detail=f"llama-server unreachable at {llama_url}",
-        ) from exc
+        return upstream_errors.gateway_error_response(
+            502, FAILURE_UPSTREAM_UNREACHABLE, "llama-server unreachable"
+        )
     except Exception as exc:
         await _persist_interaction(
             project=project,
@@ -2073,6 +2057,7 @@ async def _chat_completions_impl(
                     async with contextlib.aclosing(resp):
                         await upstream_errors.read_error_body(resp)
                         resp.raise_for_status()
+                        check = StreamReplyCheck(resp)
                         async for line in _iter_with_idle_timeout(
                             resp,
                             settings.llama_chunk_timeout,
@@ -2083,6 +2068,7 @@ async def _chat_completions_impl(
                                 # JSON parsers, holds connection through proxies.
                                 yield b": keep-alive\n\n"
                                 continue
+                            check.feed(line)
                             stripped = line.strip()
                             if not stripped.startswith("data: "):
                                 # Forward blank/non-data lines verbatim (SSE separators)
@@ -2099,6 +2085,7 @@ async def _chat_completions_impl(
                             except json.JSONDecodeError:
                                 continue
                             _accumulate_chunk(state, chunk)
+                        check.raise_unless_complete()
                 # Inject synthetic usage chunk for OpenAI clients that need it.
                 yield _build_synthetic_usage_chunk(state, requested_model)
                 if state.done_seen:
@@ -2135,7 +2122,7 @@ async def _chat_completions_impl(
             except httpx.ConnectError as exc:
                 yield _emit_sse_error_frame(
                     FAILURE_UPSTREAM_UNREACHABLE,
-                    f"llama-server unreachable at {llama_url}",
+                    "llama-server unreachable",
                     502,
                 )
                 await _persist_interaction(
@@ -2297,7 +2284,7 @@ async def _chat_completions_impl(
                 headers=llama_auth_headers(settings.llama_api_key),
             ) as client:
                 response = await client.post(llama_url, json=proxy_payload)
-            body = response.json()
+            body = upstream_errors.completion_or_raise(response, proxy_payload)
             try:
                 usage = body.get("usage", {}) or {}
                 gen_span.set_attribute(
@@ -2333,10 +2320,9 @@ async def _chat_completions_impl(
             error_detail=str(exc)[:500],
             duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
         )
-        raise HTTPException(
-            status_code=502,
-            detail=f"llama-server unreachable at {llama_url}",
-        ) from exc
+        return upstream_errors.gateway_error_response(
+            502, FAILURE_UPSTREAM_UNREACHABLE, "llama-server unreachable"
+        )
     except httpx.TimeoutException as exc:
         await _persist_interaction(
             project=project,
@@ -2353,43 +2339,26 @@ async def _chat_completions_impl(
             error_detail=str(exc)[:500],
             duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
         )
-        raise HTTPException(
-            status_code=504,
-            detail=f"llama-server timeout after {settings.llama_chunk_timeout}s",
-        ) from exc
-
-    _set_genai_response_attributes(body)
-    # ADR-033: if the upstream returned an error envelope (body has a top-level
-    # ``error`` key), persist as failed with the right failure_class. Without
-    # this hook, an upstream 500 with an OpenAI-error-shaped body got stored
-    # as ``status='success'`` because we still extracted empty choices below.
-    err_envelope = body.get("error") if isinstance(body, dict) else None
-    if isinstance(err_envelope, dict):
-        hit = upstream_errors.classify_unsupported_content(
-            response.status_code, response.text, proxy_payload
+        return upstream_errors.gateway_error_response(
+            504,
+            FAILURE_PROXY_TIMEOUT,
+            f"llama-server timeout after {settings.llama_chunk_timeout}s",
         )
-        usage = body.get("usage") or {}
-        await _persist_interaction(
+    except httpx.HTTPStatusError as exc:
+        return await upstream_errors.non_stream_upstream_error(
+            exc,
+            proxy_payload,
+            [],
             project=project,
             source=source,
             question=query,
-            answer="",
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
             session_id=session_id,
-            # Gate #5: request alias unconditionally, never body["model"].
             model=requested_model,
             user_id=user.user_id,
-            status="failed",
-            failure_class=_map_error_code_to_failure_class(err_envelope.get("code")),
-            error_detail=upstream_errors.detail_from_hit_or(
-                hit, str(err_envelope.get("message", ""))[:500]
-            ),
-            duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
+            perf_start=ns_perf_start,
         )
-        if hit:
-            return upstream_errors.client_error_response(hit)
-        return body
+
+    _set_genai_response_attributes(body)
     try:
         choices = body.get("choices") or []
         message_obj = (choices[0].get("message") or {}) if choices else {}

@@ -138,6 +138,15 @@ class Settings(BaseSettings):
     # matches the orchestrator mount 1:1.
     orchestrator_console_tool_favorites_path_prefix: str = "/console/tool-favorites"
     orchestrator_timeout_seconds: float = 120.0
+    # ADDENDUM-2 item 2: the durable record of a refused chat turn. Off unless
+    # the deployment says the memory server accepts it (the chart does).
+    orchestrator_refusal_path: str = "/interactions/refusals"
+    refusal_record_enabled: bool = False
+    refusal_record_timeout_seconds: float = 2.0
+    # ADDENDUM-3: at most this many records per user per minute. A refused
+    # turn costs the user nothing, so without a bound one user could fill
+    # their own audit trail; beyond it the turn is logged, not recorded.
+    refusal_record_max_per_minute: int = 12
     # M3 Sovereign-Attach WU-2 — the console file-upload route
     # (``POST /console/files``) always forwards to
     # ``/memory/upload?layer=<this value>``, regardless of any ``layer``
@@ -189,6 +198,9 @@ class Settings(BaseSettings):
         "http://localhost:8080/realms/audittrace/protocol/openid-connect/certs"
     )
     jwks_cache_ttl_seconds: int = 300
+    # ADDENDUM-2 item 6: a token naming a kid the cache does not hold triggers
+    # at most ONE JWKS fetch per this many seconds, however many tokens ask.
+    jwks_refresh_min_interval_seconds: int = 30
 
     # ── RFC 8693 token exchange (confidential client) ─────────────────────
     keycloak_token_url: str = (

@@ -47,8 +47,8 @@ script:pre-request {
 }
 
 tests {
-  test("HTTP 200 on the non-streaming call (the upstream error body is passed through)", function() {
-    expect(res.getStatus()).to.equal(200);
+  test("HTTP 400 on the non-streaming call (the upstream status and error object are relayed)", function() {
+    expect(res.getStatus()).to.equal(400);
   });
   test("the upstream error envelope is returned verbatim, not a completion", function() {
     const b = res.getBody();
@@ -62,9 +62,8 @@ tests {
 docs {
   AT-TOOLS-NONSTREAM-UPSTREAM-4XX-AUDIT (E-A). A non-stream tools turn whose
   upstream reply is an UNMATCHED 400 (an invalid `response_format.type`).
-  The client reply is unchanged (HTTP 200 + the upstream body); the audit row
-  is what this change fixes: it must be `failed` / `upstream_error`, read by
-  chat/15.
+  The client reply is the upstream status (HTTP 400) with the upstream error
+  object; the audit row is `failed` / `upstream_error`, read by chat/15.
 
   Inputs (env vars, defaults in environments/*.bru): `contentPartPrompt`,
   `upstreamBadResponseFormatType` (default `bogus`), `upstream4xxSessionId`

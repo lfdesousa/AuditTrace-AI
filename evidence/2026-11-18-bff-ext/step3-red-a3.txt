@@ -1,0 +1,14 @@
+tests/bff/test_all_routes_errors.py: ============================= 290 passed in 12.39s =============================
+tests/bff/test_refusal_record.py: ============================== 16 errors in 0.22s ==============================
+tests/bff/test_path_guard.py: ========================= 9 failed, 5 passed in 1.12s ==========================
+tests/test_refusal_ingest.py: ======================== 28 failed, 4 passed in 29.85s =========================
+tests/test_refusal_ingest_rls_postgres.py: ========================= 3 failed, 1 warning in 6.40s =========================
+tests/test_mesh_peer.py: =============================== 1 error in 0.13s ===============================
+tests/test_auth_realm_keys.py: ==================== 8 failed, 2 passed, 4 errors in 0.52s =====================
+tests/test_realm_keys_twin.py: ============================== 1 failed in 0.10s ===============================
+tests/test_chart_refused_turn_and_session_end.py: ==================== 4 failed, 8 passed, 1 warning in 1.19s ====================
+tests/test_keycloak_exchange_measurement_pin.py: ==================== 1 failed, 4 passed, 1 warning in 0.37s ====================
+tests/test_mesh_peer_open_quote.py: =============================== 1 error in 0.13s ===============================
+tests/test_refusal_ingest_gate_conditions.py: ============================== 4 failed in 3.92s ===============================
+tests/test_chart_refusal_switch_coupling.py: ========================= 2 failed, 1 warning in 0.65s =========================
+============================== 4 failed in 3.89s ===============================

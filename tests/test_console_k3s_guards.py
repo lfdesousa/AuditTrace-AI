@@ -48,6 +48,7 @@ Anchors: ``feedback_no_more_drifts``, ``feedback_vacuous_neuter_test_antipattern
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -238,15 +239,37 @@ class TestD2TokenForwarding:
             "has nothing to resolve from."
         )
 
-    def test_offline_access_in_openid_scope(self) -> None:
+    def test_offline_access_not_in_openid_scope(self) -> None:
+        """BFF-CHAT-ROUTE-ERRORS Q12(a) reversed the earlier ruling: the login
+        scope must NOT carry ``offline_access``. A refresh token that is not an
+        offline one lives and dies with the SSO session, so ending a session
+        stops the BFF's token exchange (measured on Keycloak 24.0.5: 4 of 4
+        ways of ending it, against 2 of 4 with the offline token)."""
         docs = _render(console_enabled=True)
         env = _container_env(_find(docs, "Deployment", "-librechat"), "librechat")
         scope = env.get("OPENID_SCOPE") or ""
-        assert "offline_access" in scope.split(), (
-            f"OPENID_SCOPE={scope!r} is missing offline_access — the #1 "
-            "stale-token-window mitigation (refresh-token grant) would be "
-            "absent."
+        assert "offline_access" not in scope.split(), (
+            f"OPENID_SCOPE={scope!r} carries offline_access: a signed-out "
+            "user's token would keep exchanging for the token's lifetime."
         )
+
+    def test_the_offline_access_scope_description_states_the_new_contract(
+        self,
+    ) -> None:
+        """Both realm sources describe the scope as it is now used (C3): the
+        old text called it the #1 stale-token-window mitigation."""
+        for path in (
+            REPO_ROOT / "keycloak" / "realm-audittrace.json",
+            CHART_DIR / "files" / "realm-audittrace.json",
+        ):
+            # The chart copy holds Helm syntax, so the file is read as text.
+            found = re.search(
+                r'"name": "offline_access",\s*"description": "([^"]*)"',
+                path.read_text(),
+            )
+            assert found, path
+            assert "stale-token-window" not in found.group(1), path
+            assert "NOT requested at login" in found.group(1), path
 
 
 class TestB4CloudFeaturesOff:

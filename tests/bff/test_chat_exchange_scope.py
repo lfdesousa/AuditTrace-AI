@@ -49,8 +49,8 @@ from bff.config import Settings, get_settings
 from bff.exchange import TokenExchangeError, exchange_token
 from tests.bff.conftest import (
     TEST_ISSUER,
+    TEST_JWK,
     TEST_PRIVATE_PEM,
-    TEST_PUBLIC_PEM,
     make_token,
 )
 from tests.bff.test_app import (
@@ -59,6 +59,7 @@ from tests.bff.test_app import (
     ORCHESTRATOR_BASE,
     _settings,
 )
+from tests.bff.test_chat_route_errors import TOKEN_EXCHANGE_INVALID, _expected_body
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CHAT_AUDIENCE = "audittrace-librechat-chat"
@@ -191,7 +192,7 @@ class Keycloak24AndOrchestrator:
     def handler(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url == KEYCLOAK_JWKS_URL:
-            return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+            return httpx.Response(200, json={"keys": [TEST_JWK]})
         if url == KEYCLOAK_TOKEN_URL:
             form = parse_qs(request.read().decode())
             self.exchange_forms.append(form)
@@ -352,7 +353,7 @@ class TestAnOverGrantFailsClosed:
         with caplog.at_level(logging.INFO, logger="bff"):
             response = _chat_turn(client)
         assert response.status_code == 502
-        assert response.json() == {"detail": "Upstream authentication service error"}
+        assert response.json() == _expected_body(TOKEN_EXCHANGE_INVALID)
         assert backend.orchestrator_requests == []
         assert f"unexpected={extra}" in caplog.text
         assert _granted_lines(caplog) == []

@@ -1,0 +1,11 @@
+Required test coverage of 90% reached. Total coverage: 98.97%
+================ 11199 passed, 3 warnings in 3167.75s (0:52:47) ================
+[no-skip-check] No skipped tests in junit.xml. Good.
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (205 files checked, 226 measured files all reported, lines >= 90%, branches >= 90% on 175 file(s) with branches)
+✅ Tests passed (scripts/ci/run-tests.sh)
+tests/test_x_trace_id_header.py::test_ac5_the_four_former_copies_and_the_middleware_hold_no_derivation[routes/chat.py] PASSED [ 99%]
+src/audittrace/routes/_memory_tool_loop.py                    296      1     94      2    99%   134, 560->568
+src/audittrace/routes/_stream_reply.py                         47      0     16      0   100%
+src/audittrace/routes/_upstream_errors.py                     164      0     46      0   100%
+src/audittrace/routes/chat.py                                 748      0    214      3    99%   1541->1549, 1870->1878, 2091->2195

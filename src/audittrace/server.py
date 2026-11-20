@@ -20,7 +20,17 @@ from audittrace.dependencies import (
 )
 from audittrace.logging_config import setup_logging
 from audittrace.memory_body_limit_middleware import MemoryBodyLimitMiddleware
-from audittrace.routes import admin, audit, chat, context, health, mcp, memory, session
+from audittrace.routes import (
+    admin,
+    audit,
+    chat,
+    context,
+    health,
+    mcp,
+    memory,
+    refusals,
+    session,
+)
 from audittrace.routes.console_acl import router as console_acl_router
 from audittrace.routes.console_agents import router as console_agents_router
 from audittrace.routes.console_chat_projects import (
@@ -832,6 +842,10 @@ def create_app() -> FastAPI:
     app.include_router(chat.router, prefix="/v1", tags=["chat"])
     app.include_router(context.router, tags=["context"])
     app.include_router(audit.router, tags=["audit"])
+    if _settings.refusal_ingest_writer:
+        # Mounted only with its writer named: otherwise the route does not
+        # exist (404, absent from the OpenAPI document).
+        app.include_router(refusals.router, tags=["audit"])
     app.include_router(session.router, prefix="/session", tags=["session"])
     app.include_router(memory.router, prefix="/memory", tags=["memory"])
     # ADR-048 PR-B3 — GET /memory/upload/status?scan_id=...

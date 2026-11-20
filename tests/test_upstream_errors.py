@@ -101,24 +101,25 @@ class TestClassifyStatusError:
 
 
 class TestStatusErrorDetail:
-    """``status_error_detail``: upstream text, else ``str(exc)`` (operator Q3, C1)."""
+    """``status_error_detail``: upstream text, else ``(empty reply)`` (operator Q3, C1, r3)."""
 
     def _exc(self, response: httpx.Response) -> httpx.HTTPStatusError:
         return httpx.HTTPStatusError(
             "boom " + "u" * 600, request=response.request, response=response
         )
 
-    def test_unread_streamed_500_falls_back_to_str_exc_without_raising(self):
+    def test_unread_streamed_500_falls_back_to_empty_reply_without_raising(self):
         # C1: reading .text on an unread stream raises ResponseNotRead; the
-        # suppress turns that into the str(exc) fallback. Deleting the
+        # suppress turns that into the (empty reply) fallback. Deleting the
         # contextlib.suppress(httpx.ResponseNotRead) reddens this test.
         response = httpx.Response(
             500,
             stream=httpx.ByteStream(b"never read"),
             request=httpx.Request("POST", "http://l/v1"),
         )
-        exc = self._exc(response)
-        assert ue.status_error_detail(exc) == "status=500: " + str(exc)[:400]
+        assert ue.status_error_detail(self._exc(response)) == (
+            "status=500: (empty reply)"
+        )
 
     def test_read_body_is_preferred_and_cut_at_400(self):
         response = httpx.Response(
@@ -128,12 +129,19 @@ class TestStatusErrorDetail:
         assert detail == "status=400: " + "r" * 400
         assert len(detail) == len("status=400: ") + 400
 
-    def test_empty_body_falls_back_to_str_exc(self):
+    def test_empty_body_is_empty_reply_and_names_no_url(self):
+        # r3: httpx's own sentence names the upstream URL; the row must not.
         response = httpx.Response(
             500, text="", request=httpx.Request("POST", "http://l/v1")
         )
-        exc = self._exc(response)
-        assert ue.status_error_detail(exc) == "status=500: " + str(exc)[:400]
+        exc = httpx.HTTPStatusError(
+            "Server error '500' for url 'http://l/v1'",
+            request=response.request,
+            response=response,
+        )
+        detail = ue.status_error_detail(exc)
+        assert detail == "status=500: (empty reply)"
+        assert "http://l" not in detail
 
 
 class TestHelpers:
@@ -183,12 +191,12 @@ class TestMovedArmHelpers:
         hit = ue.classify_unsupported_content(400, _text(400), PAYLOAD)
         assert ue.stream_detail(hit, exc) == hit.error_detail  # type: ignore[union-attr]
 
-    def test_stream_detail_empty_body_falls_back_to_str_exc(self):
+    def test_stream_detail_empty_body_is_empty_reply(self):
         response = httpx.Response(
             500, text="", request=httpx.Request("POST", "http://l/v1")
         )
         exc = httpx.HTTPStatusError("boom", request=response.request, response=response)
-        assert ue.stream_detail(None, exc) == "status=500: boom"
+        assert ue.stream_detail(None, exc) == "status=500: (empty reply)"
 
     async def test_read_error_body_reads_only_on_400_and_above(self):
         req = httpx.Request("POST", "http://l/v1")
@@ -200,9 +208,12 @@ class TestMovedArmHelpers:
         with pytest.raises(httpx.ResponseNotRead):
             ok.text  # noqa: B018
 
-    def test_client_error_response_is_a_400_with_the_hit_body(self):
+    def test_non_stream_error_reply_of_a_recognised_hit_is_a_400_with_the_hit_body(
+        self,
+    ):
         hit = ue.classify_unsupported_content(400, _text(400), PAYLOAD)
         assert hit is not None
-        resp = ue.client_error_response(hit)
+        resp = ue.non_stream_error_reply(400, _text(400), PAYLOAD, None)
+        assert resp is not None
         assert resp.status_code == 400
         assert json.loads(resp.body) == hit.error_body

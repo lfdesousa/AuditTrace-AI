@@ -1,0 +1,15 @@
+##### pytest tests/test_chat_nonstream_upstream_status.py
+      Right contains one more item: {'error': {'message': 'llama-server returned status 200', 'type': 'api_error', 'param': None, 'code': 'upstream_error', ...}}
+      Use -v to get more diff
+/home/lfdesousa/work/wt-at-nonstream/tests/test_chat_nonstream_upstream_status.py:721: AssertionError: assert [] == [{'error': {'...error', ...}}]
+================== 106 failed, 12 passed in 150.60s (0:02:30) ==================
+##### pytest tests/test_chart_chat_route_retry_policy.py
+    _enforce_hermetic(args, executable=executable, shell=shell, env=env)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+==================== 2 failed, 2 passed, 1 warning in 1.49s ====================
+##### pytest tests/test_bruno_chat_unmatched_upstream_status.py
+/home/lfdesousa/work/wt-at-nonstream/tests/test_bruno_chat_unmatched_upstream_status.py:85: AssertionError: assert '  audioPartFormat: wav' in ['vars {', '  baseUrl: https://audittrace.local:30952', '  realmIssuer: https://audittrace.allaboutdata.eu:30952/realm... '  sessionRecallPrompt: What did I just attach in this chat? Use your attachment recall tool and name the file.', ...]
+E   AssertionError: assert '  audioPartFormat: wav' in ['vars {', '  baseUrl: http://localhost:8765', '  realmIssuer: http://localhost:8081/realms/audittrace', '  clientId: ...y audittrace:context audittrace:audit audittrace:admin', '  assessmentScope: openid audittrace:assessment:ingest', ...]
+/home/lfdesousa/work/wt-at-nonstream/tests/test_bruno_chat_unmatched_upstream_status.py:85: AssertionError: assert '  audioPartFormat: wav' in ['vars {', '  baseUrl: http://localhost:8765', '  realmIssuer: http://localhost:8081/realms/audittrace', '  clientId: ...y audittrace:context audittrace:audit audittrace:admin', '  assessmentScope: openid audittrace:assessment:ingest', ...]
+========================= 8 failed, 2 passed in 0.07s ==========================

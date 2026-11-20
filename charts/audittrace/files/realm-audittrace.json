@@ -394,7 +394,7 @@
     },
     {
       "name": "offline_access",
-      "description": "M3-WU-3b (D3) — standard OIDC offline_access scope (refresh token). Bound only to audittrace-librechat, for LibreChat's OPENID_REUSE_TOKENS session-age refresh (the #1 stale-token-window mitigation).",
+      "description": "M3-WU-3b (D3): standard OIDC offline_access scope. Bound only to audittrace-librechat and NOT requested at login (BFF-CHAT-ROUTE-ERRORS): the refresh token then dies with the SSO session, so ending a session stops the token exchange.",
       "protocol": "openid-connect",
       "attributes": {
         "display.on.consent.screen": "true"
@@ -841,7 +841,9 @@
       ],
       "attributes": {
         "pkce.code.challenge.method": "S256",
-        "token-exchange.authorized-source-client": "audittrace-librechat-bff"
+        "token-exchange.authorized-source-client": "audittrace-librechat-bff",
+        "access.token.lifespan": "300",
+        "post.logout.redirect.uris": "https://{{ .Values.console.librechat.host }}/login"
       },
       "defaultClientScopes": [
         "audittrace:query",
@@ -1082,6 +1084,7 @@
     }
   ],
   "accessTokenLifespan": 86400,
+  "ssoSessionIdleTimeout": 28800,
   "ssoSessionMaxLifespan": 2592000,
   "offlineSessionIdleTimeout": 2592000
 }

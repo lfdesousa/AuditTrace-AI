@@ -14,6 +14,7 @@ Prefixed with ``_`` so pytest never collects it as a test module.
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -22,14 +23,15 @@ ROOT = Path(__file__).resolve().parent.parent / ".neuter_test_evidence"
 
 def evidence_dir_for(tmp_path: Path, name: str = "ev", *, create: bool = True) -> Path:
     """A real (non-``/tmp``) evidence dir unique to this ``tmp_path`` +
-    ``name`` -- pytest's per-test ``tmp_path`` is already collision-free,
-    so mapping through its own name keeps this collision-free too.
+    ``name``. pytest's ``tmp_path`` is collision-free WITHIN one process, but
+    its name (30 chars of the test name + a per-process counter) repeats across
+    pytest-xdist workers, so the worker id is part of the path.
 
     ``create=False`` returns the path WITHOUT making it -- needed by the
     proofs that assert a fail-closed path never created an evidence dir at
     all (creating the parent ``ROOT`` as a side effect of merely computing
     the path would silently defeat that assertion)."""
-    d = ROOT / tmp_path.name / name
+    d = ROOT / os.environ.get("PYTEST_XDIST_WORKER", "main") / tmp_path.name / name
     if create:
         d.mkdir(parents=True, exist_ok=True)
     return d

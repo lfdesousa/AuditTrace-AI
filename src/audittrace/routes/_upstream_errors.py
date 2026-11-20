@@ -42,11 +42,12 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
-from fastapi import HTTPException
 from fastapi.responses import JSONResponse
+
+from audittrace.routes._stream_reply import EMPTY_REPLY
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,17 @@ _IMAGE_MESSAGE = (
     "Choose a model that accepts images, or remove the image from the message."
 )
 _MAX_NAMED_TYPES = 3
+#: Upstream statuses about the proxy's OWN credentials towards the model server or the
+#: network in between (RFC 9110 15.5.2, 15.5.4, 15.5.8; RFC 6585 6): never relayed.
+_HOP_CREDENTIAL_STATUSES: frozenset[int] = frozenset({401, 403, 407, 511})
+#: Whether an upstream 5xx with a relayable body is relayed with its own status.
+_RELAY_SERVER_ERRORS = False
+#: Whether only a body carrying an ``error`` object is relayed (else any JSON object).
+_RELAY_REQUIRES_ERROR_OBJECT = True
+#: RFC 9110 10.2.3: delay-seconds or an IMF-fixdate; anything else is not relayed.
+_RETRY_AFTER_RE = re.compile(
+    r"\d{1,9}|[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT"
+)
 _MAX_BODY_CHARS = 400
 _PART_TYPE_RE = re.compile(r"[A-Za-z0-9_.-]{1,32}")
 
@@ -208,15 +220,20 @@ def error_detail_from_text(status_code: int, body_text: str) -> str:
 
 
 def status_error_detail(exc: httpx.HTTPStatusError) -> str:
-    """Audit detail of a raised upstream status error: body text, else ``str(exc)``.
+    """Audit detail of a raised upstream status error: body text, else a fixed sentence.
 
-    A body that was never read has no ``.text`` (``ResponseNotRead``) and an
-    empty body carries no reason: both fall back to httpx's own sentence.
+    A body that was never read has no ``.text`` (``ResponseNotRead``) and an empty
+    body carries no reason. For a non-2xx reply both read ``(empty reply)``, the
+    streamed wording: httpx's own sentence names the internal upstream URL. A 2xx
+    reply that is no completion keeps the proxy's own ``Unusable reply`` sentence
+    (``raise_status_error``), which names no URL.
     """
     text = ""
     with contextlib.suppress(httpx.ResponseNotRead):
         text = exc.response.text
-    return error_detail_from_text(exc.response.status_code, text or str(exc))
+    status = exc.response.status_code
+    fallback = str(exc) if 200 <= status < 300 else EMPTY_REPLY
+    return error_detail_from_text(status, text or fallback)
 
 
 def classify_unsupported_content(
@@ -284,12 +301,109 @@ async def read_error_body(resp: httpx.Response) -> None:
         await resp.aread()
 
 
-def client_error_response(hit: UnsupportedContentHit) -> JSONResponse:
-    """The explicit HTTP 400 reply for a recognised rejection."""
-    return JSONResponse(status_code=_UPSTREAM_STATUS, content=hit.error_body)
+def completion_body(response: httpx.Response) -> dict[str, Any] | None:
+    """The parsed completion of a usable reply, else ``None`` (silent).
+
+    Usable = a 2xx whose body is a JSON object that carries no ``error`` object.
+    """
+    if not response.is_success:
+        return None
+    body: object = None
+    with contextlib.suppress(ValueError):
+        body = response.json()
+    if isinstance(body, dict) and not isinstance(body.get("error"), dict):
+        return body
+    return None
 
 
-async def tools_non_stream_upstream_error(
+def raise_status_error(response: httpx.Response) -> NoReturn:
+    """Raise ``httpx.HTTPStatusError`` for a reply that is not a completion.
+
+    A 2xx that is not one (non-JSON, not an object, or carrying an ``error``
+    object) has no status to raise for, so the same exception is built here:
+    every caller audits one class of failure.
+    """
+    response.raise_for_status()
+    raise httpx.HTTPStatusError(
+        f"Unusable reply '{response.status_code}' from the model server",
+        request=response.request,
+        response=response,
+    )
+
+
+def completion_or_raise(
+    response: httpx.Response, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Inject non-stream arm: the completion, or ONE WARNING with the text and a raise.
+
+    A recognised rejection keeps its own line (``classify_unsupported_content``);
+    every other reply gets the generic one.
+    """
+    body = completion_body(response)
+    if body is not None:
+        return body
+    status, text = response.status_code, response.text
+    if classify_unsupported_content(status, text, payload) is None:
+        logger.warning(
+            "llama-server upstream error HTTP %d — body: %s",
+            status,
+            text[:_MAX_BODY_CHARS],
+        )
+    raise_status_error(response)
+
+
+def gateway_error_response(
+    status: int, failure_class: str, message: str
+) -> JSONResponse:
+    """A 502/504 of the proxy itself: the OpenAI error object plus ``detail``.
+
+    ``error`` has the keys of the SSE error frame; ``detail`` (the same text) is
+    kept for clients that read FastAPI's shape. Names no upstream URL.
+    """
+    # Function-local import: same chat.py cycle as unsupported_content_error_body.
+    from audittrace.routes.chat import _openai_error_body
+
+    body = _openai_error_body(message=message, code=failure_class, status=status)
+    return JSONResponse(status_code=status, content={**body, "detail": message})
+
+
+def non_stream_error_reply(
+    status: int, text: str, payload: dict[str, Any], retry_after: str | None
+) -> JSONResponse | None:
+    """The relayable client reply for an upstream reply that is not a completion.
+
+    A recognised rejection -> the explicit 400. A relayable status with a relayable
+    body -> relayed with the upstream status, and with the upstream's well-formed
+    ``Retry-After``. ``None`` -> the caller answers 502.
+    """
+    if match_image_input_unsupported(status, text):
+        return JSONResponse(
+            status_code=_UPSTREAM_STATUS, content=image_input_unsupported_error_body()
+        )
+    if match_unsupported_content(status, text):
+        return JSONResponse(
+            status_code=_UPSTREAM_STATUS,
+            content=unsupported_content_error_body(payload),
+        )
+    body: object = None
+    with contextlib.suppress(ValueError):
+        body = json.loads(text)
+    relayable = (
+        httpx.codes.is_client_error(status)
+        or (_RELAY_SERVER_ERRORS and httpx.codes.is_server_error(status))
+    ) and status not in _HOP_CREDENTIAL_STATUSES
+    shaped = isinstance(body, dict) and (
+        isinstance(body.get("error"), dict) or not _RELAY_REQUIRES_ERROR_OBJECT
+    )
+    if not (relayable and shaped):
+        return None
+    headers: dict[str, str] = {}
+    if retry_after is not None and _RETRY_AFTER_RE.fullmatch(retry_after):
+        headers["retry-after"] = retry_after
+    return JSONResponse(status_code=status, content=body, headers=headers)
+
+
+async def non_stream_upstream_error(
     exc: httpx.HTTPStatusError,
     loop_payload: dict[str, Any],
     pending: list[Any],
@@ -302,14 +416,12 @@ async def tools_non_stream_upstream_error(
     user_id: str,
     perf_start: float,
 ) -> JSONResponse:
-    """Tools non-stream arm: audit any upstream non-2xx as failed, then reply.
+    """Both non-stream arms: audit any reply that is not a completion, then reply.
 
     The failed row carries ``status=<code>: <upstream text[:400]>`` and the
     turn's already-recorded memory ``tool_calls`` (``pending``) are flushed
-    onto it. Reply: the no-projector image rejection (after that flush) or a
-    recognised unsupported-content rejection -> explicit 400; a JSON object
-    body below 500 -> 200 passed through verbatim; any other (non-JSON 4xx,
-    5xx) -> 502. Logs nothing: the retry helper's single WARNING is the one line.
+    onto it (none on the inject arm). Reply: ``non_stream_error_reply``, else the
+    502 gateway error. Logs nothing: the caller's single WARNING is the one line.
     """
     # Function-local import: chat.py imports this module at import time (cycle).
     from audittrace.routes.chat import (
@@ -336,20 +448,11 @@ async def tools_non_stream_upstream_error(
         duration_ms=int((time.perf_counter() - perf_start) * 1000),
     )
     await _flush_pending_tool_calls(pending, interaction_id)
-    if match_image_input_unsupported(status, text):
-        return JSONResponse(
-            status_code=_UPSTREAM_STATUS, content=image_input_unsupported_error_body()
+    reply = non_stream_error_reply(
+        status, text, loop_payload, exc.response.headers.get("retry-after")
+    )
+    if reply is None:
+        return gateway_error_response(
+            502, FAILURE_UPSTREAM_ERROR, f"llama-server returned {status}"
         )
-    if match_unsupported_content(status, text):
-        return JSONResponse(
-            status_code=_UPSTREAM_STATUS,
-            content=unsupported_content_error_body(loop_payload),
-        )
-    body: object = None
-    with contextlib.suppress(ValueError):
-        body = json.loads(text)
-    if isinstance(body, dict) and status < 500:
-        return JSONResponse(status_code=200, content=body)
-    raise HTTPException(
-        status_code=502, detail=f"llama-server returned {status}"
-    ) from exc
+    return reply

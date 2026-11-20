@@ -1,0 +1,28 @@
+X1 rc 1
+=================================== FAILURES ===================================
+=========================== short test summary info ============================
+FAILED tests/test_chat_error_object_discrimination.py::TestA2xxCompletionCarryingErrorNullIsASuccess::test_success_row_and_completion_relayed[tools]
+FAILED tests/test_chat_error_object_discrimination.py::TestA2xxCompletionCarryingErrorNullIsASuccess::test_success_row_and_completion_relayed[inject]
+X2 rc 1
+=================================== FAILURES ===================================
+=========================== short test summary info ============================
+FAILED tests/test_chat_error_object_discrimination.py::TestACompleteStreamWhoseChunksCarryErrorNullIsASuccess::test_success_row_no_error_frame[tools]
+FAILED tests/test_chat_error_object_discrimination.py::TestACompleteStreamWhoseChunksCarryErrorNullIsASuccess::test_success_row_no_error_frame[inject]
+X3 rc 1
+=================================== FAILURES ===================================
+=========================== short test summary info ============================
+FAILED tests/test_chat_error_object_discrimination.py::TestA4xxWhoseErrorIsNotAnObjectIsTheProxys502::test_502_gateway_object_and_one_failed_row[string-tools]
+FAILED tests/test_chat_error_object_discrimination.py::TestA4xxWhoseErrorIsNotAnObjectIsTheProxys502::test_502_gateway_object_and_one_failed_row[string-inject]
+FAILED tests/test_chat_error_object_discrimination.py::TestA4xxWhoseErrorIsNotAnObjectIsTheProxys502::test_502_gateway_object_and_one_failed_row[null-tools]
+FAILED tests/test_chat_error_object_discrimination.py::TestA4xxWhoseErrorIsNotAnObjectIsTheProxys502::test_502_gateway_object_and_one_failed_row[null-inject]
+FAILED tests/test_chat_error_object_discrimination.py::TestA4xxWhoseErrorIsNotAnObjectIsTheProxys502::test_502_gateway_object_and_one_failed_row[number-tools]
+FAILED tests/test_chat_error_object_discrimination.py::TestA4xxWhoseErrorIsNotAnObjectIsTheProxys502::test_502_gateway_object_and_one_failed_row[number-inject]
+FAILED tests/test_chat_error_object_discrimination.py::TestA4xxWhoseErrorIsNotAnObjectIsTheProxys502::test_502_gateway_object_and_one_failed_row[list-tools]
+FAILED tests/test_chat_error_object_discrimination.py::TestA4xxWhoseErrorIsNotAnObjectIsTheProxys502::test_502_gateway_object_and_one_failed_row[list-inject]
+M18 rc 1
+=================================== FAILURES ===================================
+=========================== short test summary info ============================
+FAILED tests/test_chat_error_object_discrimination.py::TestEmptyBodyDetailNamesTheStatusSentence::test_non_2xx_empty_body_detail_is_httpxs_sentence[404-tools]
+FAILED tests/test_chat_error_object_discrimination.py::TestEmptyBodyDetailNamesTheStatusSentence::test_non_2xx_empty_body_detail_is_httpxs_sentence[404-inject]
+FAILED tests/test_chat_error_object_discrimination.py::TestEmptyBodyDetailNamesTheStatusSentence::test_non_2xx_empty_body_detail_is_httpxs_sentence[503-tools]
+FAILED tests/test_chat_error_object_discrimination.py::TestEmptyBodyDetailNamesTheStatusSentence::test_non_2xx_empty_body_detail_is_httpxs_sentence[503-inject]
