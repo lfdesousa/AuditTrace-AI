@@ -35,7 +35,11 @@ class TestBuildRowNullOwnerGuard:
         empty_user = replace(user_context, user_id="")
         with pytest.raises(ValueError, match="refusing to persist"):
             await emit_memory_audit_event(
-                user=empty_user, op="read", layer="episodic", key="x.md"
+                user=empty_user,
+                op="read",
+                layer="episodic",
+                key="x.md",
+                tier="private",
             )
 
 
@@ -48,6 +52,7 @@ class TestEmitMemoryAuditEvent:
             op="read",
             layer="episodic",
             key="ADR-x.md",
+            tier="corpus",
         )
         r = client.get(
             "/interactions", params={"event_class": MEMORY_AUDIT_EVENT_CLASS}
@@ -84,6 +89,7 @@ class TestEmitMemoryAuditEvent:
             layer="semantic",
             collection="decisions",
             key="doc-1",
+            tier="private",
             detail_extra={"hard": True},
         )
         r = client.get(
@@ -103,6 +109,7 @@ class TestEmitMemoryAuditEvent:
             op="write",
             layer="procedural",
             key="fails.md",
+            tier="private",
             outcome="failed",
         )
         r = client.get(
@@ -119,6 +126,7 @@ class TestEmitMemoryAuditEvent:
             op="read",
             layer="episodic",
             key="traced.md",
+            tier="private",
             trace_id="a" * 32,
         )
         r = client.get(
@@ -139,7 +147,7 @@ class TestEmitMemoryAuditEventBackground:
         self, client, user_context
     ) -> None:
         await emit_memory_audit_event_background(
-            user=user_context, op="list", layer="procedural"
+            user=user_context, op="list", layer="procedural", tier="private+corpus"
         )
         r = client.get(
             "/interactions", params={"event_class": MEMORY_AUDIT_EVENT_CLASS}
@@ -170,7 +178,11 @@ class TestEmitMemoryAuditEventBackground:
         with patch("audittrace.services.memory_audit.logger") as mock_logger:
             # Must not raise.
             await emit_memory_audit_event_background(
-                user=user_context, op="read", layer="episodic", key="x.md"
+                user=user_context,
+                op="read",
+                layer="episodic",
+                key="x.md",
+                tier="private",
             )
         assert mock_logger.exception.call_count == 1
         message = mock_logger.exception.call_args[0][0]
@@ -182,7 +194,12 @@ class TestScheduleReadAudit:
     async def test_schedules_the_background_wrapper(self, user_context) -> None:
         bg = BackgroundTasks()
         schedule_read_audit(
-            bg, user=user_context, op="read", layer="episodic", key="k.md"
+            bg,
+            user=user_context,
+            op="read",
+            layer="episodic",
+            key="k.md",
+            tier="private",
         )
         assert len(bg.tasks) == 1
         task = bg.tasks[0]
@@ -190,11 +207,17 @@ class TestScheduleReadAudit:
         assert task.kwargs["op"] == "read"
         assert task.kwargs["layer"] == "episodic"
         assert task.kwargs["key"] == "k.md"
+        assert task.kwargs["tier"] == "private"
 
     async def test_runs_and_persists_when_invoked(self, client, user_context) -> None:
         bg = BackgroundTasks()
         schedule_read_audit(
-            bg, user=user_context, op="read", layer="semantic", collection="decisions"
+            bg,
+            user=user_context,
+            op="read",
+            layer="semantic",
+            collection="decisions",
+            tier="private",
         )
         await bg()
         r = client.get(

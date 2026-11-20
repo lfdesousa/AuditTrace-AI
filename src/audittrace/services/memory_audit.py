@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -70,6 +71,18 @@ MEMORY_AUDIT_PROJECT = "memory-governance"
 MEMORY_AUDIT_SOURCE = "memory-audit"
 
 MemoryOp = Literal["read", "list", "write", "delete"]
+
+# A list enumerates the caller's private tier AND the corpus in one call.
+MEMORY_AUDIT_TIER_BOTH = "private+corpus"
+MEMORY_AUDIT_TIERS = frozenset({"private", "corpus", MEMORY_AUDIT_TIER_BOTH})
+_ROW_FIELDS = ("op", "layer", "collection", "key", "tier")
+
+
+def read_tier(metadata: Mapping[str, Any]) -> str:
+    """The tier of a document a read returned, from the metadata the layer
+    service stamped (never the request): the predicate the read routes gate
+    on. Anything not corpus is the caller's own private document."""
+    return "corpus" if metadata.get("tier") == "corpus" else "private"
 
 
 def _now_iso() -> str:
@@ -108,6 +121,11 @@ def _build_row(
             f"memory-audit event for op={op!r} layer={layer!r} key={key!r} "
             "has no user_id; refusing to persist an unattributable audit row"
         )
+    if tier not in MEMORY_AUDIT_TIERS:
+        raise ValueError(f"memory-audit event has an unknown tier {tier!r}")
+    restated = sorted(set(detail_extra or ()) & set(_ROW_FIELDS))
+    if restated:
+        raise ValueError(f"detail_extra restates the row field(s) {restated}")
     detail: dict[str, Any] = {
         "op": op,
         "layer": layer,
@@ -139,18 +157,16 @@ async def emit_memory_audit_event(
     layer: str,
     collection: str | None = None,
     key: str | None = None,
-    tier: str = "corpus",
+    tier: str,
     outcome: str = "success",
     trace_id: str | None = None,
     detail_extra: dict[str, Any] | None = None,
 ) -> None:
     """Persist one memory-access audit row.
 
-    ``tier`` defaults to ``"corpus"`` — Phase A has not yet wired the
-    per-user ``memory-private/{sub}/`` tier (ADR-062 §9 Phase B); every
-    layer reads/writes the shared bucket/collections today (ADR-062 CS-3),
-    so every Phase-A audit row is honestly labelled ``corpus`` rather than
-    a not-yet-true ``private``.
+    ``tier`` is required and keyword-only: the call site names the tier the
+    operation ran under, from a server-held fact (the manifest row, the
+    stored stamp, the resolved target tier), never from the request.
 
     Callers on the WRITE/DELETE path should ``await`` this directly (see
     module docstring — fail-closed). Callers on the READ path should
@@ -182,7 +198,7 @@ async def emit_memory_audit_event_background(
     layer: str,
     collection: str | None = None,
     key: str | None = None,
-    tier: str = "corpus",
+    tier: str,
     outcome: str = "success",
     trace_id: str | None = None,
     detail_extra: dict[str, Any] | None = None,
@@ -230,7 +246,7 @@ def schedule_read_audit(
     layer: str,
     collection: str | None = None,
     key: str | None = None,
-    tier: str = "corpus",
+    tier: str,
     detail_extra: dict[str, Any] | None = None,
 ) -> None:
     """Schedule a fail-open read audit event on ``background_tasks``.
