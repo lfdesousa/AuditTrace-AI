@@ -35,11 +35,56 @@ collect_ignore = ["neuter_fixture", "neuter_fixture_src"]
 # Clear stale evidence from a PRIOR session's neuter-harness tests
 # (tests/_neuter_test_evidence.py) at the start of every session -- it's
 # gitignored scratch space, not evidence anyone reads back later.
+# It runs from pytest_configure, on the controller / serial process only, NOT at
+# import: tests start fresh interpreters that import this module, and under
+# pytest-xdist an import-time wipe by one of them (or by a late worker) deletes
+# the evidence directories other tests are using right now.
 from tests._neuter_test_evidence import (  # noqa: E402
     cleanup_root as _cleanup_neuter_test_evidence,
 )
 
-_cleanup_neuter_test_evidence()
+
+def pytest_configure(config: pytest.Config) -> None:
+    if not hasattr(config, "workerinput"):  # an xdist worker never cleans
+        _cleanup_neuter_test_evidence()
+
+
+def pytest_itemcollected(item: pytest.Item) -> None:
+    """Put every test of a module that uses the shared Postgres into one xdist
+    group (``--dist loadgroup`` runs a group on a single worker). Done here, not
+    in ``pytest_collection_modifyitems``: xdist reads the marker in its own
+    modifyitems hook, which runs before one defined here."""
+    from tests._shared_postgres import SHARED_POSTGRES_MODULES, XDIST_GROUP
+
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        relative = Path(str(item.path)).resolve().relative_to(repo_root).as_posix()
+    except ValueError:
+        return
+    if relative in SHARED_POSTGRES_MODULES:
+        item.add_marker(pytest.mark.xdist_group(XDIST_GROUP))
+
+
+@pytest.fixture
+def isolated_product_container_watch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scope the neuter pool's foreign-container watch to this process.
+
+    The watch treats ANY product-prefixed Postgres container that starts while a
+    neuter runs as foreign. The harness self-proofs use a fake DB and are not
+    about that watch (tests/test_neuter_pytest_run.py covers it with its own
+    prefixes), yet on a shared daemon any other process that starts such a
+    container (a scoped run outside the lock, another worker's helper) turned
+    them into ERROR foreign_pg_container. The prefix list is replaced by one
+    that only this process uses.
+    """
+    from scripts.neuter import pytest_run
+
+    monkeypatch.setattr(
+        pytest_run,
+        "_PRODUCT_PG_CONTAINER_PREFIXES",
+        (f"audittrace-neuter-selfproof-{os.getpid()}-",),
+    )
+
 
 # ─────────── Chart-rendering subprocess injection (FQDN-only chart) ───────────
 # ADR-045 (amended 2026-05-19) made the chart FQDN-only — `externalLLM.host`
@@ -831,6 +876,38 @@ def _reset_global_container():
     reset_container()
     yield
     reset_container()
+
+
+@pytest.fixture(autouse=True)
+def _restore_tool_registries():
+    """Give every test back the tool registries it found.
+
+    ``MEMORY_TOOL_REGISTRY``, its visible-name alias map and
+    ``MCP_WRITE_TOOL_REGISTRY`` are process-global dicts filled once at import
+    time. A dozen fixtures (``test_lc9_wp2b_pg``, ``test_mcp_routes``, ...) empty
+    them with ``reset_registry_for_tests()`` + a handler reload and on teardown
+    only empty them again, leaving every LATER test on the same process with no
+    memory tools (the chat-audience chart guard saw 0 tools; the tools-mode chat
+    tests saw one upstream call too few). Serially the alphabetical order hid
+    it; under xdist the worker's order is arbitrary (CI run 44540571356, gw0).
+    One autouse snapshot/restore here covers every current and future resetter;
+    the dicts are restored IN PLACE (other modules hold references to them).
+    """
+    from audittrace import tools as tools_mod
+    from audittrace.tools.mcp_write_registry import MCP_WRITE_TOOL_REGISTRY
+
+    saved = [
+        (reg, dict(reg))
+        for reg in (
+            tools_mod.MEMORY_TOOL_REGISTRY,
+            tools_mod._BY_VISIBLE_NAME,
+            MCP_WRITE_TOOL_REGISTRY,
+        )
+    ]
+    yield
+    for reg, snapshot in saved:
+        reg.clear()
+        reg.update(snapshot)
 
 
 @pytest.fixture(autouse=True)

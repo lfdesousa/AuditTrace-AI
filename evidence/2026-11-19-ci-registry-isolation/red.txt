@@ -1,0 +1,16 @@
+# RED: gw0's CI order (first 639 ids of CI run 44540571356 gw0), run serially, fix absent (HEAD b32cc8a9)
+# interpreter: Python 3.12.3 (CI: 3.12.16 - not installable locally; the leak is dict state, interpreter-independent)
+# command: pytest tests -o addopts= -p no:randomly -p no:xdist -p order_plugin --no-cov (order_plugin: scratch, runs exactly the ids in gw0 order)
+FAILED tests/test_chart_drift_guards_chat_audience.py::TestChatAudienceClient::test_scope_arrays_are_exactly_the_chat_set[chart-off]
+FAILED tests/test_chat_proxy.py::TestToolsModeIntegration::test_tools_mode_streaming_repeated_signature_exits_early
+FAILED tests/test_chat_tools_nonstream_upstream_audit.py::TestFailedTurnKeepsToolCallRows::test_stream_fallback_recall_then_400_keeps_tool_call_row
+3 failed, 636 passed, 8 warnings in 228.44s (0:03:48)
+
+# bisect: ONE leaker + the 3 victims (tests/test_lc9_wp2b_pg.py::TestRt22FaultInjection::test_fault_after_step_1_no_half_state, then the 3 ids)
+FAILED tests/test_chart_drift_guards_chat_audience.py::TestChatAudienceClient::test_scope_arrays_are_exactly_the_chat_set[chart-off]
+FAILED tests/test_chat_proxy.py::TestToolsModeIntegration::test_tools_mode_streaming_repeated_signature_exits_early
+FAILED tests/test_chat_tools_nonstream_upstream_audit.py::TestFailedTurnKeepsToolCallRows::test_stream_fallback_recall_then_400_keeps_tool_call_row
+3 failed, 1 passed, 8 warnings in 15.17s
+
+# control: the 3 victims alone, no leaker
+3 passed, 8 warnings in 16.68s

@@ -57,6 +57,17 @@ def run_label_args(environ: Mapping[str, str] | None = None) -> list[str]:
     return ["--label", f"{RUN_ID_LABEL}={run_id}"] if run_id else []
 
 
+def remove_ephemeral_container(name: str) -> None:
+    """Force-remove one ephemeral container AND its anonymous data volume.
+
+    The postgres image declares a VOLUME, so ``rm -f`` alone leaves a dangling
+    anonymous volume per container (3,835 of them filled the disk). ``-v`` is
+    the smallest complete fix: it covers every removal path, including the
+    ``--rm`` race, without changing how the container is created.
+    """
+    subprocess.run(["docker", "rm", "-fv", name], capture_output=True)
+
+
 def start_ephemeral_postgres(name_prefix: str, password: str, db: str) -> str | None:
     """Spin a throwaway, non-durable ``postgres:18.3`` container.
 
@@ -99,9 +110,7 @@ def start_ephemeral_postgres(name_prefix: str, password: str, db: str) -> str | 
     except Exception:
         return None
 
-    atexit.register(
-        lambda: subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-    )
+    atexit.register(lambda: remove_ephemeral_container(name))
 
     dsn = f"postgresql+psycopg2://postgres:{password}@127.0.0.1:{port}/{db}"
     deadline = time.time() + 60
@@ -114,5 +123,5 @@ def start_ephemeral_postgres(name_prefix: str, password: str, db: str) -> str | 
             return dsn
         except Exception:
             time.sleep(0.5)
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    remove_ephemeral_container(name)
     return None
