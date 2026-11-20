@@ -6,13 +6,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+from audittrace.auth import require_user
+from audittrace.identity import UserContext
 from audittrace.routes import memory as m
 from tests.memory_truncation_support import (
+    SCOPES,
     USER,
+    _object_store,
     distinct_body,
     fold,
     memory_client,
@@ -89,7 +95,7 @@ class TestFoldTailGuards:
                 "layer": "semantic",
                 "collection": "decisions",
                 "key": "doc.md",
-                "tier": removals[0]["tier"] if removals else None,
+                "tier": "private",
                 "reason": "refold_stale_tail",
                 "removed": was - now,
             }
@@ -104,3 +110,54 @@ class TestFoldTailGuards:
         assert [
             d for d in memory_audit_details() if d.get("reason") == "refold_stale_tail"
         ] == []
+
+
+def _corpus_fold(client: TestClient, text: str) -> Any:
+    """Fold *text* through the legacy corpus-tier key ``{layer}/{filename}``
+    (no caller-sub prefix), the shape that resolves to the corpus tier, as an
+    admin (the only caller who may write a corpus-tier episodic fold)."""
+    app: Any = client.app
+    app.dependency_overrides[require_user] = lambda: UserContext(
+        user_id=USER, username=USER, agent_type="test", scopes=SCOPES, is_admin=True
+    )
+    store = _object_store({"episodic/doc.md": text.encode("utf-8")})
+    with patch.object(m, "_get_minio_client", return_value=store):
+        return client.post(
+            "/memory/index",
+            params={"file": "episodic/doc.md", "collections": "decisions"},
+        )
+
+
+class TestStaleTailAuditTier:
+    """The stale-tail audit row names the tier the fold ran under, exactly as
+    the fold's own write audit does (it was the ``emit_memory_audit_event``
+    default, ``corpus``, for every fold)."""
+
+    def test_a_private_fold_records_private_on_the_stale_tail_event(
+        self, client: TestClient
+    ) -> None:
+        _fold(client, LONG)
+        _fold(client, SHORT)
+
+        tiers = [
+            d["tier"]
+            for d in memory_audit_details()
+            if d.get("reason") == "refold_stale_tail"
+        ]
+
+        assert tiers == ["private"]
+
+    def test_a_corpus_fold_records_corpus_on_the_stale_tail_event(
+        self, client: TestClient
+    ) -> None:
+        assert _corpus_fold(client, LONG).status_code == 200
+        shorter = _corpus_fold(client, SHORT)
+        assert shorter.status_code == 200, shorter.text
+
+        tiers = [
+            d["tier"]
+            for d in memory_audit_details()
+            if d.get("reason") == "refold_stale_tail"
+        ]
+
+        assert tiers == ["corpus"]

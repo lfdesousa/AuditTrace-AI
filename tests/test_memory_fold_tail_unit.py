@@ -49,7 +49,7 @@ class TestStaleTailUnit:
                 "audittrace.routes.memory_fold_tail.emit_memory_audit_event", audit
             ):
                 return await _tail().drop(
-                    collection, None, caller(), caller_can_write_shared=False
+                    collection, None, caller(), "private", caller_can_write_shared=False
                 )
 
         assert asyncio.run(run()) == 2
@@ -65,7 +65,7 @@ class TestStaleTailUnit:
                 "audittrace.routes.memory_fold_tail.emit_memory_audit_event", audit
             ):
                 return await StaleTail("decisions", "doc.md", ()).drop(
-                    collection, None, caller(), caller_can_write_shared=False
+                    collection, None, caller(), "private", caller_can_write_shared=False
                 )
 
         assert asyncio.run(run()) == 0
@@ -81,7 +81,7 @@ class TestStaleTailUnit:
                 "audittrace.routes.memory_fold_tail.emit_memory_audit_event", audit
             ):
                 await _tail().drop(
-                    collection, None, caller(), caller_can_write_shared=False
+                    collection, None, caller(), "private", caller_can_write_shared=False
                 )
 
         with pytest.raises(HTTPException) as raised:

@@ -976,6 +976,7 @@ async def _index_md_objects(
                 collection,
                 manifest_service,
                 user,
+                tier,
                 caller_can_write_shared=caller_can_write_shared,
             )
             continue
@@ -1069,6 +1070,7 @@ async def _index_md_objects(
             collection,
             manifest_service,
             user,
+            tier,
             caller_can_write_shared=caller_can_write_shared,
         )
         # ADR-059 WU-1c — thread the manifest write (see this function's

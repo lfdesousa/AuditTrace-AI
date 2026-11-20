@@ -65,11 +65,14 @@ class StaleTail:
         collection: Any,
         manifest_service: Any | None,
         user: UserContext,
+        tier: str,
         *,
         caller_can_write_shared: bool,
     ) -> int:
         """Delete the tail rows, tombstone their manifest rows, and write ONE
-        audit event for the fold. Returns how many chunks were removed."""
+        audit event for the fold, recording the *tier* the fold ran under (the
+        same one its own write audit records). Returns how many chunks were
+        removed."""
         if not self.rows:
             return 0
         if manifest_service is not None:
@@ -90,6 +93,7 @@ class StaleTail:
                 layer="semantic",
                 collection=self.col_name,
                 key=self.filename,
+                tier=tier,
                 detail_extra={"reason": "refold_stale_tail", "removed": removed},
             )
         except Exception as exc:
