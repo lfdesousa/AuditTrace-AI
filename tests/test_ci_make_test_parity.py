@@ -342,7 +342,7 @@ MAKEFILE_PYTEST_EXEMPTIONS: dict[str, str] = {
         "\t# an ERROR by Postgres unconditionally, which would pollute production\n"
         "\t# logs. An ephemeral container keeps the noise scoped.\n"
         '\t@echo "🐳 Spinning up ephemeral test Postgres on :15432 ..."\n'
-        "\t@docker rm -f audittrace-test-pg >/dev/null 2>&1 || true\n"
+        "\t@docker rm -fv audittrace-test-pg >/dev/null 2>&1 || true\n"
         "\t@docker run -d --rm --name audittrace-test-pg \\\n"
         "\t  -e POSTGRES_USER=postgres \\\n"
         "\t  -e POSTGRES_PASSWORD=test \\\n"
@@ -358,7 +358,7 @@ MAKEFILE_PYTEST_EXEMPTIONS: dict[str, str] = {
         "\t  .venv/bin/pytest tests/test_rls_isolation.py -v --no-cov ; \\\n"
         "\t  status=$$? ; \\\n"
         '\t  echo "🧹 Tearing down ephemeral test Postgres ..." ; \\\n'
-        "\t  docker rm -f audittrace-test-pg >/dev/null 2>&1 ; \\\n"
+        "\t  docker rm -fv audittrace-test-pg >/dev/null 2>&1 ; \\\n"
         "\t  [ $$status -eq 0 ] || exit $$status\n"
         '\t@echo "✅ RLS integration tests passed (ephemeral Postgres, no production pollution)"\n'
     ),

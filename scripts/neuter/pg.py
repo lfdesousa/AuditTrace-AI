@@ -168,7 +168,9 @@ def start_container(
 def stop_container(handle: PgHandle) -> None:
     if handle.fake:
         return
-    subprocess.run(["docker", "rm", "-f", handle.name], capture_output=True)
+    # -v: the postgres image declares a data VOLUME; without it every container
+    # leaves a dangling anonymous volume behind.
+    subprocess.run(["docker", "rm", "-fv", handle.name], capture_output=True)
 
 
 def _wait_ready(dsn: str, timeout_s: float = 60.0) -> None:

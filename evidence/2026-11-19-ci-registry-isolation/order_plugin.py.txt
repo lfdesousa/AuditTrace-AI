@@ -1,0 +1,18 @@
+"""Scratch plugin: run exactly the ids in $ORDER_IDS, in that order.
+Ids truncated at a space inside a [param] (verbose-log extraction) match by prefix."""
+import os
+import pytest
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config, items):
+    ids = [l.rstrip("\n") for l in open(os.environ["ORDER_IDS"]) if l.strip()]
+    sel, used = [], set()
+    for i, want in enumerate(ids):
+        exact = [it for it in items if it.nodeid == want]
+        if not exact and "[" in want and not want.endswith("]"):
+            exact = [it for it in items if it.nodeid.startswith(want) and id(it) not in used]
+        assert exact, f"not collected: {want}"
+        for it in exact[:1] if len(exact) > 1 and not want.endswith("]") else exact:
+            if id(it) not in used:
+                used.add(id(it)); sel.append(it)
+    items[:] = sel
