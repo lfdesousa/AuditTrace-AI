@@ -128,6 +128,10 @@ untouched (no fork change in v1.31.0).
 The fork pin is untouched (one-sided release). Assertions below reflect the
 ``1.33.0`` / ``6143572`` pins.
 
+**Superseded at the v1.33.2 Phase-E re-pin (2026-11-20):** BFF moved to
+``1.33.2`` / ``sha256:7ed9c06e...`` and the tests image to ``1.33.2`` /
+``sha256:be1cb793...`` (registry HEAD and buildx, which agree, 2026-11-20).
+
 **Superseded at the v1.33.1 Phase-E re-pin (2026-11-16):** BFF moved to
 ``1.33.1`` / ``sha256:5f3a5dc6...`` and the tests image to ``1.33.1`` /
 ``sha256:6c127361...`` (registry HEAD and buildx, which agree, 2026-11-16).
@@ -260,13 +264,13 @@ class TestBothImagesRenderWithDigest:
         repo_tag, _, digest = image.partition("@")
         assert digest, f"BFF image {image!r} carries no @digest suffix"
         assert _SHA256_RE.match(digest), f"malformed digest {digest!r}"
-        assert repo_tag.endswith(":1.33.1"), f"unexpected BFF tag: {repo_tag!r}"
+        assert repo_tag.endswith(":1.33.2"), f"unexpected BFF tag: {repo_tag!r}"
 
     def test_bff_digest_matches_pinned_values_digest(self) -> None:
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         pinned = values["console"]["bff"]["image"]["digest"]
         assert pinned == (
-            "sha256:5f3a5dc6982e9f060bb433a3cef284ed1d203b22f833f882f3f0cf82b3620866"
+            "sha256:7ed9c06eae37a8f884f2eefaff4fda39a25531d7fb0bab941378845f62bf5fcd"
         ), f"BFF digest in values.yaml drifted from the verified pin: {pinned!r}"
         resources = _render(_CONSOLE_ENABLED)
         assert _bff_image(resources).endswith(f"@{pinned}")
@@ -333,7 +337,7 @@ class TestBffDigestPlumbing:
             f"suffix entirely, got {image!r} — the conditional either "
             "isn't guarding the digest, or a stale value leaked through"
         )
-        assert image == "docker.io/lfds/audittrace-librechat-bff:1.33.1"
+        assert image == "docker.io/lfds/audittrace-librechat-bff:1.33.2"
 
     def test_restore_setting_digest_brings_the_suffix_back(self) -> None:
         custom_digest = "sha256:" + "ab" * 32
@@ -437,9 +441,9 @@ class TestNoLocalRegistryOrStaleTagSurvives:
         test_rendered_tests_image_equals_v1_28_0_pin_exactly."""
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         image = values["tests"]["image"]
-        assert image["tag"] == "1.33.1"
+        assert image["tag"] == "1.33.2"
         assert image["digest"] == (
-            "sha256:6c127361859c2ed0cdc853118cb0a87f4451bdcdd114a65430ab96d533b79c03"
+            "sha256:be1cb79331ea239e8ae85ab517960c5472ff2cae84bd1c2fc51db51af8840b25"
         )
 
 
