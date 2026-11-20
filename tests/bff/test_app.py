@@ -47,8 +47,8 @@ from bff.chat_scopes import CHAT_SCOPE_STRING
 from bff.config import Settings, get_settings
 from tests.bff.conftest import (
     TEST_ISSUER,
+    TEST_JWK,
     TEST_PRIVATE_PEM,
-    TEST_PUBLIC_PEM,
     make_token,
 )
 
@@ -140,7 +140,7 @@ class _Backend:
     def handler(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url == KEYCLOAK_JWKS_URL:
-            return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+            return httpx.Response(200, json={"keys": [TEST_JWK]})
         if url == KEYCLOAK_TOKEN_URL:
             self.keycloak_exchange_calls += 1
             body = request.read().decode()
@@ -204,7 +204,7 @@ class _MemoryBackend:
     def handler(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url == KEYCLOAK_JWKS_URL:
-            return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+            return httpx.Response(200, json={"keys": [TEST_JWK]})
         if url == KEYCLOAK_TOKEN_URL:
             body = request.read().decode()
             self.exchange_request_bodies.append(body)
@@ -514,7 +514,7 @@ class TestOrchestratorUnreachable:
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if url == KEYCLOAK_JWKS_URL:
-                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                return httpx.Response(200, json={"keys": [TEST_JWK]})
             if url == KEYCLOAK_TOKEN_URL:
                 minted = _minted_token_for("alice")
                 return httpx.Response(200, json={"access_token": minted})
@@ -821,7 +821,7 @@ class TestMemoryProxyOrchestratorUnreachable:
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if url == KEYCLOAK_JWKS_URL:
-                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+                return httpx.Response(200, json={"keys": [TEST_JWK]})
             if url == KEYCLOAK_TOKEN_URL:
                 minted = _minted_token_for("alice")
                 return httpx.Response(200, json={"access_token": minted})

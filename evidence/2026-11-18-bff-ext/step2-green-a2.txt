@@ -1,0 +1,24 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.7.0
+rootdir: <worktree>
+configfile: pyproject.toml
+plugins: anyio-4.15.1, mock-3.17.0, cov-7.1.0, langsmith-0.14.11, asyncio-1.4.0, platformdirs-4.13.5, audittrace-ai-1.33.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 229 items
+
+tests/bff/test_all_routes_errors.py .................................... [ 15%]
+........................................................................ [ 47%]
+....................................................................     [ 76%]
+tests/bff/test_realm_keys.py ..............                              [ 82%]
+tests/bff/test_refusal_record.py ..............                          [ 89%]
+tests/test_refusal_ingest.py ..............                              [ 95%]
+tests/test_chart_refused_turn_and_session_end.py .......                 [ 98%]
+tests/test_keycloak_exchange_measurement_pin.py ....                     [100%]
+
+=============================== warnings summary ===============================
+tests/test_chart_refused_turn_and_session_end.py::test_only_the_bff_may_write_a_refusal
+  <worktree>/tests/conftest.py:479: UserWarning: hermetic guard: HERMETIC_SHIM_DIR/HERMETIC_KUBECONFIG are not set — this run is not CI-shaped (scripts/ci/run-tests.sh sets them). The kubectl/helm word check still applies; the child-environment equality check does not.
+    _enforce_hermetic(args, executable=executable, shell=shell, env=env)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 229 passed, 1 warning in 22.81s ========================

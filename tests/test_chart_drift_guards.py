@@ -6024,6 +6024,23 @@ class TestClientDescriptionsWithinKeycloakColumnLimit:
                 "the description to <=255 chars."
             )
 
+    def test_every_client_scope_description_within_255(self) -> None:
+        # ``CLIENT_SCOPE.DESCRIPTION`` is varchar(255) too: a 421-char
+        # offline_access description failed realm import in CI's compose
+        # stack (PR #465, 2026-11-19) while the client-only check stayed green.
+        for label, realm in self._both_realms():
+            offenders = [
+                (s.get("name"), len(s.get("description") or ""))
+                for s in (realm.get("clientScopes") or [])
+                if len(s.get("description") or "") > self._KEYCLOAK_VARCHAR_LIMIT
+            ]
+            assert not offenders, (
+                f"{label}: client scope description(s) exceed Keycloak's "
+                f"varchar(255) CLIENT_SCOPE.DESCRIPTION limit {offenders} — "
+                "realm import will fail at container boot. Shorten the "
+                "description to <=255 chars."
+            )
+
 
 def _keycloak_container(docs: list[dict]) -> dict:
     """Return the keycloak container spec from the rendered chart."""

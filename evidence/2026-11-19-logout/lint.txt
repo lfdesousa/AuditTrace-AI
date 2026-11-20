@@ -1,0 +1,250 @@
+All checks passed!
+unformatted: File would be reformatted
+   --> docs/ADR-014.2-logging-dependency-injection.md:30:44
+    |
+29  |     @abstractmethod
+    -     def get_client(self) -> ChromaDBClient: pass
+30  +     def get_client(self) -> ChromaDBClient:
+31  +         pass
+32  +
+33  |
+--------------------------------------------------------------------------------
+37  |
+38  +
+39  | class HTTPChromaDBFactory(ChromaDBFactory):  # Phase 1+
+40  |     def get_client(self) -> ChromaDBClient:
+41  |         return chromadb.HttpClient(host=host, port=port)
+42  |
+43  +
+44  | class MockChromaDBFactory(ChromaDBFactory):  # Testing
+--------------------------------------------------------------------------------
+102 |
+103 +
+104 | @router.post("/context")
+--------------------------------------------------------------------------------
+237 |     """Test context endpoint with mocked memory service."""
+    -     response = client.post("/context", json={
+    -         "query": "test query",
+    -         "project": "test-project",
+    -         "limit": 10,
+    -     })
+238 +     response = client.post(
+239 +         "/context",
+240 +         json={
+241 +             "query": "test query",
+242 +             "project": "test-project",
+243 +             "limit": 10,
+244 +         },
+245 +     )
+246 |
+    |
+
+unformatted: File would be reformatted
+  --> docs/ADR-023-jwt-validation-jwks-caching.md:23:16
+   |
+22 | @router.post("/v1/chat/completions")
+   - async def chat(request: ChatRequest,
+   -                _auth: dict = Depends(require_scope("sovereign-ai:query"))):
+   -     ...
+23 + async def chat(
+24 +     request: ChatRequest, _auth: dict = Depends(require_scope("sovereign-ai:query"))
+25 + ): ...
+26 | ```
+   |
+
+unformatted: File would be reformatted
+   --> docs/ADR-025-memory-as-tools.md:123:1
+    |
+122 |
+123 +
+124 | @register_memory_tool(
+    |
+
+unformatted: File would be reformatted
+    --> docs/ADR-026-multi-user-identity.md:261:24
+     |
+260  | ```python
+     - async def require_user(
+     -     authorization: str = Header(...)
+     - ) -> UserContext:
+261  + async def require_user(authorization: str = Header(...)) -> UserContext:
+262  |     token = _extract_bearer(authorization)
+--------------------------------------------------------------------------------
+405  |         return True
+     -     parent = ":".join(required.split(":")[:-1])  # "memory:read-decisions" -> "memory:read"
+406  +     parent = ":".join(
+407  +         required.split(":")[:-1]
+408  +     )  # "memory:read-decisions" -> "memory:read"
+409  |     return parent in granted
+--------------------------------------------------------------------------------
+1059 |     """
+1060 +
+1061 |     KEY_PREFIX = "sovereign:token:"
+--------------------------------------------------------------------------------
+1065 |     def get(self, token_hash: str) -> UserContext | None: ...
+     -     def put(self, token_hash: str, ctx: UserContext, ttl_seconds: int | None = None) -> None: ...
+1066 +     def put(
+1067 +         self, token_hash: str, ctx: UserContext, ttl_seconds: int | None = None
+1068 +     ) -> None: ...
+1069 |     def invalidate(self, token_hash: str) -> None: ...
+1070 |     def clear(self) -> None: ...  # tests — uses SCAN, not KEYS *
+     -     def size(self) -> int: ...    # observability — approximate via SCAN
+1071 +     def size(self) -> int: ...  # observability — approximate via SCAN
+1072 | ```
+     |
+
+unformatted: File would be reformatted
+   --> docs/ADR-029-audit-trail-completeness.md:164:1
+    |
+163 |
+164 +
+165 | URLLib3Instrumentor().instrument(
+    |
+
+unformatted: File would be reformatted
+   --> docs/ADR-030-session-summarizer.md:184:67
+    |
+183 | async with session_factory() as db:
+    -     await db.execute(text("SET LOCAL app.current_user_id = :uid"),
+    -                      {"uid": row.user_id})
+184 +     await db.execute(text("SET LOCAL app.current_user_id = :uid"), {"uid": row.user_id})
+185 |     # ... fetch interactions, call LLM, insert SessionRecord, commit
+    |
+
+unformatted: File would be reformatted
+  --> docs/ADR-047-server-side-embedding.md:72:45
+   |
+71 | ```python
+   - vectors = await embed_via_nomic(documents)        # external HTTP call
+72 + vectors = await embed_via_nomic(documents)  # external HTTP call
+73 | collection.upsert(
+74 |     ids=[...],
+   -     embeddings=vectors,                            # pre-computed
+75 +     embeddings=vectors,  # pre-computed
+76 |     documents=[...],
+   |
+
+unformatted: File would be reformatted
+  --> docs/ADR-052-pades-trust-store-and-taxonomy.md:55:1
+   |
+54 |     """Where the PEM bundle lives. Pluggable: S3, Vault, File, ..."""
+55 +
+56 |     async def load(self) -> TrustStoreBundle: ...
+57 |     async def store(self, bundle: TrustStoreBundle) -> None: ...
+58 |     async def metadata(self) -> TrustStoreMetadata: ...
+59 |
+60 +
+61 | class TrustStoreBuilder(ABC):
+62 |     """Where the PEM bundle comes from. Pluggable: EU LOTL, AATL, Static, ..."""
+63 +
+64 |     async def build(self) -> TrustStoreBundle: ...
+   |
+
+unformatted: File would be reformatted
+   --> docs/ADR-054-pades-as-of-signing-time-validation.md:123:39
+    |
+122 | )
+    - retry_status = validate_pdf_signature(
+    -     embedded_sig, signer_validation_context=retry_vc
+    - )
+123 + retry_status = validate_pdf_signature(embedded_sig, signer_validation_context=retry_vc)
+124 | if retry_status.trusted:
+--------------------------------------------------------------------------------
+132 | ```python
+    - if any_tampered: return ("signed_tampered", count)
+    - if any_invalid: return ("signed_invalid", count)
+    - if any_untrusted: return ("signed_untrusted", count)
+    - if any_expired: return ("signed_expired", count)
+133 + if any_tampered:
+134 +     return ("signed_tampered", count)
+135 + if any_invalid:
+136 +     return ("signed_invalid", count)
+137 + if any_untrusted:
+138 +     return ("signed_untrusted", count)
+139 + if any_expired:
+140 +     return ("signed_expired", count)
+141 | return ("signed_valid", count)
+    |
+
+unformatted: File would be reformatted
+   --> docs/ADR-062-five-layer-memory-model.md:100:1
+    |
+99  | # src/audittrace/routes/memory.py:519-525
+    -                 # Before 2026-07-21 this path set NO ownership key at all and
+    -                 # the PDF path set ``ingested_by_user_id``, so the filter
+    -                 # matched nothing and EVERY non-admin recall returned zero
+    -                 # results for EVERY collection. ...
+100 + # Before 2026-07-21 this path set NO ownership key at all and
+101 + # the PDF path set ``ingested_by_user_id``, so the filter
+102 + # matched nothing and EVERY non-admin recall returned zero
+103 + # results for EVERY collection. ...
+104 | ```
+    |
+
+unformatted: File would be reformatted
+   --> docs/architecture/BRAINSTORM-memory-as-tools.md:657:28
+    |
+656 | ```python
+    - _persist_interaction(...)              # sync Postgres write
+    - await _record_langfuse_output(...)     # async, but still in-line
+657 + _persist_interaction(...)  # sync Postgres write
+658 + await _record_langfuse_output(...)  # async, but still in-line
+659 | ```
+    |
+
+unformatted: File would be reformatted
+  --> docs/backlog/02-langgraph-step-counter-process-global.md:40:1
+   |
+39 |
+40 +
+41 | def _next_step() -> int:
+   |
+
+unformatted: File would be reformatted
+  --> docs/backlog/14-scope-redesign-memory-upload-index.md:14:25
+   |
+13 | ```python
+   - _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:admin"]),
+14 + _auth: dict[str, Any] = (Security(validate_jwt, scopes=["audittrace:admin"]),)
+15 | ```
+   |
+
+unformatted: File would be reformatted
+   --> evidence/fix-round-1-consolestorebase-seal-descriptor-complete-2026-09-17.md:150:1
+    |
+149 | """
+150 +
+151 | from __future__ import annotations
+--------------------------------------------------------------------------------
+193 |     outcome = f"raised {type(exc).__name__}: {exc}"
+    - print(f"RealDomainNoSlots(FrozenBaseNoSlots) instance: "
+    -       f"inst.value_columns = (...) -> {outcome}")
+194 + print(
+195 +     f"RealDomainNoSlots(FrozenBaseNoSlots) instance: "
+196 +     f"inst.value_columns = (...) -> {outcome}"
+197 + )
+198 |
+--------------------------------------------------------------------------------
+207 |     outcome = f"raised {type(exc).__name__}: {exc}"
+    - print(f"RealDomainWithSlots(FrozenBaseWithSlots) instance: "
+    -       f"inst2.value_columns = (...) -> {outcome}")
+208 + print(
+209 +     f"RealDomainWithSlots(FrozenBaseWithSlots) instance: "
+210 +     f"inst2.value_columns = (...) -> {outcome}"
+211 + )
+212 | ```
+    |
+
+unformatted: File would be reformatted
+   --> evidence/wu-agents-console-agents-store-local-capture-2026-09-12.md:311:32
+    |
+310 | ```python
+    - assert "user_sub" not in body   # tautology — ConsoleAgentItem has no such field
+    - assert "user_id" not in body    # tautology
+311 + assert "user_sub" not in body  # tautology — ConsoleAgentItem has no such field
+312 + assert "user_id" not in body  # tautology
+313 | ```
+    |
+
+15 files would be reformatted, 848 files already formatted
+Success: no issues found in 1 source file

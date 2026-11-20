@@ -106,7 +106,7 @@ target client's own scope profile, not from this client's scope grants.
 The chat turn's target is the dedicated `audittrace-librechat-chat`
 client (LC10A-CHAT-EXCHANGE-SCOPE; `AUDITTRACE_BFF_CHAT_EXCHANGE_AUDIENCE`),
 whose DEFAULT scopes are exactly `bff/chat_scopes.py::CHAT_SCOPES`; the
-BFF requests those six by name and refuses (502) any minted token with a
+BFF requests those six by name and refuses (502 `token_exchange_invalid`) any minted token with a
 scope outside `CHAT_SCOPE_CEILING`, and answers a caller whose own token
 lacks one of them with an explicit 403 `insufficient_scope` before any
 exchange. Keycloak 24's legacy exchange grants the target's DEFAULT scopes
@@ -140,3 +140,25 @@ just mocks. The concrete deploy-time follow-up before WU-3 exercises
 the BFF against a live Keycloak is therefore two-part: (1) enable the
 `token-exchange` feature flag on the Keycloak workload, THEN (2) grant
 the admin fine-grained exchange permission described above.
+
+## Chat-route errors (BFF-CHAT-ROUTE-ERRORS)
+
+Every answer the BFF itself gives on `POST /v1/chat/completions` is an OpenAI
+error object (`{"error": {"message", "type", "param", "code", "status"}}`) with
+a fixed message that names a cause class; nothing from a token, a request
+header or a Keycloak response is interpolated (`bff/chat_refusals.py`).
+
+| `error.code` | Status | Cause |
+|---|---|---|
+| `missing_token` | 401 `WWW-Authenticate: Bearer` | no bearer credentials |
+| `invalid_token` | 401 `WWW-Authenticate: Bearer error="invalid_token", ...` | invalid or expired token; also Keycloak refusing the subject token (400 + `invalid_token`) |
+| `auth_service_unavailable` | 502 | JWKS or token endpoint unreachable, 5xx, or an answer that cannot be used |
+| `token_exchange_refused` | 502 | any other 4xx of the token endpoint (server configuration) |
+| `token_exchange_invalid` | 502 | 200 with an unusable token |
+| `upstream_unavailable` | 502 | the memory server cannot be reached |
+| `internal_error` | 500 | the last resort (`bff/chat_last_resort.py`): an exception nobody foresaw |
+
+Each refused turn logs one `chat.refused` event (code, status, verified `sub`,
+`session_id`, the caller's `inbound_trace_id`, cause). The memory server's own
+answers are relayed untouched. The chart bounds the fork's retries for this
+endpoint with `console.librechat.endpointMaxRetries` (default 1).

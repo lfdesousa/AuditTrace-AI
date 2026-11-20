@@ -204,6 +204,14 @@ spec:
             # oidc.ts) resolves from exactly this token.
             - name: OPENID_REUSE_TOKENS
               value: "true"
+            # A LibreChat logout also ends the Keycloak SSO session
+            # (ADDENDUM-2 finding 1; measured E13: without this, Login signs
+            # the user straight back in). The fork redirects to the realm's
+            # end_session_endpoint with the id_token_hint that
+            # OPENID_REUSE_TOKENS keeps, and returns to DOMAIN_CLIENT/login,
+            # which the realm client allows (post.logout.redirect.uris).
+            - name: OPENID_USE_END_SESSION_ENDPOINT
+              value: "true"
             - name: OPENID_SESSION_SECRET
               valueFrom:
                 secretKeyRef:

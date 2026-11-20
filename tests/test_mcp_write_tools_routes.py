@@ -49,6 +49,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization as _crypto_serialization
 from cryptography.hazmat.primitives.asymmetric import rsa as _crypto_rsa
 from fastapi.testclient import TestClient
+from jose import jwk as _jose_jwk
 from jose import jwt as _jose_jwt
 from sqlalchemy import select
 
@@ -172,7 +173,7 @@ def _real_auth_stack(monkeypatch: pytest.MonkeyPatch):
     _jwks_cache.clear()
 
     async def _fake_fetch_jwks_keys(_url: str) -> list[str]:
-        return [_JWT_PUBLIC_PEM]
+        return [_jose_jwk.construct(_JWT_PUBLIC_PEM, "RS256").to_dict()]
 
     monkeypatch.setattr("audittrace.auth._fetch_jwks_keys", _fake_fetch_jwks_keys)
     monkeypatch.setattr("audittrace.auth._jwks_client", None)

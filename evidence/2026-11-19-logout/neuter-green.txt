@@ -1,0 +1,29 @@
+== C11 neuter env var
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_librechat_logout_ends_the_sso_session
+=================== 1 failed, 14 passed, 1 warning in 1.04s ====================
+== C12a neuter repo realm file
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_login_client_token_lives_five_minutes[repository file]
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_login_client_token_lives_five_minutes[chart]
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_realm_sets_its_sso_idle_timeout[repository file]
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_realm_sets_its_sso_idle_timeout[chart]
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_logout_return_page_is_allowed_by_the_realm[repository file]
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_logout_return_page_is_allowed_by_the_realm[chart]
+==================== 6 failed, 9 passed, 1 warning in 1.06s ====================
+== C12b neuter chart realm file
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_login_client_token_lives_five_minutes[repository file]
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_login_client_token_lives_five_minutes[chart]
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_realm_sets_its_sso_idle_timeout[repository file]
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_realm_sets_its_sso_idle_timeout[chart]
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_logout_return_page_is_allowed_by_the_realm[repository file]
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_logout_return_page_is_allowed_by_the_realm[chart]
+==================== 6 failed, 9 passed, 1 warning in 1.07s ====================
+== GREEN restored
+======================== 15 passed, 1 warning in 1.05s =========================
+== C12a neuter repo realm file
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_logout_return_page_is_allowed_by_the_realm[repository file]
+=================== 1 failed, 14 passed, 1 warning in 1.04s ====================
+== C12b neuter chart realm file
+FAILED tests/test_chart_refused_turn_and_session_end.py::test_the_logout_return_page_is_allowed_by_the_realm[chart]
+=================== 1 failed, 14 passed, 1 warning in 1.05s ====================
+== GREEN restored
+======================== 15 passed, 1 warning in 0.94s =========================

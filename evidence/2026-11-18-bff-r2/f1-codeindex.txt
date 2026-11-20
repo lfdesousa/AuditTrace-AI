@@ -1,0 +1,19 @@
+SHA bb70ed290ac039c0ba5541f927d4e7bcec226607
+✅ build: bb70ed2 -> <cache>/ (content_sha256=c8569e643f49ecaf…)
+{
+ "commit": "bb70ed290ac039c0ba5541f927d4e7bcec226607",
+ "content_sha256": "c8569e643f49ecaf604d9e86c74979bcb20508d34b2ea570b28cd962616af8f1",
+ "counts": {
+  "helm:cell": 5,
+  "k8s:container": 97,
+  "k8s:object": 529,
+  "k8s:serviceaccount": 72,
+path	lineno	qualname
+bff/app.py	269	create_app|app.add_middleware@269:4
+src/audittrace/server.py	807	create_app|app.add_middleware@807:8
+src/audittrace/server.py	834	create_app|app.add_middleware@834:4
+path	lineno	name
+bff/app.py	248	FastAPI
+n
+21
+path	lineno

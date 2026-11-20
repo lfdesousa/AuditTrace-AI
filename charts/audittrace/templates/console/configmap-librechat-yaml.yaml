@@ -40,5 +40,9 @@ data:
             default: ["audittrace-chat"]
             fetch: false
           titleConvo: false
+          # BFF-CHAT-ROUTE-ERRORS R9: bound the client's retries of a 5xx (the
+          # default is six). The value is a chart value, never a literal here.
+          addParams:
+            maxRetries: {{ .Values.console.librechat.endpointMaxRetries | int }}
           modelDisplayLabel: "AuditTrace"
 {{- end }}

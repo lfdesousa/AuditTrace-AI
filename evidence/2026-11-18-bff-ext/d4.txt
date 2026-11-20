@@ -1,0 +1,172 @@
+tests/bff/test_app.py repeat1: ============================== 38 passed in 2.07s ==============================
+tests/bff/test_app.py repeat2: ============================== 38 passed in 2.10s ==============================
+tests/bff/test_app.py repeat3: ============================== 38 passed in 2.05s ==============================
+tests/bff/test_app.py reversed (38 ids): ============================== 38 passed in 2.18s ==============================
+tests/bff/test_auth.py repeat1: ============================== 12 passed in 0.31s ==============================
+tests/bff/test_auth.py repeat2: ============================== 12 passed in 0.27s ==============================
+tests/bff/test_auth.py repeat3: ============================== 12 passed in 0.31s ==============================
+tests/bff/test_auth.py reversed (12 ids): ============================== 12 passed in 0.29s ==============================
+tests/bff/test_chat_exchange_scope.py repeat1: ============================== 23 passed in 1.63s ==============================
+tests/bff/test_chat_exchange_scope.py repeat2: ============================== 23 passed in 1.62s ==============================
+tests/bff/test_chat_exchange_scope.py repeat3: ============================== 23 passed in 1.57s ==============================
+tests/bff/test_chat_exchange_scope.py reversed (23 ids): ============================== 23 passed in 1.56s ==============================
+tests/bff/test_console_agents.py repeat1: ============================== 17 passed in 1.26s ==============================
+tests/bff/test_console_agents.py repeat2: ============================== 17 passed in 1.24s ==============================
+tests/bff/test_console_agents.py repeat3: ============================== 17 passed in 1.26s ==============================
+tests/bff/test_console_agents.py reversed (17 ids): ============================== 17 passed in 1.26s ==============================
+tests/bff/test_console_chat_projects.py repeat1: ============================== 16 passed in 1.27s ==============================
+tests/bff/test_console_chat_projects.py repeat2: ============================== 16 passed in 1.21s ==============================
+tests/bff/test_console_chat_projects.py repeat3: ============================== 16 passed in 1.19s ==============================
+tests/bff/test_console_chat_projects.py reversed (16 ids): ============================== 16 passed in 1.22s ==============================
+tests/bff/test_console_conversation_tags.py repeat1: ============================== 16 passed in 1.20s ==============================
+tests/bff/test_console_conversation_tags.py repeat2: ============================== 16 passed in 1.19s ==============================
+tests/bff/test_console_conversation_tags.py repeat3: ============================== 16 passed in 1.18s ==============================
+tests/bff/test_console_conversation_tags.py reversed (16 ids): ============================== 16 passed in 1.28s ==============================
+tests/bff/test_console_conversations.py repeat1: ============================== 18 passed in 1.37s ==============================
+tests/bff/test_console_conversations.py repeat2: ============================== 18 passed in 1.33s ==============================
+tests/bff/test_console_conversations.py repeat3: ============================== 18 passed in 1.28s ==============================
+tests/bff/test_console_conversations.py reversed (18 ids): ============================== 18 passed in 1.28s ==============================
+tests/bff/test_console_file_records.py repeat1: ============================== 18 passed in 1.33s ==============================
+tests/bff/test_console_file_records.py repeat2: ============================== 18 passed in 1.33s ==============================
+tests/bff/test_console_file_records.py repeat3: ============================== 18 passed in 1.30s ==============================
+tests/bff/test_console_file_records.py reversed (18 ids): ============================== 18 passed in 1.31s ==============================
+tests/bff/test_console_files.py repeat1: ============================== 20 passed in 1.23s ==============================
+tests/bff/test_console_files.py repeat2: ============================== 20 passed in 1.26s ==============================
+tests/bff/test_console_files.py repeat3: ============================== 20 passed in 1.20s ==============================
+tests/bff/test_console_files.py reversed (20 ids): ============================== 20 passed in 1.23s ==============================
+tests/bff/test_console_files_promote.py repeat1: ============================== 20 passed in 1.24s ==============================
+tests/bff/test_console_files_promote.py repeat2: ============================== 20 passed in 1.31s ==============================
+tests/bff/test_console_files_promote.py repeat3: ============================== 20 passed in 1.35s ==============================
+tests/bff/test_console_files_promote.py reversed (20 ids): ============================== 20 passed in 1.27s ==============================
+tests/bff/test_console_presets.py repeat1: ============================== 16 passed in 1.27s ==============================
+tests/bff/test_console_presets.py repeat2: ============================== 16 passed in 1.31s ==============================
+tests/bff/test_console_presets.py repeat3: ============================== 16 passed in 1.27s ==============================
+tests/bff/test_console_presets.py reversed (16 ids): ============================== 16 passed in 1.32s ==============================
+tests/bff/test_console_prompts.py repeat1: ============================== 18 passed in 1.46s ==============================
+tests/bff/test_console_prompts.py repeat2: ============================== 18 passed in 1.43s ==============================
+tests/bff/test_console_prompts.py repeat3: ============================== 18 passed in 1.37s ==============================
+tests/bff/test_console_prompts.py reversed (18 ids): ============================== 18 passed in 1.45s ==============================
+tests/bff/test_console_tool_favorites.py repeat1: ============================== 17 passed in 1.39s ==============================
+tests/bff/test_console_tool_favorites.py repeat2: ============================== 17 passed in 1.35s ==============================
+tests/bff/test_console_tool_favorites.py repeat3: ============================== 17 passed in 1.34s ==============================
+tests/bff/test_console_tool_favorites.py reversed (17 ids): ============================== 17 passed in 1.35s ==============================
+tests/bff/test_exchange.py repeat1: ============================== 12 passed in 0.66s ==============================
+tests/bff/test_exchange.py repeat2: ============================== 12 passed in 0.63s ==============================
+tests/bff/test_exchange.py repeat3: ============================== 12 passed in 0.65s ==============================
+tests/bff/test_exchange.py reversed (12 ids): ============================== 12 passed in 0.64s ==============================
+tests/bff/test_exchange_scope_log.py repeat1: ============================== 3 passed in 0.21s ===============================
+tests/bff/test_exchange_scope_log.py repeat2: ============================== 3 passed in 0.21s ===============================
+tests/bff/test_exchange_scope_log.py repeat3: ============================== 3 passed in 0.21s ===============================
+tests/bff/test_exchange_scope_log.py reversed (3 ids): ============================== 3 passed in 0.21s ===============================
+tests/test_auth.py repeat1: ============================== 41 passed in 1.40s ==============================
+tests/test_auth.py repeat2: ============================== 41 passed in 1.44s ==============================
+tests/test_auth.py repeat3: ============================== 41 passed in 1.39s ==============================
+tests/test_auth.py reversed (41 ids): ============================== 41 passed in 1.48s ==============================
+tests/test_chart_refused_turn_and_session_end.py repeat1: ======================== 12 passed, 1 warning in 0.99s =========================
+tests/test_chart_refused_turn_and_session_end.py repeat2: ======================== 12 passed, 1 warning in 0.90s =========================
+tests/test_chart_refused_turn_and_session_end.py repeat3: ======================== 12 passed, 1 warning in 0.91s =========================
+tests/test_chart_refused_turn_and_session_end.py reversed (12 ids): ======================== 12 passed, 1 warning in 1.00s =========================
+tests/test_console_k3s_guards.py repeat1: ======================== 22 passed, 1 warning in 6.69s =========================
+tests/test_console_k3s_guards.py repeat2: ======================== 22 passed, 1 warning in 7.02s =========================
+tests/test_console_k3s_guards.py repeat3: ======================== 22 passed, 1 warning in 6.72s =========================
+tests/test_console_k3s_guards.py reversed (22 ids): ======================== 22 passed, 1 warning in 6.63s =========================
+tests/test_keycloak_exchange_measurement_pin.py repeat1: ========================= 5 passed, 1 warning in 0.70s =========================
+tests/test_keycloak_exchange_measurement_pin.py repeat2: ========================= 5 passed, 1 warning in 0.70s =========================
+tests/test_keycloak_exchange_measurement_pin.py repeat3: ========================= 5 passed, 1 warning in 0.66s =========================
+tests/test_keycloak_exchange_measurement_pin.py reversed (5 ids): ========================= 5 passed, 1 warning in 0.69s =========================
+tests/test_librechat_openid_scope_covers_bff_exchanges.py repeat1: ========================= 8 passed, 1 warning in 1.47s =========================
+tests/test_librechat_openid_scope_covers_bff_exchanges.py repeat2: ========================= 8 passed, 1 warning in 1.44s =========================
+tests/test_librechat_openid_scope_covers_bff_exchanges.py repeat3: ========================= 8 passed, 1 warning in 1.40s =========================
+tests/test_librechat_openid_scope_covers_bff_exchanges.py reversed (8 ids): ========================= 8 passed, 1 warning in 1.42s =========================
+tests/test_log_call_redaction.py repeat1: ============================= 132 passed in 21.70s =============================
+tests/test_log_call_redaction.py repeat2: ============================= 132 passed in 21.57s =============================
+tests/test_log_call_redaction.py repeat3: ============================= 132 passed in 21.76s =============================
+tests/test_log_call_redaction.py reversed (132 ids): ============================= 132 passed in 20.88s =============================
+tests/test_mcp_broker_routes.py repeat1: ============================== 8 passed in 8.40s ===============================
+tests/test_mcp_broker_routes.py repeat2: ============================== 8 passed in 8.55s ===============================
+tests/test_mcp_broker_routes.py repeat3: ============================== 8 passed in 8.40s ===============================
+tests/test_mcp_broker_routes.py reversed (8 ids): ============================== 8 passed in 8.47s ===============================
+tests/test_mcp_routes.py repeat1: ============================= 17 passed in 16.87s ==============================
+tests/test_mcp_routes.py repeat2: ============================= 17 passed in 16.75s ==============================
+tests/test_mcp_routes.py repeat3: ============================= 17 passed in 16.77s ==============================
+tests/test_mcp_routes.py reversed (17 ids): ============================= 17 passed in 16.89s ==============================
+tests/test_mcp_write_tools_routes.py repeat1: ============================= 15 passed in 14.86s ==============================
+tests/test_mcp_write_tools_routes.py repeat2: ============================= 15 passed in 14.90s ==============================
+tests/test_mcp_write_tools_routes.py repeat3: ============================= 15 passed in 15.73s ==============================
+tests/test_mcp_write_tools_routes.py reversed (15 ids): ============================= 15 passed in 15.24s ==============================
+tests/test_mesh_peer.py repeat1: ============================== 13 passed in 0.07s ==============================
+tests/test_mesh_peer.py repeat2: ============================== 13 passed in 0.06s ==============================
+tests/test_mesh_peer.py repeat3: ============================== 13 passed in 0.06s ==============================
+tests/test_mesh_peer.py reversed (13 ids): ============================== 13 passed in 0.06s ==============================
+tests/test_mesh_peer_open_quote.py repeat1: ============================== 6 passed in 0.05s ===============================
+tests/test_mesh_peer_open_quote.py repeat2: ============================== 6 passed in 0.05s ===============================
+tests/test_mesh_peer_open_quote.py repeat3: ============================== 6 passed in 0.05s ===============================
+tests/test_mesh_peer_open_quote.py reversed (6 ids): ============================== 6 passed in 0.05s ===============================
+tests/test_realm_keys_twin.py repeat1: ============================== 1 passed in 0.04s ===============================
+tests/test_realm_keys_twin.py repeat2: ============================== 1 passed in 0.04s ===============================
+tests/test_realm_keys_twin.py repeat3: ============================== 1 passed in 0.05s ===============================
+tests/test_realm_keys_twin.py reversed (1 ids): ============================== 1 passed in 0.04s ===============================
+tests/test_refusal_ingest_rls_postgres.py repeat1: ========================= 3 passed, 1 warning in 5.30s =========================
+tests/test_refusal_ingest_rls_postgres.py repeat2: ========================= 3 passed, 1 warning in 5.60s =========================
+tests/test_refusal_ingest_rls_postgres.py repeat3: ========================= 3 passed, 1 warning in 6.28s =========================
+tests/test_refusal_ingest_rls_postgres.py reversed (3 ids): ========================= 3 passed, 1 warning in 5.67s =========================
+tests/test_scrub_event_loop_stall.py repeat1: ============================= 71 passed in 12.32s ==============================
+tests/test_scrub_event_loop_stall.py repeat2: ============================= 71 passed in 12.08s ==============================
+tests/test_scrub_event_loop_stall.py repeat3: ============================= 71 passed in 12.35s ==============================
+tests/test_scrub_event_loop_stall.py reversed (71 ids): ============================= 71 passed in 12.31s ==============================
+tests/test_branches_found_by_the_coverage_gate.py repeat1: ============================== 12 passed in 0.07s ==============================
+tests/test_branches_found_by_the_coverage_gate.py repeat2: ============================== 12 passed in 0.06s ==============================
+tests/test_branches_found_by_the_coverage_gate.py repeat3: ============================== 12 passed in 0.07s ==============================
+tests/test_branches_found_by_the_coverage_gate.py reversed (12 ids): ============================== 12 passed in 0.07s ==============================
+tests/bff/test_chat_caller_scope_backstop.py repeat1: 1 passed in 0.20s
+tests/bff/test_chat_caller_scope_backstop.py repeat2: 1 passed in 0.21s
+tests/bff/test_chat_caller_scope_backstop.py repeat3: 1 passed in 0.17s
+tests/bff/test_chat_caller_scope_backstop.py reversed (1 ids): 1 passed in 0.19s
+tests/bff/test_chat_last_resort_frames.py repeat1: 3 passed in 0.05s
+tests/bff/test_chat_last_resort_frames.py repeat2: 3 passed in 0.05s
+tests/bff/test_chat_last_resort_frames.py repeat3: 3 passed in 0.05s
+tests/bff/test_chat_last_resort_frames.py reversed (3 ids): 3 passed in 0.05s
+tests/bff/test_chat_route_last_resort.py repeat1: 5 passed in 0.33s
+tests/bff/test_chat_route_last_resort.py repeat2: 5 passed in 0.36s
+tests/bff/test_chat_route_last_resort.py repeat3: 5 passed in 0.39s
+tests/bff/test_chat_route_last_resort.py reversed (5 ids): 5 passed in 0.33s
+tests/test_chart_librechat_retry_bound.py repeat1: 2 passed, 1 warning in 0.64s
+tests/test_chart_librechat_retry_bound.py repeat2: 2 passed, 1 warning in 0.63s
+tests/test_chart_librechat_retry_bound.py repeat3: 2 passed, 1 warning in 0.67s
+tests/test_chart_librechat_retry_bound.py reversed (2 ids): 2 passed, 1 warning in 0.69s
+tests/bff/test_all_routes_errors.py repeat1: 290 passed in 12.17s
+tests/bff/test_all_routes_errors.py repeat2: 290 passed in 12.35s
+tests/bff/test_all_routes_errors.py repeat3: 290 passed in 12.23s
+tests/bff/test_all_routes_errors.py reversed (290 ids): 290 passed in 12.65s
+tests/bff/test_chat_route_errors.py repeat1: 135 passed in 5.93s
+tests/bff/test_chat_route_errors.py repeat2: 135 passed in 5.83s
+tests/bff/test_chat_route_errors.py repeat3: 135 passed in 5.90s
+tests/bff/test_chat_route_errors.py reversed (135 ids): 135 passed in 5.89s
+tests/bff/test_realm_keys.py repeat1: 14 passed in 1.54s
+tests/bff/test_realm_keys.py repeat2: 14 passed in 1.46s
+tests/bff/test_realm_keys.py repeat3: 14 passed in 1.43s
+tests/bff/test_realm_keys.py reversed (14 ids): 14 passed in 1.54s
+tests/bff/test_refusal_record.py repeat1: 16 passed in 1.65s
+tests/bff/test_refusal_record.py repeat2: 16 passed in 1.65s
+tests/bff/test_refusal_record.py repeat3: 16 passed in 1.66s
+tests/bff/test_refusal_record.py reversed (16 ids): 16 passed in 1.61s
+tests/test_auth_realm_keys.py repeat1: 14 passed in 0.37s
+tests/test_auth_realm_keys.py repeat2: 14 passed in 0.41s
+tests/test_auth_realm_keys.py repeat3: 14 passed in 0.37s
+tests/test_auth_realm_keys.py reversed (14 ids): 14 passed in 0.38s
+tests/test_chart_refusal_switch_coupling.py repeat1: 2 passed, 1 warning in 0.57s
+tests/test_chart_refusal_switch_coupling.py repeat2: 2 passed, 1 warning in 0.62s
+tests/test_chart_refusal_switch_coupling.py repeat3: 2 passed, 1 warning in 0.68s
+tests/test_chart_refusal_switch_coupling.py reversed (2 ids): 2 passed, 1 warning in 0.61s
+tests/test_refusal_ingest.py repeat1: 32 passed in 21.24s
+tests/test_refusal_ingest.py repeat2: 32 passed in 21.13s
+tests/test_refusal_ingest.py repeat3: 32 passed in 21.84s
+tests/test_refusal_ingest.py reversed (32 ids): 32 passed in 19.27s
+tests/test_refusal_ingest_gate_conditions.py repeat1: 4 passed in 2.64s
+tests/test_refusal_ingest_gate_conditions.py repeat2: 4 passed in 2.69s
+tests/test_refusal_ingest_gate_conditions.py repeat3: 4 passed in 2.35s
+tests/test_refusal_ingest_gate_conditions.py reversed (4 ids): 4 passed in 3.20s
+tests/bff/test_path_guard.py repeat1: 29 passed in 1.45s
+tests/bff/test_path_guard.py repeat2: 29 passed in 1.40s
+tests/bff/test_path_guard.py repeat3: 29 passed in 1.34s
+tests/bff/test_path_guard.py reversed (29 ids): 29 passed in 1.36s
