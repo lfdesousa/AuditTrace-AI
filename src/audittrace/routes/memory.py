@@ -29,7 +29,6 @@ content itself lives in S3 (episodic/procedural) or ChromaDB
 
 import asyncio
 import contextlib
-import hashlib
 import logging
 import time
 from enum import StrEnum
@@ -83,6 +82,12 @@ from audittrace.models import (
 from audittrace.routes import memory_pdf as _pdf  # noqa: E402
 from audittrace.routes import memory_scan as _scan  # noqa: E402
 from audittrace.routes._session_bind import bound_upload_session  # noqa: E402
+from audittrace.routes.memory_chunking import chunk_document
+from audittrace.routes.memory_fold_tail import find_stale_tail
+from audittrace.routes.memory_layer_writes import (
+    authorize_layer_write,
+    record_layer_write,
+)
 from audittrace.routes.memory_list_view import (
     entries_to_dicts,
     entries_with_prefix,
@@ -96,20 +101,36 @@ from audittrace.routes.memory_promote import (
 )
 from audittrace.routes.memory_semantic_writes import (
     chroma_id_conflict_409,
-    concurrent_write_409,
     drop_copied_forward_chunk,
     require_visible_row_or_404,
     semantic_write_errors_as_http,
+)
+from audittrace.routes.memory_whole_document import (
+    STAMP_FOLD,
+    STAMP_TOTAL,
+    chunk_id,
+    fold_stamp,
+    gather_whole_document,
+    reassemble_chunk_sequence,
+)
+from audittrace.routes.memory_write_audit import emit_write_audit, emit_write_audits
+from audittrace.routes.memory_write_refusal import (
+    read_upload_bounded,
+    refuse_oversize_or_413,
+)
+from audittrace.routes.memory_write_support import (
+    concurrent_write_as_409,
+    corpus_write_authorized,
+    has_corpus_scope,
+    legacy_copy_forward_source,
+    manifest_authorization_as_403,
+    semantic_key,
 )
 from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.episodic import EpisodicService
 from audittrace.services.index_routing import collection_for_key
 from audittrace.services.layer_listing import list_layer_objects
-from audittrace.services.memory_audit import (
-    MemoryOp,
-    emit_memory_audit_event,
-    schedule_read_audit,
-)
+from audittrace.services.memory_audit import schedule_read_audit
 from audittrace.services.memory_keys import (
     ID_FORM_LC9,
     ChromaIdConflictError,
@@ -132,6 +153,9 @@ from audittrace.services.recall_telemetry import (
     emit_recall_telemetry,
 )
 from audittrace.services.semantic import ChromaSemanticService
+from audittrace.services.semantic_document_incomplete_error import (
+    SemanticDocumentIncompleteError,
+)
 from audittrace.services.session_memory import SessionMemoryService
 from audittrace.services.write_telemetry import emit_chunks_indexed, emit_memory_write
 
@@ -178,6 +202,18 @@ _PDF_ANNOT_REDACT = _pdf._PDF_ANNOT_REDACT
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# The chunk-id formula lives in memory_whole_document; this name is what
+# the PDF fold and the tests import.
+_doc_id = chunk_id
+# Shared with the sibling write modules (``memory_write_support``); the
+# underscore names stay for every existing caller and test.
+_semantic_key = semantic_key
+_has_corpus_scope = has_corpus_scope
+_corpus_write_authorized = corpus_write_authorized
+_raise_manifest_authorization_as_403 = manifest_authorization_as_403
+_raise_concurrent_write_as_409 = concurrent_write_as_409
+_legacy_copy_forward_source = legacy_copy_forward_source
 
 # Chunking parameters — must match scripts/index-chromadb.py
 CHUNK_SIZE = 1500
@@ -236,12 +272,6 @@ def _chunk_text(
     return chunks
 
 
-def _doc_id(collection: str, source: str, chunk_idx: int) -> str:
-    """Generate a deterministic document ID."""
-    raw = f"{collection}:{source}:{chunk_idx}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-
 def _chroma_ids(user: UserContext, tier: str, ids: list[str]) -> list[str]:
     """The ChromaDB ids a fold writes for the LOGICAL chunk *ids* (LC-9 WP3):
     ``{owner}__{id}`` for a private-tier write, unchanged for corpus. The one
@@ -249,33 +279,6 @@ def _chroma_ids(user: UserContext, tier: str, ids: list[str]) -> list[str]:
     if tier == "corpus":
         return list(ids)
     return [private_physical_id(user, i) for i in ids]
-
-
-# WU-1 (SPEC-2026-09-17-memory-retrieval-and-learning-loop-telemetry, closes
-# D15 item 2 — whole-document read). A generous safety cap on how many
-# chunks ``_iter_document_chunk_ids`` will ever probe for one document: real
-# build records/specs folded by ``_index_md_objects`` at
-# ``CHUNK_SIZE=1500`` have not been observed needing more than a few dozen
-# chunks, so this cap exists to bound worst-case work (a malformed/huge
-# title should not make a single read loop indefinitely), not because any
-# real document is expected to approach it.
-_MAX_DOCUMENT_CHUNKS = 500
-
-
-def _iter_document_chunk_ids(collection: str, title: str) -> list[str]:
-    """The deterministic chunk-id SEQUENCE for one folded document.
-
-    ``_doc_id`` is a pure function of ``(collection, source, chunk_idx)`` —
-    the SAME formula ``_index_md_objects`` uses to name each chunk it
-    writes. Given just the document's ``title`` (== the original
-    filename), chunk 0's id — the front-matter chunk — is directly
-    computable with no hash-guessing, closing the WU-1 obstacle: "front
-    matter (chunk 0) is reachable only via the deterministic ``_doc_id``
-    hash — a real obstacle to the Layer-2 build-record verification every
-    reviewer performs." See ``read_semantic``'s ``whole_document`` mode,
-    the documented consumer of this sequence.
-    """
-    return [_doc_id(collection, title, i) for i in range(_MAX_DOCUMENT_CHUNKS)]
 
 
 def _get_minio_client() -> Any:
@@ -395,15 +398,6 @@ def _require_admin(user: UserContext, action: str) -> None:
 # ``_reject_corpus_promotion_for`` below).
 
 
-def _has_corpus_scope(user: UserContext, collection: str, action: str) -> bool:
-    """``True`` iff *user* holds ``memory:corpus:<collection>:<action>``
-    (or an admin bypass). Boolean twin of ``_require_corpus_scope`` for
-    call sites that need to silently FILTER (list endpoints) rather than
-    reject the whole request (single-doc read/write)."""
-    required = f"memory:corpus:{collection}:{action}"
-    return user.is_admin or "audittrace:admin" in user.scopes or required in user.scopes
-
-
 def _require_corpus_scope(user: UserContext, collection: str, action: str) -> None:
     """Raise 403 unless *user* holds ``memory:corpus:<collection>:<action>``.
 
@@ -421,99 +415,6 @@ def _require_corpus_scope(user: UserContext, collection: str, action: str) -> No
         status_code=403,
         detail=f"Required scope: {required} (or audittrace:admin)",
     )
-
-
-def _corpus_write_authorized(user: UserContext, collection: str | None) -> bool:
-    """``True`` iff *user* may overwrite/demote an EXISTING **corpus**-tier
-    manifest row — the ``caller_can_write_shared`` authorization
-    ``MemoryManifestService.record_create``/``record_update`` require to
-    touch such a row (SPEC security-memory-manifest-tier-authz,
-    2026-08-30).
-
-    ``collection`` is one of the three ADR-062 §4 corpus-scoped ChromaDB
-    collections (``decisions``/``skills``/``semantic``) for ``/memory/
-    semantic`` writes — delegates to ``_has_corpus_scope`` for the exact
-    per-collection grant (or admin). ``None`` is passed for the episodic/
-    procedural layers, which have NO ``memory:corpus:<layer>:write`` scope
-    declared at all (the module note above ``_has_corpus_scope`` — the
-    closed scope set is exactly the three collections above); for those
-    layers only an admin (``audittrace:admin`` or ``is_admin``) can ever
-    satisfy this — matching that no ordinary caller can hold a shared-
-    write grant that does not exist.
-    """
-    if collection is None:
-        return user.is_admin or "audittrace:admin" in user.scopes
-    return _has_corpus_scope(user, collection, "write")
-
-
-def _raise_manifest_authorization_as_403(
-    exc: ManifestAuthorizationError,
-) -> HTTPException:
-    """Map :class:`ManifestAuthorizationError` to the route-layer HTTP 403
-    every other authorization failure in this file uses — never let it
-    fall through to the generic 500 handler (SPEC security-memory-
-    manifest-tier-authz, 2026-08-30, invariant #4: fail-closed, RAISE, not
-    a silent overwrite AND not an opaque 500)."""
-    return HTTPException(status_code=403, detail=str(exc))
-
-
-def _raise_concurrent_write_as_409(exc: ConcurrentManifestWriteError) -> HTTPException:
-    """A lost ``UNIQUE (layer, key)`` race is a retryable 409, never a 500
-    (LC-9 WP1 review A2); the body lives in ``memory_semantic_writes``."""
-    return concurrent_write_409(exc)
-
-
-async def _legacy_copy_forward_source(
-    manifest: Any, user: UserContext, layer: str, filename: str
-) -> str | None:
-    """The stored key of the caller's OWN live legacy bare-key private row
-    that the coming create/update of *filename* will copy forward, else
-    ``None`` (LC-9 WP2a, ADDENDUM-1 S2: the audit trail records the
-    copy-forward). Decided through ``resolve_read``: the caller's owner key
-    wins; the legacy row counts only when it is the caller's own, private and
-    live. Another user's row is invisible to ``resolve_read``, so it can
-    never be named here."""
-    prior: ManifestEntry | None = await manifest.resolve_read(layer, filename, user)
-    if (
-        prior is not None
-        and prior.tier == "private"
-        and prior.deleted_at_ms is None
-        and prior.created_by_user_id == user.user_id
-        and prior.storage_key == filename
-    ):
-        return prior.storage_key
-    return None
-
-
-async def _emit_write_audits(
-    *,
-    user: UserContext,
-    layer: str,
-    filename: str,
-    copied_from: str | None,
-    collection: str | None = None,
-) -> None:
-    """One ``_emit_write_audit`` per manifest mutation (ADDENDUM-1 S2): the
-    create/update row, and -- on a copy-forward -- the legacy tombstone.
-    The write carries ``copied_from``; the tombstone ``reason``. Both keys
-    are additive ``detail`` fields."""
-    await _emit_write_audit(
-        user=user,
-        op="write",
-        layer=layer,
-        collection=collection,
-        key=filename,
-        detail_extra={"copied_from": copied_from} if copied_from else None,
-    )
-    if copied_from:
-        await _emit_write_audit(
-            user=user,
-            op="delete",
-            layer=layer,
-            collection=collection,
-            key=filename,
-            detail_extra={"reason": "copy_forward"},
-        )
 
 
 def _resolve_requested_tier(payload: dict[str, Any] | None, promote: str | None) -> str:
@@ -570,7 +471,9 @@ def _manifest_visible(entry: ManifestEntry, user: UserContext) -> bool:
     return entry.created_by_user_id == user.user_id or entry.tier == "corpus"
 
 
-_SEMANTIC_METADATA_SECURITY_KEYS = frozenset({"tier", "user_id", "id_form"})
+_SEMANTIC_METADATA_SECURITY_KEYS = frozenset(
+    {"tier", "user_id", "id_form", STAMP_TOTAL, STAMP_FOLD}
+)
 
 
 def _sanitize_semantic_metadata(metadata: Any) -> Any:
@@ -618,48 +521,6 @@ def _reject_corpus_promotion_for(layer: str, tier: str) -> None:
                 "(ADR-062 Phase B, WU-B5)"
             ),
         )
-
-
-async def _emit_write_audit(
-    *,
-    user: UserContext,
-    op: MemoryOp,
-    layer: str,
-    collection: str | None = None,
-    key: str | None = None,
-    detail_extra: dict[str, Any] | None = None,
-) -> None:
-    """Fail-closed wrapper around :func:`emit_memory_audit_event` for every
-    WRITE/DELETE call site (ADR-062 §5, WU-A4).
-
-    See ``services/memory_audit.py``'s module docstring for the full
-    read=fail-open / write=fail-closed rationale. This wrapper converts an
-    audit-store failure into an explicit ``HTTPException(500)`` rather than
-    letting a bare exception fall through to the app-wide catch-all
-    handler — the caller gets a precise, on-brand error (matching every
-    other 5xx in this file) instead of a generic unhandled-exception
-    envelope, and the failure is deterministically visible to
-    ``TestClient`` (Starlette's ``ServerErrorMiddleware`` always re-raises
-    after an unhandled exception, which ``TestClient`` in turn re-raises
-    into the caller's test — an explicit ``HTTPException`` is the
-    established pattern this file already uses everywhere else a service
-    call can fail, e.g. ``_require_admin``'s 403, the 502s below)."""
-    try:
-        await emit_memory_audit_event(
-            user=user,
-            op=op,
-            layer=layer,
-            collection=collection,
-            key=key,
-            detail_extra=detail_extra,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"memory audit-write failed — mutation not confirmed audited: {exc}"
-            ),
-        ) from exc
 
 
 async def _write_layer_private(
@@ -778,7 +639,7 @@ async def upload_memory_file(
     _require_layer_write(user, layer)
     settings = get_settings()
     target_filename = filename or file.filename or "unnamed"
-    content = await file.read()
+    content = await read_upload_bounded(file)
     minio_client = _get_minio_client()
 
     # ── ADR-048 PR-B3 dispatch ───────────────────────────────────
@@ -849,8 +710,21 @@ async def upload_memory_file(
             detail="non-PDF /memory/upload content must be UTF-8 text",
         ) from exc
 
+    manifest = get_memory_manifest_service()
+    if layer != MemoryLayer.session:
+        await authorize_layer_write(manifest, user, layer.value, target_filename, tier)
     with bound_upload_session(request):  # LC-10a: the chat compartment
         await _write_layer_private(layer, user, target_filename, text_content)
+    if layer != MemoryLayer.session:
+        await record_layer_write(
+            manifest,
+            user,
+            layer.value,
+            target_filename,
+            text_content,
+            title=None,
+            tier=tier,
+        )
 
     # M2 — write-telemetry counter (layer label, no PII).
     emit_memory_write(layer=layer.value)
@@ -863,7 +737,7 @@ async def upload_memory_file(
         # invariant (traceability, feedback_traceability_requirement):
         # write the usual audit row, token-derived identity, awaited
         # inline (fail-closed — see services/memory_audit.py).
-        await _emit_write_audit(
+        await emit_write_audit(
             user=user,
             op="write",
             layer=MemoryLayer.session.value,
@@ -1089,16 +963,34 @@ async def _index_md_objects(
         if outcomes is not None:
             outcomes.append(True)
         content = raw.decode("utf-8", errors="replace")
-        chunks = _chunk_text(content)
+        chunks = chunk_document(content, CHUNK_SIZE, CHUNK_OVERLAP)
+        stale = await find_stale_tail(
+            collection, user, tier, col_name, obj["filename"], kept=len(chunks)
+        )
         if not chunks:
+            # A blank document folds to nothing, and every chunk of an earlier
+            # fold goes with it: authorized first, audited once (gate r3 S14).
+            # Left in place they would read back, ``verified``, as the old text.
+            await stale.authorize(manifest_service, user, tier)
+            await stale.drop(
+                collection,
+                manifest_service,
+                user,
+                tier,
+                caller_can_write_shared=caller_can_write_shared,
+            )
             continue
         ids = [_doc_id(col_name, obj["filename"], i) for i in range(len(chunks))]
+        stamp = fold_stamp(content, len(chunks))
         metadatas: list[dict[str, Any]] = [
             {
                 "source": obj["filename"],
                 "category": category,
                 "file_type": "md",
                 "chunk": i,
+                # How many chunks THIS fold wrote for the document: the pin a
+                # whole-document read holds itself to (complete, or a 409).
+                **stamp,
                 # ``user_id`` is the ONE ownership key across every writer
                 # (this path and routes/memory_pdf/pipeline.py). It is the
                 # key ``ChromaSemanticService.search`` filters on for
@@ -1146,6 +1038,7 @@ async def _index_md_objects(
         # test that deliberately omits it to exercise something else — see
         # ``_flush_md_manifest``'s own None-skip contract; production
         # always resolves a real manifest service.
+        await stale.authorize(manifest_service, user, tier)
         if manifest_service is not None:
             for doc_id in ids:
                 await authorize_write(
@@ -1173,6 +1066,13 @@ async def _index_md_objects(
             collection, _chroma_ids(user, tier, ids), chunks, metadatas
         )
         total += len(chunks)
+        await stale.drop(
+            collection,
+            manifest_service,
+            user,
+            tier,
+            caller_can_write_shared=caller_can_write_shared,
+        )
         # ADR-059 WU-1c — thread the manifest write (see this function's
         # docstring + the memory_md_manifest module docstring). Runs after
         # the ChromaDB upsert, same ordering as the PDF path
@@ -1630,7 +1530,7 @@ async def index_memory(
     # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
     # closed). One event per /memory/index call, naming every target
     # collection touched; single-file mode additionally names the key.
-    await _emit_write_audit(
+    await emit_write_audit(
         user=user,
         op="write",
         layer="semantic",
@@ -1799,48 +1699,23 @@ async def create_episodic(
             detail="filename and content are required string fields",
         )
     _validate_filename_or_400(filename, "episodic")
+    refuse_oversize_or_413(content)
     tier = _resolve_requested_tier(payload, promote)
     _reject_corpus_promotion_for("episodic", tier)
     title = payload.get("title")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
-    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
-    # PRE-WRITE choke, checked BEFORE any content lands (S3 write below).
-    # Supersedes relying on record_create's own guard alone, which only
-    # fires AFTER the content write on other paths (this route never had
-    # that ordering bug, but every content-write entry point now calls
-    # the same choke uniformly per the ratified spec).
-    try:
-        await authorize_write(manifest, user, "episodic", filename, requested_tier=tier)
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
+    # The pre-write choke, the manifest row and the write audit are the
+    # ``memory_layer_writes`` sequence ``POST /memory/upload`` shares.
+    await authorize_layer_write(manifest, user, "episodic", filename, tier)
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    copied_from = await _legacy_copy_forward_source(
-        manifest, user, "episodic", filename
-    )
-    try:
-        entry: ManifestEntry = await manifest.record_create(
-            layer="episodic",
-            key=filename,
-            title=title,
-            size_bytes=len(content.encode("utf-8")),
-            user_id=user.user_id,
-            tier=tier,
-            caller_can_write_shared=_corpus_write_authorized(user, None),
-        )
-    except ConcurrentManifestWriteError as exc:
-        raise _raise_concurrent_write_as_409(exc) from exc
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
-    # closed: see services/memory_audit.py module docstring).
-    await _emit_write_audits(
-        user=user, layer="episodic", filename=filename, copied_from=copied_from
+    entry = await record_layer_write(
+        manifest, user, "episodic", filename, content, title=title, tier=tier
     )
     return entry.to_dict()
 
@@ -2074,6 +1949,7 @@ async def update_episodic(
         raise HTTPException(
             status_code=400, detail="content is a required string field"
         )
+    refuse_oversize_or_413(content)
     title = payload.get("title")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
@@ -2111,7 +1987,7 @@ async def update_episodic(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audits(
+    await emit_write_audits(
         user=user, layer="episodic", filename=filename, copied_from=copied_from
     )
     return entry.to_dict()
@@ -2169,7 +2045,7 @@ async def delete_episodic(
             await service.delete(user, filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-    await _emit_write_audit(
+    await emit_write_audit(
         user=user,
         op="delete",
         layer="episodic",
@@ -2209,44 +2085,23 @@ async def create_procedural(
             detail="filename and content are required string fields",
         )
     _validate_filename_or_400(filename, "procedural")
+    refuse_oversize_or_413(content)
     tier = _resolve_requested_tier(payload, promote)
     _reject_corpus_promotion_for("procedural", tier)
     title = payload.get("title")
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
-    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
-    # PRE-WRITE choke, before the S3 write below.
-    try:
-        await authorize_write(
-            manifest, user, "procedural", filename, requested_tier=tier
-        )
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
+    # The pre-write choke, the manifest row and the write audit are the
+    # ``memory_layer_writes`` sequence ``POST /memory/upload`` shares.
+    await authorize_layer_write(manifest, user, "procedural", filename, tier)
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    copied_from = await _legacy_copy_forward_source(
-        manifest, user, "procedural", filename
-    )
-    try:
-        entry: ManifestEntry = await manifest.record_create(
-            layer="procedural",
-            key=filename,
-            title=title,
-            size_bytes=len(content.encode("utf-8")),
-            user_id=user.user_id,
-            tier=tier,
-            caller_can_write_shared=_corpus_write_authorized(user, None),
-        )
-    except ConcurrentManifestWriteError as exc:
-        raise _raise_concurrent_write_as_409(exc) from exc
-    except ManifestAuthorizationError as exc:
-        raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audits(
-        user=user, layer="procedural", filename=filename, copied_from=copied_from
+    entry = await record_layer_write(
+        manifest, user, "procedural", filename, content, title=title, tier=tier
     )
     return entry.to_dict()
 
@@ -2346,6 +2201,7 @@ async def update_procedural(
         raise HTTPException(
             status_code=400, detail="content is a required string field"
         )
+    refuse_oversize_or_413(content)
     title = payload.get("title")
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
@@ -2383,7 +2239,7 @@ async def update_procedural(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    await _emit_write_audits(
+    await emit_write_audits(
         user=user, layer="procedural", filename=filename, copied_from=copied_from
     )
     return entry.to_dict()
@@ -2428,7 +2284,7 @@ async def delete_procedural(
             await service.delete(user, filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-    await _emit_write_audit(
+    await emit_write_audit(
         user=user,
         op="delete",
         layer="procedural",
@@ -2444,11 +2300,6 @@ async def delete_procedural(
 # slash-separated key lives in the manifest's `key` column; the route
 # splits it into path segments for the URL but recombines for the
 # manifest lookup.
-
-
-def _semantic_key(collection: str, document_id: str) -> str:
-    """Manifest lookup key for a semantic doc. ``<collection>/<doc_id>``."""
-    return f"{collection}/{document_id}"
 
 
 @router.post("/semantic")
@@ -2492,6 +2343,7 @@ async def create_semantic(
             status_code=400,
             detail="collection, document_id and text are required strings",
         )
+    refuse_oversize_or_413(text)
     metadata = _sanitize_semantic_metadata(payload.get("metadata"))
     title = payload.get("title")
     tier = _resolve_requested_tier(payload, promote)
@@ -2532,7 +2384,7 @@ async def create_semantic(
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
     await drop_copied_forward_chunk(service, user, collection, document_id, copied_from)
-    await _emit_write_audits(
+    await emit_write_audits(
         user=user,
         layer="semantic",
         collection=collection,
@@ -2907,109 +2759,11 @@ async def list_semantic(
     }
 
 
-async def _gather_whole_document(
-    service: Any,
-    user: UserContext,
-    collection: str,
-    document_id: str,
-    doc: Any,
-) -> tuple[list[str], list[Any]]:
-    """WU-1 (closes D15 item 2 — whole-document read). Reconstruct every
-    chunk of the document ``doc`` (already fetched at ``document_id``)
-    belongs to, via the deterministic ``_iter_document_chunk_ids``
-    sequence, so the caller gets chunk 0 (the front matter) regardless of
-    which chunk id it originally asked for.
-
-    Returns ``(chunk_keys, chunk_docs)`` in chunk-index order. Falls back
-    to the single already-fetched ``doc`` when it carries no
-    ``title``/``source`` metadata to reconstruct the sequence from (e.g. a
-    direct ``POST /memory/semantic`` write with no title) — a document we
-    genuinely cannot re-derive the sequence for is still returned, just as
-    itself rather than as an error.
-    """
-    title = doc.metadata.get("title") or doc.metadata.get("source")
-    if not isinstance(title, str) or not title:
-        return [document_id], [doc]
-    chunk_ids: list[str] = []
-    chunk_docs: list[Any] = []
-    # LC-9 WP3 (ADDENDUM-1 S2): the whole sequence is resolved with ONE batched
-    # read (owner ids and the caller's legacy ids together; missing ids are
-    # omitted), not one ``get_document`` per chunk.
-    sequence = _iter_document_chunk_ids(collection, title)
-    fetched = await service.get_documents(user, collection, sequence)
-    for chunk_id, candidate in zip(sequence, fetched, strict=True):
-        if candidate is None:
-            break
-        chunk_ids.append(chunk_id)
-        chunk_docs.append(candidate)
-    if not chunk_ids:
-        # The deterministic sequence never reproduced the requested chunk
-        # (e.g. a legacy row whose title predates this hash scheme) —
-        # degrade to the single chunk we DID find rather than an empty
-        # "document".
-        return [document_id], [doc]
-    return chunk_ids, chunk_docs
-
-
 def _reassemble_chunk_sequence(
     chunk_docs: list[Any], overlap: int = CHUNK_OVERLAP
 ) -> str:
-    """WU-1 fix-round-2 (closes the round-1 F1 reject — ``?whole_document=
-    true`` duplicated every chunk overlap instead of reconstructing the
-    document). De-overlap and concatenate a CONTIGUOUS chunk sequence
-    (index 0..N, as produced by :func:`_gather_whole_document`) back into
-    the ORIGINAL text, BYTE-EXACT.
-
-    **Why dropping a flat ``overlap`` characters off every chunk after the
-    first is exact, not approximate.** ``_chunk_text`` advances by
-    ``CHUNK_SIZE - CHUNK_OVERLAP`` characters per chunk (``start = end -
-    overlap``), so consecutive full-size chunks share exactly their last/
-    first ``overlap`` characters. The one case that looks like it could
-    break this — the document's TAIL, where later chunks get truncated —
-    does not: whenever an earlier chunk ``i`` is itself shorter than
-    ``CHUNK_SIZE`` (i.e. truncated because it reached the end of the
-    text), the NEXT chunk ``i+1`` is provably no longer than the true
-    overlap between them (algebraically, chunk ``i+1``'s length equals
-    exactly that overlap — it is a pure suffix of chunk ``i``, contributing
-    zero new characters). Python slicing clamps ``chunk[overlap:]`` to
-    ``""`` whenever ``len(chunk) <= overlap``, which is precisely correct
-    in that case: dropping "more than the chunk has" removes all of it,
-    which is right because all of it was already covered by the previous
-    chunk. So the same one-line rule is exact whether or not the tail is
-    truncated — see the WU-1 fix-round-2 build record for the worked
-    numeric proof.
-
-    **Two known, documented limits** (properties of the chunking scheme
-    itself, not introduced here — both are non-goals for THIS fix):
-
-    * Assumes ``overlap`` (``CHUNK_OVERLAP`` at call time) matches the
-      value used when the document was ORIGINALLY chunked. If that
-      constant is ever changed, documents indexed under the old value
-      need re-indexing before a whole-document read of them stays exact
-      under the new value — this function has no way to detect a stale
-      value from the chunk content alone.
-    * Assumes the fetched chunk sequence is CONTIGUOUS, i.e. no physical
-      chunk was silently dropped by ``_chunk_text``'s ``if chunk.strip():``
-      guard (which happens only for a >= ``CHUNK_SIZE``-character run of
-      pure whitespace inside the source document — not observed in real
-      build records/specs). A skipped chunk would shift later chunks out
-      of arithmetic lockstep with their id index in a way this function
-      cannot detect from the fetched text alone.
-    Not defensive against an empty ``chunk_docs``: the sole caller
-    (``read_semantic``) only ever reaches this function after
-    :func:`_gather_whole_document` has run, which itself always returns
-    at least one doc (its own ``if not chunk_ids:`` fallback degrades to
-    ``[document_id], [doc]`` rather than an empty pair — see that
-    function's docstring) — an empty ``chunk_docs`` here would mean
-    :func:`_gather_whole_document`'s own invariant broke, which this
-    function is not positioned to guard against. (WU-1 fix-round-3, F16:
-    a prior ``if not chunk_docs: return ""`` here was unreachable — no
-    test could distinguish it from dead code — and has been removed
-    rather than kept as a guard that guards nothing.)
-    """
-    parts = [chunk_docs[0].page_content]
-    parts.extend(doc.page_content[overlap:] for doc in chunk_docs[1:])
-    return "".join(parts)
+    """De-overlap a contiguous chunk sequence (see ``memory_whole_document``)."""
+    return reassemble_chunk_sequence(chunk_docs, overlap)
 
 
 @router.get("/semantic/{collection}/{document_id}")
@@ -3051,9 +2805,12 @@ async def read_semantic(
         _require_corpus_scope(user, collection, "read")
 
     if whole_document:
-        chunk_ids, chunk_docs = await _gather_whole_document(
-            service, user, collection, document_id, doc
-        )
+        try:
+            chunk_ids, chunk_docs, verified = await gather_whole_document(
+                service, user, collection, document_id, doc, overlap=CHUNK_OVERLAP
+            )
+        except SemanticDocumentIncompleteError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         front_matter = chunk_docs[0]
         entry = await manifest.resolve_read(
             "semantic", _semantic_key(collection, chunk_ids[0]), user
@@ -3079,6 +2836,7 @@ async def read_semantic(
             "metadata": front_matter.metadata,
             "manifest": entry.to_dict() if entry is not None else None,
             "chunk_count": len(chunk_docs),
+            "verified": verified,
             "chunk_keys": [_semantic_key(collection, cid) for cid in chunk_ids],
         }
 
@@ -3126,6 +2884,7 @@ async def update_semantic(
     text = payload.get("text")
     if not isinstance(text, str):
         raise HTTPException(status_code=400, detail="text is a required string field")
+    refuse_oversize_or_413(text)
     metadata = _sanitize_semantic_metadata(payload.get("metadata"))
     title = payload.get("title")
     service = get_semantic_service()
@@ -3166,7 +2925,7 @@ async def update_semantic(
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
     await drop_copied_forward_chunk(service, user, collection, document_id, copied_from)
-    await _emit_write_audits(
+    await emit_write_audits(
         user=user,
         layer="semantic",
         collection=collection,
@@ -3221,7 +2980,7 @@ async def delete_semantic(
             await service.delete_document(user, collection, document_id)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-    await _emit_write_audit(
+    await emit_write_audit(
         user=user,
         op="delete",
         layer="semantic",

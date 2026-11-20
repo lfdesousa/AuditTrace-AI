@@ -564,14 +564,14 @@ class TestWholeDocumentRead:
         assert body["content"] == "legacy content predating the hash scheme"
         assert body["chunk_keys"] == ["decisions/legacy-hash-mismatch"]
 
-    def test_whole_document_falls_back_when_chunk_sequence_is_empty(
-        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    def test_single_chunk_fallback_is_for_unstamped_rows_only(
+        self, client: TestClient
     ) -> None:
-        """Defensive branch: if the deterministic chunk-id sequence itself
-        were ever empty (``_MAX_DOCUMENT_CHUNKS`` is a fixed positive
-        constant today, so this cannot happen via the real function — this
-        proves the CALLER handles it anyway rather than raising
-        ``IndexError`` on an empty ``chunk_docs``)."""
+        """The single-chunk fallback exists for a row that carries no fold
+        stamp (here: a titled direct write whose chunk sequence does not
+        reproduce): it is read as itself, ``verified: false``. A row that DOES
+        carry a stamp never falls back to one chunk: when its document cannot be
+        read whole it is a ``409`` (MEMORY-SERVER-SILENT-TRUNCATION C4')."""
         r = client.post(
             "/memory/semantic",
             json={
@@ -583,12 +583,49 @@ class TestWholeDocumentRead:
         )
         assert r.status_code == 200, r.text
 
-        monkeypatch.setattr(m, "_iter_document_chunk_ids", lambda *_a, **_k: [])
         read = client.get("/memory/semantic/decisions/titled-doc?whole_document=true")
+
         assert read.status_code == 200, read.text
         body = read.json()
         assert body["chunk_count"] == 1
         assert body["content"] == "titled content"
+        assert body["verified"] is False
+
+    def test_a_stamped_row_never_falls_back_to_one_chunk(
+        self, client: TestClient
+    ) -> None:
+        """The same row, but stamped by a fold (written at the ChromaDB level:
+        no REST write can set the stamp): its sequence does not reproduce, so
+        the answer is the explicit ``409``, never the one chunk."""
+        import asyncio
+
+        from tests.memory_truncation_support_a1 import chroma_collection
+
+        asyncio.run(
+            chroma_collection("decisions").upsert(
+                ids=["stamped-orphan"],
+                documents=["stamped content"],
+                metadatas=[
+                    {
+                        "source": "stamped-file.md",
+                        "user_id": "x",
+                        "tier": "corpus",
+                        "chunk_total": 3,
+                        "fold_sha256": "0" * 64,
+                    }
+                ],
+                embeddings=[[0.1, 0.2, 0.3]],
+            )
+        )
+
+        read = client.get(
+            "/memory/semantic/decisions/stamped-orphan?whole_document=true"
+        )
+
+        assert read.status_code == 409, read.text
+        assert read.json() == {
+            "detail": "semantic document incomplete: 0 of 3 chunks readable"
+        }
 
     def test_whole_document_manifest_block_hidden_when_not_visible(
         self, client: TestClient

@@ -718,7 +718,7 @@ class TestHandlerFailurePaths:
     ) -> None:
         """The mutation + manifest row already landed by the time the
         memory-audit event write is attempted (matches
-        ``routes/memory.py::_emit_write_audit``'s existing fail-closed
+        ``routes/memory_write_audit.py::emit_write_audit``'s existing fail-closed
         shape) — the caller sees an explicit error, never a false
         'success'."""
 

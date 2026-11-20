@@ -1,0 +1,15 @@
+== tests/test_body_limit_middlewares_asgi.py run1: ============================== 12 passed in 0.08s ==============================
+== tests/test_body_limit_middlewares_asgi.py run2: ============================== 12 passed in 0.08s ==============================
+== tests/test_body_limit_middlewares_asgi.py run3: ============================== 12 passed in 0.08s ==============================
+== tests/test_memory_request_body_ceiling.py run1: ============================== 9 passed in 8.38s ===============================
+== tests/test_memory_request_body_ceiling.py run2: ============================== 9 passed in 8.07s ===============================
+== tests/test_memory_request_body_ceiling.py run3: ============================== 9 passed in 7.96s ===============================
+== tests/bff/test_body_limit.py run1: ============================== 14 passed in 0.73s ==============================
+== tests/bff/test_body_limit.py run2: ============================== 14 passed in 0.73s ==============================
+== tests/bff/test_body_limit.py run3: ============================== 14 passed in 0.79s ==============================
+== tests/test_memory_whole_document_stamp_edges.py run1: ============================== 10 passed in 8.52s ==============================
+== tests/test_memory_whole_document_stamp_edges.py run2: ============================== 10 passed in 8.21s ==============================
+== tests/test_memory_whole_document_stamp_edges.py run3: ============================== 10 passed in 8.39s ==============================
+== tests/test_memory_upload_refusals.py run1: ============================== 8 passed in 6.64s ===============================
+== tests/test_memory_upload_refusals.py run2: ============================== 8 passed in 6.32s ===============================
+== tests/test_memory_upload_refusals.py run3: ============================== 8 passed in 6.46s ===============================

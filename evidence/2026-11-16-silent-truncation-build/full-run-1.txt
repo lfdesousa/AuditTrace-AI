@@ -1,0 +1,12 @@
+First full run (make test under the shared lock) at cd583fbb, before the order-pollution fix and the coverage tests:
+Required test coverage of 90% reached. Total coverage: 98.88%
+FAILED tests/test_memory_stamp_is_server_only.py::TestStampIsServerOnly::test_a_stamp_in_an_mcp_write_is_stripped - assert True is False
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_mcp_write_tool_over_the_limit_is_a_tool_error_and_not_indexed[write_decision-decisions] - assert 'memory document exceeds the limit of 4096 bytes' in '{"error": "
+FAILED tests/test_memory_write_limit.py::TestMemoryWriteLimit::test_mcp_write_tool_over_the_limit_is_a_tool_error_and_not_indexed[write_skill-skills] - assert 'memory document exceeds the limit of 4096 bytes' in '{"error": "unknow
+FAILED tests/test_memory_write_tools_pin.py::TestMemoryWriteToolsPin::test_every_registered_mcp_write_tool_has_an_over_limit_case - AssertionError: assert set() == {'write_skill', 'write_decision'}
+=========== 4 failed, 11167 passed, 3 warnings in 4223.44s (1:10:23) ===========
+
+Its per-file gate (scripts/check-per-file-coverage.py on that run's coverage data) failed three files on BRANCH coverage, since fixed (see coverage-new-modules.txt):
+  bff/body_limit_middleware.py                        lines 90.00%  branches 71.43%
+  src/audittrace/memory_body_limit_middleware.py      lines 94.12%  branches 78.57%
+  src/audittrace/routes/memory_fold_tail.py           lines 95.08%  branches 83.33%

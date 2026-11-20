@@ -1,0 +1,7 @@
+        # non-vacuous: the memory write surface has POST and PUT body routes
+        assert {verb for verb, _ in body_ops} >= {"POST", "PUT"}
+        assert len(body_ops) >= 8
+>       assert unbounded == []
+E       AssertionError: assert [('PUT', '/me...ocument_id}')] == []
+E         Left contains 3 more items, first extra item: ('PUT', '/memory/episodic/{filename}')
+============================== 1 passed in 1.20s ===============================

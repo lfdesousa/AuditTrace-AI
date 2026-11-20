@@ -132,6 +132,7 @@ from starlette.responses import StreamingResponse
 
 from bff import refusal_record
 from bff.auth import InboundTokenError, validate_inbound_token
+from bff.body_limit_middleware import BodyLimitMiddleware
 from bff.chat_caller_scope import insufficient_scope_response, missing_chat_scopes
 from bff.chat_last_resort import last_resort
 from bff.chat_refusals import (
@@ -266,6 +267,8 @@ def create_app() -> FastAPI:
     )
 
     app.add_exception_handler(StarletteHTTPException, framework_error)
+    # An oversized body is refused before any route buffers it.
+    app.add_middleware(BodyLimitMiddleware)
     app.add_middleware(PathGuard)
 
     @app.get("/health")

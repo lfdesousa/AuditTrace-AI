@@ -1,0 +1,5 @@
+FAILED tests/bff/test_body_limit.py::TestBffBodyLimit::test_every_method_is_bounded_a_proxy_buffers_a_body_whatever_the_verb[DELETE]
+FAILED tests/bff/test_body_limit.py::TestBffBodyLimit::test_every_method_is_bounded_a_proxy_buffers_a_body_whatever_the_verb[GET]
+FAILED tests/bff/test_body_limit.py::TestBffBodyLimit::test_a_console_proxy_bounds_every_method_too[DELETE]
+FAILED tests/bff/test_body_limit.py::TestBffBodyLimit::test_a_console_proxy_bounds_every_method_too[GET]
+======================== 4 failed, 49 passed in 27.82s =========================

@@ -1,0 +1,22 @@
+tests/bff/test_console_files_refusal_relay.py: collected=1 | fwd1 rc=0 1 passed in 0.15s | fwd2 rc=0 1 passed in 0.14s | fwd3 rc=0 1 passed in 0.13s | reversed(ids=1) rc=0 1 passed in 0.14s
+tests/test_mcp_write_tools_routes.py: collected=15 | fwd1 rc=0 15 passed in 12.40s | fwd2 rc=0 15 passed in 8.88s | fwd3 rc=0 15 passed in 8.82s | reversed(ids=15) rc=0 15 passed in 8.76s
+tests/test_memory_blank_refold_clears_the_document.py: collected=7 | fwd1 rc=0 7 passed in 4.45s | fwd2 rc=0 7 passed in 4.44s | fwd3 rc=0 7 passed in 4.16s | reversed(ids=7) rc=0 7 passed in 4.26s
+tests/test_memory_body_routes_use_bounded_verbs.py: collected=1 | fwd1 rc=0 1 passed in 0.83s | fwd2 rc=0 1 passed in 0.80s | fwd3 rc=0 1 passed in 0.81s | reversed(ids=1) rc=0 1 passed in 0.81s
+tests/test_memory_chunk_document.py: collected=3 | fwd1 rc=0 3 passed in 1.64s | fwd2 rc=0 3 passed in 1.67s | fwd3 rc=0 3 passed in 1.69s | reversed(ids=3) rc=0 3 passed in 1.63s
+tests/test_memory_documents_folded_before_the_stamp.py: collected=3 | fwd1 rc=0 3 passed in 1.85s | fwd2 rc=0 3 passed in 1.86s | fwd3 rc=0 3 passed in 1.91s | reversed(ids=3) rc=0 3 passed in 1.91s
+tests/test_memory_fold_tail_guards.py: collected=3 | fwd1 rc=0 3 passed in 1.96s | fwd2 rc=0 3 passed in 1.96s | fwd3 rc=0 3 passed in 2.09s | reversed(ids=3) rc=0 3 passed in 2.14s
+tests/test_memory_fold_tail_unit.py: collected=4 | fwd1 rc=0 4 passed in 0.59s | fwd2 rc=0 4 passed in 0.61s | fwd3 rc=0 4 passed in 0.57s | reversed(ids=4) rc=0 4 passed in 0.58s
+tests/test_memory_pdf_upload_bound.py: collected=3 | fwd1 rc=0 3 passed in 1.74s | fwd2 rc=0 3 passed in 1.63s | fwd3 rc=0 3 passed in 1.63s | reversed(ids=3) rc=0 3 passed in 1.68s
+tests/test_memory_pdf_upload_cap.py: collected=3 | fwd1 rc=0 3 passed in 1.34s | fwd2 rc=0 3 passed in 1.25s | fwd3 rc=0 3 passed in 1.28s | reversed(ids=3) rc=0 3 passed in 1.83s
+tests/test_memory_refusal_audit.py: collected=2 | fwd1 rc=0 2 passed in 2.15s | fwd2 rc=0 2 passed in 1.43s | fwd3 rc=0 2 passed in 1.51s | reversed(ids=2) rc=0 2 passed in 2.38s
+tests/test_memory_stamp_is_server_only.py: collected=3 | fwd1 rc=0 3 passed in 4.43s | fwd2 rc=0 3 passed in 4.50s | fwd3 rc=0 3 passed in 1.78s | reversed(ids=3) rc=0 3 passed in 1.82s
+tests/test_memory_upload_manifest_row.py: collected=4 | fwd1 rc=0 4 passed in 2.30s | fwd2 rc=0 4 passed in 2.30s | fwd3 rc=0 4 passed in 2.36s | reversed(ids=4) rc=0 4 passed in 2.36s
+tests/test_memory_verified_means_the_fold.py: collected=2 | fwd1 rc=0 2 passed in 1.42s | fwd2 rc=0 2 passed in 1.42s | fwd3 rc=0 2 passed in 1.40s | reversed(ids=2) rc=0 2 passed in 1.43s
+tests/test_memory_whitespace_documents_read_whole.py: collected=7 | fwd1 rc=0 7 passed in 7.36s | fwd2 rc=0 7 passed in 4.03s | fwd3 rc=0 7 passed in 4.00s | reversed(ids=7) rc=0 7 passed in 3.51s
+tests/test_memory_whole_document_complete.py: collected=17 | fwd1 rc=0 17 passed in 9.44s | fwd2 rc=0 17 passed in 9.71s | fwd3 rc=0 17 passed in 11.08s | reversed(ids=17) rc=0 17 passed in 11.81s
+tests/test_memory_whole_document_integrity.py: collected=8 | fwd1 rc=0 8 passed in 4.57s | fwd2 rc=0 8 passed in 5.17s | fwd3 rc=0 8 passed in 12.01s | reversed(ids=8) rc=0 8 passed in 4.34s
+tests/test_memory_write_limit.py: collected=19 | fwd1 rc=0 19 passed in 9.07s | fwd2 rc=0 19 passed in 32.51s | fwd3 rc=0 19 passed in 17.95s | reversed(ids=19) rc=0 19 passed in 10.71s
+tests/test_memory_write_tools_pin.py: collected=2 | fwd1 rc=0 2 passed in 0.05s | fwd2 rc=0 2 passed in 0.05s | fwd3 rc=0 2 passed in 0.05s | reversed(ids=2) rc=0 2 passed in 0.05s
+tests/test_wu1_memory_retrieval_correctness.py: collected=25 | fwd1 rc=0 25 passed in 30.72s | fwd2 rc=0 25 passed in 11.82s | fwd3 rc=0 25 passed in 11.57s | reversed(ids=25) rc=0 25 passed in 12.03s
+tests/test_memory_routes.py: collected=358 | fwd1 rc=0 358 passed, 2 warnings in 119.93s (0:01:59) | fwd2 rc=0 358 passed, 2 warnings in 119.46s (0:01:59) | fwd3 rc=0 358 passed, 2 warnings in 120.10s (0:02:00) | reversed(ids=358) rc=0 358 passed, 2 warnings in 121.53s (0:02:01)
+tests/test_lc9_wp2b_semantic_routes.py: collected=101 | fwd1 rc=0 101 passed in 79.35s (0:01:19) | fwd2 rc=0 101 passed in 78.72s (0:01:18) | fwd3 rc=0 101 passed in 79.39s (0:01:19) | reversed(ids=101) rc=0 101 passed in 79.32s (0:01:19)

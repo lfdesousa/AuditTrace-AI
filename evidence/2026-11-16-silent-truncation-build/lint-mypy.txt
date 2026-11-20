@@ -1,0 +1,13 @@
+## make lint
+🔍 Running linter...
+All checks passed!
+✅ Linting passed
+📝 Running formatter check...
+644 files already formatted
+✅ Formatting passed
+## make typecheck (src/)
+🔎 Running type checker via .venv/bin/mypy ...
+Success: no issues found in 192 source files
+✅ Type checking passed
+## mypy bff/ and every file of the change under tests/
+Success: no issues found in 67 source files

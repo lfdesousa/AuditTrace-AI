@@ -1,0 +1,20 @@
+Coverage of the new and changed modules by the change's own tests only (chain tests, the rewritten retrieval-correctness file, ASGI and unit tests), line and branch, from a --cov-branch run at 403f304a.
+The first full run (before the ASGI and unit tests) failed the per-file gate on three of them (branch coverage 71.4% bff/body_limit_middleware.py, 78.6% memory_body_limit_middleware.py, 83.3% memory_fold_tail.py); all three are now above 90%.
+
+A file whose figure is lower here (memory_write_support.py branches, mcp_write_handlers.py) is also exercised by the rest of the suite; in the first full run the per-file gate reported exactly those three files and no other.
+
+bff/body_limit_middleware.py: lines 100.0% branches 100.0%
+bff/body_limit_refusal.py: lines 100.0% branches 0.0%
+bff/request_too_large_error.py: lines 100.0% branches 0.0%
+src/audittrace/memory_body_limit_middleware.py: lines 100.0% branches 100.0%
+src/audittrace/memory_request_too_large_error.py: lines 100.0% branches 0.0%
+src/audittrace/routes/memory_chunking.py: lines 100.0% branches 100.0%
+src/audittrace/routes/memory_fold_tail.py: lines 96.7% branches 94.4%
+src/audittrace/routes/memory_layer_writes.py: lines 90.9% branches 0.0%
+src/audittrace/routes/memory_whole_document.py: lines 97.5% branches 92.1%
+src/audittrace/routes/memory_write_refusal.py: lines 100.0% branches 0.0%
+src/audittrace/routes/memory_write_support.py: lines 95.8% branches 75.0%
+src/audittrace/services/memory_document_too_large_error.py: lines 100.0% branches 0.0%
+src/audittrace/services/memory_write_limit.py: lines 100.0% branches 100.0%
+src/audittrace/services/semantic_document_incomplete_error.py: lines 100.0% branches 0.0%
+src/audittrace/tools/mcp_write_handlers.py: lines 70.5% branches 50.0%

@@ -4,7 +4,7 @@ import os
 from functools import lru_cache
 from typing import Literal, Self
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -252,6 +252,16 @@ class Settings(BaseSettings):
     # "sovereign:tool-result:" — disjoint from the TokenCache namespace.
     memory_tool_cache_ttl_seconds: int = 900
 
+    # MEMORY-SERVER-SILENT-TRUNCATION: the one size bound of every memory
+    # write path (upload of non-PDF text, per-layer create/update, semantic
+    # upsert, MCP write tools), on the UTF-8 length of the document, in bytes.
+    # Over the bound: 413, nothing stored, nothing indexed. A PDF at upload has
+    # ``pdf_upload_max_size_mb``. Not measured: the fold time of a document of
+    # this size on the real embedder. The request-body ceilings derived from it
+    # (``services.memory_write_limit.request_body_ceiling``) are a multiple of
+    # it, so a larger value raises the memory the server may hold per request.
+    memory_max_document_bytes: int = Field(default=4_194_304, gt=0)
+
     # ─────────────── M3 slice 1 — sources trailer (spec §3 / §4.4) ──────────
     # Kill switch, default OFF so /v1/chat/completions is byte-identical for
     # every existing consumer until an operator opts in for the LibreChat
@@ -337,6 +347,13 @@ class Settings(BaseSettings):
     # extracted text) AND time (parse timeout). Each layer catches a
     # different bomb shape; together they bound the worst case.
     pdf_max_size_mb: int = 200
+    # The bound on a PDF at UPLOAD (the request holds the whole file in memory
+    # once; later copies, e.g. the hash and the quarantine put, are not counted
+    # here). Never above ``pdf_max_size_mb``, which stays the fold's bound for
+    # objects that reached storage another way. With the memory server's
+    # container limit this bounds the uploads in flight at AT MOST
+    # limit / this value, before the process's own steady usage is subtracted.
+    pdf_upload_max_size_mb: int = Field(default=64, gt=0)
     pdf_max_pages: int = 2000
     # Total declared object count in the PDF cross-reference table.
     # Benign documents are typically O(10²-10⁴); bombs use O(10⁶+).

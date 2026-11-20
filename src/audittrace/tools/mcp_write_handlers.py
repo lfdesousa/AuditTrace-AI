@@ -77,6 +77,9 @@ from audittrace.dependencies import get_memory_manifest_service, get_semantic_se
 from audittrace.identity import UserContext
 from audittrace.routes.memory_semantic_writes import drop_copied_forward_chunk
 from audittrace.services.memory_audit import emit_memory_audit_event
+from audittrace.services.memory_document_too_large_error import (
+    MemoryDocumentTooLargeError,
+)
 from audittrace.services.memory_keys import (
     ChromaIdConflictError,
     ConcurrentManifestWriteError,
@@ -87,6 +90,7 @@ from audittrace.services.memory_manifest import (
     ManifestAuthorizationError,
     authorize_write,
 )
+from audittrace.services.memory_write_limit import check_document_size
 from audittrace.tools.mcp_write_registry import register_mcp_write_tool
 
 logger = logging.getLogger(__name__)
@@ -100,7 +104,10 @@ _IDENTITY_ARG_KEYS = frozenset({"user_id", "sub", "userId"})
 # mirrors ``routes/memory.py::_sanitize_semantic_metadata``: ``tier`` and
 # ``user_id`` are token-derived/route-authorized values, never
 # caller-supplied, even from an operator holding write scope.
-_SECURITY_METADATA_KEYS = frozenset({"tier", "user_id", "id_form"})
+# ``chunk_total`` / ``fold_sha256`` are the fold's stamp: only a fold writes them.
+_SECURITY_METADATA_KEYS = frozenset(
+    {"tier", "user_id", "id_form", "chunk_total", "fold_sha256"}
+)
 
 
 def _sanitize_metadata(metadata: Any) -> dict[str, Any]:
@@ -122,6 +129,12 @@ async def _write_semantic_document(
         return {"error": "document_id is required and must be a non-empty string"}
     if not isinstance(text, str) or not text:
         return {"error": "text is required and must be a non-empty string"}
+    try:
+        check_document_size(text)
+    except MemoryDocumentTooLargeError as exc:
+        # The MCP counterpart of the REST 413: a tool-level ``{"error"}``
+        # (``isError: true``), before any write.
+        return {"error": str(exc)}
     title = clean_args.get("title")
     if title is not None and not isinstance(title, str):
         return {"error": "title must be a string if provided"}
@@ -244,7 +257,7 @@ async def _write_semantic_document(
                 detail_extra={"reason": "copy_forward"},
             )
     except Exception as exc:
-        # Fail-closed like routes/memory.py::_emit_write_audit — the
+        # Fail-closed like routes/memory_write_audit.py::emit_write_audit — the
         # mutation above already landed (same known limitation that
         # wrapper accepts: the audit-write failure is reported, not the
         # mutation undone), but the caller is told plainly rather than

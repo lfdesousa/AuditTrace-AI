@@ -1,0 +1,3 @@
+Reach set: the 55 existing test modules that import a touched module or name a touched route (CODE-INDEX importers plus URL literals), plus the chain's tests and the ASGI and unit tests, at 403f304a, no coverage, no lock-held full suite:
+================= 1960 passed, 3 warnings in 815.63s (0:13:35) =================
+0

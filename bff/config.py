@@ -157,6 +157,16 @@ class Settings(BaseSettings):
     # the same wall.
     console_files_forced_layer: str = "session"
 
+    # MEMORY-SERVER-SILENT-TRUNCATION: the most bytes a request may carry before
+    # the BFF buffers it. ``/console/files`` only ever reaches the session layer
+    # (text, bounded at 4 MiB by the server); every other route may proxy an
+    # upload up to the server's own upload ceiling. The BFF buffers a body whole,
+    # so with its container limit the bodies in flight at the general ceiling
+    # are AT MOST limit / ceiling, before its steady usage is subtracted
+    # (arithmetic, not a measurement).
+    console_files_max_body_bytes: int = Field(default=5_242_880, gt=0)
+    max_request_body_bytes: int = Field(default=68_157_440, gt=0)
+
     # M3 Sovereign-Attach WU-4 — the "keep this" promote route
     # (``POST /console/files/{filename}/promote``) forwards this value
     # as the orchestrator ``/memory/promote`` request's ``target_layer``
