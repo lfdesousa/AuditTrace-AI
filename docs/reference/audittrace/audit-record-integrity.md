@@ -138,33 +138,21 @@ of the refused part. The reasons are:
 The text of a refused link is not kept anywhere: not in the audit row, not in traces, not in logs.
 Other kinds of rows use their own values in this column; none of them uses `request_refused`.
 
-## 4. Traces: one known limit
+## 4. Traces: what is removed and what is not
 
-Media payloads are removed from traces and logs. One case is not covered: a raw base64 payload of
-128 characters or fewer (96 bytes of content at most), sent in a part that is not an image and has
-a media type the service knows (`input_audio`, `input_video` or `file`; for example a very short
-audio clip), can appear in span attributes of that turn. It is never in the audit record. Images
-are not affected: an inline image is replaced by its digest whatever its size. Longer payloads are
-removed whatever the part type.
+No media payload of any size reaches a span attribute, a log line, the input tag of the entry
+span or the trace-ingestion body. An inline image is replaced by its digest. A part of type
+`input_audio`, `input_video` or `file` keeps its type and its other keys, and its payload
+(`data`, `url`, `file_data`) is replaced by a marker that gives its length. A part of any type the
+service does not know (for example a custom `blob` part) is replaced whole by a marker that
+keeps its type name and its number of keys. The model server still receives every part
+unchanged, and the audit record never holds a payload.
 
-A part of any type the service does not know (for example a custom `blob` part) is not in that
-case. Every part of such a type is replaced whole, in every span attribute, log line and the
-trace-ingestion body, by a marker that keeps its type name and its number of keys. The model
-server still receives it unchanged. The types the service treats as text are `text`, `refusal` and
-`image_url` (the OpenAI content-part types for text, assistant refusals and images); every other
-type that is not `input_audio`, `input_video` or `file` is unknown.
+The types the service treats as text are `text`, `refusal` and `image_url` (the OpenAI
+content-part types for text, assistant refusals and images). A text-bearing part that carries
+anything besides its one content key is replaced whole too.
 
-The attributes that can carry the short payload of a known media part are fixed by the code:
-
-- the prompt-assembly span (`chat-merge-system`): `output.value` and `langfuse.observation.output`
-  (two);
-- the span of the request (`sovereign-chat-request`): `input.value` and `langfuse.observation.input`
-  (two);
-- the model-call span (`llm.chat.completions`): `input.value`, one attribute per model call.
-
-That is at most 5 attributes of 3 spans for a request with one model call, and it is what a trace
-of an audio turn on the cluster showed. A request that runs the memory tool loop without streaming
-opens one model-call span per iteration, up to `memory_tool_loop_max_iterations` (5 by default in
-the code, 10 in the shipped chart), one attribute each. The streaming paths open no model-call
-span. The audit record, the trace-ingestion body and the input tag of the entry span are clean for
-these three part types.
+What is not removed is text. A `text` part is traced as written, by design: a base64 string a
+caller types into a text part is traced like any other text. The export-time scrub drops
+data-URL payloads and runs of more than 128 characters of standard-alphabet base64 from every
+string; a shorter run, a URL-safe run or one broken into short lines, written in text, stays.

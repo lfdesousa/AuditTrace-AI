@@ -49,11 +49,6 @@ def _placeholder(part: dict[str, Any]) -> dict[str, Any]:
     return {"type": name, "redacted": f"[REDACTED:media {name} keys={len(part)}]"}
 
 
-def _is_known_media_part(part: dict[str, Any]) -> bool:
-    kind = part.get("type")
-    return isinstance(kind, str) and kind in _PAYLOAD_SLOTS
-
-
 def _is_known_text_part(part: dict[str, Any]) -> bool:
     kind = part.get("type")
     if not isinstance(kind, str) or kind not in _TEXT_SLOTS:
@@ -81,31 +76,13 @@ def _redact_part(part: dict[str, Any]) -> dict[str, Any]:
     return _placeholder(part)
 
 
-def redact_unknown_content_parts(parts: list[Any]) -> list[Any]:
-    """The parts with every part of an UNKNOWN type (or a text part with extras) replaced.
+def redact_content_parts(parts: list[Any]) -> list[Any]:
+    """The parts of one message, each redacted as ``_redact_part`` says (non-dicts as they are).
 
-    The narrow variant for spans and logs that render the messages themselves: a known
-    media part (audio, video, file) is left as it is there, the residual R-1 of the
-    contract note; only what the service cannot name is removed.
+    For the renderer every span attribute and log line passes: a message's ``content`` list
+    never reaches telemetry with a media payload or a part the service cannot name.
     """
-    return [
-        part
-        if not isinstance(part, dict)
-        or _is_known_media_part(part)
-        or _is_known_text_part(part)
-        else _placeholder(part)
-        for part in parts
-    ]
-
-
-def redact_unknown_message_parts(messages: list[Any]) -> list[Any]:
-    """A copy of ``messages`` for a span attribute, with unknown content parts replaced."""
-    return [
-        {**message, "content": redact_unknown_content_parts(message["content"])}
-        if isinstance(message, dict) and isinstance(message.get("content"), list)
-        else message
-        for message in messages
-    ]
+    return [_redact_part(part) if isinstance(part, dict) else part for part in parts]
 
 
 def redact_media_payloads(

@@ -3,10 +3,10 @@
 * S1: the note's list of refusal reasons is an EQUALITY with the reasons the service can
   emit (the keys of the one message table every refusal body is built from, and every
   ``REASON_*`` constant of the media package), and each of them is observed through the route.
-* S2: the note states residual R-1 (a short raw payload in a non-image part can appear in
-  span attributes), with its bound and what stays clean. The bound is an upper bound derived
-  from the code (every site that writes request messages to a span attribute) and pinned here
-  against the spans a request really ends, for a typed part and for a part of an unknown type.
+* S2: the note states that no media payload of any size reaches a span attribute, a log
+  line, the entry tag or the ingestion body (residual R-1 is closed), and what stays: text.
+  Pinned here against the spans a request really ends, for each known media part and for a
+  part of an unknown type; the model server still receives the part unchanged.
 * S4: the note names the canonical serialisation of ``input_media``, and an image row's
   ``content_hash`` is recomputed here from nothing but the JSON of ``GET /interactions`` and
   the note's words.
@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 
 from tests import conftest as net
 from tests._image_slice import (
@@ -53,17 +52,6 @@ REFUSAL_REASONS = {
 }
 #: 72 bytes -> 96 base64 characters: under the 128-character run rule (residual R-1)
 SHORT = base64.b64encode(bytes(range(72))).decode()
-#: The attributes the note's section 4 counts (typed part: 5 of 3 spans; a part of an unknown type: none).
-#: ``sovereign-chat-request`` exists as an ended span only under a live Langfuse client, so a
-#: request through the test client can carry at most the others; the subset check below is
-#: therefore against the full set and the control asserts the carried ones are non-empty.
-TYPED_BOUND = {
-    "chat-merge-system :: output.value",
-    "chat-merge-system :: langfuse.observation.output",
-    "sovereign-chat-request :: input.value",
-    "sovereign-chat-request :: langfuse.observation.input",
-    "llm.chat.completions :: input.value",
-}
 SERIALISATION = 'json.dumps(obj, sort_keys=True, separators=(",", ":"))'
 #: ADDENDUM-1's set (CODE-INDEX, ``InteractionRecord`` and its alias), restated here so
 #: this file stands alone; the equality below is what binds it.
@@ -75,25 +63,6 @@ ROW_WRITER_MODULES = {
     "services/memory_audit.py",
     "services/scan_audit_consumer.py",
 }
-
-
-def _chart_value(name: str) -> str:
-    """The string the chart's values file sets for env var ``name`` (exactly one place)."""
-    found: list[str] = []
-
-    def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if key == name:
-                    found.append(str(value))
-                walk(value)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(yaml.safe_load((ROOT / "charts/audittrace/values.yaml").read_text("utf-8")))
-    assert len(found) == 1, (name, found)
-    return found[0]
 
 
 def _note() -> str:
@@ -161,62 +130,49 @@ class TestRefusalReasonsArePublished:
         assert seen == set(re.findall(r"`(\w+)`", _block("request-refused-reasons")))
 
 
-class TestResidualIsStated:
-    def test_the_note_states_r1_with_its_bound_and_what_stays_clean(self) -> None:
+class TestTheNoteStatesWhatIsRemoved:
+    def test_the_note_states_the_rule_and_the_limit_that_remains(self) -> None:
         text = _flat()
         for needle in (
-            "128 characters or fewer",
-            "that is not an image",
-            "raw base64",
-            "can appear in span attributes",
-            "at most 5 attributes of 3 spans",
-            "one attribute per model call",
-            "`memory_tool_loop_max_iterations`",
+            "No media payload of any size reaches a span attribute",
+            "the trace-ingestion body",
             "`input_audio`, `input_video` or `file`",
             "replaced whole",
-            "never in the audit record",
-            "Images are not affected",
+            "audit record never holds a payload",
+            "What is not removed is text",
+            "A `text` part is traced as written",
+            "more than 128 characters",
             "`url_sha256`",
             "can be matched by guessing",
         ):
             assert needle in text, needle
+        assert "can appear in span attributes" not in text, "R-1 is closed"
 
-    def test_the_tool_loop_bound_is_the_setting_and_the_chart_value_not_a_literal(
-        self,
+    @pytest.mark.parametrize(
+        "part",
+        [
+            {"type": "input_audio", "input_audio": {"data": SHORT, "format": "wav"}},
+            {"type": "input_video", "input_video": {"data": SHORT}},
+            {"type": "file", "file": {"filename": "n.pdf", "file_data": SHORT}},
+        ],
+        ids=["audio", "video", "file"],
+    )
+    def test_the_short_payload_of_a_known_media_part_is_in_no_span_attribute(
+        self, client: Any, arm: tuple[str, bool], part: dict[str, Any]
     ) -> None:
-        """F1: "up to N model-call spans" must be an upper bound on what ships.
-
-        N is derived from the setting's default and from the value the chart sets, never
-        typed here: change either and the note must change with it.
-        """
-        from audittrace.config import Settings
-
-        default = Settings.model_fields["memory_tool_loop_max_iterations"].default
-        chart = _chart_value("AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS")
-        assert isinstance(default, int) and chart.isdigit()
-        text = _flat()
-        assert (
-            f"({default} by default in the code, {chart} in the shipped chart)" in text
-        )
-        assert max(default, int(chart)) == int(chart), "the chart is the larger bound"
-
-    def test_the_short_payload_is_in_no_audit_field(
-        self, client: Any, arm: tuple[str, bool]
-    ) -> None:
-        """What the note says stays clean, does; and R-1 is still real (else the note is stale)."""
+        """R-1 closed: 96 base64 characters, under the export-time run rule, reach nothing."""
         mode, stream = arm
-        audio = {"type": "input_audio", "input_audio": {"data": SHORT, "format": "wav"}}
         messages = [
-            {"role": "user", "content": [{"type": "text", "text": QUESTION}, audio]}
+            {"role": "user", "content": [{"type": "text", "text": QUESTION}, part]}
         ]
-        response = post_chat(
-            client, ok_fake(mode, stream), stream=stream, messages=messages
-        )
+        fake = ok_fake(mode, stream)
+        response = post_chat(client, fake, stream=stream, messages=messages)
         assert response.status_code == 200
         item = client.get("/interactions?limit=5").json()["interactions"][0]
         assert item["input_media"] is None
         assert SHORT not in json.dumps(item)
         spans = [json.loads(s) for s in net._SPAN_END_SNAPSHOTS]
+        assert spans, "control: spans ended"
         carrying = sorted(
             {
                 f"{s['name']} :: {k}"
@@ -225,9 +181,12 @@ class TestResidualIsStated:
                 if SHORT in str(v)
             }
         )
-        assert carrying != [], "R-1 is closed: remove section 4 of the note"
-        assert "POST /v1/chat/completions :: langfuse.observation.input" not in carrying
-        assert set(carrying) <= TYPED_BOUND, sorted(set(carrying) - TYPED_BOUND)
+        assert carrying == []
+        assert any(
+            "[REDACTED:media" in str(v) for s in spans for v in s["attributes"].values()
+        ), "control: the marker is traced"
+        sent = [b["messages"][-1]["content"][-1] for b in upstream_bodies(fake)]
+        assert sent and all(p == part for p in sent), "forwarded unchanged"
 
     def test_a_part_of_an_unknown_type_reaches_no_span_attribute(
         self, client: Any, arm: tuple[str, bool]

@@ -46,7 +46,7 @@ import httpx
 from opentelemetry import trace
 
 from audittrace.identity import UserContext
-from audittrace.media.redaction import redact_unknown_message_parts
+from audittrace.media.redaction import redact_media_payloads
 from audittrace.routes import _upstream_errors as upstream_errors
 from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS, llama_auth_headers
 from audittrace.routes._model_route import upstream_host
@@ -513,7 +513,7 @@ async def run_memory_tool_loop(
                 gen_span.set_attribute(
                     "input.value",
                     json.dumps(
-                        {"messages": redact_unknown_message_parts(messages[-10:])},
+                        {"messages": redact_media_payloads(messages[-10:], None)},
                         ensure_ascii=False,
                     )[:_SPAN_ATTR_CAP],
                 )

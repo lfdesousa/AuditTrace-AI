@@ -64,7 +64,7 @@ from audittrace.identity import (
     build_secret_window_index as _secret_window_index,  # noqa: F401
 )
 from audittrace.media.payload_scrub import scrub_base64_runs, scrub_data_url_payloads
-from audittrace.media.redaction import redact_unknown_content_parts
+from audittrace.media.redaction import redact_content_parts
 
 
 def _is_expected_client_error(exc: BaseException) -> bool:
@@ -700,9 +700,10 @@ def _render_value_inner(
             if budget is not None and budget.exhausted():
                 break
             if k == "content" and isinstance(v, list):
-                # #474 F-d: a message's content parts of a type the service does not
-                # know are never rendered into a span attribute or a log line.
-                v = redact_unknown_content_parts(v)
+                # #474: a message's content parts never reach a span attribute or a log
+                # line with a media payload, or as a part of a type the service does
+                # not know.
+                v = redact_content_parts(v)
             if isinstance(k, str):
                 rendered_key = scrub_text(k)
             else:

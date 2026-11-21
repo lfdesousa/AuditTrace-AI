@@ -31,10 +31,7 @@ from typing import Any
 
 import pytest
 
-from audittrace.media.redaction import (
-    redact_media_payloads,
-    redact_unknown_message_parts,
-)
+from audittrace.media.redaction import redact_media_payloads
 from tests import conftest as net
 from tests._image_slice import (
     ARM_IDS,
@@ -55,6 +52,20 @@ SHAPES: dict[str, dict[str, Any]] = {
     "nested-one": {"type": "custom_blob", "blob": {"u": SHORT}},
     "nested-list": {"type": "custom_blob", "blobs": [[SHORT]]},
     "future-type": {"type": "input_hologram", "input_hologram": {"data": SHORT}},
+    # known media types: the payload of ANY length never reaches telemetry (R-1 closed)
+    "audio-short": {
+        "type": "input_audio",
+        "input_audio": {"data": SHORT, "format": "wav"},
+    },
+    "video-short": {"type": "input_video", "input_video": {"data": SHORT}},
+    "file-short": {"type": "file", "file": {"filename": "n.pdf", "file_data": SHORT}},
+    "audio-url-safe": {
+        "type": "input_audio",
+        "input_audio": {
+            "data": SHORT.replace("+", "-").replace("/", "_") + "-_",
+            "format": "wav",
+        },
+    },
 }
 
 
@@ -166,7 +177,6 @@ class TestTheRedactionFunction:
         messages = _user(copy.deepcopy(SHAPES["nested-one"]))
         before = copy.deepcopy(messages)
         redact_media_payloads(messages, None)
-        redact_unknown_message_parts(messages)
         assert messages == before
 
     def test_deeply_nested_unknown_parts_do_not_raise(self) -> None:
@@ -180,12 +190,17 @@ class TestTheRedactionFunction:
         messages: list[Any] = ["x", {"role": "user", "content": ["bare", 3]}]
         assert redact_media_payloads(messages, None) == messages
 
-    def test_the_unknown_only_variant_leaves_typed_media_parts_alone(self) -> None:
-        audio = {"type": "input_audio", "input_audio": {"data": SHORT, "format": "wav"}}
-        messages = _user(audio)
-        assert redact_unknown_message_parts(messages) == messages
-        out = redact_unknown_message_parts(_user(SHAPES["data-key"]))
-        assert SHORT not in json.dumps(out)
+    @pytest.mark.parametrize("kind", ["input_audio", "input_video", "file"])
+    def test_a_known_media_part_keeps_its_shape_and_loses_its_payload(
+        self, kind: str
+    ) -> None:
+        slot = "file_data" if kind == "file" else "data"
+        part = {"type": kind, kind: {slot: SHORT, "format": "wav"}}
+        out = redact_media_payloads(_user(part), None)[0]["content"][1]
+        assert out == {
+            "type": kind,
+            kind: {slot: f"[REDACTED:media {kind} chars=96]", "format": "wav"},
+        }
 
 
 class TestTheRouteOnFourArms:
@@ -249,10 +264,11 @@ class TestTheRequestSpanAttributes:
             lambda attrs: written.append(dict(attrs)),
         )
         payload = {"model": "m", "messages": _user(SHAPES[shape])}
+        before = copy.deepcopy(payload)
         chat._set_genai_request_attributes(payload, "q", "s", "src", "u")
         assert len(written) == 1
         value = written[0]["input.value"]
         assert QUESTION in value, "control: the text is traced"
         assert SHORT not in value
         assert "[REDACTED:media" in value
-        assert SHORT in json.dumps(payload), "the payload itself is untouched"
+        assert payload == before, "the payload itself is untouched"
