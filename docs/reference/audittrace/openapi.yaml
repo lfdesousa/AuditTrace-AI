@@ -2091,6 +2091,8 @@ components:
           anyOf:
           - type: string
           - type: 'null'
+          description: SHA-256 over the canonical JSON of the row's content fields. input_media is part of the hashed content
+            only when it is not null; see the audit record integrity note for the exact recipe.
           title: Content Hash
         created_at:
           anyOf:
@@ -2120,6 +2122,16 @@ components:
         id:
           title: Id
           type: integer
+        input_media:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          description: 'Images carried by the chat request of this row: one entry per image part with its position, declared
+            media type, decoded size in bytes and SHA-256 of the decoded bytes; never the image. null means no image recorded,
+            which is not always the same as no image sent: rows written before this field existed, rows written by a server
+            of an earlier release, and rows that are not chat turns are always null.'
+          title: Input Media
         model:
           anyOf:
           - type: string

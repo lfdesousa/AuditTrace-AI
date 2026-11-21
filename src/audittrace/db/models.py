@@ -154,6 +154,10 @@ class InteractionRecord(Base):
     # append-only trigger (WS-A2), a post-hoc mutation is detectable by
     # recomputation. Nullable for rows predating the column.
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Migration 040 (LIBRECHAT-IMAGE-SLICE): canonical JSON naming every image part
+    # of the request (declared type, decoded size, sha256), never the bytes. NULL =
+    # no image RECORDED (rows before 040, rows of an older pod, non-chat writers).
+    input_media: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ToolCall(Base):

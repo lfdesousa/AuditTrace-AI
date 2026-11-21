@@ -1,0 +1,77 @@
+meta {
+  name: POST /v1/chat/completions (image part the audit cannot name: explicit 400)
+  type: http
+  seq: 21
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": [
+        { "type": "text", "text": "What does this picture show?" },
+        { "type": "image_url", "image_url": { "url": "{{imageRefusedUrl}}" } }
+      ] }
+    ],
+    "stream": false
+  }
+}
+
+script:pre-request {
+  // Body rebuilt here so the value cannot break the JSON. `imageRefusedUrl`
+  // defaults to a link (environments/*.bru): this service does not fetch
+  // images, so the turn is refused before the model server is called.
+  req.setBody({
+    model: "audittrace-default",
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: "What does this picture show?" },
+        { type: "image_url", image_url: { url: bru.getEnvVar("imageRefusedUrl") } }
+      ]
+    }],
+    stream: false
+  });
+  const sid = "bru-image-refused-" + Date.now();
+  req.setHeader("X-Session-Id", sid);
+  bru.setVar("imageRefusedSessionId", sid);
+}
+
+tests {
+  test("returns 400 exactly", function() {
+    expect(res.getStatus()).to.equal(400);
+  });
+  test("explicit OpenAI-shaped error naming the reason", function() {
+    const e = res.getBody().error;
+    expect(e.type).to.equal("invalid_request_error");
+    expect(e.param).to.equal("messages");
+    expect(e.code).to.equal(bru.getEnvVar("imageRefusedCode"));
+    expect(e.status).to.equal(400);
+    expect(e.message).to.be.a("string").and.not.empty;
+  });
+  test("the reply does not echo the URL", function() {
+    expect(JSON.stringify(res.getBody())).to.not.contain(bru.getEnvVar("imageRefusedUrl"));
+  });
+}
+
+docs {
+  LIBRECHAT-IMAGE-SLICE. An image part whose bytes the audit cannot name is
+  refused with an explicit error (HTTP 400) and never reaches the model
+  server: a link (`image_url_not_supported`, the default) or a malformed
+  data URL (`image_data_invalid`; run with
+  `--env-var imageRefusedUrl='data:image/png;base64,AAAA BBBB' --env-var imageRefusedCode=image_data_invalid`).
+  Stashes `imageRefusedSessionId`; read the failed row with
+  `audit/01-list-interactions.bru --env-var auditSince=<ISO time>` (status
+  `failed`, failure_class `request_refused`, `input_media.items[0].status`
+  `refused`). Needs scope audittrace:query.
+}

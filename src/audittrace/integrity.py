@@ -39,6 +39,10 @@ _CONTENT_FIELDS: tuple[str, ...] = (
     "event_class",
 )
 
+# Hashed ONLY when set: a row without it hashes exactly as before the column existed
+# (migration 040), so no existing row's ``content_hash`` moves.
+_OPTIONAL_CONTENT_FIELDS: tuple[str, ...] = ("input_media",)
+
 
 def content_hash(fields: dict[str, Any]) -> str:
     """Return the SHA-256 hex digest of an audit row's immutable content.
@@ -47,6 +51,9 @@ def content_hash(fields: dict[str, Any]) -> str:
     the digest is stable across processes and Python builds.
     """
     payload = {k: fields.get(k) for k in _CONTENT_FIELDS}
+    for k in _OPTIONAL_CONTENT_FIELDS:
+        if fields.get(k) is not None:
+            payload[k] = fields[k]
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -60,5 +67,7 @@ def verify_content_hash(row: Any) -> bool:
     stored = getattr(row, "content_hash", None)
     if not stored:
         return False
-    fields = {k: getattr(row, k, None) for k in _CONTENT_FIELDS}
+    fields = {
+        k: getattr(row, k, None) for k in _CONTENT_FIELDS + _OPTIONAL_CONTENT_FIELDS
+    }
     return bool(content_hash(fields) == stored)

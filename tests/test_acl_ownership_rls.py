@@ -1124,6 +1124,8 @@ _INTERACTIONS_MIGRATION_FILES: tuple[str, ...] = (
     "015_add_interactions_created_at.py",
     "016_append_only_audit_rows.py",
     "017_add_interactions_content_hash.py",
+    # LIBRECHAT-IMAGE-SLICE: the ORM row now carries ``input_media`` (migration 040).
+    "040_add_interactions_input_media.py",
 )
 
 
