@@ -89,7 +89,8 @@ def scrub_data_url_payloads(value: str) -> str:
     token split, the last-``:`` test and the payload scan read each character of their
     own span a bounded number of times. No nested or overlapping quantifier, no
     backtracking: the output equals the former pattern's on every input
-    (``tests/test_media_unit.py`` compares both on a few hundred thousand strings).
+    (``tests/test_media_scan_complexity.py`` compares both on 40 000 seeded random
+    strings and on the valid and invalid shapes).
     """
     if "base64," not in value:
         return value

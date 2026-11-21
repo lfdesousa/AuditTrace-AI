@@ -16,10 +16,12 @@ guard) every Unicode code point.
 
 from __future__ import annotations
 
+import contextlib
 import random
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from types import CodeType
 
 import pytest
 
@@ -77,6 +79,62 @@ SHAPES: dict[str, Callable[[int], str]] = {
     "valid-matches": lambda n: "data:image/png;base64,QUJD " * n,
 }
 SIZES = (2000, 8000)
+
+
+_TOOL = 3  # sys.monitoring tool id (0 debugger, 1 coverage, 2 profiler, 5 optimizer are taken)
+
+
+@contextlib.contextmanager
+def _line_events(filename: str) -> Iterator[list[int]]:
+    """Count the Python line events executed in ``filename`` while the block runs.
+
+    Every line a Python-level loop executes is one event, wherever the work hides (in the
+    two seams or outside them); C-level work (``str.find``, ``split``, ``rfind``) is one
+    event per call. No clock: the count is a property of the code and the input.
+    """
+    events = sys.monitoring.events
+    count = [0]
+
+    def on_line(code: CodeType, line: int) -> None:
+        if code.co_filename == filename:
+            count[0] += 1
+
+    sys.monitoring.use_tool_id(_TOOL, "media-scan-complexity")
+    try:
+        sys.monitoring.register_callback(_TOOL, events.LINE, on_line)
+        sys.monitoring.set_events(_TOOL, events.LINE)
+        yield count
+    finally:
+        sys.monitoring.set_events(_TOOL, 0)
+        sys.monitoring.register_callback(_TOOL, events.LINE, None)
+        sys.monitoring.free_tool_id(_TOOL)
+
+
+def _lines(text: str) -> int:
+    with _line_events(payload_scrub.__file__) as count:
+        scrub_data_url_payloads(text)
+    return count[0]
+
+
+class TestLineEventLinearity:
+    """All Python-level work of the scan, not only what goes through the two seams."""
+
+    @pytest.mark.parametrize("shape", sorted(SHAPES))
+    def test_line_events_stay_below_a_constant_per_character_and_grow_linearly(
+        self, shape: str
+    ) -> None:
+        small, large = (SHAPES[shape](n) for n in SIZES)
+        a, b = _lines(small), _lines(large)
+        assert a <= 12 * len(small) + 200 and b <= 12 * len(large) + 200, (
+            a,
+            len(small),
+            b,
+            len(large),
+        )
+        assert b <= 4.4 * max(a, 1), (shape, a, b)
+
+    def test_control_the_counter_sees_the_scan(self) -> None:
+        assert _lines(SHAPES["markers-only"](SIZES[0])) >= SIZES[0]
 
 
 class TestStructuralLinearity:

@@ -11,7 +11,7 @@ REASON_MEDIA_LINK = "media_link_not_supported"
 _SCHEMES = ("http://", "https://", "file://")
 #: The ignore-case matching of the former pattern ``\s*(?:https?|file)://`` (``re.IGNORECASE``
 #: on ``str``) also equates these characters with ASCII letters; every other character is
-#: compared by ``str.lower``. ``tests/test_media_unit.py`` checks all code points.
+#: compared by ``str.lower``. ``tests/test_media_scan_complexity.py`` checks all code points.
 _FOLD = str.maketrans({"\u017f": "s", "\u0130": "i", "\u0131": "i"})
 _LONGEST_SCHEME = max(len(scheme) for scheme in _SCHEMES)
 #: part types the link rule does not look at (an image has its own rule)
