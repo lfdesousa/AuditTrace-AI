@@ -8,7 +8,10 @@ turns up, in a module that exists today or one added later, without naming sinks
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any
+
+from audittrace.media.json_walk import map_strings
 
 MEDIA_MARK = "[REDACTED:media]"
 #: Longer than a hex SHA-512 (128 characters): every digest this service emits
@@ -40,12 +43,6 @@ def scrub_base64_runs(value: str) -> str:
     return _BASE64_RUN_RE.sub(MEDIA_MARK, value)
 
 
-def scrub_strings(value: Any, scrub: Any) -> Any:
-    """``scrub`` applied to every string leaf of a JSON-shaped value (a copy)."""
-    if isinstance(value, str):
-        return scrub(value)
-    if isinstance(value, dict):
-        return {k: scrub_strings(v, scrub) for k, v in value.items()}
-    if isinstance(value, list):
-        return [scrub_strings(v, scrub) for v in value]
-    return value
+def scrub_strings(value: Any, scrub: Callable[[str], str]) -> Any:
+    """``scrub`` applied to every string leaf of a JSON-shaped value (a copy, iterative)."""
+    return map_strings(value, scrub)

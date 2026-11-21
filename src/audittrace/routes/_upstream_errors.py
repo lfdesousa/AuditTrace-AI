@@ -497,4 +497,6 @@ async def refused_request_response(
         duration_ms=0,
         input_media=input_media,
     )
+    # The reason and the position only: never the link or the payload.
+    logger.warning("chat request refused: %s", refusal.detail)
     return JSONResponse(status_code=400, content=refusal.body())

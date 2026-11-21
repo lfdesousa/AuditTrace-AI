@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from audittrace.media.json_walk import any_string, map_strings
+
 REASON_MEDIA_LINK = "media_link_not_supported"
 #: llama-server fetches exactly ``http://`` / ``https://`` and opens ``file://``
 _LINK = re.compile(r"\s*(?:https?|file)://", re.IGNORECASE)
@@ -12,14 +14,8 @@ _LINK = re.compile(r"\s*(?:https?|file)://", re.IGNORECASE)
 _EXEMPT_TYPES = ("text", "image_url")
 
 
-def _has_link(value: Any) -> bool:
-    if isinstance(value, str):
-        return _LINK.match(value) is not None
-    if isinstance(value, dict):
-        return any(_has_link(v) for v in value.values())
-    if isinstance(value, list):
-        return any(_has_link(v) for v in value)
-    return False
+def _is_link(value: str) -> bool:
+    return _LINK.match(value) is not None
 
 
 def find_media_link(messages: list[Any]) -> tuple[int, int] | None:
@@ -31,19 +27,13 @@ def find_media_link(messages: list[Any]) -> tuple[int, int] | None:
         for pi, part in enumerate(content):
             if not isinstance(part, dict) or part.get("type") in _EXEMPT_TYPES:
                 continue
-            if _has_link(part):
+            if any_string(part, _is_link):
                 return mi, pi
     return None
 
 
-def _without_links(value: Any) -> Any:
-    if isinstance(value, str):
-        return f"[REDACTED:link chars={len(value)}]" if _LINK.match(value) else value
-    if isinstance(value, dict):
-        return {k: _without_links(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_without_links(v) for v in value]
-    return value
+def _hide_link(value: str) -> str:
+    return f"[REDACTED:link chars={len(value)}]" if _is_link(value) else value
 
 
 def redact_media_links(part: dict[str, Any]) -> dict[str, Any]:
@@ -54,5 +44,5 @@ def redact_media_links(part: dict[str, Any]) -> dict[str, Any]:
     """
     if part.get("type") in _EXEMPT_TYPES:
         return part
-    replaced: dict[str, Any] = _without_links(part)
+    replaced: dict[str, Any] = map_strings(part, _hide_link)
     return replaced
