@@ -139,6 +139,8 @@ class TestTheNoteStatesWhatIsRemoved:
             "`input_audio`, `input_video` or `file`",
             "replaced whole",
             "audit record never holds a payload",
+            "neither a string nor a list",
+            "a list element that is not a part object",
             "What is not removed is text",
             "A `text` part is traced as written",
             "more than 128 characters",

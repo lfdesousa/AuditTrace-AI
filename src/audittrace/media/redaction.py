@@ -29,9 +29,10 @@ _TYPE_NAME_MAX = 32
 def _type_name(kind: Any) -> str:
     """The part's type when it is a short plain identifier, else ``unknown``.
 
-    The name is attacker-controlled; keeping it only when it cannot carry a payload
-    (at most 32 characters of letters, digits, ``_``, ``-``, ``.``) keeps the placeholder
-    readable without being a channel.
+    The name is attacker-controlled. It is kept only when it is at most 32 characters of
+    letters, digits, ``_``, ``-``, ``.``: that can still carry up to 24 bytes of base64, and
+    that bound is the accepted one (it keeps the marker readable; a longer or odder name is
+    replaced, so the channel is never wider than 32 characters).
     """
     if (
         isinstance(kind, str)
@@ -47,6 +48,42 @@ def _placeholder(part: dict[str, Any]) -> dict[str, Any]:
     """A part reduced to its type name and its number of keys (no walk: any depth)."""
     name = _type_name(part.get("type"))
     return {"type": name, "redacted": f"[REDACTED:media {name} keys={len(part)}]"}
+
+
+def _placeholder_value(value: Any) -> dict[str, Any]:
+    """A list element that is not a part object, reduced to its kind and its size.
+
+    The OpenAI schema allows only objects in a ``content`` list, so a bare string, a number,
+    a nested list or a null is a shape the service does not know: it is treated as an unknown
+    part and never traced.
+    """
+    kind = type(value).__name__
+    size = (
+        f" chars={len(value)}"
+        if isinstance(value, str)
+        else f" items={len(value)}"
+        if isinstance(value, (list, tuple))
+        else ""
+    )
+    return {"type": "unknown", "redacted": f"[REDACTED:media unknown {kind}{size}]"}
+
+
+def redact_content(content: Any) -> Any:
+    """A message's ``content`` made safe for telemetry (the input is never modified).
+
+    ``str`` is text, traced as written by design; ``None`` carries nothing (OpenAI allows a
+    null content on an assistant message that has ``tool_calls``); a list is redacted part by
+    part (an element that is not an object is an unknown part); any other container or scalar
+    (a dict, a number) is not a shape the schema allows and is replaced whole by a marker that
+    records its type and its size.
+    """
+    if content is None or isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return redact_content_parts(content)
+    kind = type(content).__name__
+    size = f" keys={len(content)}" if isinstance(content, dict) else ""
+    return f"[REDACTED:media content {kind}{size}]"
 
 
 def _is_known_text_part(part: dict[str, Any]) -> bool:
@@ -80,9 +117,13 @@ def redact_content_parts(parts: list[Any]) -> list[Any]:
     """The parts of one message, each redacted as ``_redact_part`` says (non-dicts as they are).
 
     For the renderer every span attribute and log line passes: a message's ``content`` list
-    never reaches telemetry with a media payload or a part the service cannot name.
+    never reaches telemetry with a media payload or a part the service cannot name (a
+    non-object element included).
     """
-    return [_redact_part(part) if isinstance(part, dict) else part for part in parts]
+    return [
+        _redact_part(part) if isinstance(part, dict) else _placeholder_value(part)
+        for part in parts
+    ]
 
 
 def redact_media_payloads(
@@ -102,7 +143,11 @@ def redact_media_payloads(
     for mi, message in enumerate(messages):
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
-            out.append(message)
+            out.append(
+                message
+                if not isinstance(message, dict)
+                else {**message, "content": redact_content(content)}
+            )
             continue
         parts = [
             {
@@ -110,7 +155,11 @@ def redact_media_payloads(
                 "image_url": {"url": by_position[(mi, pi)].placeholder()},
             }
             if (mi, pi) in by_position
-            else (_redact_part(part) if isinstance(part, dict) else part)
+            else (
+                _redact_part(part)
+                if isinstance(part, dict)
+                else _placeholder_value(part)
+            )
             for pi, part in enumerate(content)
         ]
         out.append({**message, "content": parts})

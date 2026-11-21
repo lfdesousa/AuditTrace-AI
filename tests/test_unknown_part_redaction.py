@@ -73,6 +73,24 @@ def _user(part: Any) -> list[dict[str, Any]]:
     return [{"role": "user", "content": [{"type": "text", "text": QUESTION}, part]}]
 
 
+#: shapes of a whole message ``content`` that the OpenAI schema does not allow (a string or a
+#: list of part objects only): each carries the canary and must be redacted whole.
+CONTAINERS: dict[str, Any] = {
+    "content-is-a-dict": {"type": "custom_blob", "blob": SHORT},
+    "content-is-a-number": 12345678901234567890,
+    "unknown-part-one-list-deeper": [
+        {"type": "text", "text": QUESTION},
+        [{"type": "custom_blob", "blob": SHORT}],
+    ],
+    "bare-string-element": [{"type": "text", "text": QUESTION}, SHORT],
+    "null-element": [{"type": "text", "text": QUESTION}, None, SHORT],
+}
+
+
+def _container(content: Any) -> list[dict[str, Any]]:
+    return [{"role": "user", "content": content}]
+
+
 @pytest.fixture(params=ARMS, ids=ARM_IDS)
 def arm(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
@@ -84,6 +102,11 @@ def arm(
 
 @pytest.fixture(params=sorted(SHAPES))
 def shape(request: pytest.FixtureRequest) -> str:
+    return str(request.param)
+
+
+@pytest.fixture(params=sorted(CONTAINERS))
+def container(request: pytest.FixtureRequest) -> str:
     return str(request.param)
 
 
@@ -186,9 +209,52 @@ class TestTheRedactionFunction:
         out = redact_media_payloads(_user({"type": "custom_blob", "b": deep}), None)
         assert out[0]["content"][1]["type"] == "custom_blob"
 
-    def test_non_dict_parts_and_messages_are_left_to_the_other_guards(self) -> None:
-        messages: list[Any] = ["x", {"role": "user", "content": ["bare", 3]}]
-        assert redact_media_payloads(messages, None) == messages
+    def test_a_non_object_message_is_left_alone(self) -> None:
+        """A message that is not an object has no ``content`` to read: out of this rule."""
+        assert redact_media_payloads(["x"], None) == ["x"]
+
+    @pytest.mark.parametrize("name", sorted(CONTAINERS))
+    def test_a_content_shape_the_schema_does_not_allow_is_redacted_whole(
+        self, name: str
+    ) -> None:
+        out = redact_media_payloads(_container(CONTAINERS[name]), None)
+        assert SHORT not in json.dumps(out)
+        assert "[REDACTED:media" in json.dumps(out)
+
+    @pytest.mark.parametrize(
+        ("element", "marker"),
+        [
+            ("bare", "[REDACTED:media unknown str chars=4]"),
+            (3, "[REDACTED:media unknown int]"),
+            (None, "[REDACTED:media unknown NoneType]"),
+            ([1, 2], "[REDACTED:media unknown list items=2]"),
+        ],
+        ids=["str", "int", "none", "list"],
+    )
+    def test_a_list_element_that_is_not_an_object_is_an_unknown_part(
+        self, element: Any, marker: str
+    ) -> None:
+        out = redact_media_payloads(_container([element]), None)
+        assert out[0]["content"] == [{"type": "unknown", "redacted": marker}]
+
+    def test_the_container_marker_records_the_type_and_the_size(self) -> None:
+        out = redact_media_payloads(_container({"a": 1, "b": 2}), None)
+        assert out[0]["content"] == "[REDACTED:media content dict keys=2]"
+        out = redact_media_payloads(_container(7), None)
+        assert out[0]["content"] == "[REDACTED:media content int]"
+
+    def test_text_and_a_null_content_pass_as_they_are(self) -> None:
+        """A string is text, traced as written; null is legal on a tool-calling assistant."""
+        for content in ("plain words", None):
+            assert redact_media_payloads(_container(content), None)[0]["content"] == (
+                content
+            )
+
+    def test_a_dict_content_is_not_mutated(self) -> None:
+        messages = _container(copy.deepcopy(CONTAINERS["content-is-a-dict"]))
+        before = copy.deepcopy(messages)
+        redact_media_payloads(messages, None)
+        assert messages == before
 
     @pytest.mark.parametrize("kind", ["input_audio", "input_video", "file"])
     def test_a_known_media_part_keeps_its_shape_and_loses_its_payload(
@@ -247,6 +313,64 @@ class TestTheRouteOnFourArms:
         assert QUESTION in posts[0], "control: the trace input still holds the text"
         assert SHORT not in posts[0]
         assert "[REDACTED:media" in posts[0]
+
+
+class TestContainerShapesOnFourArms:
+    """The review's finding: a part outside a list of objects reached every site."""
+
+    def test_no_span_log_or_ingestion_body_carries_it_and_upstream_gets_it(
+        self,
+        client: Any,
+        arm: tuple[str, bool],
+        container: str,
+        langfuse_on: None,
+        debug_logs: None,
+    ) -> None:
+        mode, stream = arm
+        messages = _container(CONTAINERS[container])
+        fake = ok_fake(mode, stream)
+        response = post_chat(client, fake, stream=stream, messages=messages)
+        assert response.status_code == 200
+        sent = [b["messages"][-1] for b in upstream_bodies(fake)]
+        assert sent and all(m == messages[-1] for m in sent), "ADR-024: unchanged"
+        spans = [json.loads(s) for s in net._SPAN_END_SNAPSHOTS]
+        assert any(s["name"] == "POST /v1/chat/completions" for s in spans), "control"
+        carrying = sorted(
+            {
+                f"{s['name']} :: {k}"
+                for s in spans
+                for k, v in s["attributes"].items()
+                if SHORT in str(v)
+            }
+        )
+        assert carrying == []
+        records = list(net._LOG_RECORD_SNAPSHOTS)
+        assert any("chat" in r for r in records), "control: chat log records seen"
+        assert [r[:100] for r in records if SHORT in r] == []
+        posts = non_upstream_posts(fake)
+        assert len(posts) == 1, "control: one Langfuse ingestion POST"
+        assert SHORT not in posts[0]
+        assert "[REDACTED:media" in posts[0]
+
+
+class TestTheQueryIsReadLikeTheRedaction:
+    """Review A-6: a bare string in a content list is not text; the query ignores it too.
+
+    OpenAI's schema: ``content`` is a string or a list of part OBJECTS. The redaction treats
+    any other element as an unknown part; the retrieval query reads only ``text`` parts that
+    are objects, so the two agree and the element reaches neither.
+    """
+
+    def test_only_text_objects_make_the_query(self) -> None:
+        from audittrace.routes.chat import _extract_query
+
+        for content, expected in (
+            ([{"type": "text", "text": "q"}, SHORT, None, 3, [SHORT]], "q"),
+            ({"type": "text", "text": SHORT}, ""),
+            ("plain", "plain"),
+        ):
+            payload = {"messages": [{"role": "user", "content": content}]}
+            assert _extract_query(payload) == expected, content
 
 
 class TestTheRequestSpanAttributes:

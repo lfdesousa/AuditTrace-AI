@@ -790,7 +790,9 @@ def _extract_query(payload: dict[str, Any]) -> str:
 
     Honours an explicit ``context_query`` field, otherwise falls back to the
     last user message. Tolerates OpenAI multi-part content arrays by joining
-    their text parts.
+    their text parts. Only ``text`` parts that are objects are read: the schema allows
+    ``content`` to be a string or a list of part objects, so any other element (a bare
+    string, a number, a nested list) is not text here, as in ``media.redaction``.
     """
     cq = payload.get("context_query")
     if isinstance(cq, str) and cq:

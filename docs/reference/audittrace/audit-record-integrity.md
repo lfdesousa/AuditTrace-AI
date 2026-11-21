@@ -145,8 +145,11 @@ span or the trace-ingestion body. An inline image is replaced by its digest. A p
 `input_audio`, `input_video` or `file` keeps its type and its other keys, and its payload
 (`data`, `url`, `file_data`) is replaced by a marker that gives its length. A part of any type the
 service does not know (for example a custom `blob` part) is replaced whole by a marker that
-keeps its type name and its number of keys. The model server still receives every part
-unchanged, and the audit record never holds a payload.
+keeps its type name and its number of keys. The same holds for a shape the OpenAI schema
+does not allow: a message `content` that is neither a string nor a list (a dict, a number) is
+replaced whole by a marker that records its type and size, and a list element that is not a part
+object (a bare string, a number, a nested list) is treated as an unknown part. The model server
+still receives every part unchanged, and the audit record never holds a payload.
 
 The types the service treats as text are `text`, `refusal` and `image_url` (the OpenAI
 content-part types for text, assistant refusals and images). A text-bearing part that carries
