@@ -510,6 +510,7 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         procedural=procedural,
         conversational=conversational,
         semantic=semantic,
+        manifest=memory_manifest,
     )
 
     container._instances["episodic"] = episodic
@@ -684,6 +685,7 @@ def get_context_builder(
         procedural=scoped_procedural,
         conversational=conversational,
         semantic=scoped_semantic,
+        manifest=container._instances["memory_manifest"],
     )
 
 
@@ -885,6 +887,7 @@ def _register_mock_memory_services() -> None:
         procedural=procedural,
         conversational=conversational,
         semantic=semantic,
+        manifest=memory_manifest,
     )
     container._instances["episodic"] = episodic
     container._instances["procedural"] = procedural
@@ -933,6 +936,7 @@ def create_test_container() -> DependencyContainer:
         procedural=procedural,
         conversational=conversational,
         semantic=semantic,
+        manifest=memory_manifest,
     )
     test_container._instances["episodic"] = episodic
     test_container._instances["procedural"] = procedural

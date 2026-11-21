@@ -83,6 +83,10 @@ from audittrace.routes import memory_pdf as _pdf  # noqa: E402
 from audittrace.routes import memory_scan as _scan  # noqa: E402
 from audittrace.routes._session_bind import bound_upload_session  # noqa: E402
 from audittrace.routes.memory_chunking import chunk_document
+from audittrace.routes.memory_delete_cascade import (
+    audit_source_folds,
+    tombstone_source_folds,
+)
 from audittrace.routes.memory_fold_tail import find_stale_tail
 from audittrace.routes.memory_layer_writes import (
     authorize_layer_write,
@@ -106,9 +110,6 @@ from audittrace.routes.memory_semantic_writes import (
     semantic_write_errors_as_http,
 )
 from audittrace.routes.memory_whole_document import (
-    STAMP_FOLD,
-    STAMP_TOTAL,
-    chunk_id,
     fold_stamp,
     gather_whole_document,
     reassemble_chunk_sequence,
@@ -131,6 +132,7 @@ from audittrace.services.episodic import EpisodicService
 from audittrace.services.index_routing import collection_for_key
 from audittrace.services.layer_listing import list_layer_objects
 from audittrace.services.memory_audit import schedule_read_audit
+from audittrace.services.memory_chunk_ids import STAMP_FOLD, STAMP_TOTAL, chunk_id
 from audittrace.services.memory_keys import (
     ID_FORM_LC9,
     ChromaIdConflictError,
@@ -146,6 +148,14 @@ from audittrace.services.memory_manifest import (
     ManifestAuthorizationError,
     ManifestEntry,
     authorize_write,
+)
+from audittrace.services.memory_tombstone import (
+    any_hidden,
+    is_hidden,
+    reads_tombstones,
+    source_is_tombstoned,
+    stamped_chunk_ids,
+    tombstone_semantic_document,
 )
 from audittrace.services.procedural import ProceduralService
 from audittrace.services.recall_telemetry import (
@@ -203,7 +213,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# The chunk-id formula lives in memory_whole_document; this name is what
+# The chunk-id formula lives in services.memory_chunk_ids; this name is what
 # the PDF fold and the tests import.
 _doc_id = chunk_id
 # Shared with the sibling write modules (``memory_write_support``); the
@@ -835,6 +845,13 @@ def _physical_collection(name: str) -> str:
     return f"{name}_v2"
 
 
+def _logical_collection(physical: str) -> str:
+    """The inverse of :func:`_physical_collection`: a discovered row keys under
+    the LOGICAL collection, as its manifest row does (a tracked or tombstoned
+    chunk is never listed again as ``decisions_v2/<id>``)."""
+    return physical.removesuffix("_v2")
+
+
 async def _upsert_in_batches(
     collection: Any,
     ids: list[str],
@@ -1371,6 +1388,23 @@ async def index_memory(
             minio_client, bucket, "procedural/"
         )
 
+    # B21: a soft-deleted source is never folded again, for any caller. It is
+    # handled as an ABSENT object (no indexer runs, nothing is written or
+    # revived), so a non-admin gets the reply of a key that never existed.
+    source_refused = (
+        file is not None
+        and layer_for_scope is not None
+        and await source_is_tombstoned(
+            manifest_service,
+            user,
+            layer_for_scope.value,
+            file.rsplit("/", 1)[-1],
+            tier,
+        )
+    )
+    if source_refused:
+        episodic_objects, procedural_objects = [], []
+
     for col_name in target_collections:
         # Bulk mode: delete-and-recreate for idempotency. Single-file
         # mode: get-or-create only — preserves chunks for other files
@@ -1570,6 +1604,11 @@ async def index_memory(
     # Bulk mode is exempt (an admin whole-collection rebuild legitimately
     # attempts 0 objects when nothing matches) and dry-run is exempt (no
     # write intended) — both keep returning 200.
+    if source_refused and reads_tombstones(user):
+        raise HTTPException(
+            status_code=409,
+            detail="source is soft-deleted: re-create it before indexing it again",
+        )
     if single_file_mode and not dry_run and not any(object_outcomes):
         raise HTTPException(
             status_code=422,
@@ -1918,6 +1957,8 @@ async def read_episodic(
     entry: ManifestEntry | None = await manifest.resolve_read(
         "episodic", filename, user
     )
+    if is_hidden(entry, user):
+        raise HTTPException(status_code=404, detail="ADR not found")
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
@@ -2029,6 +2070,15 @@ async def delete_episodic(
         await authorize_write(manifest, user, "episodic", filename)
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
+    # B8: the folds of this source are tombstoned BEFORE the source row.
+    cascaded = await tombstone_source_folds(
+        get_semantic_service(),
+        manifest,
+        user,
+        "episodic",
+        filename,
+        caller_can_write_shared=_corpus_write_authorized(user, None),
+    )
     try:
         entry: ManifestEntry = await manifest.record_delete(
             "episodic",
@@ -2052,6 +2102,7 @@ async def delete_episodic(
         key=filename,
         detail_extra={"hard": hard},
     )
+    await audit_source_folds(user, cascaded)
     return entry.to_dict()
 
 
@@ -2173,6 +2224,8 @@ async def read_procedural(
     entry: ManifestEntry | None = await manifest.resolve_read(
         "procedural", filename, user
     )
+    if is_hidden(entry, user):
+        raise HTTPException(status_code=404, detail="SKILL not found")
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
@@ -2268,6 +2321,15 @@ async def delete_procedural(
         await authorize_write(manifest, user, "procedural", filename)
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
+    # B8: the folds of this source are tombstoned BEFORE the source row.
+    cascaded = await tombstone_source_folds(
+        get_semantic_service(),
+        manifest,
+        user,
+        "procedural",
+        filename,
+        caller_can_write_shared=_corpus_write_authorized(user, None),
+    )
     try:
         entry: ManifestEntry = await manifest.record_delete(
             "procedural",
@@ -2291,6 +2353,7 @@ async def delete_procedural(
         key=filename,
         detail_extra={"hard": hard},
     )
+    await audit_source_folds(user, cascaded)
     return entry.to_dict()
 
 
@@ -2548,7 +2611,9 @@ async def _merge_semantic_with_chroma(
             # chunk maps to its bare id, which is its legacy manifest key. The
             # owner comes from the chunk's own metadata, never from the id.
             owner = new_form_owner(meta)
-            key = _semantic_key(col_name, logical_id(doc_id, owner))
+            key = _semantic_key(
+                _logical_collection(col_name), logical_id(doc_id, owner)
+            )
             if key in known_keys:
                 continue
             content = docs[i] if i < len(docs) else ""
@@ -2801,6 +2866,18 @@ async def read_semantic(
     doc = await service.get_document(user, collection, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="semantic doc not found")
+    # B10/B11: a tombstoned row of the document answers the never-existed 404
+    # BEFORE the corpus scope is asked (a 403 would confirm a deleted document).
+    if await any_hidden(
+        manifest,
+        "semantic",
+        [
+            _semantic_key(collection, cid)
+            for cid in stamped_chunk_ids(collection, document_id, doc)
+        ],
+        user,
+    ):
+        raise HTTPException(status_code=404, detail="semantic doc not found")
     if doc.metadata.get("tier") == "corpus":
         _require_corpus_scope(user, collection, "read")
 
@@ -2811,6 +2888,13 @@ async def read_semantic(
             )
         except SemanticDocumentIncompleteError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if await any_hidden(
+            manifest,
+            "semantic",
+            [_semantic_key(collection, cid) for cid in chunk_ids],
+            user,
+        ):
+            raise HTTPException(status_code=404, detail="semantic doc not found")
         front_matter = chunk_docs[0]
         entry = await manifest.resolve_read(
             "semantic", _semantic_key(collection, chunk_ids[0]), user
@@ -2975,6 +3059,20 @@ async def delete_semantic(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
+        # B9/B17: one chunk's delete (hard or soft) tombstones the whole
+        # document, BEFORE the vector row of a hard delete goes.
+        try:
+            chunks = await tombstone_semantic_document(
+                service,
+                manifest,
+                user,
+                collection,
+                document_id,
+                entry,
+                caller_can_write_shared=_corpus_write_authorized(user, collection),
+            )
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete_document(user, collection, document_id)
@@ -2986,7 +3084,7 @@ async def delete_semantic(
         layer="semantic",
         collection=collection,
         key=document_id,
-        detail_extra={"hard": hard},
+        detail_extra={"hard": hard, "chunks": chunks},
     )
     return entry.to_dict()
 

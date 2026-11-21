@@ -18,26 +18,16 @@ import hashlib
 from typing import Any
 
 from audittrace.identity import UserContext
+from audittrace.services.memory_chunk_ids import (
+    CHUNK_READ_WINDOW,
+    STAMP_FOLD,
+    STAMP_TOTAL,
+    document_chunk_ids,
+    read_stamp,
+)
 from audittrace.services.semantic_document_incomplete_error import (
     SemanticDocumentIncompleteError,
 )
-
-# How many chunk ids one read asks ChromaDB for per round trip. Not a cap on
-# the document: the reader keeps going until the stamped total or a miss.
-CHUNK_READ_WINDOW = 500
-STAMP_TOTAL = "chunk_total"
-STAMP_FOLD = "fold_sha256"
-
-
-def chunk_id(collection: str, source: str, chunk_idx: int) -> str:
-    """The deterministic id of chunk *chunk_idx* of *source* in *collection*."""
-    raw = f"{collection}:{source}:{chunk_idx}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-
-def document_chunk_ids(collection: str, title: str, start: int, stop: int) -> list[str]:
-    """The chunk ids ``[start, stop)`` of one folded document."""
-    return [chunk_id(collection, title, i) for i in range(start, stop)]
 
 
 def text_sha256(text: str) -> str:
@@ -47,18 +37,6 @@ def text_sha256(text: str) -> str:
 def fold_stamp(text: str, chunk_count: int) -> dict[str, Any]:
     """The stamp one fold puts on every chunk it writes."""
     return {STAMP_TOTAL: chunk_count, STAMP_FOLD: text_sha256(text)}
-
-
-def read_stamp(metadata: dict[str, Any]) -> tuple[int, str] | None:
-    """``(total, fold)`` of a stamped chunk, ``None`` for an unstamped one.
-    Half a stamp, or one of the wrong type, is not a stamp anybody wrote."""
-    total, fold = metadata.get(STAMP_TOTAL), metadata.get(STAMP_FOLD)
-    if total is None and fold is None:
-        return None
-    if isinstance(total, int) and not isinstance(total, bool) and total > 0:
-        if isinstance(fold, str) and fold:
-            return total, fold
-    raise SemanticDocumentIncompleteError("semantic document carries a malformed stamp")
 
 
 def reassemble_chunk_sequence(chunk_docs: list[Any], overlap: int) -> str:

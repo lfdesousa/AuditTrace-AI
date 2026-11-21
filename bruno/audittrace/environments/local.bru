@@ -17,6 +17,13 @@ vars {
   indexPdfCollection: ai_research_papers
   uploadPdfFile: /tmp/clean.pdf
   mcpRecallQuery: AuditTrace architecture
+  mcpRecallTool: recall_semantic
+  mcpReadTool: read_decision
+  mcpReadFile: ADR-bruno-test.md
+  contextQuery: What did ADR-025 decide about memory tools?
+  expectedReadStatus: 200
+  expectedIndexStatus: 200
+  deleteHard: false
   mcpWriteDocId: bruno-mcp-track-c-probe
   mcpBrokerServerName: example-server
   mcpBrokerToolName: example-tool

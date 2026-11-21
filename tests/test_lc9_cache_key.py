@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+from dataclasses import replace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -325,8 +326,12 @@ async def test_same_subject_admin_and_non_admin_tokens_do_not_share_results(
     container._instances["semantic"] = ChromaSemanticService(
         client=chroma, default_collections=["audittrace"]
     )
-    tool = get_tool_by_name("recall_semantic")
-    assert tool is not None
+    registered = get_tool_by_name("recall_semantic")
+    assert registered is not None
+    # SOFTDELETE-DIRECT-READ B22: recall_semantic is registered cacheable=False.
+    # This test pins the cache IDENTITY (scope set and admin flag are part of
+    # the key), so it runs the real handler flagged cacheable.
+    tool = replace(registered, cacheable=True)
     args = {"query": "cache", "k": 10}
     admin = _ctx("user-x", _READ_SCOPES + ("audittrace:admin",))
     plain = _ctx("user-x", _READ_SCOPES)

@@ -20,10 +20,11 @@ query {
 }
 
 tests {
-  test("returns 200", function() {
-    expect(res.getStatus()).to.equal(200);
+  test("returns the expected status (expectedIndexStatus, default 200)", function() {
+    expect(res.getStatus()).to.equal(Number(bru.getEnvVar("expectedIndexStatus")));
   });
-  test("indexed exactly one chunk into the decisions collection", function() {
+  test("indexed at least one chunk into the decisions collection (a 200 only)", function() {
+    if (res.getStatus() !== 200) { return; }
     const body = res.getBody();
     expect(body.status).to.equal("indexed");
     expect(body.collections).to.be.an("object");
@@ -33,6 +34,10 @@ tests {
 }
 
 docs {
+  `expectedIndexStatus` (default 200): a source the caller soft-deleted is not folded
+  again. 422 for a caller who is not an admin (the reply of a key that never existed),
+  409 for an admin; re-create the source (seed-file.bru) before indexing it again.
+
   The EOD-memo → decisions flow proven live 2026-05-15 with v1.0.22
   + the Keycloak scope grant (PR #87 / #88). A markdown file is
   uploaded to MinIO under ``episodic/`` (typical operator use:
