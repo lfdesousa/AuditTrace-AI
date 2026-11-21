@@ -4,7 +4,9 @@
   emit (the keys of the one message table every refusal body is built from, and every
   ``REASON_*`` constant of the media package), and each of them is observed through the route.
 * S2: the note states residual R-1 (a short raw payload in a non-image part can appear in
-  trace attributes), with its bound and what stays clean.
+  span attributes), with its bound and what stays clean. The bound is an upper bound derived
+  from the code (every site that writes request messages to a span attribute) and pinned here
+  against the spans a request really ends, for a typed part and for a part of an unknown type.
 * S4: the note names the canonical serialisation of ``input_media``, and an image row's
   ``content_hash`` is recomputed here from nothing but the JSON of ``GET /interactions`` and
   the note's words.
@@ -49,6 +51,22 @@ REFUSAL_REASONS = {
 }
 #: 72 bytes -> 96 base64 characters: under the 128-character run rule (residual R-1)
 SHORT = base64.b64encode(bytes(range(72))).decode()
+#: The attributes the note's section 4 counts (typed part: 5 of 3 spans; unknown type: 8 of 4).
+#: ``sovereign-chat-request`` exists as an ended span only under a live Langfuse client, so a
+#: request through the test client can carry at most the others; the subset check below is
+#: therefore against the full set and the control asserts the carried ones are non-empty.
+TYPED_BOUND = {
+    "chat-merge-system :: output.value",
+    "chat-merge-system :: langfuse.observation.output",
+    "sovereign-chat-request :: input.value",
+    "sovereign-chat-request :: langfuse.observation.input",
+    "llm.chat.completions :: input.value",
+}
+UNKNOWN_BOUND = TYPED_BOUND | {
+    "chat-merge-system :: input.value",
+    "chat-merge-system :: langfuse.observation.input",
+    "POST /v1/chat/completions :: langfuse.observation.input",
+}
 SERIALISATION = 'json.dumps(obj, sort_keys=True, separators=(",", ":"))'
 #: ADDENDUM-1's set (CODE-INDEX, ``InteractionRecord`` and its alias), restated here so
 #: this file stands alone; the equality below is what binds it.
@@ -134,7 +152,10 @@ class TestResidualIsStated:
             "128 characters or fewer",
             "that is not an image",
             "raw base64",
-            "can appear in trace attributes",
+            "can appear in span attributes",
+            "at most 5 attributes of 3 spans",
+            "at most 8 attributes of 4 spans",
+            "up to four more model-call spans",
             "never in the audit record",
             "Images are not affected",
             "`url_sha256`",
@@ -169,6 +190,33 @@ class TestResidualIsStated:
         )
         assert carrying != [], "R-1 is closed: remove section 4 of the note"
         assert "POST /v1/chat/completions :: langfuse.observation.input" not in carrying
+        assert set(carrying) <= TYPED_BOUND, sorted(set(carrying) - TYPED_BOUND)
+
+    def test_a_part_of_an_unknown_type_stays_inside_its_stated_bound(
+        self, client: Any, arm: tuple[str, bool]
+    ) -> None:
+        """The note's second paragraph: no redaction by type, so the entry tag carries it too."""
+        mode, stream = arm
+        blob = {"type": "custom_blob", "data": SHORT}
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": QUESTION}, blob]}
+        ]
+        response = post_chat(
+            client, ok_fake(mode, stream), stream=stream, messages=messages
+        )
+        assert response.status_code == 200
+        item = client.get("/interactions?limit=5").json()["interactions"][0]
+        assert SHORT not in json.dumps(item), "the audit record is still clean"
+        carrying = {
+            f"{s['name']} :: {k}"
+            for s in map(json.loads, net._SPAN_END_SNAPSHOTS)
+            for k, v in s["attributes"].items()
+            if SHORT in str(v)
+        }
+        assert carrying != set(), "control: an unknown part type is not redacted"
+        assert carrying <= UNKNOWN_BOUND, sorted(carrying - UNKNOWN_BOUND)
+        assert "POST /v1/chat/completions :: langfuse.observation.input" in carrying
+        assert len(TYPED_BOUND) == 5 and len(UNKNOWN_BOUND) == 8
 
 
 class TestHashFromTheApiResponse:

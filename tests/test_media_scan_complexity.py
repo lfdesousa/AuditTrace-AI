@@ -5,22 +5,30 @@ backtracked quadratically on caller text (``base64,`` followed by ``data:+`` and
 repeated 16000 times, 112 KB, ran for about 20 s). It is now a scan anchored on the literal
 ``;base64,`` that validates backwards. The link guard's pattern is replaced by a string check.
 
-No assertion here reads a clock (a wall-clock bound is a flake). Linearity is proved
-STRUCTURALLY: the scan's primitive steps are counted through two seams (the per-character
-test of the backward walk and the per-token head test), on adversarial inputs at two sizes:
-the count stays below a constant times the input length and grows linearly with it. The
-112 KB adversarial inputs are also ordinary inputs that must give the correct output.
-Equality with the former patterns is checked on random strings, the valid shapes, and (link
-guard) every Unicode code point.
+No assertion here reads a clock (a wall-clock bound is a flake). Linearity is argued
+STRUCTURALLY, with three counters, on adversarial inputs at two sizes (the count stays below a
+constant times the input length and grows linearly with it). What each one proves, and what
+none of them can see, is stated on the counter (see ``_Steps``, ``_line_events``,
+``_instruction_events``). Taken together they are a regression net for the quadratic shape that
+code scanning found, NOT a proof of linearity: work done inside one C-level call (``str.count``,
+``str.find``, ``re`` and the like) costs one event whatever the input, and is closed only by the
+other guard in this package (``test_media_regex_allowlist.py``: no regular expression on the
+scan, and no import of anything else), by review, and by CodeQL on the pull request. The 112 KB
+adversarial inputs are also ordinary inputs that must give the correct output. Equality with the
+former patterns is checked on random strings, the valid shapes, and (link guard) every Unicode
+code point.
 """
 
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import random
 import re
 import sys
+import types
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from types import CodeType
 
 import pytest
@@ -42,7 +50,17 @@ def _old_scrub(value: str) -> str:
 
 
 class _Steps:
-    """Counts the primitive steps of the backward scan through its two seams."""
+    """Counts the primitive steps of the backward scan through its two seams.
+
+    PROVES: each call of the per-character test and of the per-token head test is counted
+    (a token head costs 1 + its length), so a scan that walks back over the same characters
+    again for every marker shows as a count that grows faster than the input.
+    MISSES: any work that does not go through those two functions (a loop added beside them,
+    a second pass, a one-line comprehension) and any work inside one C-level call. The line
+    and instruction counters below cover the Python-level part of that; nothing here covers
+    the C-level part. Its control test asserts the seams are live, so a scan that no longer
+    reaches them (a regular expression) cannot pass this guard vacuously.
+    """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.count = 0
@@ -88,9 +106,16 @@ _TOOL = 3  # sys.monitoring tool id (0 debugger, 1 coverage, 2 profiler, 5 optim
 def _line_events(filename: str) -> Iterator[list[int]]:
     """Count the Python line events executed in ``filename`` while the block runs.
 
-    Every line a Python-level loop executes is one event, wherever the work hides (in the
-    two seams or outside them); C-level work (``str.find``, ``split``, ``rfind``) is one
-    event per call. No clock: the count is a property of the code and the input.
+    PROVES: every time the interpreter starts a source line of that file counts one event, so a
+    Python-level loop whose body is on its own lines costs (iterations x body lines), wherever
+    the work hides (in the two seams or outside them). No clock: the count is a property of the
+    code and the input.
+    MISSES (measured on CPython 3.12, ``test_the_line_counter_is_blind_to_one_line_loops``):
+    a loop or comprehension that sits on ONE source line (``sum(1 for _ in t for _ in t)``, a
+    one-line nested ``for``) fires a single event whatever its trip count, so a one-line
+    quadratic is invisible here; and C-level work (``str.find``, ``str.count``, ``rfind``,
+    ``split``) is one event per call whatever the input length. The instruction counter below
+    closes the first gap; nothing here closes the second.
     """
     events = sys.monitoring.events
     count = [0]
@@ -110,6 +135,62 @@ def _line_events(filename: str) -> Iterator[list[int]]:
         sys.monitoring.free_tool_id(_TOOL)
 
 
+def _code_objects(code: CodeType) -> Iterator[CodeType]:
+    """``code`` and every code object nested in it (inner functions, comprehensions)."""
+    yield code
+    for const in code.co_consts:
+        if isinstance(const, CodeType):
+            yield from _code_objects(const)
+
+
+def _module_code(module: types.ModuleType) -> list[CodeType]:
+    """The code objects of the functions defined in ``module`` (not of what it imports)."""
+    roots = [
+        value.__code__
+        for value in vars(module).values()
+        if isinstance(value, types.FunctionType) and value.__module__ == module.__name__
+    ]
+    return [code for root in roots for code in _code_objects(root)]
+
+
+@contextlib.contextmanager
+def _instruction_events(codes: list[CodeType]) -> Iterator[list[int]]:
+    """Count the bytecode instructions executed in ``codes`` while the block runs.
+
+    PROVES: each executed instruction of the given code objects counts one event, so a
+    quadratic Python-level loop is seen even when it sits on one source line (the case the
+    line counter is blind to). Local events are set per code object, so the objects must be
+    listed (``_module_code`` collects the functions of a module and what is nested in them).
+    MISSES: work inside one C-level call (``str.count``, ``str.find``, ``re``): that is a
+    handful of instructions whatever the input length. A function added to the module AFTER the
+    code objects were collected, or code reached only through another module, is not counted.
+    """
+    events = sys.monitoring.events
+    count = [0]
+
+    def on_instruction(code: CodeType, offset: int) -> None:
+        count[0] += 1
+
+    sys.monitoring.use_tool_id(_TOOL, "media-scan-complexity")
+    try:
+        sys.monitoring.register_callback(_TOOL, events.INSTRUCTION, on_instruction)
+        for code in codes:
+            sys.monitoring.set_local_events(_TOOL, code, events.INSTRUCTION)
+        yield count
+    finally:
+        for code in codes:
+            sys.monitoring.set_local_events(_TOOL, code, 0)
+        sys.monitoring.register_callback(_TOOL, events.INSTRUCTION, None)
+        sys.monitoring.free_tool_id(_TOOL)
+
+
+def _instructions(text: str) -> int:
+    codes = _module_code(payload_scrub)
+    with _instruction_events(codes) as count:
+        scrub_data_url_payloads(text)
+    return count[0]
+
+
 def _lines(text: str) -> int:
     with _line_events(payload_scrub.__file__) as count:
         scrub_data_url_payloads(text)
@@ -117,7 +198,12 @@ def _lines(text: str) -> int:
 
 
 class TestLineEventLinearity:
-    """All Python-level work of the scan, not only what goes through the two seams."""
+    """Python-level work of the scan on its own lines, not only what goes through the two seams.
+
+    Bounds: at most 12 line events per input character (plus 200) and x4.4 for x4 the input.
+    Blind to one-line loops and to C-level work (see ``_line_events``); the next class and the
+    planted-code tests at the end of the file are about exactly that.
+    """
 
     @pytest.mark.parametrize("shape", sorted(SHAPES))
     def test_line_events_stay_below_a_constant_per_character_and_grow_linearly(
@@ -135,6 +221,121 @@ class TestLineEventLinearity:
 
     def test_control_the_counter_sees_the_scan(self) -> None:
         assert _lines(SHAPES["markers-only"](SIZES[0])) >= SIZES[0]
+
+
+#: instruction events per character (the real scan measures about 39 at the worst) and growth
+#: for x4 the input; the same predicate judges the real scan and the planted one-liners.
+_PER_CHAR = 60
+_GROWTH = 4.4
+
+
+def _linear(a: int, b: int, small: int, large: int) -> bool:
+    """True when the counts ``a`` (small input) and ``b`` (large) look linear in the length."""
+    return (
+        a <= _PER_CHAR * small + 400
+        and b <= _PER_CHAR * large + 400
+        and b <= _GROWTH * max(a, 1)
+    )
+
+
+class TestInstructionLinearity:
+    """Every bytecode instruction of the scan module's functions, one-line loops included.
+
+    PROVES: the Python-level work of ``payload_scrub`` (every function defined there and what
+    is nested in it) grows linearly on the adversarial shapes, even where a loop or comprehension
+    shares one source line. MISSES: work inside one C-level call; see ``_instruction_events``.
+    """
+
+    @pytest.mark.parametrize("shape", sorted(SHAPES))
+    def test_instructions_stay_below_a_constant_per_character_and_grow_linearly(
+        self, shape: str
+    ) -> None:
+        small, large = (SHAPES[shape](n) for n in SIZES)
+        a, b = _instructions(small), _instructions(large)
+        assert _linear(a, b, len(small), len(large)), (shape, a, b)
+
+    def test_control_the_counter_sees_the_scan_and_its_nested_code(self) -> None:
+        codes = _module_code(payload_scrub)
+        names = {code.co_name for code in codes}
+        assert {"scrub_data_url_payloads", "_opening", "_data_start"} <= names
+        assert _instructions(SHAPES["markers-only"](SIZES[0])) >= SIZES[0]
+
+
+def _one_line_quadratic(text: str) -> int:
+    return sum(1 for _ in text for _ in text)
+
+
+def _one_line_c_level_quadratic(text: str) -> int:
+    return sum(text.count("a") for _ in text)
+
+
+def _measure(fn: Callable[[str], int], counter: str) -> tuple[int, int, int, int]:
+    small, large = "a" * 500, "a" * 2000
+    out = []
+    for text in (small, large):
+        if counter == "line":
+            with _line_events(__file__) as count:
+                fn(text)
+        else:
+            with _instruction_events(list(_code_objects(fn.__code__))) as count:
+                fn(text)
+        out.append(count[0])
+    return out[0], out[1], len(small), len(large)
+
+
+class TestWhatTheCountersCannotSee:
+    """The limits the docstrings state, pinned so that they stay true (G1)."""
+
+    def test_the_line_counter_is_blind_to_one_line_loops(self) -> None:
+        a, b, small, large = _measure(_one_line_quadratic, "line")
+        assert _linear(a, b, small, large), (
+            "a one-line quadratic passes the line counter"
+        )
+        assert b == a, "one event however many iterations: the count is flat"
+
+    def test_the_instruction_counter_catches_the_one_line_quadratic(self) -> None:
+        a, b, small, large = _measure(_one_line_quadratic, "instruction")
+        assert not _linear(a, b, small, large), (a, b)
+        assert b >= 12 * a, "x4 the input gives about x16 the instructions"
+
+    def test_neither_counter_sees_a_c_level_quadratic(self) -> None:
+        for counter in ("line", "instruction"):
+            a, b, small, large = _measure(_one_line_c_level_quadratic, counter)
+            assert _linear(a, b, small, large), (counter, a, b)
+
+    def test_a_planted_one_liner_in_a_copy_of_the_scan_passes_lines_fails_instructions(
+        self, tmp_path: Path
+    ) -> None:
+        """The neuter: the real scan plus ONE quadratic line, loaded from a temp copy."""
+        source = Path(payload_scrub.__file__).read_text(encoding="utf-8")
+        head = "def scrub_data_url_payloads(value: str) -> str:"
+        anchor = '    if "base64," not in value:\n        return value\n'
+        assert source.count(head) == 1 and source.count(anchor) == 1
+        planted = source.replace(
+            anchor, anchor + "    _ = sum(1 for _a in value for _b in value)\n"
+        )
+        path = tmp_path / "payload_scrub_planted.py"
+        path.write_text(planted, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("payload_scrub_planted", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        text_small, text_large = (SHAPES["many-markers-payload"](n) for n in (200, 800))
+        counts = {}
+        for kind in ("line", "instruction"):
+            row = []
+            for text in (text_small, text_large):
+                if kind == "line":
+                    with _line_events(str(path)) as count:
+                        module.scrub_data_url_payloads(text)
+                else:
+                    with _instruction_events(_module_code(module)) as count:
+                        module.scrub_data_url_payloads(text)
+                row.append(count[0])
+            counts[kind] = row
+        sizes = (len(text_small), len(text_large))
+        assert _linear(*counts["line"], *sizes), ("line", counts)
+        assert not _linear(*counts["instruction"], *sizes), ("instruction", counts)
 
 
 class TestStructuralLinearity:

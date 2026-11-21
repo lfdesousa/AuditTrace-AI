@@ -142,7 +142,26 @@ Other kinds of rows use their own values in this column; none of them uses `requ
 
 Media payloads are removed from traces and logs. One case is not covered: a raw base64 payload of
 128 characters or fewer (96 bytes of content at most), sent in a part that is not an image (for
-example a very short audio clip), can appear in trace attributes of that turn (the spans of the
-prompt-assembly step and of the model call). It is never in the audit record. Images are not affected:
-an inline image is replaced by its digest whatever its size. Longer payloads are removed whatever
-the part type.
+example a very short audio clip), can appear in span attributes of that turn. It is never in the
+audit record. Images are not affected: an inline image is replaced by its digest whatever its size.
+Longer payloads are removed whatever the part type.
+
+The attributes that can carry it are fixed by the code. For a part of type `input_audio` or `file`:
+
+- the prompt-assembly span (`chat-merge-system`): `output.value` and `langfuse.observation.output`
+  (two);
+- the span of the request (`sovereign-chat-request`): `input.value` and `langfuse.observation.input`
+  (two);
+- the model-call span (`llm.chat.completions`): `input.value` (one per model call).
+
+That is at most 5 attributes of 3 spans for a request with one model call, and it is what a trace
+of an audio turn on the cluster showed. A request that runs the memory tool loop makes up to five
+model calls (`memory_tool_loop_max_iterations`), so up to four more model-call spans, one attribute
+each. The audit record, the trace-ingestion body and the input tag of the entry span are clean for
+these two part types.
+
+A part of any other type the service does not know (for example a custom `blob` part) is not
+redacted by type. Its short payload can also appear in the two input attributes of
+`chat-merge-system`, in the input tag of the entry span (`POST /v1/chat/completions`,
+`langfuse.observation.input`) and in the trace-ingestion body: at most 8 attributes of 4 spans for
+one model call, plus the ingestion body. The audit record is still clean.

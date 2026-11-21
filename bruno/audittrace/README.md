@@ -11,7 +11,7 @@ bruno/audittrace/
 ├── chat/           — /v1/models, /v1/chat/completions
 ├── context/        — /context (memory bundle for a query)
 ├── environments/   — cluster + local
-├── health/         — /health, /metrics
+├── health/         — /health, /metrics, /openapi.json
 ├── mcp/            — POST /mcp (JSON-RPC, ADR-063 Phase 1+2 A/B/C)
 ├── memory/         — per-layer CRUD + index/upload (5 ops × 4 layers)
 │   ├── conversational/
@@ -54,6 +54,7 @@ minimal.
 |---|---|
 | `GET /health` | health/health.bru |
 | `GET /metrics` | health/metrics.bru |
+| `GET /openapi.json` | health/openapi.bru (unauthenticated, like `/health`) |
 | `POST /v1/chat/completions` | chat/02-chat-completions.bru, chat/03-chat-completions-param.bru, chat/04-chat-untrusted-traceparent.bru |
 | `GET /v1/models` | chat/01-list-models.bru |
 | `POST /context` | context/01-context.bru ← **NEW 2026-05-09** |
