@@ -37,8 +37,18 @@ from tests._log_trace_id_support import (
     isolated_logging_state,
     log_lines,
 )
-from tests.memory_truncation_support import USER, memory_client, read_whole
-from tests.memory_truncation_support_a1 import as_admin
+from tests.memory_truncation_support import (
+    USER,
+    distinct_body,
+    memory_client,
+    read_whole,
+)
+from tests.memory_truncation_support_a1 import (
+    STEP,
+    as_admin,
+    fold_before_the_stamp,
+    manifest,
+)
 from tests.test_softdelete_direct_read_a1 import (
     CANARY,
     SOURCES,
@@ -213,6 +223,35 @@ class TestARefusedReadLeavesOneTracedLogLine:
         text = json.dumps(line).lower()
         for word in ("delet", "tombstone", CANARY, "soft"):
             assert word not in text
+
+    def test_a_whole_read_refused_on_a_gathered_chunk_logs_one_line_too(
+        self, logs: io.StringIO
+    ) -> None:
+        """The second refusal site: an UNSTAMPED fold whose chunk 0 row was
+        tombstoned before the build. The entry chunk names no tombstone; the
+        whole read finds it among the gathered chunks."""
+        client = a1_client[-1]
+        text = CANARY + "\n" + distinct_body(4 * STEP)
+        count = fold_before_the_stamp("decisions", "old.md", text)
+        ids = [a1.m._doc_id("decisions", "old.md", i) for i in range(count)]
+        key = a1.m._semantic_key("decisions", ids[0])
+        asyncio.run(
+            manifest().record_create(
+                layer="semantic", key=key, title="old.md", size_bytes=1, user_id=USER
+            )
+        )
+        asyncio.run(manifest().record_delete("semantic", key, USER))
+        before = len(_refused_lines(logs))
+
+        with in_span():
+            whole = client.get(
+                f"/memory/semantic/decisions/{ids[1]}",
+                params={"whole_document": "true"},
+            )
+
+        assert whole.status_code == 404
+        (line,) = _refused_lines(logs)[before:]
+        assert TRACE_SHAPE.match(line["trace_id"]) and line["user_id"] == USER
 
     @pytest.mark.parametrize("route", ["source", "chunk", "whole"])
     @pytest.mark.parametrize("layer", sorted(SOURCES))
