@@ -92,7 +92,7 @@ _OWNER_ONLY_TABLES = ("console_agents", "console_prompt_groups")
 def _build_acl_write_schema() -> str:
     """A fresh throwaway schema holding EVERYTHING A1's write path
     touches: owner tables (``console_agents``/``console_prompt_groups``,
-    WU-2a owner-only RLS) + the ten interactions migrations (016's
+    WU-2a owner-only RLS) + the interactions migrations (016's
     append-only function + trigger) + **031 + 032 + 033** — 033 is
     applied ONLY here, never against ``app_factory_before``/
     ``app_factory_after`` (those run frozen tests that issue a raw

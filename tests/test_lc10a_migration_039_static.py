@@ -23,6 +23,7 @@ _REPO = Path(__file__).resolve().parent.parent
 _MIGRATIONS = _REPO / "src" / "audittrace" / "migrations"
 _FILE = _MIGRATIONS / "versions" / "039_session_memory_items_session_id.py"
 _REVISION = "5b4bd766374f"
+_HEAD = "ae606b421cf9"  # 040_add_interactions_input_media.py
 _PARENT = "c76f1b005b75"
 _INDEX = "ix_session_memory_items_user_session"
 
@@ -42,9 +43,13 @@ def test_revision_id_is_the_documented_sha256_prefix() -> None:
     assert hashlib.sha256(seed.encode()).hexdigest()[:12] == _REVISION
 
 
-def test_single_head_is_039_and_parent_is_034() -> None:
+def test_single_head_sits_on_039_and_039_is_parented_on_034() -> None:
+    # LIBRECHAT-IMAGE-SLICE: migration 040 (``_HEAD``) now sits on 039, so 039 is no
+    # longer the head; every other part of the original assertion is kept.
     script = _script()
-    assert script.get_heads() == [_REVISION]
+    assert script.get_heads() == [_HEAD]
+    head = script.get_revision(_HEAD)
+    assert head is not None and head.down_revision == _REVISION
     rev = script.get_revision(_REVISION)
     assert rev is not None and rev.down_revision == _PARENT
 
