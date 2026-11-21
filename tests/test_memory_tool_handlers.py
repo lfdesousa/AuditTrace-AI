@@ -300,7 +300,7 @@ class TestErrorHandling:
         self, _populated_container, _fakeredis_cache
     ):
         user = sentinel_user_context()
-        tool = get_tool_by_name("recall_decisions")
+        tool = _cacheable_tool("recall_decisions")
         result, was_cache_hit = await invoke_tool(user, tool, {}, session_id="sess-1")
         assert "error" in result
         assert was_cache_hit is False
@@ -383,7 +383,7 @@ class TestErrorHandling:
         echoes parameters — and this payload flows into the LLM response,
         the audit row, and INFO logs, none of which may contain user
         content from a regulated-industry deployment."""
-        tool = get_tool_by_name("recall_decisions")
+        tool = _cacheable_tool("recall_decisions")
 
         async def _exploding(user_context, args):
             # The message contains both an inner identifier ("episodic layer")

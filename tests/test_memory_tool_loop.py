@@ -512,6 +512,25 @@ class TestLoopExitConditions:
 # ─────────────────────── Audit row bookkeeping ──────────────────────────────
 
 
+def _make_recall_decisions_cacheable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register ``recall_decisions`` as cacheable for the enclosed test.
+
+    SOFTDELETE-DIRECT-READ B22: the recall tools that serve manifest-tracked
+    content are registered ``cacheable=False`` (a cached result would outlive
+    a delete). The two tests below pin what the tool loop records for a
+    CACHE-SERVED result (the read-audit row, the span), so they run the real
+    handler flagged cacheable instead of dropping an assertion."""
+    from dataclasses import replace
+
+    from audittrace.tools import MEMORY_TOOL_REGISTRY, get_tool_by_name
+
+    tool = get_tool_by_name("recall_decisions")
+    assert tool is not None
+    monkeypatch.setitem(
+        MEMORY_TOOL_REGISTRY, "recall_decisions", replace(tool, cacheable=True)
+    )
+
+
 class TestPendingAuditRows:
     @pytest.mark.asyncio
     async def test_successful_handler_produces_pending_record(
@@ -551,7 +570,7 @@ class TestPendingAuditRows:
 
     @pytest.mark.asyncio
     async def test_cache_hit_records_read_audit_row(
-        self, _populated_container, _fakeredis_cache
+        self, _populated_container, _fakeredis_cache, monkeypatch
     ):
         """ADR-060 / #372 D3: a cache-served recall still SHAPED the answer,
         so it records a lightweight read-audit row — flagged ``cache_hit`` in
@@ -560,6 +579,7 @@ class TestPendingAuditRows:
         the shaping memory could not be identified from its own record."""
         import json
 
+        _make_recall_decisions_cacheable(monkeypatch)
         user = sentinel_user_context()
 
         # First loop — cold cache, one fresh (non-cache) pending row
@@ -829,11 +849,12 @@ class TestSpanEmission:
 
     @pytest.mark.asyncio
     async def test_cache_hit_still_emits_span(
-        self, _populated_container, _fakeredis_cache, span_exporter
+        self, _populated_container, _fakeredis_cache, span_exporter, monkeypatch
     ):
         """ADR-025 §Decision.8: cache hits skip the audit row, but the
         span MUST still emit so Langfuse shows the latency of the cached
         recall (else the flame-graph hides fast paths)."""
+        _make_recall_decisions_cacheable(monkeypatch)
         user = sentinel_user_context()
 
         # Cold — populates cache, emits 1 span

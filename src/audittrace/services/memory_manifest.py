@@ -613,10 +613,12 @@ class MemoryManifestService:
         _validate_layer(layer)
         async with self._session_factory() as session:
             rows = await self._read_rows(session, layer, logical_keys, user.user_id)
-        return {
-            key: ManifestEntry.from_row(row) if row is not None else None
-            for key, row in rows.items()
-        }
+            # Entries are built INSIDE the session: an ORM row read after its
+            # session closed is the #364 hazard.
+            return {
+                key: ManifestEntry.from_row(row) if row is not None else None
+                for key, row in rows.items()
+            }
 
     @log_call(logger=logger)
     async def record_delete_many(
