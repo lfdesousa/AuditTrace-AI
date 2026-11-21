@@ -103,6 +103,7 @@ from audittrace.routes.memory_md_manifest import _flush_md_manifest
 from audittrace.routes.memory_promote import (
     promote_session_to_durable as _promote_session_to_durable,
 )
+from audittrace.routes.memory_refused_read import refused_read
 from audittrace.routes.memory_semantic_writes import (
     chroma_id_conflict_409,
     drop_copied_forward_chunk,
@@ -1564,12 +1565,42 @@ async def index_memory(
     # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
     # closed). One event per /memory/index call, naming every target
     # collection touched; single-file mode additionally names the key.
+    # F-b: a refused re-fold is never recorded as a success. The refusal is
+    # decided BEFORE the row is written, the row keeps the attempt (ADR-058,
+    # ``total_chunks: 0``) with the audit schema's existing ``failed`` status,
+    # and it carries no reason: the owner reads it back and must learn no more
+    # than the 422 told them.
+    refusal: HTTPException | None = None
+    if source_refused and reads_tombstones(user):
+        refusal = HTTPException(
+            status_code=409,
+            detail="source is soft-deleted: re-create it before indexing it again",
+        )
+    elif single_file_mode and not dry_run and not any(object_outcomes):
+        refusal = HTTPException(
+            status_code=422,
+            detail=(
+                f"single-file index of file={file!r} into "
+                f"collections={target_collections!r} wrote 0 chunks — "
+                "the object was NOT indexed (it was not accepted by any "
+                "indexer for this collection). Plausible causes: the "
+                "object's layer prefix does not match the target "
+                "collection's ingestion routing (e.g. a procedural/ or "
+                "episodic/ key indexed into a collection that only "
+                "accepts the other layer), the object's file extension "
+                "does not match what this collection ingests (e.g. a "
+                ".pdf key indexed into a .md-only collection), the file "
+                "could not be read from object storage, or the file "
+                "could not be parsed (e.g. a corrupted/unreadable PDF)."
+            ),
+        )
     await emit_write_audit(
         user=user,
         op="write",
         layer="semantic",
         collection=",".join(target_collections),
         key=file,
+        outcome="success" if refusal is None else "failed",
         detail_extra={
             "mode": "single_file" if single_file_mode else "bulk",
             "dry_run": dry_run,
@@ -1604,29 +1635,8 @@ async def index_memory(
     # Bulk mode is exempt (an admin whole-collection rebuild legitimately
     # attempts 0 objects when nothing matches) and dry-run is exempt (no
     # write intended) — both keep returning 200.
-    if source_refused and reads_tombstones(user):
-        raise HTTPException(
-            status_code=409,
-            detail="source is soft-deleted: re-create it before indexing it again",
-        )
-    if single_file_mode and not dry_run and not any(object_outcomes):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"single-file index of file={file!r} into "
-                f"collections={target_collections!r} wrote 0 chunks — "
-                "the object was NOT indexed (it was not accepted by any "
-                "indexer for this collection). Plausible causes: the "
-                "object's layer prefix does not match the target "
-                "collection's ingestion routing (e.g. a procedural/ or "
-                "episodic/ key indexed into a collection that only "
-                "accepts the other layer), the object's file extension "
-                "does not match what this collection ingests (e.g. a "
-                ".pdf key indexed into a .md-only collection), the file "
-                "could not be read from object storage, or the file "
-                "could not be parsed (e.g. a corrupted/unreadable PDF)."
-            ),
-        )
+    if refusal is not None:
+        raise refusal
     return response
 
 
@@ -1958,7 +1968,7 @@ async def read_episodic(
         "episodic", filename, user
     )
     if is_hidden(entry, user):
-        raise HTTPException(status_code=404, detail="ADR not found")
+        raise refused_read(user=user, layer="episodic", detail="ADR not found")
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
@@ -2225,7 +2235,7 @@ async def read_procedural(
         "procedural", filename, user
     )
     if is_hidden(entry, user):
-        raise HTTPException(status_code=404, detail="SKILL not found")
+        raise refused_read(user=user, layer="procedural", detail="SKILL not found")
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
@@ -2877,7 +2887,7 @@ async def read_semantic(
         ],
         user,
     ):
-        raise HTTPException(status_code=404, detail="semantic doc not found")
+        raise refused_read(user=user, layer="semantic", detail="semantic doc not found")
     if doc.metadata.get("tier") == "corpus":
         _require_corpus_scope(user, collection, "read")
 
@@ -2894,7 +2904,9 @@ async def read_semantic(
             [_semantic_key(collection, cid) for cid in chunk_ids],
             user,
         ):
-            raise HTTPException(status_code=404, detail="semantic doc not found")
+            raise refused_read(
+                user=user, layer="semantic", detail="semantic doc not found"
+            )
         front_matter = chunk_docs[0]
         entry = await manifest.resolve_read(
             "semantic", _semantic_key(collection, chunk_ids[0]), user
