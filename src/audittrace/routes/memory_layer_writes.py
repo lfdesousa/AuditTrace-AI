@@ -70,6 +70,8 @@ async def record_layer_write(
     except ConcurrentManifestWriteError as exc:
         # The content write already happened: it is audited even though the
         # manifest row went to the concurrent writer.
+        # The row records the storage write that landed, not the HTTP answer:
+        # the caller gets 409; the row carries ``manifest: concurrent_write``.
         await emit_write_audit(
             user=user,
             op="write",

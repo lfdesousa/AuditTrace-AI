@@ -7,10 +7,13 @@ trace: ``trace_id``, ``span_id`` (stamped by ``logging_config.TraceContextFilter
 from the active span) and ``user_id`` (explicit, so it does not depend on a
 bound ContextVar).
 
-The ``code`` is neutral on purpose: it is the code of the 404 the caller got
-(``not_found``), not the reason. Logs here never say a document existed, was
-deleted or is a tombstone (the same discipline as the audit row of a refused
-re-fold), so reading Loki cannot confirm to anyone what the 404 hides.
+The ``code`` is neutral: it is the code of the 404 the caller got
+(``not_found``). The line itself is operator-side and DOES reveal that the key
+existed and was deleted: it is written only for a deleted key, a key that never
+existed logs nothing. That is within precedent: Tempo already tells the two
+apart (``MemoryManifestService.resolve_read``), logs and traces are
+operator-only, and admins can already read tombstones. What stays
+byte-equal to a never-existed key is the caller-visible 404 body.
 No ``read`` audit row is written: a refused read returns nothing, and the
 existing read rows (``schedule_read_audit``) record reads that returned data.
 """
