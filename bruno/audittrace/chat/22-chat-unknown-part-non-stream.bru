@@ -1,0 +1,75 @@
+meta {
+  name: POST /v1/chat/completions (unknown-type part, non-stream; the canary must reach no trace)
+  type: http
+  seq: 22
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": [
+        { "type": "text", "text": "{{contentPartPrompt}}" },
+        { "type": "custom_blob", "data": "{{unknownPartCanary}}" }
+      ] }
+    ],
+    "stream": false,
+    "max_tokens": 64
+  }
+}
+
+script:pre-request {
+  // Body rebuilt here so values containing quotes cannot break the JSON.
+  req.setBody({
+    model: "audittrace-default",
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: bru.getEnvVar("contentPartPrompt") },
+        { type: "custom_blob", data: bru.getEnvVar("unknownPartCanary") }
+      ]
+    }],
+    stream: false,
+    max_tokens: 64
+  });
+}
+
+tests {
+  test("the turn is answered with an HTTP status (recorded, not asserted)", function() {
+    expect(res.getStatus()).to.be.a("number");
+    bru.setVar("unknownPartReplyStatus", res.getStatus());
+  });
+  test("no echo of the canary", function() {
+    const raw = JSON.stringify(res.getBody());
+    expect(raw).to.not.contain(bru.getEnvVar("unknownPartCanary"));
+  });
+  test("the reply carries X-Trace-Id (stashed as unknownPartTraceId)", function() {
+    expect(res.getHeader("x-trace-id")).to.match(/^[0-9a-f]{32}$/);
+    bru.setVar("unknownPartTraceId", res.getHeader("x-trace-id"));
+  });
+}
+
+docs {
+  #474 F-d / R-1. One non-stream turn whose content carries a part of a type the service
+  does not know (`custom_blob`) beside a text part. The service forwards the part to the
+  model server unchanged and records the turn; it must reach NO span attribute, log line,
+  Langfuse input or audit row (the part is replaced by a `[REDACTED:media custom_blob keys=2]`
+  marker). Which status the model server answers for a part it does not understand is
+  recorded, not asserted. After the run: the trace id of this turn is stashed as
+  `unknownPartTraceId`; read the audit row with `audit/02-list-by-trace-id.bru`
+  (`--env-var traceId=<it>`), and look the trace up read-only in Tempo and Langfuse: the
+  canary must be absent and the marker present.
+
+  Inputs (env vars, defaults in environments/*.bru): `contentPartPrompt`,
+  `unknownPartCanary` (a fixed short base64 string, the canary). Needs scope audittrace:query.
+}

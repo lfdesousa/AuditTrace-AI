@@ -88,6 +88,7 @@ vacuously as separate runs) and F5 (no shipped request sends a
 | `chat/09-audit-tool-calls-of-traceparent-turn.bru` | The `tool_calls` audit rows (ids, tools, scopes) of that interaction; with `expectSourcesTrailer=true` at least one recall tool (`recall_*` / `read_decision`) is required. |
 | `chat/16-chat-image-part-non-stream.bru` | `POST /v1/chat/completions` with an `image_url` content part (default: a small test diagram, env `imagePartData`); 200, OpenAI shape, the answer names what the image shows, `x-trace-id` stashed. |
 | `chat/17-chat-image-part-no-projector.bru` | The same image part with a model routed to a server without a vision projector (env `imageNoProjectorModel`, default `mistral`): HTTP 400, `code=image_input_unsupported`, the whole error object compared; `x-trace-id` stashed. Needs that route's server up. |
+| `chat/22-chat-unknown-part-non-stream.bru` | `POST /v1/chat/completions` with a text part and a part of an unknown type (`custom_blob`, env `unknownPartCanary`, a fixed short base64 canary). The status is recorded, not asserted; the body must not echo the canary; `x-trace-id` stashed as `unknownPartTraceId` for `audit/02-list-by-trace-id.bru`, Tempo and Langfuse, where the canary must be absent. |
 
 **These must run in ONE `bru run`.** 05-09 read runtime vars (`bru.setVar`)
 set by 04/05 and each carries a precondition test that FAILS (it does not pass vacuously)
