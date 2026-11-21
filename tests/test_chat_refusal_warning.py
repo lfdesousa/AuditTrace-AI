@@ -23,6 +23,9 @@ from tests._image_slice import (
     post_chat,
 )
 
+_BARE = logging.LogRecord("x", logging.WARNING, "f", 1, "m", None, None)
+#: the identity fields the service's logging adds to EVERY record (traceability)
+SERVICE_FIELDS = frozenset({"message", "session_id", "span_id", "trace_id", "user_id"})
 TARGET = "intranet-canary.example.test/secret-path"
 CASES = {
     "image_url_not_supported": {
@@ -74,7 +77,16 @@ def test_one_warning_with_the_reason_and_the_position_only(
         if r.levelno == logging.WARNING and "refus" in r.getMessage().lower()
     ]
     assert len(warnings) == 1, [r.getMessage() for r in caplog.records][-5:]
-    text = warnings[0].getMessage()
-    assert reason in text
-    assert "message 0 part 1" in text
-    assert "canary" not in text and TARGET not in text
+    record = warnings[0]
+    detail = f"{reason}: message 0 part 1"
+    # The EXACT text and the exact arguments: anything appended (a URL, a host, a
+    # payload, the reply body, a dropped position) changes one of these.
+    assert record.getMessage() == f"chat request refused: {detail}"
+    assert record.msg == "chat request refused: %s"
+    assert record.args == (detail,)
+    # No extra field carrying payload: only the attributes a bare LogRecord has plus the
+    # ones the service's own logging filters add for every record.
+    assert set(vars(record)) - set(vars(_BARE)) <= SERVICE_FIELDS, sorted(
+        set(vars(record)) - set(vars(_BARE)) - SERVICE_FIELDS
+    )
+    assert "canary" not in repr(vars(record)) and TARGET not in repr(vars(record))
