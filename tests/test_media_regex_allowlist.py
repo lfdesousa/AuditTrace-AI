@@ -9,7 +9,9 @@ code scanning found (quadratic backtracking). So, structurally:
   a compiled pattern's method) must be on an explicit allow-list below, each entry with a
   one-line complexity note; an unlisted use, or a listed one that no longer exists, fails.
   ``re`` is followed through ``import re as r``, ``from re import compile [as c]`` and
-  module-level aliases of either (``_re = re``, ``make = re.compile``, ``q = _PATTERN``);
+  aliases of either, at module level or inside a function (``_re = re``, ``make =
+  re.compile``, ``q = _PATTERN``, and a bound method of a pattern, ``s = _PATTERN.search``,
+  also a reference to ``_PATTERN.search`` that is never called);
   the callees the package may use at all are the stated set ``ALLOWED_CALLEES``;
 * the two scan modules (``link_guard``, ``payload_scrub``) import nothing from ``audittrace``
   outside ``audittrace.media``, so a pattern or helper cannot be pulled in from elsewhere to do
@@ -18,11 +20,26 @@ code scanning found (quadratic backtracking). So, structurally:
   (``_is_link``) use no regular expression at all, neither ``re`` nor any compiled pattern.
 
 Read from the source with ``ast``: no clock, no execution of the scanned code. WHAT IT
-MISSES: ``getattr(re, name)`` with a computed name, a pattern built by a third-party module the
-scan modules do not import (the import rule forbids the in-repo ones; the standard library and
-``typing`` imports are not restricted), and the cost of a pattern that IS on the list (each
-entry's note is the claim; the complexity guard measures it). CodeQL on the pull request is the
-backstop. The planted-code tests at the end pin that the checks do fire (neuters).
+MISSES (all of them ways to reach ``re`` or a pattern without a name this analysis follows;
+none is used in the package today):
+
+* ``getattr(re, "findall")`` or ``getattr(_PATTERN, "search")`` (a literal name too, not only
+  a computed one) and ``vars(re)["findall"]``;
+* ``sys.modules["re"]``, ``import re._compiler``, ``import sre_compile`` / ``sre_parse``
+  (the same engine reached under another module name; the import rule restricts only what
+  the scan modules take from ``audittrace``);
+* a compiled pattern put in a container (``PATTERNS = [_P]``) or passed to a helper whose
+  parameter is then used (``def run(p, v): return p.search(v)``): the use is a name this file
+  does not bind to the pattern;
+* a sibling media module that is not a scan module importing from outside ``audittrace.media``
+  (the foreign-import rule covers the two scan modules, as ruled);
+* a pattern built by a third-party module the scan modules do not import (the standard library
+  and ``typing`` imports are not restricted), and the cost of a pattern that IS on the list
+  (each entry's note is the claim; the complexity guard measures it).
+
+``importlib.import_module("re")`` and ``from re import *`` ARE caught. CodeQL on the pull
+request and review are the backstop. The planted-code tests at the end pin that the checks do
+fire (neuters).
 """
 
 from __future__ import annotations
@@ -173,16 +190,20 @@ def _module_uses(tree: ast.Module) -> tuple[set[str], set[str]]:
             for name in targets:
                 patterns[name] = value
                 uses.add(f"re.compile:{name}")
-    # a pattern may be re-bound (``q = _HEADER``) or the compiled call may sit elsewhere
+    # a pattern may be re-bound (``q = _HEADER``) or have a method bound to a name
+    # (``s = _HEADER.search``): both names are the pattern, to a fixed point
     changed = True
     while changed:
         changed = False
         for node in ast.walk(tree):
             targets, value = _assignment(node)
-            if isinstance(value, ast.Name) and value.id in patterns:
+            holder = value
+            if isinstance(value, ast.Attribute):
+                holder = value.value
+            if isinstance(holder, ast.Name) and holder.id in patterns:
                 for name in targets:
                     if name not in patterns:
-                        patterns[name] = patterns[value.id]
+                        patterns[name] = patterns[holder.id]
                         changed = True
     compiled_calls = {id(call) for call in patterns.values()}
     for node in ast.walk(tree):
@@ -190,16 +211,15 @@ def _module_uses(tree: ast.Module) -> tuple[set[str], set[str]]:
             called = _re_callee(node.func, modules, functions)
             if called is not None:
                 uses.add(f"re.{called}")
-            elif (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in patterns
-            ):
-                uses.add(f"{node.func.value.id}.{node.func.attr}")
-        elif isinstance(node, ast.Attribute) and not _is_call_target(tree, node):
-            called = _re_callee(node, modules, functions)
-            if called is not None:
-                uses.add(f"re.{called}")
+        elif isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id in patterns:
+                # a method of a compiled pattern, called or only referenced (bound to a
+                # name, passed as a callback): the attribute is the use
+                uses.add(f"{node.value.id}.{node.attr}")
+            elif not _is_call_target(tree, node):
+                called = _re_callee(node, modules, functions)
+                if called is not None:
+                    uses.add(f"re.{called}")
     return uses, set(patterns)
 
 
@@ -291,17 +311,47 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
     raise AssertionError(f"{name} not found")
 
 
+def _regex_names_in(tree: ast.Module, function: str) -> set[str]:
+    """The names in ``function`` that are ``re`` or a compiled pattern (or a bound method)."""
+    _, patterns = _module_uses(tree)
+    names = {
+        node.id
+        for node in ast.walk(_function(tree, function))
+        if isinstance(node, ast.Name)
+    }
+    return names & ({"re"} | patterns)
+
+
 class TestTheScansUseNoRegex:
     @pytest.mark.parametrize(("file", "function"), REGEX_FREE)
     def test_function_has_no_regular_expression(self, file: str, function: str) -> None:
-        tree = _parse(file)
-        _, patterns = _module_uses(tree)
-        names = {
-            node.id
-            for node in ast.walk(_function(tree, function))
-            if isinstance(node, ast.Name)
-        }
-        assert names & ({"re"} | patterns) == set()
+        assert _regex_names_in(_parse(file), function) == set()
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "return _P.search(v)",
+            "s = _P.search\n    return s(v)",
+            "return re.sub('a', 'b', v)",
+            "q = _P\n    return q.sub('a', v)",
+        ],
+        ids=["method", "bound-method-local", "re-call", "pattern-alias"],
+    )
+    def test_a_planted_regex_in_a_regex_free_function_is_reported(
+        self, body: str
+    ) -> None:
+        clean = "import re\n_P = re.compile('a')\n\ndef f(v):\n    return v\n"
+        planted = clean.replace("    return v", "    " + body)
+        assert _regex_names_in(ast.parse(clean), "f") == set(), "control"
+        assert _regex_names_in(ast.parse(planted), "f") != set(), body
+
+    def test_a_bound_method_alias_declared_at_module_level_is_reported(self) -> None:
+        """Review round: ``_S = _PATTERN.search`` then ``_S(v)`` in a regex-free function."""
+        source = (
+            "import re\n_P = re.compile('a')\n_S = _P.search\n\n"
+            "def f(v):\n    return _S(v)\n"
+        )
+        assert _regex_names_in(ast.parse(source), "f") == {"_S"}
 
     def test_the_link_guard_module_imports_no_re(self) -> None:
         tree = _parse("link_guard.py")
@@ -361,6 +411,21 @@ PLANTED_RE: list[tuple[str, str, str]] = [
         "pattern-alias-method",
         "digest.py",
         "_Q = _HEADER\n\ndef _f(v):\n    return _Q.search(v)\n",
+    ),
+    (
+        "bound-method-alias",
+        "payload_scrub.py",
+        "_S = _BASE64_RUN_RE.search\n\ndef _f(v):\n    return _S(v)\n",
+    ),
+    (
+        "bound-method-alias-local",
+        "digest.py",
+        "def _f(v):\n    s = _HEADER.match\n    return s(v)\n",
+    ),
+    (
+        "method-reference-only",
+        "payload_scrub.py",
+        "_L = list(map(_BASE64_RUN_RE.search, []))\n",
     ),
 ]
 

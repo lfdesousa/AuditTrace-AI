@@ -3,11 +3,16 @@
 Parsed, not grepped, in the manner of ``tests/test_bruno_chat_image_part.py``. The request
 reads the contract a running image serves; its assertions are compared with the vendored
 snapshot (``tests/fixtures/openapi.snapshot.yaml``) and with the live app's own document, so
-the names it asserts cannot drift away from the contract.
+the names it asserts are compared with both.
+
+The names are read out of the assertion CODE and matched EXACTLY (a name only mentioned in a
+test title does not count, and ``content_hashes`` or ``input_mediaX`` is not ``content_hash`` /
+``input_media``): ``test_a_misspelled_asserted_name_is_not_accepted`` pins that.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
@@ -52,6 +57,46 @@ def test_the_asserted_schema_names_exist_in_the_snapshot_and_in_the_app() -> Non
         kinds = {s.get("type") for s in item["properties"]["input_media"]["anyOf"]}
         assert kinds == {"object", "null"}
         assert "/health" in doc["paths"] and "/v1/chat/completions" in doc["paths"]
-    text = _block(REQUEST.read_text(), "tests")
-    for needle in ("InteractionListItem", "input_media", "content_hash", "/health"):
-        assert needle in text, needle
+    assert _asserted(_block(REQUEST.read_text(), "tests")) == EXPECTED
+
+
+#: what the request must assert, as exact names
+EXPECTED = {
+    "paths": {"/health", "/v1/chat/completions"},
+    "schemas": {"InteractionListItem"},
+    "properties": {"input_media", "content_hash"},
+}
+
+
+def _asserted(tests: str) -> dict[str, set[str]]:
+    """The names the assertion code uses: path keys, schema names, schema properties.
+
+    ``expect(body.paths).to.have.property("<path>")`` for the paths, ``components.schemas.<Name>``
+    for the schema, ``expect(item.properties).to.have.property("<name>")`` and
+    ``item.properties.<name>`` for the properties. Test titles are not read.
+    """
+    return {
+        "paths": set(
+            re.findall(r'body\.paths\)\.to\.have\.property\("([^"]+)"\)', tests)
+        ),
+        "schemas": set(re.findall(r"components\.schemas\.(\w+)", tests)),
+        "properties": set(
+            re.findall(r'item\.properties\)\.to\.have\.property\("([^"]+)"\)', tests)
+        )
+        | set(re.findall(r"item\.properties\.(\w+)", tests)),
+    }
+
+
+def test_a_misspelled_asserted_name_is_not_accepted() -> None:
+    """Review A3: substring membership accepted ``content_hashes`` and ``input_mediaX``."""
+    tests = _block(REQUEST.read_text(), "tests")
+    assert _asserted(tests) == EXPECTED, "control: the shipped request is exact"
+    for old, new in (
+        ('property("content_hash")', 'property("content_hashes")'),
+        ('property("input_media")', 'property("input_mediaX")'),
+        ("item.properties.input_media.anyOf", "item.properties.input_mediaX.anyOf"),
+        ("schemas.InteractionListItem", "schemas.InteractionListItems"),
+        ('property("/health")', 'property("/healthz")'),
+    ):
+        assert old in tests, f"control: {old} is in the request"
+        assert _asserted(tests.replace(old, new)) != EXPECTED, new
