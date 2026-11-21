@@ -42,7 +42,13 @@ from audittrace.config import Settings, get_settings
 from audittrace.db.models import InteractionRecord, ToolCall
 from audittrace.dependencies import get_context_builder, get_postgres_factory
 from audittrace.identity import UserContext
-from audittrace.logging_config import log_call, reset_langgraph_step
+from audittrace.logging_config import log_call, reset_langgraph_step, scrub_text
+from audittrace.media import (
+    classify_refusal,
+    digest_input_media,
+    redact_media_payloads,
+)
+from audittrace.media.payload_scrub import scrub_strings
 from audittrace.routes import _upstream_errors as upstream_errors
 from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS, llama_auth_headers
 from audittrace.routes._memory_tool_loop import (
@@ -86,6 +92,7 @@ FAILURE_PROXY_TIMEOUT = "proxy_timeout"
 FAILURE_UPSTREAM_ERROR = "upstream_error"
 FAILURE_UPSTREAM_UNREACHABLE = "upstream_unreachable"
 FAILURE_INTERNAL_ERROR = "internal_error"
+FAILURE_REQUEST_REFUSED = "request_refused"
 
 
 def _openai_error_body(
@@ -513,6 +520,7 @@ async def _persist_interaction(
     error_detail: str | None = None,
     duration_ms: int | None = None,
     trace_id: str | None = None,
+    input_media: str | None = None,
 ) -> int | None:
     """Persist a question/answer pair to PostgreSQL ``interactions``.
 
@@ -567,6 +575,8 @@ async def _persist_interaction(
                 "error_detail": error_detail,
                 "duration_ms": duration_ms,
                 "trace_id": trace_id,
+                # Migration 040: part of the hashed content only when set.
+                "input_media": input_media,
             }
             record = InteractionRecord(**_fields, content_hash=_content_hash(_fields))
             db.add(record)
@@ -953,6 +963,9 @@ async def _record_langfuse_output(
         body["userId"] = user_id
     if session_id:
         body["sessionId"] = session_id
+    # Every string leaf passes the ``scrub_text`` chokepoint (the same one spans and
+    # log records pass), off the event loop: megabytes of regex must not run on it.
+    body = await asyncio.to_thread(scrub_strings, body, scrub_text)
     try:
         ingestion_url = settings.langfuse_host.rstrip("/") + "/api/public/ingestion"
         async with httpx.AsyncClient(timeout=5) as client:
@@ -1443,6 +1456,8 @@ async def _handle_tools_mode(
     query: str,
     settings: Settings,
     persist_mode: str = "sync",
+    input_media: str | None = None,
+    safe_messages: list[Any],
 ) -> Any:
     """ADR-025 ``memory_mode=tools`` path.
 
@@ -1580,6 +1595,7 @@ async def _handle_tools_mode(
                     failure_class=FAILURE_PROXY_TIMEOUT,
                     error_detail=str(exc)[:500],
                     duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
+                    input_media=input_media,
                 )
                 return
             except httpx.ConnectError as exc:
@@ -1602,6 +1618,7 @@ async def _handle_tools_mode(
                     failure_class=FAILURE_UPSTREAM_UNREACHABLE,
                     error_detail=str(exc)[:500],
                     duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
+                    input_media=input_media,
                 )
                 return
             except httpx.HTTPStatusError as exc:
@@ -1628,6 +1645,7 @@ async def _handle_tools_mode(
                     failure_class=FAILURE_UPSTREAM_ERROR,
                     error_detail=upstream_errors.stream_detail(hit, exc),
                     duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
+                    input_media=input_media,
                 )
                 await _flush_pending_tool_calls(result.pending, interaction_id)
                 return
@@ -1652,6 +1670,7 @@ async def _handle_tools_mode(
                     failure_class=FAILURE_INTERNAL_ERROR,
                     error_detail=str(exc)[:500],
                     duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
+                    input_media=input_media,
                 )
                 return
 
@@ -1675,6 +1694,7 @@ async def _handle_tools_mode(
                 model=requested_model,
                 user_id=user.user_id,
                 duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
+                input_media=input_media,
             )
             await _record_langfuse_output(
                 trace_id=trace_id,
@@ -1686,7 +1706,7 @@ async def _handle_tools_mode(
                 session_id=session_id,
                 model=requested_model,
                 user_id=user.user_id,
-                input_messages=payload.get("messages"),
+                input_messages=safe_messages,
             )
 
         return StreamingResponse(
@@ -1730,6 +1750,7 @@ async def _handle_tools_mode(
             failure_class=FAILURE_PROXY_TIMEOUT,
             error_detail=str(exc)[:500],
             duration_ms=int((time.perf_counter() - perf_start) * 1000),
+            input_media=input_media,
         )
         return upstream_errors.gateway_error_response(
             504,
@@ -1748,6 +1769,7 @@ async def _handle_tools_mode(
             model=requested_model,
             user_id=user.user_id,
             perf_start=perf_start,
+            input_media=input_media,
         )
     except httpx.ConnectError as exc:
         await _persist_interaction(
@@ -1764,6 +1786,7 @@ async def _handle_tools_mode(
             failure_class=FAILURE_UPSTREAM_UNREACHABLE,
             error_detail=str(exc)[:500],
             duration_ms=int((time.perf_counter() - perf_start) * 1000),
+            input_media=input_media,
         )
         return upstream_errors.gateway_error_response(
             502, FAILURE_UPSTREAM_UNREACHABLE, "llama-server unreachable"
@@ -1783,6 +1806,7 @@ async def _handle_tools_mode(
             failure_class=FAILURE_INTERNAL_ERROR,
             error_detail=str(exc)[:500],
             duration_ms=int((time.perf_counter() - perf_start) * 1000),
+            input_media=input_media,
         )
         raise  # let the FastAPI global handler shape the 500
 
@@ -1825,6 +1849,7 @@ async def _handle_tools_mode(
         model=requested_model,
         user_id=user.user_id,
         duration_ms=int((time.perf_counter() - perf_start) * 1000),
+        input_media=input_media,
     )
 
     # 5 — Push the output to Langfuse. Best-effort: the helper swallows
@@ -1840,7 +1865,7 @@ async def _handle_tools_mode(
         session_id=session_id,
         model=requested_model,
         user_id=user.user_id,
-        input_messages=payload.get("messages"),
+        input_messages=safe_messages,
     )
 
     # Tag the currently-active span (the FastAPI root observation) with
@@ -1928,6 +1953,13 @@ async def _chat_completions_impl(
     if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
         raise HTTPException(status_code=422, detail="messages: list required")
 
+    # LIBRECHAT-IMAGE-SLICE: digest every image part ONCE, off the event loop (decode
+    # + sha256 of megabytes is CPU work; /health shares the loop). Telemetry below is
+    # given the redacted copy; the model server gets the original, byte for byte.
+    media = await asyncio.to_thread(digest_input_media, payload["messages"])
+    input_media = media.to_json() if media is not None else None
+    safe_messages = redact_media_payloads(payload["messages"], media)
+
     # Tag the ACTIVE FastAPI root span with Langfuse-native input so the
     # observation detail panel shows the caller's messages instead of
     # rendering "undefined". The trace-level input/output set via the
@@ -1938,12 +1970,14 @@ async def _chat_completions_impl(
         telemetry.set_current_span_attributes(
             {
                 "langfuse.observation.input": json.dumps(
-                    payload["messages"][-10:], ensure_ascii=False
+                    safe_messages[-10:], ensure_ascii=False
                 )[:4000],
                 "user.id": user.user_id,
                 "langfuse.user.id": user.user_id,
             }
         )
+        if media is not None:
+            telemetry.set_current_span_attributes(media.span_attributes())
     except Exception:  # pragma: no cover - defensive attribute write
         pass
 
@@ -1976,6 +2010,21 @@ async def _chat_completions_impl(
     # when ``chat_completions`` exits ``request_scope`` (AC-6.3).
     request_scope.enter_context(bound_session_id(session_id))
 
+    # An image the audit cannot name, or a media link the model host would fetch,
+    # is refused BEFORE the mode and stream branches: one branch for every refusal.
+    refusal = classify_refusal(payload["messages"], media)
+    if refusal is not None:
+        return await upstream_errors.refused_request_response(
+            refusal,
+            project=payload["project"],
+            source=source,
+            question=query,
+            session_id=session_id,
+            model=str(payload.get("model", "")),
+            user_id=user.user_id,
+            input_media=input_media,
+        )
+
     # ADR-025 Phase 4: branch on memory_mode. The inject path (default)
     # runs the pre-Phase-4 4-layer context build; the tools path runs
     # the proxy-internal tool-call loop.
@@ -1990,6 +2039,8 @@ async def _chat_completions_impl(
             query=query,
             settings=settings,
             persist_mode=persist_mode,
+            input_media=input_media,
+            safe_messages=safe_messages,
         )
 
     # FLEET-ROUTE: resolve the upstream from the request `model` BEFORE
@@ -2117,6 +2168,7 @@ async def _chat_completions_impl(
                     failure_class=FAILURE_PROXY_TIMEOUT,
                     error_detail=str(exc)[:500],
                     duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                    input_media=input_media,
                 )
                 return
             except httpx.ConnectError as exc:
@@ -2139,6 +2191,7 @@ async def _chat_completions_impl(
                     failure_class=FAILURE_UPSTREAM_UNREACHABLE,
                     error_detail=str(exc)[:500],
                     duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                    input_media=input_media,
                 )
                 return
             except httpx.HTTPStatusError as exc:
@@ -2165,6 +2218,7 @@ async def _chat_completions_impl(
                     failure_class=FAILURE_UPSTREAM_ERROR,
                     error_detail=upstream_errors.stream_detail(hit, exc),
                     duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                    input_media=input_media,
                 )
                 return
             except Exception as exc:
@@ -2188,6 +2242,7 @@ async def _chat_completions_impl(
                     failure_class=FAILURE_INTERNAL_ERROR,
                     error_detail=str(exc)[:500],
                     duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                    input_media=input_media,
                 )
                 return
 
@@ -2220,6 +2275,7 @@ async def _chat_completions_impl(
                 model=requested_model,
                 user_id=user.user_id,
                 duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                input_media=input_media,
             )
             await _record_langfuse_output(
                 trace_id=trace_id,
@@ -2235,7 +2291,7 @@ async def _chat_completions_impl(
                 session_id=session_id,
                 model=requested_model,
                 user_id=user.user_id,
-                input_messages=payload.get("messages"),
+                input_messages=safe_messages,
             )
 
         return StreamingResponse(
@@ -2319,6 +2375,7 @@ async def _chat_completions_impl(
             failure_class=FAILURE_UPSTREAM_UNREACHABLE,
             error_detail=str(exc)[:500],
             duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
+            input_media=input_media,
         )
         return upstream_errors.gateway_error_response(
             502, FAILURE_UPSTREAM_UNREACHABLE, "llama-server unreachable"
@@ -2338,6 +2395,7 @@ async def _chat_completions_impl(
             failure_class=FAILURE_PROXY_TIMEOUT,
             error_detail=str(exc)[:500],
             duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
+            input_media=input_media,
         )
         return upstream_errors.gateway_error_response(
             504,
@@ -2356,6 +2414,7 @@ async def _chat_completions_impl(
             model=requested_model,
             user_id=user.user_id,
             perf_start=ns_perf_start,
+            input_media=input_media,
         )
 
     _set_genai_response_attributes(body)
@@ -2396,6 +2455,7 @@ async def _chat_completions_impl(
             model=requested_model,
             user_id=user.user_id,
             duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
+            input_media=input_media,
         )
         await _record_langfuse_output(
             trace_id=trace_id,
@@ -2407,7 +2467,7 @@ async def _chat_completions_impl(
             session_id=session_id,
             model=requested_model,
             user_id=user.user_id,
-            input_messages=payload.get("messages"),
+            input_messages=safe_messages,
         )
         # Tag the root observation with the answer so clicking it in
         # Langfuse shows real content instead of "undefined" (parity

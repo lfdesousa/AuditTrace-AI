@@ -47,6 +47,7 @@ from typing import Any, NoReturn
 import httpx
 from fastapi.responses import JSONResponse
 
+from audittrace.media.request_refusal import RequestRefusal
 from audittrace.routes._stream_reply import EMPTY_REPLY
 
 logger = logging.getLogger(__name__)
@@ -415,6 +416,7 @@ async def non_stream_upstream_error(
     model: str,
     user_id: str,
     perf_start: float,
+    input_media: str | None = None,
 ) -> JSONResponse:
     """Both non-stream arms: audit any reply that is not a completion, then reply.
 
@@ -446,6 +448,7 @@ async def non_stream_upstream_error(
         failure_class=FAILURE_UPSTREAM_ERROR,
         error_detail=status_error_detail(exc),
         duration_ms=int((time.perf_counter() - perf_start) * 1000),
+        input_media=input_media,
     )
     await _flush_pending_tool_calls(pending, interaction_id)
     reply = non_stream_error_reply(
@@ -456,3 +459,42 @@ async def non_stream_upstream_error(
             502, FAILURE_UPSTREAM_ERROR, f"llama-server returned {status}"
         )
     return reply
+
+
+async def refused_request_response(
+    refusal: RequestRefusal,
+    *,
+    project: str,
+    source: str,
+    question: str,
+    session_id: str,
+    model: str,
+    user_id: str,
+    input_media: str | None,
+) -> JSONResponse:
+    """A request refused before any upstream call: its ONE audit row, then the 400.
+
+    ``audittrace.media`` only classifies; the write stays here, in a module the
+    write-site guard reads (``chat.py`` is past the 2000-line trigger). Nothing of
+    the refused part is written: the row's detail is the reason and the position.
+    """
+    # Function-local import: chat.py imports this module at import time (cycle).
+    from audittrace.routes.chat import FAILURE_REQUEST_REFUSED, _persist_interaction
+
+    await _persist_interaction(
+        project=project,
+        source=source,
+        question=question,
+        answer="",
+        prompt_tokens=0,
+        completion_tokens=0,
+        session_id=session_id,
+        model=model,
+        user_id=user_id,
+        status="failed",
+        failure_class=FAILURE_REQUEST_REFUSED,
+        error_detail=refusal.detail,
+        duration_ms=0,
+        input_media=input_media,
+    )
+    return JSONResponse(status_code=400, content=refusal.body())

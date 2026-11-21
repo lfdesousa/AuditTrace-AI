@@ -63,6 +63,7 @@ from audittrace.identity import _FRAGMENT_WINDOW_LEN, request_secret_index
 from audittrace.identity import (
     build_secret_window_index as _secret_window_index,  # noqa: F401
 )
+from audittrace.media.payload_scrub import scrub_base64_runs, scrub_data_url_payloads
 
 
 def _is_expected_client_error(exc: BaseException) -> bool:
@@ -276,6 +277,7 @@ def scrub_text(value: str) -> str:
     """
     if not value:
         return value
+    value = scrub_data_url_payloads(value)
     try:
         from audittrace.identity import request_secrets
 
@@ -294,7 +296,8 @@ def scrub_text(value: str) -> str:
         value = _scrub_secret_fragments(value, secret)
     value = _JWT_SHAPE_RE.sub("[REDACTED:jwt]", value)
     value = _AUTHZ_SHAPE_RE.sub("[REDACTED:authz]", value)
-    return value
+    # LIBRECHAT-IMAGE-SLICE: LAST, after every secret rule (see payload_scrub).
+    return scrub_base64_runs(value)
 
 
 # D2/N3 — the structural allowlist. Everything NOT named here renders as

@@ -89,7 +89,16 @@ def _row_to_dict(row: InteractionRow) -> dict[str, Any]:
         # Migration 017 (ADR-058 WS-A3): content-integrity hash; a
         # mismatch on recomputation means the row was tampered with.
         "content_hash": row.content_hash,
+        # Migration 040: the stored canonical JSON, returned parsed (null = no
+        # image recorded). ``getattr``: the schema-drift stand-in has no column.
+        "input_media": _parsed_input_media(row),
     }
+
+
+def _parsed_input_media(row: InteractionRow) -> dict[str, Any] | None:
+    raw = getattr(row, "input_media", None)
+    parsed: dict[str, Any] | None = json.loads(raw) if raw else None
+    return parsed
 
 
 @router.get("/interactions", response_model=InteractionListResponse)

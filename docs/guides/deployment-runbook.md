@@ -345,6 +345,14 @@ TOKEN=$(docker exec -e CLIENT_SECRET=$(cat secrets/dev_client_secret.txt) \
 docker exec audittrace-server python -m alembic upgrade head
 ```
 
+**Downgrade of migration 040 (`interactions.input_media`).** The downgrade refuses while any
+row records an image, and says how many: dropping the column would destroy that record and make
+those rows fail content-hash verification. Run it online. An offline script (`alembic downgrade
+--sql`) cannot count the rows, so it fails with a message instead of emitting a `DROP`; this was
+observed on 2026-11-21. A code rollback needs no downgrade: the column is nullable and the older
+release never names it (see `docs/reference/audittrace/audit-record-integrity.md`, section 2, for
+the effect on image rows).
+
 ### LLM server not responding
 ```bash
 curl http://localhost:11435/health  # Qwen
