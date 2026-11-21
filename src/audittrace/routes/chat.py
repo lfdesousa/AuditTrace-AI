@@ -49,6 +49,7 @@ from audittrace.media import (
     redact_media_payloads,
 )
 from audittrace.media.payload_scrub import scrub_strings
+from audittrace.media.redaction import redact_unknown_message_parts
 from audittrace.routes import _upstream_errors as upstream_errors
 from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS, llama_auth_headers
 from audittrace.routes._memory_tool_loop import (
@@ -747,7 +748,9 @@ def _set_genai_request_attributes(
             # Langfuse-native attributes
             "langfuse.session.id": session_id,
             "langfuse.user.id": user_id,
-            "input.value": json.dumps(messages, ensure_ascii=False)[:8000],
+            "input.value": json.dumps(
+                redact_unknown_message_parts(messages), ensure_ascii=False
+            )[:8000],
             "sovereign.memory.query": query,
             "sovereign.memory.project": payload.get("project") or "",
             "sovereign.source": source,
@@ -2323,7 +2326,11 @@ async def _chat_completions_impl(
                 gen_span.set_attribute(
                     "input.value",
                     json.dumps(
-                        {"messages": proxy_payload.get("messages", [])[-10:]},
+                        {
+                            "messages": redact_unknown_message_parts(
+                                proxy_payload.get("messages", [])[-10:]
+                            )
+                        },
                         ensure_ascii=False,
                     )[:4000],
                 )

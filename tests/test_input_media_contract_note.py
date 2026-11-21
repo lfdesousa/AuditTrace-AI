@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from tests import conftest as net
 from tests._image_slice import (
@@ -39,6 +40,7 @@ from tests._image_slice import (
     image_messages,
     ok_fake,
     post_chat,
+    upstream_bodies,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +53,7 @@ REFUSAL_REASONS = {
 }
 #: 72 bytes -> 96 base64 characters: under the 128-character run rule (residual R-1)
 SHORT = base64.b64encode(bytes(range(72))).decode()
-#: The attributes the note's section 4 counts (typed part: 5 of 3 spans; unknown type: 8 of 4).
+#: The attributes the note's section 4 counts (typed part: 5 of 3 spans; a part of an unknown type: none).
 #: ``sovereign-chat-request`` exists as an ended span only under a live Langfuse client, so a
 #: request through the test client can carry at most the others; the subset check below is
 #: therefore against the full set and the control asserts the carried ones are non-empty.
@@ -61,11 +63,6 @@ TYPED_BOUND = {
     "sovereign-chat-request :: input.value",
     "sovereign-chat-request :: langfuse.observation.input",
     "llm.chat.completions :: input.value",
-}
-UNKNOWN_BOUND = TYPED_BOUND | {
-    "chat-merge-system :: input.value",
-    "chat-merge-system :: langfuse.observation.input",
-    "POST /v1/chat/completions :: langfuse.observation.input",
 }
 SERIALISATION = 'json.dumps(obj, sort_keys=True, separators=(",", ":"))'
 #: ADDENDUM-1's set (CODE-INDEX, ``InteractionRecord`` and its alias), restated here so
@@ -78,6 +75,25 @@ ROW_WRITER_MODULES = {
     "services/memory_audit.py",
     "services/scan_audit_consumer.py",
 }
+
+
+def _chart_value(name: str) -> str:
+    """The string the chart's values file sets for env var ``name`` (exactly one place)."""
+    found: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == name:
+                    found.append(str(value))
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(yaml.safe_load((ROOT / "charts/audittrace/values.yaml").read_text("utf-8")))
+    assert len(found) == 1, (name, found)
+    return found[0]
 
 
 def _note() -> str:
@@ -154,14 +170,35 @@ class TestResidualIsStated:
             "raw base64",
             "can appear in span attributes",
             "at most 5 attributes of 3 spans",
-            "at most 8 attributes of 4 spans",
-            "up to four more model-call spans",
+            "one attribute per model call",
+            "`memory_tool_loop_max_iterations`",
+            "`input_audio`, `input_video` or `file`",
+            "replaced whole",
             "never in the audit record",
             "Images are not affected",
             "`url_sha256`",
             "can be matched by guessing",
         ):
             assert needle in text, needle
+
+    def test_the_tool_loop_bound_is_the_setting_and_the_chart_value_not_a_literal(
+        self,
+    ) -> None:
+        """F1: "up to N model-call spans" must be an upper bound on what ships.
+
+        N is derived from the setting's default and from the value the chart sets, never
+        typed here: change either and the note must change with it.
+        """
+        from audittrace.config import Settings
+
+        default = Settings.model_fields["memory_tool_loop_max_iterations"].default
+        chart = _chart_value("AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS")
+        assert isinstance(default, int) and chart.isdigit()
+        text = _flat()
+        assert (
+            f"({default} by default in the code, {chart} in the shipped chart)" in text
+        )
+        assert max(default, int(chart)) == int(chart), "the chart is the larger bound"
 
     def test_the_short_payload_is_in_no_audit_field(
         self, client: Any, arm: tuple[str, bool]
@@ -192,31 +229,38 @@ class TestResidualIsStated:
         assert "POST /v1/chat/completions :: langfuse.observation.input" not in carrying
         assert set(carrying) <= TYPED_BOUND, sorted(set(carrying) - TYPED_BOUND)
 
-    def test_a_part_of_an_unknown_type_stays_inside_its_stated_bound(
+    def test_a_part_of_an_unknown_type_reaches_no_span_attribute(
         self, client: Any, arm: tuple[str, bool]
     ) -> None:
-        """The note's second paragraph: no redaction by type, so the entry tag carries it too."""
+        """F-d closed: a part of a type the service does not know is redacted whole.
+
+        Flipped from the round that pinned the gap (8 attributes of 4 spans carried it).
+        The model server still receives the part byte for byte (ADR-024).
+        """
         mode, stream = arm
         blob = {"type": "custom_blob", "data": SHORT}
         messages = [
             {"role": "user", "content": [{"type": "text", "text": QUESTION}, blob]}
         ]
-        response = post_chat(
-            client, ok_fake(mode, stream), stream=stream, messages=messages
-        )
+        fake = ok_fake(mode, stream)
+        response = post_chat(client, fake, stream=stream, messages=messages)
         assert response.status_code == 200
         item = client.get("/interactions?limit=5").json()["interactions"][0]
-        assert SHORT not in json.dumps(item), "the audit record is still clean"
+        assert SHORT not in json.dumps(item), "the audit record is clean"
+        spans = [json.loads(s) for s in net._SPAN_END_SNAPSHOTS]
+        assert spans, "control: the request ended spans"
         carrying = {
             f"{s['name']} :: {k}"
-            for s in map(json.loads, net._SPAN_END_SNAPSHOTS)
+            for s in spans
             for k, v in s["attributes"].items()
             if SHORT in str(v)
         }
-        assert carrying != set(), "control: an unknown part type is not redacted"
-        assert carrying <= UNKNOWN_BOUND, sorted(carrying - UNKNOWN_BOUND)
-        assert "POST /v1/chat/completions :: langfuse.observation.input" in carrying
-        assert len(TYPED_BOUND) == 5 and len(UNKNOWN_BOUND) == 8
+        assert carrying == set(), sorted(carrying)
+        assert any(
+            "custom_blob" in str(v) for s in spans for v in s["attributes"].values()
+        ), "control: the part's type is still traced, so the redaction is not a drop"
+        sent = [b["messages"][-1]["content"][-1] for b in upstream_bodies(fake)]
+        assert sent and all(part == blob for part in sent), "forwarded unchanged"
 
 
 class TestHashFromTheApiResponse:
