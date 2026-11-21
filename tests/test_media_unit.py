@@ -100,3 +100,53 @@ class TestRecordAttributes:
         stored = json.loads(self._record().to_json())["items"][1]
         assert stored["url_chars"] == len("https://x.invalid/a")
         assert "x.invalid" not in json.dumps(stored)
+
+
+class TestJsonWalk:
+    """The iterative walks (round 2, review F1): every level, every leaf kind, no recursion."""
+
+    def test_any_string_ignores_non_string_leaves_and_finds_none(self) -> None:
+        from audittrace.media.json_walk import any_string
+
+        assert (
+            any_string({"a": [1, None, 2.5, True, {"b": []}]}, lambda s: True) is False
+        )
+        assert any_string(7, lambda s: True) is False
+
+    def test_any_string_finds_a_string_at_any_depth(self) -> None:
+        from audittrace.media.json_walk import any_string
+
+        deep: object = "needle"
+        for _ in range(5000):
+            deep = {"k": [deep]}
+        assert any_string(deep, lambda s: s == "needle") is True
+
+    def test_map_strings_maps_a_bare_string_and_returns_other_scalars_as_is(
+        self,
+    ) -> None:
+        from audittrace.media.json_walk import map_strings
+
+        assert map_strings("a", str.upper) == "A"
+        assert map_strings(7, str.upper) == 7
+        assert map_strings(None, str.upper) is None
+
+    def test_map_strings_copies_mixed_containers_keeping_keys_and_order(self) -> None:
+        from audittrace.media.json_walk import map_strings
+
+        value = {"k": ["a", 1, {"z": "b", "n": None}], "s": "c"}
+        out = map_strings(value, str.upper)
+        assert out == {"k": ["A", 1, {"z": "B", "n": None}], "s": "C"}
+        assert list(out) == ["k", "s"]
+        assert value["s"] == "c", "the input is not modified"
+
+    def test_map_strings_covers_a_5000_level_nesting(self) -> None:
+        from audittrace.media.json_walk import map_strings
+
+        deep: object = "x"
+        for _ in range(5000):
+            deep = [deep]
+        out: object = map_strings(deep, str.upper)
+        for _ in range(5000):
+            assert isinstance(out, list) and len(out) == 1
+            out = out[0]
+        assert out == "X"
