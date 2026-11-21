@@ -28,6 +28,8 @@ interaction stays identifiable from its own record.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import fakeredis
 import httpx
 import pytest
@@ -42,7 +44,11 @@ from audittrace.routes._memory_tool_loop import (
     PendingToolCall,
     run_memory_tool_loop,
 )
-from audittrace.tools import reset_registry_for_tests
+from audittrace.tools import (
+    MEMORY_TOOL_REGISTRY,
+    get_tool_by_name,
+    reset_registry_for_tests,
+)
 from audittrace.tools.cache import (
     ToolResultCache,
     reset_tool_result_cache,
@@ -520,10 +526,6 @@ def _make_recall_decisions_cacheable(monkeypatch: pytest.MonkeyPatch) -> None:
     a delete). The two tests below pin what the tool loop records for a
     CACHE-SERVED result (the read-audit row, the span), so they run the real
     handler flagged cacheable instead of dropping an assertion."""
-    from dataclasses import replace
-
-    from audittrace.tools import MEMORY_TOOL_REGISTRY, get_tool_by_name
-
     tool = get_tool_by_name("recall_decisions")
     assert tool is not None
     monkeypatch.setitem(

@@ -42,6 +42,7 @@ from audittrace.services.memory_manifest import (
     MemoryManifestService,
     MockMemoryManifestService,
 )
+from audittrace.services.semantic import tombstone_candidates
 from audittrace.services.semantic_document_incomplete_error import (
     SemanticDocumentIncompleteError,
 )
@@ -589,7 +590,7 @@ class TestTheContextFilters:
     async def test_chunks_use_recalls_derivation_and_one_lookup(self) -> None:
         gone = _doc({"collection": "decisions", "chunk_id": "c1", "user_id": A})
         live = _doc({"collection": "decisions", "chunk_id": "c2", "user_id": A})
-        candidates = tomb.tombstone_candidates(gone)
+        candidates = tombstone_candidates(gone)
         manifest = _Manifest(set(), set(candidates))
 
         kept = await tomb.without_tombstoned_chunks(manifest, [gone, live])  # type: ignore[arg-type]
@@ -610,3 +611,34 @@ class TestTheContextFilters:
         doc = _doc({"collection": "decisions", "chunk_id": "c1", "user_id": A})
         with pytest.raises(RuntimeError, match="manifest down"):
             await tomb.without_tombstoned_chunks(_Down(), [doc])  # type: ignore[arg-type]
+
+
+class TestOneDocumentTwoCreators:
+    """B8/B9 say "same tier AND owner": a corpus document can hold chunk rows
+    written by two curators. The delete tombstones the addressed curator's rows
+    only; the other curator's rows stay live (and, with the tier equal, are not
+    swept by the first one's delete)."""
+
+    async def test_only_the_addressed_rows_owner_is_tombstoned(self, env: Env) -> None:
+        ids = document_chunk_ids("decisions", "doc.md", 0, 3)
+        keys = [semantic_logical_key("decisions", cid) for cid in ids]
+        await env.seed(keys[0], A, tier="corpus")
+        await env.seed(keys[1], A, tier="corpus")
+        await env.seed(keys[2], B, tier="corpus")  # another curator's chunk
+        store = _Semantic({ids[0]: _doc({"title": "doc.md", **STAMP})})
+        anchor = await env.svc.resolve_read("semantic", keys[0], _user(A))
+
+        count = await tomb.tombstone_semantic_document(
+            store,  # type: ignore[arg-type]
+            env.svc,
+            _user(A),
+            "decisions",
+            ids[0],
+            anchor,
+            caller_can_write_shared=True,
+        )
+
+        assert count == 2
+        assert await env.stored_deleted(keys[0])
+        assert await env.stored_deleted(keys[1])
+        assert not await env.stored_deleted(keys[2])

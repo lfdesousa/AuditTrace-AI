@@ -10,6 +10,8 @@ in ``tests/test_memory_tombstone_unit.py``.
 from __future__ import annotations
 
 import asyncio
+import time
+import uuid
 from typing import Any
 from unittest.mock import patch
 
@@ -30,12 +32,14 @@ from tests.memory_truncation_support import (
 from tests.memory_truncation_support_a1 import (
     STEP,
     as_admin,
+    fold_before_the_stamp,
     manifest,
     memory_audit_details,
 )
 from tests.test_softdelete_direct_read_a1 import (
     CANARY,
     SOURCES,
+    _chroma_ids,
     _delete_source,
     _fold_source,
     _same_reply,
@@ -174,6 +178,48 @@ class TestCorpusSource:
         assert len(attempts) == 3
         assert {a["total_chunks"] for a in attempts} == {0}
 
+    def test_a_same_named_private_row_does_not_hide_the_corpus_tombstone(
+        self, client: TestClient
+    ) -> None:
+        """B21 on a corpus key reads the BARE corpus row. The corpus writer also
+        owns a live private row of the same name (the coexistence the spec's
+        gate A4 names): the re-fold is still refused, nothing is written."""
+        stored = self._corpus_source(client)
+        with as_admin(client):
+            assert client.delete("/memory/episodic/doc.md").status_code == 200
+        now = int(time.time() * 1000)
+        manifest()._rows[("episodic", f"{USER}/doc.md")] = {
+            "id": str(uuid.uuid4()),
+            "layer": "episodic",
+            "key": f"{USER}/doc.md",
+            "title": "doc",
+            "size_bytes": 3,
+            "created_at_ms": now,
+            "modified_at_ms": now,
+            "created_by_user_id": USER,
+            "modified_by_user_id": USER,
+            "deleted_at_ms": None,
+            "deleted_by_user_id": None,
+            "tier": "private",
+        }
+        writer = UserContext(
+            user_id=USER,
+            username=USER,
+            agent_type="test",
+            scopes=(*SCOPES, *CORPUS_WRITE),
+            is_admin=False,
+        )
+        app: Any = client.app
+        app.dependency_overrides[require_user] = lambda: writer
+        chroma_before = _chroma_ids("decisions")
+
+        never = self._fold(client, None)
+        plain = self._fold(client, stored)
+
+        assert plain.status_code == never.status_code == 422, plain.text
+        assert plain.content == never.content
+        assert _chroma_ids("decisions") == chroma_before
+
     def test_the_cascade_row_of_a_corpus_source_says_corpus(
         self, client: TestClient
     ) -> None:
@@ -209,3 +255,61 @@ class TestTheChunkDeleteRowCountsTheDocument:
         assert (row["key"], row["hard"], row["chunks"]) == (ids[2], False, len(ids))
         never = client.get("/memory/semantic/decisions/0000000000000000")
         _same_reply(client.get(f"/memory/semantic/decisions/{ids[4]}"), never)
+
+
+class TestAPartlyDeletedUnstampedDocumentIsRefusedWhole:
+    """AC-14, the chunk-0 case: an UNSTAMPED fold whose chunk 0 row was
+    tombstoned before this build. The single-read check cannot name the sequence
+    (no stamp), so the whole read must check every gathered chunk, chunk 0
+    included, whichever chunk the caller entered through."""
+
+    @pytest.mark.parametrize("entry", [1, 2])
+    def test_whole_read_through_a_later_chunk_is_the_never_existed_404(
+        self, client: TestClient, entry: int
+    ) -> None:
+        text = CANARY + "\n" + distinct_body(4 * STEP)
+        count = fold_before_the_stamp("decisions", "old.md", text)
+        assert count >= 3
+        ids = [m._doc_id("decisions", "old.md", i) for i in range(count)]
+        key = m._semantic_key("decisions", ids[0])
+        asyncio.run(
+            manifest().record_create(
+                layer="semantic", key=key, title="old.md", size_bytes=1, user_id=USER
+            )
+        )
+        live = read_whole(client, "decisions", "old.md")
+        assert live.status_code == 200 and CANARY in live.json()["content"]
+        asyncio.run(manifest().record_delete("semantic", key, USER))
+
+        never = client.get("/memory/semantic/decisions/0000000000000000")
+        whole = client.get(
+            f"/memory/semantic/decisions/{ids[entry]}",
+            params={"whole_document": "true"},
+        )
+
+        _same_reply(whole, never)
+
+
+class TestAFailedDocumentTombstoneFailsClosed:
+    """The chunk delete tombstones the addressed row, then the document in one
+    transaction (two transactions in all). A failure between them leaves the
+    document MORE hidden, never less: the addressed chunk already answers the
+    never-existed 404, the error is a 5xx and no delete row says otherwise."""
+
+    def test_the_addressed_chunk_is_hidden_and_the_delete_is_a_5xx(
+        self, client: TestClient
+    ) -> None:
+        ids = _fold_source(client, "episodic", "decisions")
+
+        with (
+            patch(
+                "audittrace.routes.memory.tombstone_semantic_document",
+                side_effect=RuntimeError("manifest down"),
+            ),
+            pytest.raises(RuntimeError, match="manifest down"),
+        ):
+            client.delete(f"/memory/semantic/decisions/{ids[1]}")
+
+        never = client.get("/memory/semantic/decisions/0000000000000000")
+        _same_reply(client.get(f"/memory/semantic/decisions/{ids[1]}"), never)
+        assert not [d for d in memory_audit_details() if d.get("op") == "delete"]
