@@ -35,6 +35,22 @@ def has_corpus_scope(user: UserContext, collection: str, action: str) -> bool:
     return user.is_admin or "audittrace:admin" in user.scopes or required in user.scopes
 
 
+def corpus_read_cleared(user: UserContext, collection: str | None) -> bool:
+    """``True`` iff the semantic list's corpus gate can admit a corpus-tier row
+    for *user*: an admin bypass, the granular read scope of *collection*, or,
+    for a list over every collection, the read scope of at least one."""
+    if collection is not None:
+        return has_corpus_scope(user, collection, "read")
+    return (
+        user.is_admin
+        or "audittrace:admin" in user.scopes
+        or any(
+            scope.startswith("memory:corpus:") and scope.endswith(":read")
+            for scope in user.scopes
+        )
+    )
+
+
 def corpus_write_authorized(user: UserContext, collection: str | None) -> bool:
     """``True`` iff *user* may overwrite/demote an EXISTING **corpus**-tier
     manifest row — the ``caller_can_write_shared`` authorization
