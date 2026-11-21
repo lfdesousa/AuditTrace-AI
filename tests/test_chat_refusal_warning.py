@@ -13,7 +13,11 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 
+from audittrace.db.models import InteractionRecord
+from audittrace.dependencies import get_postgres_factory
+from audittrace.identity import sentinel_user_context
 from tests._image_slice import (
     ARM_IDS,
     ARMS,
@@ -53,7 +57,7 @@ def arm(
 
 
 @pytest.mark.parametrize("reason", sorted(CASES))
-def test_one_warning_with_the_reason_and_the_position_only(
+async def test_one_warning_with_the_reason_and_the_position_only(
     client: Any,
     arm: tuple[str, bool],
     reason: str,
@@ -90,3 +94,11 @@ def test_one_warning_with_the_reason_and_the_position_only(
         set(vars(record)) - set(vars(_BARE)) - SERVICE_FIELDS
     )
     assert "canary" not in repr(vars(record)) and TARGET not in repr(vars(record))
+    # The identity fields are the BOUND identity: the caller's user and the turn's session,
+    # the same ones the audit row of this refusal carries (traceability, EU AI Act Art. 12).
+    async with get_postgres_factory().get_session_factory()() as db:
+        rows = list((await db.execute(select(InteractionRecord))).scalars().all())
+    assert len(rows) == 1
+    assert record.user_id == rows[0].user_id == sentinel_user_context().user_id
+    assert record.session_id == rows[0].session_id
+    assert rows[0].session_id
