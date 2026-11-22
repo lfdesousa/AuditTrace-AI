@@ -504,6 +504,20 @@ class TestMessageShapesOnFourArms:
 REQUEST_EXTRAS: dict[str, dict[str, Any]] = {
     "input-nested-unknown-part": {"input": [[_BLOB]]},
     "blob-field": {"blob_field": SHORT},
+    "metadata-nested": {"metadata": {"a": {"blob": SHORT}}},
+    "tool-choice-extra": {
+        "tool_choice": {"type": "function", "function": {"name": "f", "blob": SHORT}}
+    },
+    "stop-nested": {"stop": [[SHORT]]},
+    "modalities-object": {"modalities": {"blob": SHORT}},
+    "logit-bias-nested": {"logit_bias": {"50256": {"blob": SHORT}}},
+    "stream-options-extra": {"stream_options": {"include_usage": True, "blob": SHORT}},
+    "web-search-extra": {
+        "web_search_options": {
+            "search_context_size": "low",
+            "user_location": {"blob": SHORT},
+        }
+    },
     "prediction-content-part": {"prediction": {"type": "content", "content": [_BLOB]}},
 }
 
@@ -552,20 +566,29 @@ class TestRequestFieldsOnFourArms:
 
 class TestMessageKeysAreAnAllowList:
     @pytest.mark.parametrize(
-        "key",
+        ("key", "value"),
         [
-            "role",
-            "content",
-            "name",
-            "tool_calls",
-            "tool_call_id",
-            "refusal",
-            "function_call",
-            "audio",
+            ("role", "assistant"),
+            ("content", "words"),
+            ("name", "n"),
+            ("tool_call_id", "c1"),
+            ("refusal", "no"),
+            ("reasoning_content", "thinking aloud"),
+            ("audio", {"id": "a1"}),
+            ("function_call", {"name": "f", "arguments": "{}"}),
+            (
+                "tool_calls",
+                [
+                    {
+                        "id": "c",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    }
+                ],
+            ),
         ],
     )
-    def test_the_openai_message_keys_pass(self, key: str) -> None:
-        value: Any = "v" if key != "tool_calls" else [{"id": "c", "type": "function"}]
+    def test_the_openai_message_keys_pass(self, key: str, value: Any) -> None:
         out = redact_media_payloads([{key: value}], None)
         assert out == [{key: value}]
 
@@ -649,6 +672,112 @@ class TestLogCallRedactsByParameterName:
         assert any("OUTPUT" in str(r.getMessage()) for r in records), "control"
         assert any("INPUT" in str(r.getMessage()) for r in records), "control"
         assert [ln[:80] for ln in lines if SHORT in ln] == []
+
+
+#: values an allowed message key must not carry whole: the nested schema leaves only these
+NESTED: dict[str, dict[str, Any]] = {
+    "replayed-assistant-audio": {
+        "role": "assistant",
+        "content": "ok",
+        "audio": {"id": "a1", "data": SHORT, "transcript": "t", "expires_at": 1},
+    },
+    "tool-call-extra-key": {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{}", "blob": SHORT},
+                "blob": SHORT,
+            }
+        ],
+    },
+    "function-call-extra-key": {
+        "role": "assistant",
+        "function_call": {"name": "f", "arguments": "{}", "blob": SHORT},
+    },
+    "audio-is-a-string": {"role": "assistant", "audio": SHORT},
+    "tool-calls-is-a-dict": {"role": "assistant", "tool_calls": {"blob": SHORT}},
+    "name-is-an-object": {"role": "user", "content": "q", "name": {"blob": SHORT}},
+    "reasoning-is-an-object": {
+        "role": "assistant",
+        "reasoning_content": {"blob": SHORT},
+    },
+}
+
+
+@pytest.fixture(params=sorted(NESTED))
+def nested(request: pytest.FixtureRequest) -> str:
+    return str(request.param)
+
+
+class TestNestedValuesOnFourArms:
+    """An allowed key keeps only what its schema allows inside (a replayed audio message)."""
+
+    def test_no_telemetry_site_carries_it_and_upstream_gets_it(
+        self,
+        client: Any,
+        arm: tuple[str, bool],
+        nested: str,
+        langfuse_on: None,
+        debug_logs: None,
+    ) -> None:
+        mode, stream = arm
+        message = NESTED[nested]
+        messages = [message, _Q]
+        before = copy.deepcopy(messages)
+        fake = ok_fake(mode, stream)
+        post_chat(client, fake, stream=stream, messages=messages)
+        assert messages == before, "the input is never mutated"
+        sent = [m for b in upstream_bodies(fake) for m in b["messages"]]
+        assert message in sent, "ADR-024: forwarded as it came"
+        spans = [json.loads(s) for s in net._SPAN_END_SNAPSHOTS]
+        assert any(s["name"] == "POST /v1/chat/completions" for s in spans), "control"
+        carrying = sorted(
+            {
+                f"{s['name']} :: {k}"
+                for s in spans
+                for k, v in s["attributes"].items()
+                if SHORT in str(v)
+            }
+        )
+        assert carrying == []
+        records = list(net._LOG_RECORD_SNAPSHOTS)
+        assert any("chat" in r for r in records), "control: chat log records seen"
+        assert [r[:100] for r in records if SHORT in r] == []
+        assert [p[:100] for p in non_upstream_posts(fake) if SHORT in p] == []
+
+    def test_the_request_audio_field_keeps_only_voice_and_format(
+        self, client: Any, arm: tuple[str, bool], langfuse_on: None
+    ) -> None:
+        mode, stream = arm
+        extra = {"audio": {"voice": "alloy", "format": "wav", "data": SHORT}}
+        fake = ok_fake(mode, stream)
+        post_chat(client, fake, stream=stream, messages=[_Q], extra=extra)
+        spans = [json.loads(s) for s in net._SPAN_END_SNAPSHOTS]
+        assert any(s["name"] == "chat-extract-query" for s in spans), "control"
+        assert [
+            s["name"]
+            for s in spans
+            if any(SHORT in str(v) for v in s["attributes"].values())
+        ] == []
+        assert all(b.get("audio") == extra["audio"] for b in upstream_bodies(fake))
+
+    def test_chat_template_kwargs_scalars_are_traced_and_nested_values_are_not(
+        self, client: Any, arm: tuple[str, bool]
+    ) -> None:
+        mode, stream = arm
+        extra = {"chat_template_kwargs": {"enable_thinking": True, "x": {"b": SHORT}}}
+        fake = ok_fake(mode, stream)
+        post_chat(client, fake, stream=stream, messages=[_Q], extra=extra)
+        spans = [json.loads(s) for s in net._SPAN_END_SNAPSHOTS]
+        text = " ".join(
+            str(v)
+            for s in spans
+            if s["name"] == "chat-extract-query"
+            for v in s["attributes"].values()
+        )
+        assert "enable_thinking" in text and SHORT not in text
 
 
 class TestTheQueryIsReadLikeTheRedaction:

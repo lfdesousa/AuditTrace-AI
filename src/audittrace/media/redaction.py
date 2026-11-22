@@ -85,52 +85,111 @@ def placeholder_message(message: Any) -> dict[str, Any]:
     return {"redacted": f"[REDACTED:media message {kind}{size}]"}
 
 
-#: The keys of a message object in the OpenAI chat-completions request schema (messages of
-#: role developer/system/user/assistant/tool/function): ``role``, ``content``, ``name``,
-#: ``tool_calls``, ``tool_call_id``, ``refusal``, ``function_call``, ``audio``. ``content`` is
-#: redacted by ``redact_content``; ``tool_calls`` and ``function_call`` hold the tool name and
-#: its JSON ``arguments`` (text, traced as written like any text); ``audio`` is a reference
-#: ({"id": ...}), not a payload. Any other key is fail-closed: its value is never traced.
-_MESSAGE_KEYS = frozenset(
-    {
-        "role",
-        "content",
-        "name",
-        "tool_calls",
-        "tool_call_id",
-        "refusal",
-        "function_call",
-        "audio",
-    }
-)
+#: Value schemas of the allow-lists below. ``_TEXT``: a scalar (string, number, boolean,
+#: null), traced as written like any text; an object or an array there is a marker. ``_ANY``:
+#: text-like definitions (tool and function definitions, ``metadata``, ``response_format``...)
+#: traced as written (a stated limit of the contract note). ``_CONTENT``: left to
+#: ``redact_content`` (a message's ``content``, a prediction's ``content``). A ``dict`` is an
+#: object with exactly those keys (any other key is a marker); ``(_LIST, s)`` an array of
+#: ``s``; ``(_MAP, s)`` an object with any keys (names bounded) whose values are ``s``;
+#: ``(_ONE, a, b)`` a value that fits ``a`` or ``b`` (the first that fits is applied).
+_TEXT = "text"
+_ANY = "any"
+_CONTENT = "content"
+_LIST = "list"
+_MAP = "map"
+_ONE = "one"
 
-#: The fields of a chat-completions request body in the OpenAI schema, plus the two the
-#: service itself reads (``context_query``, ``project``). A request field not listed here
-#: is replaced by a marker in telemetry; ``messages`` is redacted message by message.
-_REQUEST_KEYS = frozenset(
-    {
-        "messages", "model", "audio", "frequency_penalty", "function_call", "functions",
-        "logit_bias", "logprobs", "max_completion_tokens", "max_tokens", "metadata",
-        "modalities", "n", "parallel_tool_calls", "prediction", "presence_penalty",
-        "prompt_cache_key", "reasoning_effort", "response_format", "safety_identifier",
-        "seed", "service_tier", "stop", "store", "stream", "stream_options",
-        "temperature", "tool_choice", "tools", "top_logprobs", "top_p", "user",
-        "verbosity", "web_search_options", "context_query", "project",
-    }
-)  # fmt: skip
+#: The tool name and its JSON ``arguments`` (a string): text, traced as written.
+_FUNCTION: dict[str, Any] = {"name": _TEXT, "arguments": _TEXT}
 
+#: A message object in the OpenAI chat-completions request schema (developer, system, user,
+#: assistant, tool and function messages) and the replayed assistant message of a client:
+#: ``role``, ``content``, ``name``, ``tool_call_id``, ``refusal``, ``reasoning_content``
+#: (the text some servers return and clients replay), ``audio`` {id} (the response audio
+#: holds ``data``, ``transcript``, ``expires_at``: only the reference id is traced),
+#: ``tool_calls`` [{id, type, function {name, arguments}}] and the deprecated
+#: ``function_call`` {name, arguments}. Anything else, at any level, is a marker.
+_MESSAGE_SCHEMA: dict[str, Any] = {
+    "role": _TEXT,
+    "content": _CONTENT,
+    "name": _TEXT,
+    "tool_call_id": _TEXT,
+    "refusal": _TEXT,
+    "reasoning_content": _TEXT,
+    "audio": {"id": _TEXT},
+    "tool_calls": (
+        _LIST,
+        {"id": _TEXT, "type": _TEXT, "index": _TEXT, "function": _FUNCTION},
+    ),
+    "function_call": _FUNCTION,
+}
 
-#: The keys of the object a media content part holds, in the OpenAI chat-completions part
-#: schemas: ``input_audio`` {data, format}, ``file`` {file_data, file_id, filename},
-#: ``image_url`` {url, detail}; ``input_video`` is not an OpenAI part, the model server reads
-#: its source from ``data`` else ``url`` (the slots handled in ``_PAYLOAD_SLOTS``) plus a
-#: ``format``; ``input_audio`` also accepts ``url`` there. Any other key of the holder is
-#: fail-closed: its value is never traced (the payload slots are redacted as before).
-_HOLDER_KEYS = {
-    "input_audio": frozenset({"data", "format", "url"}),
-    "input_video": frozenset({"data", "url", "format"}),
-    "file": frozenset({"file_data", "file_id", "filename"}),
-    "image_url": frozenset({"url", "detail"}),
+#: A chat-completions request body: the OpenAI fields plus what the service itself reads or
+#: writes (``context_query``, ``project``, ``chat_template_kwargs`` for X-Thinking, whose
+#: values must be scalars). A field outside the list is a marker where the request is traced.
+_REQUEST_SCHEMA: dict[str, Any] = {
+    **dict.fromkeys(
+        (
+            "model",
+            "frequency_penalty",
+            "logprobs",
+            "max_completion_tokens",
+            "max_tokens",
+            "n",
+            "parallel_tool_calls",
+            "presence_penalty",
+            "prompt_cache_key",
+            "reasoning_effort",
+            "safety_identifier",
+            "seed",
+            "service_tier",
+            "store",
+            "stream",
+            "temperature",
+            "top_logprobs",
+            "top_p",
+            "user",
+            "verbosity",
+            "context_query",
+            "project",
+        ),
+        _TEXT,
+    ),  # fmt: skip
+    # definitions whose body is free-form JSON (a stated limit: text traced as written)
+    **dict.fromkeys(("functions", "response_format", "tools"), _ANY),
+    "function_call": (_ONE, _TEXT, {"name": _TEXT}),
+    "tool_choice": (_ONE, _TEXT, {"type": _TEXT, "function": {"name": _TEXT}}),
+    "stop": (_ONE, _TEXT, (_LIST, _TEXT)),
+    "modalities": (_LIST, _TEXT),
+    "logit_bias": (_MAP, _TEXT),
+    "metadata": (_MAP, _TEXT),
+    "stream_options": {"include_usage": _TEXT, "include_obfuscation": _TEXT},
+    "web_search_options": {
+        "search_context_size": _TEXT,
+        "user_location": {
+            "type": _TEXT,
+            "approximate": dict.fromkeys(
+                ("city", "country", "region", "timezone"), _TEXT
+            ),
+        },
+    },
+    "messages": _ANY,  # redacted message by message by ``redact_message_list``
+    "audio": {"voice": _TEXT, "format": _TEXT},
+    "prediction": {"type": _TEXT, "content": _CONTENT},
+    "chat_template_kwargs": (_MAP, _TEXT),
+}
+
+#: The object a media content part holds, in the OpenAI part schemas: ``input_audio``
+#: {data, format}, ``file`` {file_data, file_id, filename}, ``image_url`` {url, detail};
+#: ``input_video`` is not an OpenAI part, the model server reads its source from ``data`` else
+#: ``url`` (``_PAYLOAD_SLOTS``) plus a ``format``; ``input_audio`` also accepts ``url`` there.
+#: A value that is not a scalar, or any other key, is a marker (payload slots as before).
+_HOLDER_SCHEMA: dict[str, dict[str, Any]] = {
+    "input_audio": dict.fromkeys(("data", "format", "url"), _TEXT),
+    "input_video": dict.fromkeys(("data", "url", "format"), _TEXT),
+    "file": dict.fromkeys(("file_data", "file_id", "filename"), _TEXT),
+    "image_url": dict.fromkeys(("url", "detail"), _TEXT),
 }
 
 
@@ -144,20 +203,70 @@ def _size(value: Any) -> str:
     return ""
 
 
-def _redact_unknown_keys(
-    mapping: dict[str, Any], allowed: frozenset[str], label: str
-) -> dict[str, Any]:
-    """A copy of ``mapping`` in which every key outside ``allowed`` holds only a marker.
+def _marker(label: str, what: str, value: Any) -> str:
+    return f"[REDACTED:media {label} {what} {type(value).__name__}{_size(value)}]"
 
-    The key name is kept when it passes the type-name bound (at most 32 plain identifier
-    characters, so at most 24 bytes can ride in it: the accepted bound), else it becomes
-    ``unknown`` (``unknown_2``, ... when several collide). Nothing is walked: any depth.
+
+def _apply(value: Any, schema: Any, label: str) -> Any:
+    """``value`` made safe by ``schema`` (see ``_TEXT``): nothing outside it is traced.
+
+    The schemas are finite, so the recursion is as deep as the schema and no deeper: whatever
+    a value holds below the last level a schema names is a marker, whatever its depth.
+    """
+    if schema == _ANY or schema == _CONTENT:
+        return value
+    if schema == _TEXT:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return _marker(label, "value", value)
+    if isinstance(schema, tuple) and schema[0] == _ONE:
+        for alternative in schema[1:]:
+            if _fits(value, alternative):
+                return _apply(value, alternative, label)
+        return _marker(label, "value", value)
+    if isinstance(schema, tuple) and schema[0] == _LIST:
+        if not isinstance(value, list):
+            return _marker(label, "value", value)
+        return [_apply(item, schema[1], label) for item in value]
+    if isinstance(schema, tuple) and schema[0] == _MAP:
+        if not isinstance(value, dict):
+            return _marker(label, "value", value)
+        return _apply_object(value, dict.fromkeys(_names(value), schema[1]), label)
+    if not isinstance(value, dict):
+        return _marker(label, "value", value)
+    return _apply_object(value, schema, label)
+
+
+def _fits(value: Any, schema: Any) -> bool:
+    """Whether ``value`` has the outer shape ``schema`` names (a scalar, an array, an object)."""
+    if schema == _TEXT:
+        return value is None or isinstance(value, (str, int, float, bool))
+    if isinstance(schema, tuple):
+        return isinstance(value, list if schema[0] == _LIST else dict)
+    return isinstance(value, dict)
+
+
+def _names(mapping: dict[str, Any]) -> list[str]:
+    """The keys of a mapping whose names pass the bound (those that do not are not allowed)."""
+    return [key for key in mapping if _type_name(key) == key]
+
+
+def _apply_object(
+    mapping: dict[str, Any], schema: dict[str, Any], label: str
+) -> dict[str, Any]:
+    """A copy of ``mapping`` keeping the keys of ``schema`` (their values by ``_apply``).
+
+    Every other key holds only a marker. Its name is kept when it passes the type-name bound
+    (at most 32 plain identifier characters, so at most 24 bytes can ride in it: the
+    accepted bound), else it becomes ``unknown`` (``unknown_2``, ... when several collide).
     """
     out: dict[str, Any] = {}
     unknown = 0
     for key, value in mapping.items():
-        if key in allowed:
-            out[key] = value
+        if key in schema:
+            out[key] = _apply(
+                value, schema[key], key if _type_name(key) == key else label
+            )
             continue
         name = _type_name(key)
         if name == "unknown":
@@ -165,18 +274,18 @@ def _redact_unknown_keys(
             name = "unknown" if unknown == 1 else f"unknown_{unknown}"
         while name in out:
             name = f"{name}_"
-        out[name] = f"[REDACTED:media {label} key {type(value).__name__}{_size(value)}]"
+        out[name] = _marker(label, "key", value)
     return out
 
 
 def redact_message_keys(message: dict[str, Any]) -> dict[str, Any]:
-    """A message object with every key outside the OpenAI message keys replaced by a marker."""
-    return _redact_unknown_keys(message, _MESSAGE_KEYS, "message")
+    """A message object reduced to the OpenAI message schema (``content`` left to its own rule)."""
+    return _apply_object(message, _MESSAGE_SCHEMA, "message")
 
 
 def redact_request_fields(payload: dict[str, Any]) -> dict[str, Any]:
-    """A chat request body with every field outside the OpenAI schema replaced by a marker."""
-    safe = _redact_unknown_keys(payload, _REQUEST_KEYS, "request field")
+    """A chat request body reduced to the OpenAI request schema; messages one by one."""
+    safe = _apply_object(payload, _REQUEST_SCHEMA, "request field")
     if isinstance(safe.get("messages"), list):
         safe["messages"] = redact_message_list(safe["messages"])
     return safe
@@ -230,7 +339,7 @@ def _redact_part(part: dict[str, Any]) -> dict[str, Any]:
         holder = part.get(kind)
         if not (isinstance(holder, dict) and set(part) <= {"type", kind}):
             return _placeholder(part)
-        safe = _redact_unknown_keys(holder, _HOLDER_KEYS[kind], kind)
+        safe = _apply_object(holder, _HOLDER_SCHEMA[kind], kind)
         for slot in _PAYLOAD_SLOTS[kind]:
             if isinstance(safe.get(slot), str):
                 safe[slot] = f"[REDACTED:media {kind} chars={len(safe[slot])}]"
@@ -239,8 +348,8 @@ def _redact_part(part: dict[str, Any]) -> dict[str, Any]:
         if kind == "image_url" and isinstance(part.get("image_url"), dict):
             part = {
                 **part,
-                "image_url": _redact_unknown_keys(
-                    part["image_url"], _HOLDER_KEYS["image_url"], "image_url"
+                "image_url": _apply_object(
+                    part["image_url"], _HOLDER_SCHEMA["image_url"], "image_url"
                 ),
             }
         return redact_media_links(part)

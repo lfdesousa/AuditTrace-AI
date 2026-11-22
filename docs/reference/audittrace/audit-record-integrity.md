@@ -141,34 +141,48 @@ Other kinds of rows use their own values in this column; none of them uses `requ
 ## 4. Traces: what is removed and what is not
 
 No media payload of any size reaches a span attribute, a log line, the input tag of the entry
-span or the trace-ingestion body. An inline image is replaced by its digest. A part of type
-`input_audio`, `input_video` or `file` keeps its type and the keys of its schema (`input_audio`
-holds `data` and `format`, `file` holds `file_data`, `file_id` and `filename`, an `image_url` holds
-`url` and `detail`), and its payload (`data`, `url`, `file_data`) is replaced by a marker that gives
-its length. Any other key of that object holds a marker. A part of any type the
-service does not know (for example a custom `blob` part) is replaced whole by a marker that
-keeps its type name and its number of keys. The same holds for a shape the OpenAI schema
-does not allow: a message `content` that is neither a string nor a list (a dict, a number) is
-replaced whole by a marker that records its type and size, and a list element that is not a part
-object (a bare string, a number, a nested list) is treated as an unknown part. A message that is not an object is replaced whole by a marker that records its container type
-and size. A message object keeps only the keys of the OpenAI chat message schema (`role`,
-`content`, `name`, `tool_calls`, `tool_call_id`, `refusal`, `function_call`, `audio`); the value of
-any other key is replaced by a marker, whether or not the message has a `role`. The `arguments` of
-a tool call are text and are traced as written, like any text. The same rule applies to the
-request body: a field outside the OpenAI chat-completions request schema (plus `context_query` and
-`project`, which the service reads) is replaced by a marker where the request is traced. A marker
-keeps the key's name when it is at most 32 plain identifier characters, so a name can carry at most
-24 bytes; otherwise the name is `unknown`. These rules apply where the route copies a message (a
+span or the trace-ingestion body. The model server still receives every part unchanged, and the
+audit record never holds a payload.
+
+Content parts. An inline image is replaced by its digest. A part of type `input_audio`,
+`input_video` or `file` keeps its type and the keys of its schema (`input_audio` holds `data`,
+`format` and `url`; `input_video`, which is not an OpenAI part, holds `data`, `url` and `format`,
+the slots the model server reads; `file` holds `file_data`, `file_id` and `filename`; an `image_url`
+holds `url` and `detail`), and its payload (`data`, `url`, `file_data`) is replaced by a marker that
+gives its length. Any other key of that object, and a value that is not a scalar, holds a marker. A
+part of any type the service does not know (for example a custom `blob` part) is replaced whole by
+a marker that keeps its type name and its number of keys. The types the service treats as text are
+`text`, `refusal` and `image_url` (the OpenAI content-part types for text, assistant refusals and
+images); a text-bearing part that carries anything besides its one content key is replaced whole
+too.
+
+Shapes the schema does not allow. A message `content` that is neither a string nor a list (a dict,
+a number) is replaced whole by a marker that records its type and size, and a list element that is
+not a part object (a bare string, a number, a nested list) is treated as an unknown part. A message
+that is not an object is replaced whole by a marker that records its container type and size.
+
+Messages and the request body, by schema. A message object keeps only the keys of the OpenAI chat
+message schema, and inside them only what that schema allows: `role`, `name`, `tool_call_id`,
+`refusal` and `reasoning_content` (the text some servers return and clients replay) as scalars;
+`content` as above; `audio` as its reference `id` only (the response audio also carries `data`,
+`transcript` and `expires_at`, which are markers); each entry of `tool_calls` as `id`, `type` and
+`function` {`name`, `arguments`}; `function_call` as {`name`, `arguments`}. The request body keeps
+the fields of the OpenAI chat-completions request schema, each by its own schema (for example
+`audio` as `voice` and `format`, `tool_choice`, `stop`, `modalities`, `metadata`, `logit_bias`,
+`stream_options` and `web_search_options` as the shapes OpenAI defines, scalars where it defines
+scalars), plus `context_query`, `project` and `chat_template_kwargs`, which the service reads or
+writes (its values must be scalars). A key or a field outside its schema, whether or not the
+message has a `role`, holds a marker, and so does a value of the wrong shape. A marker keeps the
+key's name when it is at most 32 plain identifier characters, so a name can carry at most 24
+bytes; otherwise the name is `unknown`. These rules apply where the route copies a message (a
 `[key, value]` pair that the route turns into an object) as well. How the route answers a
 malformed request is not changed by this: some of them already end in an error of their own, and
-the telemetry written before that error is clean. The model server
-still receives every part unchanged, and the audit record never holds a payload.
-
-The types the service treats as text are `text`, `refusal` and `image_url` (the OpenAI
-content-part types for text, assistant refusals and images). A text-bearing part that carries
-anything besides its one content key is replaced whole too.
+the telemetry written before that error is clean.
 
 What is not removed is text. A `text` part is traced as written, by design: a base64 string a
-caller types into a text part is traced like any other text. The export-time scrub drops
-data-URL payloads and runs of more than 128 characters of standard-alphabet base64 from every
-string; a shorter run, a URL-safe run or one broken into short lines, written in text, stays.
+caller types into a text part is traced like any other text. The `arguments` of a tool call or a
+function call, `reasoning_content`, and the free-form definitions of the request body (`tools`,
+`functions`, `response_format`) are text and are traced as written, like any text. The
+export-time scrub drops data-URL payloads and runs of more than 128 characters of
+standard-alphabet base64 from every string; a shorter run, a URL-safe run or one broken into short
+lines, written in text, stays.
