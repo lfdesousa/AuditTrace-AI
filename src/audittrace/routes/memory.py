@@ -1968,7 +1968,9 @@ async def read_episodic(
         "episodic", filename, user
     )
     if is_hidden(entry, user):
-        raise refused_read(user=user, layer="episodic", detail="ADR not found")
+        raise refused_read(
+            request=request, user=user, layer="episodic", detail="ADR not found"
+        )
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
@@ -2235,7 +2237,9 @@ async def read_procedural(
         "procedural", filename, user
     )
     if is_hidden(entry, user):
-        raise refused_read(user=user, layer="procedural", detail="SKILL not found")
+        raise refused_read(
+            request=request, user=user, layer="procedural", detail="SKILL not found"
+        )
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
@@ -2887,7 +2891,12 @@ async def read_semantic(
         ],
         user,
     ):
-        raise refused_read(user=user, layer="semantic", detail="semantic doc not found")
+        raise refused_read(
+            request=request,
+            user=user,
+            layer="semantic",
+            detail="semantic doc not found",
+        )
     if doc.metadata.get("tier") == "corpus":
         _require_corpus_scope(user, collection, "read")
 
@@ -2905,7 +2914,10 @@ async def read_semantic(
             user,
         ):
             raise refused_read(
-                user=user, layer="semantic", detail="semantic doc not found"
+                request=request,
+                user=user,
+                layer="semantic",
+                detail="semantic doc not found",
             )
         front_matter = chunk_docs[0]
         entry = await manifest.resolve_read(

@@ -62,6 +62,14 @@ _real_read_tools = a1._real_read_tools
 
 TRACE_SHAPE = re.compile(r"^[0-9a-f]{32}$")
 REFUSED = "memory.read refused"
+SEMANTIC_TEMPLATE = "/memory/semantic/{collection}/{document_id}"
+# The route TEMPLATE of the refused request, never the raw URL (it holds the key).
+TEMPLATE = {
+    "source": {
+        "episodic": "/memory/episodic/{filename:path}",
+        "procedural": "/memory/procedural/{filename:path}",
+    },
+}
 
 
 @pytest.fixture
@@ -218,6 +226,10 @@ class TestARefusedReadLeavesOneTracedLogLine:
         assert TRACE_SHAPE.match(line["trace_id"])
         assert line["user_id"] == USER
         assert line["code"] == "not_found"
+        assert line["status"] == 404 and isinstance(line["status"], int)
+        assert line["route"] == (
+            TEMPLATE["source"][layer] if route == "source" else SEMANTIC_TEMPLATE
+        )
         assert line["level"] == "INFO"
         # nothing in the line says the document existed or was deleted
         text = json.dumps(line).lower()
@@ -252,6 +264,9 @@ class TestARefusedReadLeavesOneTracedLogLine:
         assert whole.status_code == 404
         (line,) = _refused_lines(logs)[before:]
         assert TRACE_SHAPE.match(line["trace_id"]) and line["user_id"] == USER
+        assert line["status"] == 404 and isinstance(line["status"], int)
+        assert line["route"] == SEMANTIC_TEMPLATE
+        assert ids[1] not in line["route"]
 
     @pytest.mark.parametrize("route", ["source", "chunk", "whole"])
     @pytest.mark.parametrize("layer", sorted(SOURCES))
