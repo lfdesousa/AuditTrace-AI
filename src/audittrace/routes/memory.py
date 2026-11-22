@@ -120,6 +120,7 @@ from audittrace.routes.memory_write_refusal import (
 )
 from audittrace.routes.memory_write_support import (
     concurrent_write_as_409,
+    corpus_read_cleared,
     corpus_write_authorized,
     has_corpus_scope,
     legacy_copy_forward_source,
@@ -130,7 +131,11 @@ from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.episodic import EpisodicService
 from audittrace.services.index_routing import collection_for_key
 from audittrace.services.layer_listing import list_layer_objects
-from audittrace.services.memory_audit import schedule_read_audit
+from audittrace.services.memory_audit import (
+    MEMORY_AUDIT_TIER_BOTH,
+    read_tier,
+    schedule_read_audit,
+)
 from audittrace.services.memory_keys import (
     ID_FORM_LC9,
     ChromaIdConflictError,
@@ -742,7 +747,7 @@ async def upload_memory_file(
             op="write",
             layer=MemoryLayer.session.value,
             key=target_filename,
-            detail_extra={"tier": "private"},
+            tier="private",
         )
         key = f"{user.user_id}/{layer.value}/{target_filename}"
         logger.info(
@@ -1536,14 +1541,11 @@ async def index_memory(
         layer="semantic",
         collection=",".join(target_collections),
         key=file,
+        tier=tier,
         detail_extra={
             "mode": "single_file" if single_file_mode else "bulk",
             "dry_run": dry_run,
             "total_chunks": total_chunks,
-            # ADR-062 Phase B (#426) — additive-only field (audit schema
-            # frozen at 1.17.0): "private" or "corpus", per the tier
-            # resolution above.
-            "tier": tier,
         },
     )
     # #430 — a single-file index whose object was never actually accepted by
@@ -1879,7 +1881,13 @@ async def list_episodic(
     )
     # ADR-062 §5 (WU-A4) — read path, fail-open background emit (see
     # services/memory_audit.py module docstring).
-    schedule_read_audit(background_tasks, user=user, op="list", layer="episodic")
+    schedule_read_audit(
+        background_tasks,
+        user=user,
+        op="list",
+        layer="episodic",
+        tier=MEMORY_AUDIT_TIER_BOTH,
+    )
     emit_recall_telemetry(
         classify_recall_source_from_request(request), "episodic", total, cache="n/a"
     )
@@ -1921,7 +1929,12 @@ async def read_episodic(
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
-        background_tasks, user=user, op="read", layer="episodic", key=filename
+        background_tasks,
+        user=user,
+        op="read",
+        layer="episodic",
+        key=filename,
+        tier=read_tier(doc.metadata),
     )
     emit_recall_telemetry(
         classify_recall_source_from_request(request), "episodic", 1, cache="n/a"
@@ -1988,7 +2001,11 @@ async def update_episodic(
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
     await emit_write_audits(
-        user=user, layer="episodic", filename=filename, copied_from=copied_from
+        user=user,
+        layer="episodic",
+        filename=filename,
+        copied_from=copied_from,
+        tier=entry.tier,
     )
     return entry.to_dict()
 
@@ -2050,6 +2067,7 @@ async def delete_episodic(
         op="delete",
         layer="episodic",
         key=filename,
+        tier=entry.tier,
         detail_extra={"hard": hard},
     )
     return entry.to_dict()
@@ -2143,7 +2161,13 @@ async def list_procedural(
     page, total = _sort_and_paginate(
         items, sort=sort, order=order, limit=limit, offset=offset
     )
-    schedule_read_audit(background_tasks, user=user, op="list", layer="procedural")
+    schedule_read_audit(
+        background_tasks,
+        user=user,
+        op="list",
+        layer="procedural",
+        tier=MEMORY_AUDIT_TIER_BOTH,
+    )
     emit_recall_telemetry(
         classify_recall_source_from_request(request), "procedural", total, cache="n/a"
     )
@@ -2176,7 +2200,12 @@ async def read_procedural(
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(
-        background_tasks, user=user, op="read", layer="procedural", key=filename
+        background_tasks,
+        user=user,
+        op="read",
+        layer="procedural",
+        key=filename,
+        tier=read_tier(doc.metadata),
     )
     emit_recall_telemetry(
         classify_recall_source_from_request(request), "procedural", 1, cache="n/a"
@@ -2240,7 +2269,11 @@ async def update_procedural(
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
     await emit_write_audits(
-        user=user, layer="procedural", filename=filename, copied_from=copied_from
+        user=user,
+        layer="procedural",
+        filename=filename,
+        copied_from=copied_from,
+        tier=entry.tier,
     )
     return entry.to_dict()
 
@@ -2289,6 +2322,7 @@ async def delete_procedural(
         op="delete",
         layer="procedural",
         key=filename,
+        tier=entry.tier,
         detail_extra={"hard": hard},
     )
     return entry.to_dict()
@@ -2390,6 +2424,7 @@ async def create_semantic(
         collection=collection,
         filename=document_id,
         copied_from=copied_from,
+        tier=entry.tier,
     )
     return entry.to_dict()
 
@@ -2741,6 +2776,11 @@ async def list_semantic(
         op="list",
         layer="semantic",
         collection=collection,
+        tier=(
+            MEMORY_AUDIT_TIER_BOTH
+            if corpus_read_cleared(user, collection)
+            else "private"
+        ),
     )
     emit_recall_telemetry(
         classify_recall_source_from_request(request),
@@ -2824,6 +2864,7 @@ async def read_semantic(
             layer="semantic",
             collection=collection,
             key=document_id,
+            tier=read_tier(doc.metadata),
         )
         emit_recall_telemetry(
             classify_recall_source_from_request(request),
@@ -2852,6 +2893,7 @@ async def read_semantic(
         layer="semantic",
         collection=collection,
         key=document_id,
+        tier=read_tier(doc.metadata),
     )
     emit_recall_telemetry(
         classify_recall_source_from_request(request), collection, 1, cache="n/a"
@@ -2931,6 +2973,7 @@ async def update_semantic(
         collection=collection,
         filename=document_id,
         copied_from=copied_from,
+        tier=entry.tier,
     )
     return entry.to_dict()
 
@@ -2986,6 +3029,7 @@ async def delete_semantic(
         layer="semantic",
         collection=collection,
         key=document_id,
+        tier=entry.tier,
         detail_extra={"hard": hard},
     )
     return entry.to_dict()

@@ -17,7 +17,9 @@ from unittest.mock import patch
 
 import pytest
 from fastapi import BackgroundTasks
+from fastapi.testclient import TestClient
 
+from audittrace.identity import UserContext
 from audittrace.services.memory_audit import (
     MEMORY_AUDIT_EVENT_CLASS,
     MEMORY_AUDIT_PROJECT,
@@ -31,23 +33,30 @@ from audittrace.services.memory_audit import (
 class TestBuildRowNullOwnerGuard:
     """ADR-058 invariant — never persist an audit row with a NULL owner."""
 
-    async def test_missing_user_id_raises(self, client, user_context) -> None:
+    async def test_missing_user_id_raises(
+        self, client: TestClient, user_context: UserContext
+    ) -> None:
         empty_user = replace(user_context, user_id="")
         with pytest.raises(ValueError, match="refusing to persist"):
             await emit_memory_audit_event(
-                user=empty_user, op="read", layer="episodic", key="x.md"
+                user=empty_user,
+                op="read",
+                layer="episodic",
+                key="x.md",
+                tier="private",
             )
 
 
 class TestEmitMemoryAuditEvent:
     async def test_persists_row_queryable_via_interactions(
-        self, client, user_context
+        self, client: TestClient, user_context: UserContext
     ) -> None:
         await emit_memory_audit_event(
             user=user_context,
             op="read",
             layer="episodic",
             key="ADR-x.md",
+            tier="corpus",
         )
         r = client.get(
             "/interactions", params={"event_class": MEMORY_AUDIT_EVENT_CLASS}
@@ -76,7 +85,7 @@ class TestEmitMemoryAuditEvent:
         }
 
     async def test_collection_and_detail_extra_are_recorded(
-        self, client, user_context
+        self, client: TestClient, user_context: UserContext
     ) -> None:
         await emit_memory_audit_event(
             user=user_context,
@@ -84,6 +93,7 @@ class TestEmitMemoryAuditEvent:
             layer="semantic",
             collection="decisions",
             key="doc-1",
+            tier="private",
             detail_extra={"hard": True},
         )
         r = client.get(
@@ -96,13 +106,14 @@ class TestEmitMemoryAuditEvent:
         assert detail["hard"] is True
 
     async def test_outcome_failed_sets_failure_class(
-        self, client, user_context
+        self, client: TestClient, user_context: UserContext
     ) -> None:
         await emit_memory_audit_event(
             user=user_context,
             op="write",
             layer="procedural",
             key="fails.md",
+            tier="private",
             outcome="failed",
         )
         r = client.get(
@@ -113,12 +124,15 @@ class TestEmitMemoryAuditEvent:
         row = next(row for row in rows if row["question"].startswith("op=write"))
         assert row["failure_class"] == "memory_access_failed"
 
-    async def test_trace_id_passthrough(self, client, user_context) -> None:
+    async def test_trace_id_passthrough(
+        self, client: TestClient, user_context: UserContext
+    ) -> None:
         await emit_memory_audit_event(
             user=user_context,
             op="read",
             layer="episodic",
             key="traced.md",
+            tier="private",
             trace_id="a" * 32,
         )
         r = client.get(
@@ -136,10 +150,10 @@ class TestEmitMemoryAuditEventBackground:
     """The fail-open wrapper used for the READ path."""
 
     async def test_success_persists_like_the_foreground_call(
-        self, client, user_context
+        self, client: TestClient, user_context: UserContext
     ) -> None:
         await emit_memory_audit_event_background(
-            user=user_context, op="list", layer="procedural"
+            user=user_context, op="list", layer="procedural", tier="private+corpus"
         )
         r = client.get(
             "/interactions", params={"event_class": MEMORY_AUDIT_EVENT_CLASS}
@@ -148,7 +162,10 @@ class TestEmitMemoryAuditEventBackground:
         assert any(row["question"] == "op=list layer=procedural key=-" for row in rows)
 
     async def test_failure_is_swallowed_and_logged(
-        self, client, user_context, monkeypatch
+        self,
+        client: TestClient,
+        user_context: UserContext,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A read must never fail because its audit-store write failed —
         the exception is caught here, not propagated.
@@ -170,7 +187,11 @@ class TestEmitMemoryAuditEventBackground:
         with patch("audittrace.services.memory_audit.logger") as mock_logger:
             # Must not raise.
             await emit_memory_audit_event_background(
-                user=user_context, op="read", layer="episodic", key="x.md"
+                user=user_context,
+                op="read",
+                layer="episodic",
+                key="x.md",
+                tier="private",
             )
         assert mock_logger.exception.call_count == 1
         message = mock_logger.exception.call_args[0][0]
@@ -179,10 +200,17 @@ class TestEmitMemoryAuditEventBackground:
 
 
 class TestScheduleReadAudit:
-    async def test_schedules_the_background_wrapper(self, user_context) -> None:
+    async def test_schedules_the_background_wrapper(
+        self, user_context: UserContext
+    ) -> None:
         bg = BackgroundTasks()
         schedule_read_audit(
-            bg, user=user_context, op="read", layer="episodic", key="k.md"
+            bg,
+            user=user_context,
+            op="read",
+            layer="episodic",
+            key="k.md",
+            tier="private",
         )
         assert len(bg.tasks) == 1
         task = bg.tasks[0]
@@ -190,11 +218,19 @@ class TestScheduleReadAudit:
         assert task.kwargs["op"] == "read"
         assert task.kwargs["layer"] == "episodic"
         assert task.kwargs["key"] == "k.md"
+        assert task.kwargs["tier"] == "private"
 
-    async def test_runs_and_persists_when_invoked(self, client, user_context) -> None:
+    async def test_runs_and_persists_when_invoked(
+        self, client: TestClient, user_context: UserContext
+    ) -> None:
         bg = BackgroundTasks()
         schedule_read_audit(
-            bg, user=user_context, op="read", layer="semantic", collection="decisions"
+            bg,
+            user=user_context,
+            op="read",
+            layer="semantic",
+            collection="decisions",
+            tier="private",
         )
         await bg()
         r = client.get(
