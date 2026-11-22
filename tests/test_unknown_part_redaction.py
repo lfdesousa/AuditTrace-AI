@@ -780,6 +780,22 @@ class TestNestedValuesOnFourArms:
         assert "enable_thinking" in text and SHORT not in text
 
 
+class TestMapKeyNamesAreBounded:
+    def test_a_payload_used_as_a_map_key_is_not_traced(self) -> None:
+        from audittrace.media.redaction import redact_request_fields
+
+        out = redact_request_fields(
+            {
+                "chat_template_kwargs": {SHORT: True, "enable_thinking": False},
+                "metadata": {SHORT: "x"},
+                "logit_bias": {SHORT: 1},
+            }
+        )
+        assert SHORT not in json.dumps(out)
+        assert out["chat_template_kwargs"]["enable_thinking"] is False
+        assert out["chat_template_kwargs"]["unknown"].startswith("[REDACTED:media")
+
+
 class TestTheQueryIsReadLikeTheRedaction:
     """Review A-6: a bare string in a content list is not text; the query ignores it too.
 
