@@ -87,6 +87,23 @@ CONTAINERS: dict[str, Any] = {
 }
 
 
+_BLOB = {"type": "custom_blob", "blob": SHORT}
+_Q = {"role": "user", "content": QUESTION}
+#: whole ``messages`` lists the schema does not allow (a message without a role, a message
+#: that is not an object): the canary must reach no telemetry site although the route may
+#: answer them with an error of its own (outside this change).
+MESSAGE_SHAPES: dict[str, list[Any]] = {
+    "roleless-list": [{"content": [{"type": "text", "text": QUESTION}, _BLOB]}, _Q],
+    "roleless-dict-content": [{"content": _BLOB}, _Q],
+    "roleless-last": [_Q, {"content": [_BLOB]}],
+    "non-object-list": [_Q, [_BLOB]],
+    "non-object-str": [_Q, SHORT],
+    "non-object-number-list": [_Q, [1, [SHORT]]],
+    "non-object-only": [[_BLOB]],
+    "non-object-str-only": [SHORT],
+}
+
+
 def _container(content: Any) -> list[dict[str, Any]]:
     return [{"role": "user", "content": content}]
 
@@ -107,6 +124,11 @@ def shape(request: pytest.FixtureRequest) -> str:
 
 @pytest.fixture(params=sorted(CONTAINERS))
 def container(request: pytest.FixtureRequest) -> str:
+    return str(request.param)
+
+
+@pytest.fixture(params=sorted(MESSAGE_SHAPES))
+def message_shape(request: pytest.FixtureRequest) -> str:
     return str(request.param)
 
 
@@ -209,9 +231,20 @@ class TestTheRedactionFunction:
         out = redact_media_payloads(_user({"type": "custom_blob", "b": deep}), None)
         assert out[0]["content"][1]["type"] == "custom_blob"
 
-    def test_a_non_object_message_is_left_alone(self) -> None:
-        """A message that is not an object has no ``content`` to read: out of this rule."""
-        assert redact_media_payloads(["x"], None) == ["x"]
+    @pytest.mark.parametrize(
+        ("message", "marker"),
+        [
+            ("bare", "[REDACTED:media message str chars=4]"),
+            ([1, 2], "[REDACTED:media message list items=2]"),
+            (7, "[REDACTED:media message int]"),
+            (None, "[REDACTED:media message NoneType]"),
+        ],
+        ids=["str", "list", "int", "none"],
+    )
+    def test_a_message_that_is_not_an_object_is_replaced_whole(
+        self, message: Any, marker: str
+    ) -> None:
+        assert redact_media_payloads([message], None) == [{"redacted": marker}]
 
     @pytest.mark.parametrize("name", sorted(CONTAINERS))
     def test_a_content_shape_the_schema_does_not_allow_is_redacted_whole(
@@ -351,6 +384,54 @@ class TestContainerShapesOnFourArms:
         assert len(posts) == 1, "control: one Langfuse ingestion POST"
         assert SHORT not in posts[0]
         assert "[REDACTED:media" in posts[0]
+
+
+class TestMessageShapesOnFourArms:
+    """Review of the fail-closed round: a message without a role, a message that is no object."""
+
+    def test_no_telemetry_site_carries_it(
+        self,
+        client: Any,
+        arm: tuple[str, bool],
+        message_shape: str,
+        langfuse_on: None,
+        debug_logs: None,
+    ) -> None:
+        mode, stream = arm
+        messages = MESSAGE_SHAPES[message_shape]
+        before = copy.deepcopy(messages)
+        fake = ok_fake(mode, stream)
+        try:
+            post_chat(client, fake, stream=stream, messages=messages)
+        except Exception:
+            pass  # the route's own error for such a request is not under test here
+        assert messages == before, "the input is never mutated"
+        spans = [json.loads(s) for s in net._SPAN_END_SNAPSHOTS]
+        assert any(s["name"] == "POST /v1/chat/completions" for s in spans), "control"
+        carrying = sorted(
+            {
+                f"{s['name']} :: {k}"
+                for s in spans
+                for k, v in s["attributes"].items()
+                if SHORT in str(v)
+            }
+        )
+        assert carrying == []
+        records = list(net._LOG_RECORD_SNAPSHOTS)
+        assert any("chat" in r for r in records), "control: chat log records seen"
+        assert [r[:100] for r in records if SHORT in r] == []
+        assert [p[:100] for p in non_upstream_posts(fake) if SHORT in p] == []
+
+    def test_a_role_less_message_reaches_the_model_server_unchanged(
+        self, client: Any, arm: tuple[str, bool]
+    ) -> None:
+        mode, stream = arm
+        messages = MESSAGE_SHAPES["roleless-list"]
+        fake = ok_fake(mode, stream)
+        response = post_chat(client, fake, stream=stream, messages=messages)
+        assert response.status_code == 200
+        sent = [m for b in upstream_bodies(fake) for m in b["messages"]]
+        assert messages[0] in sent, "ADR-024: forwarded as it came"
 
 
 class TestTheQueryIsReadLikeTheRedaction:

@@ -68,6 +68,39 @@ def _placeholder_value(value: Any) -> dict[str, Any]:
     return {"type": "unknown", "redacted": f"[REDACTED:media unknown {kind}{size}]"}
 
 
+def placeholder_message(message: Any) -> dict[str, Any]:
+    """A ``messages`` element that is not an object, reduced to its kind and its size.
+
+    The schema allows only message objects. Whatever else is in the list (a list of parts, a
+    bare string, a number) is a shape the service does not know and is never traced.
+    """
+    kind = type(message).__name__
+    size = (
+        f" chars={len(message)}"
+        if isinstance(message, str)
+        else f" items={len(message)}"
+        if isinstance(message, (list, tuple))
+        else ""
+    )
+    return {"redacted": f"[REDACTED:media message {kind}{size}]"}
+
+
+def redact_message_list(messages: list[Any]) -> list[Any]:
+    """The elements of a ``messages`` list that are not objects, replaced (objects as they are).
+
+    For the renderer, which redacts each message object's ``content`` itself when it reaches it.
+    """
+    return [
+        message if isinstance(message, dict) else placeholder_message(message)
+        for message in messages
+    ]
+
+
+def looks_like_messages(value: list[Any]) -> bool:
+    """A list with at least one message object (an object with a ``role``) is a messages list."""
+    return any(isinstance(item, dict) and "role" in item for item in value)
+
+
 def redact_content(content: Any) -> Any:
     """A message's ``content`` made safe for telemetry (the input is never modified).
 
@@ -144,7 +177,7 @@ def redact_media_payloads(
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             out.append(
-                message
+                placeholder_message(message)
                 if not isinstance(message, dict)
                 else {**message, "content": redact_content(content)}
             )

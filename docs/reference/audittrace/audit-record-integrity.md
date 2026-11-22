@@ -148,7 +148,10 @@ service does not know (for example a custom `blob` part) is replaced whole by a 
 keeps its type name and its number of keys. The same holds for a shape the OpenAI schema
 does not allow: a message `content` that is neither a string nor a list (a dict, a number) is
 replaced whole by a marker that records its type and size, and a list element that is not a part
-object (a bare string, a number, a nested list) is treated as an unknown part. The model server
+object (a bare string, a number, a nested list) is treated as an unknown part. A message that
+is not an object, and a message without a `role`, are redacted the same way (the marker records the
+container type and its size). How the route answers such a request is not changed by this: some of
+them already end in an error of their own, and the telemetry written before that error is clean. The model server
 still receives every part unchanged, and the audit record never holds a payload.
 
 The types the service treats as text are `text`, `refusal` and `image_url` (the OpenAI

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import inspect
 import itertools
 import json
 import logging
@@ -64,7 +65,11 @@ from audittrace.identity import (
     build_secret_window_index as _secret_window_index,  # noqa: F401
 )
 from audittrace.media.payload_scrub import scrub_base64_runs, scrub_data_url_payloads
-from audittrace.media.redaction import redact_content
+from audittrace.media.redaction import (
+    looks_like_messages,
+    redact_content,
+    redact_message_list,
+)
 
 
 def _is_expected_client_error(exc: BaseException) -> bool:
@@ -699,11 +704,15 @@ def _render_value_inner(
         for k, v in value.items():
             if budget is not None and budget.exhausted():
                 break
-            if k == "content" and "role" in value:
+            if k == "content":
                 # #474: a message's content never reaches a span attribute or a log line
                 # with a media payload, as a part of a type the service does not know, or
                 # in a shape the schema does not allow (a dict, a bare string in a list).
+                # Decided by the SHAPE of the value, not by a sibling key: a message
+                # without a ``role`` is redacted too (a string and a null pass as text).
                 v = redact_content(v)
+            elif k == "messages" and isinstance(v, list):
+                v = redact_message_list(v)
             if isinstance(k, str):
                 rendered_key = scrub_text(k)
             else:
@@ -746,6 +755,9 @@ def _render_value_inner(
         # ``test_g_p2b_n08_neuter_increasing_the_list_charge_reddens``
         # for the guard that still catches a GENUINE increase (e.g. to
         # "+3") over this baseline.
+        if isinstance(value, list) and looks_like_messages(value):
+            # a messages list handed over as an argument (no key names it)
+            value = redact_message_list(value)
         rendered_list: list[Any] = []
         for item in value:
             if budget is not None and budget.exhausted():
@@ -1489,6 +1501,20 @@ def log_call(
                 )
             )
             real_args = args[1:] if starts_with_self else args
+            # #474: a parameter named ``messages`` is a messages list; its elements that
+            # are not objects are never traced (the renderer cannot tell otherwise: the
+            # positional argument has no key).
+            try:
+                names = list(inspect.signature(func).parameters)
+                names = names[1:] if starts_with_self else names
+                real_args = tuple(
+                    redact_message_list(a)
+                    if i < len(names) and names[i] == "messages" and isinstance(a, list)
+                    else a
+                    for i, a in enumerate(real_args)
+                )
+            except (TypeError, ValueError):  # pragma: no cover - no signature
+                pass
             payload: dict[str, Any] = {}
             if real_args:
                 payload["args"] = real_args

@@ -141,6 +141,8 @@ class TestTheNoteStatesWhatIsRemoved:
             "audit record never holds a payload",
             "neither a string nor a list",
             "a list element that is not a part object",
+            "A message that\nis not an object".replace("\n", " "),
+            "a message without a `role`",
             "What is not removed is text",
             "A `text` part is traced as written",
             "more than 128 characters",
