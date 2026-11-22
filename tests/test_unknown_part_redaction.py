@@ -200,8 +200,13 @@ class TestKnownHoldersKeepTheirSchemaKeys:
         assert SHORT not in json.dumps(out)
         assert safe["blob"].startswith(f"[REDACTED:media {kind} key str chars=96")
         assert set(safe) == keys | {"blob"}
-        passed = {k: v for k, v in safe.items() if k in keys and k != "blob"}
-        assert passed, "control: the schema keys are still traced"
+        from audittrace.media.redaction import _PAYLOAD_SLOTS
+
+        plain = keys - set(_PAYLOAD_SLOTS.get(kind, ()))
+        assert plain, "control: the kind has schema keys that are not payload slots"
+        assert all(safe[k] == "v" for k in plain), (
+            "the schema keys are traced as written"
+        )
 
     def test_the_input_is_not_mutated(self) -> None:
         part = {"type": "file", "file": {"filename": "n", "blob": SHORT}}
