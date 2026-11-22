@@ -528,6 +528,73 @@ class TestMessageKeysAreAnAllowList:
         assert out[0]["tool_calls"] == calls
 
 
+class TestLogCallRedactsByParameterName:
+    """The DEBUG lines and the span input/output of a decorated function, without a route.
+
+    A positional argument has no key the renderer could see, so ``log_call`` redacts a
+    ``messages`` list, a ``payload`` dict and the list a ``messages`` function returns.
+    """
+
+    def _run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[list[dict[str, Any]], list[Any]]:
+        import logging as _logging
+
+        from audittrace import telemetry
+        from audittrace.logging_config import log_call
+
+        written: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            telemetry,
+            "set_current_span_attributes",
+            lambda attrs: written.append(dict(attrs)),
+        )
+        log = _logging.getLogger("test.log_call.by_name")
+        records: list[Any] = []
+
+        class _Grab(_logging.Handler):
+            def emit(self, record: _logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Grab(_logging.DEBUG)
+        log.addHandler(handler)
+        log.setLevel(_logging.DEBUG)
+
+        @log_call(logger=log)
+        def merge(
+            messages: list[Any], context: str, payload: dict[str, Any]
+        ) -> list[Any]:
+            return [dict(m) if isinstance(m, list) else m for m in messages]
+
+        try:
+            merge(
+                [{"role": "user", "content": QUESTION}, [["blob", SHORT]], SHORT],
+                "ctx",
+                {"model": "m", "input": [[_BLOB]], "blob_field": SHORT},
+            )
+        finally:
+            log.removeHandler(handler)
+        return written, records
+
+    def test_span_input_and_output_carry_no_payload(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        written, _ = self._run(monkeypatch)
+        text = json.dumps(written)
+        assert "input.value" in text and "output.value" in text, "control"
+        assert QUESTION in text, "control: text is traced"
+        assert SHORT not in text and "custom_blob" not in text.replace("[REDACTED", "")
+
+    def test_the_debug_lines_carry_no_payload(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, records = self._run(monkeypatch)
+        lines = [json.dumps(r.__dict__, default=str) for r in records]
+        assert any("OUTPUT" in str(r.getMessage()) for r in records), "control"
+        assert any("INPUT" in str(r.getMessage()) for r in records), "control"
+        assert [ln[:80] for ln in lines if SHORT in ln] == []
+
+
 class TestTheQueryIsReadLikeTheRedaction:
     """Review A-6: a bare string in a content list is not text; the query ignores it too.
 
