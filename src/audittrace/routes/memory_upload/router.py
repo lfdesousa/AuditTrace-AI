@@ -67,6 +67,8 @@ async def get_upload_status(
         # detached row raises rather than returning a wrong value, so this
         # was fail-closed rather than a leak, but a 500 in an authz path is
         # still the wrong failure.
+        # The row's own tier (NOT NULL column), for the audit row below.
+        scan_tier = None if row is None else row.tier
         snapshot = (
             None
             if row is None
@@ -83,7 +85,7 @@ async def get_upload_status(
             }
         )
 
-    if snapshot is None:
+    if snapshot is None or scan_tier is None:
         raise HTTPException(status_code=404, detail=f"scan_id not found: {scan_id}")
     if not (
         user.is_admin
@@ -105,6 +107,7 @@ async def get_upload_status(
         op="read",
         layer="episodic",
         key=scan_id,
+        tier=scan_tier,
         detail_extra={"endpoint": "upload_status"},
     )
 

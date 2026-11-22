@@ -245,6 +245,7 @@ async def _write_semantic_document(
             layer="semantic",
             collection=collection,
             key=document_id,
+            tier=entry.tier,
             detail_extra={"copied_from": copied_from} if copied_from else None,
         )
         if copied_from:
@@ -254,6 +255,7 @@ async def _write_semantic_document(
                 layer="semantic",
                 collection=collection,
                 key=document_id,
+                tier=entry.tier,
                 detail_extra={"reason": "copy_forward"},
             )
     except Exception as exc:
