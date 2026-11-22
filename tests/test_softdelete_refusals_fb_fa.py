@@ -299,3 +299,45 @@ class TestARefusedReadLeavesOneTracedLogLine:
                 assert client.get(f"/memory/{layer}/{name}").status_code == 200
 
         assert _refused_lines(logs) == []
+
+
+class _Route:
+    """A stand-in for a matched route: a path template and, optionally, its regex."""
+
+    def __init__(self, path: str, regex: re.Pattern[str] | None) -> None:
+        self.path = path
+        self.path_regex = regex
+
+
+class TestTheRouteTemplateNeverFallsBackToTheRawUrl:
+    """F-a route field. The fallbacks of ``_route_template`` return a template or
+    nothing, never the request path (which holds the requested key)."""
+
+    @staticmethod
+    def _template(route: object | None, path: str) -> str:
+        from starlette.requests import Request
+
+        from audittrace.routes.memory_refused_read import _route_template
+
+        scope: dict[str, Any] = {"type": "http", "path": path}
+        if route is not None:
+            scope["route"] = route
+        return _route_template(Request(scope))
+
+    def test_a_request_with_no_matched_route_has_an_empty_route(self) -> None:
+        assert self._template(None, "/memory/episodic/secret.md") == ""
+
+    def test_a_route_without_a_regex_is_its_own_path(self) -> None:
+        assert (
+            self._template(_Route("/episodic/{filename:path}", None), "/x/secret.md")
+            == "/episodic/{filename:path}"
+        )
+
+    def test_a_path_the_regex_does_not_match_keeps_the_route_path_only(self) -> None:
+        route = _Route("/episodic/{filename:path}", re.compile(r"^/episodic/(.*)$"))
+        assert self._template(route, "/other/secret.md") == "/episodic/{filename:path}"
+
+    def test_the_include_prefix_is_kept_and_the_key_is_not(self) -> None:
+        route = _Route("/episodic/{filename:path}", re.compile(r"^/episodic/(.*)$"))
+        got = self._template(route, "/memory/episodic/secret.md")
+        assert got == "/memory/episodic/{filename:path}" and "secret" not in got
