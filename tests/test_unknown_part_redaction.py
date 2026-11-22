@@ -103,6 +103,9 @@ MESSAGE_SHAPES: dict[str, list[Any]] = {
     "roleless-blob-key": [{"blob": SHORT}, _Q],
     "roleless-parts-key": [{"parts": [_BLOB]}, _Q],
     "role-bearing-extra-key": [{"role": "user", "content": QUESTION, "blob": SHORT}],
+    "list-content-extra-key": [
+        {"role": "user", "content": [{"type": "text", "text": QUESTION}], "blob": SHORT}
+    ],
     # the route turns a [key, value] pair into {key: value} (dict(m)) before the model call
     "mangled-pairs": [_Q, [["blob", SHORT]]],
     "mangled-pairs-first": [[["blob", SHORT]], _Q],
