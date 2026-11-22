@@ -65,11 +65,7 @@ from audittrace.identity import (
     build_secret_window_index as _secret_window_index,  # noqa: F401
 )
 from audittrace.media.payload_scrub import scrub_base64_runs, scrub_data_url_payloads
-from audittrace.media.redaction import (
-    looks_like_messages,
-    redact_content,
-    redact_message_list,
-)
+from audittrace.media.redaction import redact_content, redact_message_list
 
 
 def _is_expected_client_error(exc: BaseException) -> bool:
@@ -755,9 +751,6 @@ def _render_value_inner(
         # ``test_g_p2b_n08_neuter_increasing_the_list_charge_reddens``
         # for the guard that still catches a GENUINE increase (e.g. to
         # "+3") over this baseline.
-        if isinstance(value, list) and looks_like_messages(value):
-            # a messages list handed over as an argument (no key names it)
-            value = redact_message_list(value)
         rendered_list: list[Any] = []
         for item in value:
             if budget is not None and budget.exhausted():

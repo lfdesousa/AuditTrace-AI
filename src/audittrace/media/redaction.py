@@ -96,11 +96,6 @@ def redact_message_list(messages: list[Any]) -> list[Any]:
     ]
 
 
-def looks_like_messages(value: list[Any]) -> bool:
-    """A list with at least one message object (an object with a ``role``) is a messages list."""
-    return any(isinstance(item, dict) and "role" in item for item in value)
-
-
 def redact_content(content: Any) -> Any:
     """A message's ``content`` made safe for telemetry (the input is never modified).
 
