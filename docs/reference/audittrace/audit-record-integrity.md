@@ -142,8 +142,10 @@ Other kinds of rows use their own values in this column; none of them uses `requ
 
 No media payload of any size reaches a span attribute, a log line, the input tag of the entry
 span or the trace-ingestion body. An inline image is replaced by its digest. A part of type
-`input_audio`, `input_video` or `file` keeps its type and its other keys, and its payload
-(`data`, `url`, `file_data`) is replaced by a marker that gives its length. A part of any type the
+`input_audio`, `input_video` or `file` keeps its type and the keys of its schema (`input_audio`
+holds `data` and `format`, `file` holds `file_data`, `file_id` and `filename`, an `image_url` holds
+`url` and `detail`), and its payload (`data`, `url`, `file_data`) is replaced by a marker that gives
+its length. Any other key of that object holds a marker. A part of any type the
 service does not know (for example a custom `blob` part) is replaced whole by a marker that
 keeps its type name and its number of keys. The same holds for a shape the OpenAI schema
 does not allow: a message `content` that is neither a string nor a list (a dict, a number) is

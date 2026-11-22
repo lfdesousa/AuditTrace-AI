@@ -36,6 +36,7 @@ from tests import conftest as net
 from tests._image_slice import (
     ARM_IDS,
     ARMS,
+    DATA_URL,
     QUESTION,
     flip_mode,
     non_upstream_posts,
@@ -59,6 +60,23 @@ SHAPES: dict[str, dict[str, Any]] = {
     },
     "video-short": {"type": "input_video", "input_video": {"data": SHORT}},
     "file-short": {"type": "file", "file": {"filename": "n.pdf", "file_data": SHORT}},
+    # an extra key inside a known media holder (the holder keeps only its schema keys)
+    "audio-holder-extra": {
+        "type": "input_audio",
+        "input_audio": {"data": "AAAA", "format": "wav", "blob": SHORT},
+    },
+    "video-holder-extra": {
+        "type": "input_video",
+        "input_video": {"data": "AAAA", "blob": SHORT},
+    },
+    "file-holder-extra": {
+        "type": "file",
+        "file": {"filename": "n.pdf", "file_data": "AAAA", "blob": SHORT},
+    },
+    "image-holder-extra": {
+        "type": "image_url",
+        "image_url": {"url": DATA_URL, "detail": "low", "blob": SHORT},
+    },
     "audio-url-safe": {
         "type": "input_audio",
         "input_audio": {
@@ -161,6 +179,35 @@ def debug_logs() -> Iterator[None]:
     root.setLevel(logging.DEBUG)
     yield
     root.setLevel(before)
+
+
+class TestKnownHoldersKeepTheirSchemaKeys:
+    @pytest.mark.parametrize(
+        ("kind", "keys"),
+        [
+            ("input_audio", {"data", "format"}),
+            ("input_video", {"data", "url", "format"}),
+            ("file", {"file_data", "file_id", "filename"}),
+            ("image_url", {"url", "detail"}),
+        ],
+    )
+    def test_the_schema_keys_pass_and_any_other_key_is_a_marker(
+        self, kind: str, keys: set[str]
+    ) -> None:
+        holder = {k: "v" for k in keys} | {"blob": SHORT}
+        out = redact_media_payloads(_user({"type": kind, kind: holder}), None)
+        safe = out[0]["content"][1][kind]
+        assert SHORT not in json.dumps(out)
+        assert safe["blob"].startswith(f"[REDACTED:media {kind} key str chars=96")
+        assert set(safe) == keys | {"blob"}
+        passed = {k: v for k, v in safe.items() if k in keys and k != "blob"}
+        assert passed, "control: the schema keys are still traced"
+
+    def test_the_input_is_not_mutated(self) -> None:
+        part = {"type": "file", "file": {"filename": "n", "blob": SHORT}}
+        before = copy.deepcopy(part)
+        redact_media_payloads(_user(part), None)
+        assert part == before
 
 
 class TestTheRedactionFunction:
@@ -304,11 +351,12 @@ class TestTheRedactionFunction:
         self, kind: str
     ) -> None:
         slot = "file_data" if kind == "file" else "data"
-        part = {"type": kind, kind: {slot: SHORT, "format": "wav"}}
+        extra = {"format": "wav"} if kind != "file" else {"filename": "n.pdf"}
+        part = {"type": kind, kind: {slot: SHORT, **extra}}
         out = redact_media_payloads(_user(part), None)[0]["content"][1]
         assert out == {
             "type": kind,
-            kind: {slot: f"[REDACTED:media {kind} chars=96]", "format": "wav"},
+            kind: {slot: f"[REDACTED:media {kind} chars=96]", **extra},
         }
 
 
@@ -332,7 +380,10 @@ class TestTheRouteOnFourArms:
         entry = [s for s in spans if s["name"] == "POST /v1/chat/completions"]
         assert entry, "control: the entry span ended"
         assert all(
-            "[REDACTED:media" in s["attributes"].get("langfuse.observation.input", "")
+            any(
+                m in s["attributes"].get("langfuse.observation.input", "")
+                for m in ("[REDACTED:media", "[image sha256=")
+            )
             for s in entry
         ), "control: the entry tag shows a payload was removed"
         if not stream:
@@ -355,7 +406,7 @@ class TestTheRouteOnFourArms:
         assert len(posts) == 1, "control: one Langfuse ingestion POST"
         assert QUESTION in posts[0], "control: the trace input still holds the text"
         assert SHORT not in posts[0]
-        assert "[REDACTED:media" in posts[0]
+        assert "[REDACTED:media" in posts[0] or "[image sha256=" in posts[0]
 
 
 class TestContainerShapesOnFourArms:

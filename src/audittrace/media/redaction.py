@@ -120,6 +120,20 @@ _REQUEST_KEYS = frozenset(
 )  # fmt: skip
 
 
+#: The keys of the object a media content part holds, in the OpenAI chat-completions part
+#: schemas: ``input_audio`` {data, format}, ``file`` {file_data, file_id, filename},
+#: ``image_url`` {url, detail}; ``input_video`` is not an OpenAI part, the model server reads
+#: its source from ``data`` else ``url`` (the slots handled in ``_PAYLOAD_SLOTS``) plus a
+#: ``format``; ``input_audio`` also accepts ``url`` there. Any other key of the holder is
+#: fail-closed: its value is never traced (the payload slots are redacted as before).
+_HOLDER_KEYS = {
+    "input_audio": frozenset({"data", "format", "url"}),
+    "input_video": frozenset({"data", "url", "format"}),
+    "file": frozenset({"file_data", "file_id", "filename"}),
+    "image_url": frozenset({"url", "detail"}),
+}
+
+
 def _size(value: Any) -> str:
     if isinstance(value, str):
         return f" chars={len(value)}"
@@ -216,12 +230,19 @@ def _redact_part(part: dict[str, Any]) -> dict[str, Any]:
         holder = part.get(kind)
         if not (isinstance(holder, dict) and set(part) <= {"type", kind}):
             return _placeholder(part)
-        safe = dict(holder)
+        safe = _redact_unknown_keys(holder, _HOLDER_KEYS[kind], kind)
         for slot in _PAYLOAD_SLOTS[kind]:
             if isinstance(safe.get(slot), str):
                 safe[slot] = f"[REDACTED:media {kind} chars={len(safe[slot])}]"
         return redact_media_links({**part, kind: safe})
     if _is_known_text_part(part):
+        if kind == "image_url" and isinstance(part.get("image_url"), dict):
+            part = {
+                **part,
+                "image_url": _redact_unknown_keys(
+                    part["image_url"], _HOLDER_KEYS["image_url"], "image_url"
+                ),
+            }
         return redact_media_links(part)
     return _placeholder(part)
 

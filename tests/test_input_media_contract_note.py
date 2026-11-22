@@ -138,6 +138,8 @@ class TestTheNoteStatesWhatIsRemoved:
             "the trace-ingestion body",
             "`input_audio`, `input_video` or `file`",
             "replaced whole",
+            "keeps its type and the keys of its schema",
+            "Any other key of that object holds a marker",
             "audit record never holds a payload",
             "neither a string nor a list",
             "a list element that is not a part object",
