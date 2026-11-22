@@ -6457,6 +6457,8 @@ class TestServiceFailurePaths:
         )
         with patch("audittrace.routes.memory.get_semantic_service") as mock_get:
             svc = MagicMock()
+            # B9 reads the addressed chunk to find its document: awaitable.
+            svc.get_document = AsyncMock(return_value=None)
             svc.delete_document.side_effect = RuntimeError("Chroma down")
             mock_get.return_value = svc
             r = client.delete("/memory/semantic/decisions/doc-shd?hard=true")
@@ -9360,7 +9362,9 @@ class TestMergeSemanticWithChroma:
         """
         from audittrace.routes import memory as m
 
-        tracked = self._entry("audittrace_v2/doc-1")
+        # The manifest keys a row by its LOGICAL collection (B15): the
+        # discovered copy of the same chunk must collapse onto it.
+        tracked = self._entry("audittrace/doc-1")
 
         class _Manifest:
             async def list_for_layer(self, layer, include_deleted=False, caller=None):
@@ -9376,7 +9380,7 @@ class TestMergeSemanticWithChroma:
             [tracked], collection=None, user=user_context
         )
         keys = [i["key"] for i in items]
-        assert keys.count("audittrace_v2/doc-1") == 1, f"duplicated: {keys}"
+        assert keys == ["audittrace/doc-1"], f"duplicated: {keys}"
 
     @pytest.mark.asyncio
     async def test_untracked_document_is_discovered(
@@ -9404,7 +9408,9 @@ class TestMergeSemanticWithChroma:
         items = await m._merge_semantic_with_chroma(
             [], collection=None, user=user_context
         )
-        assert [i["key"] for i in items] == ["audittrace_v2/ghost"]
+        # B15: a discovered row keys under its LOGICAL collection, as its
+        # manifest row would (was ``audittrace_v2/ghost``: the Q2 defect).
+        assert [i["key"] for i in items] == ["audittrace/ghost"]
         assert items[0]["title"] == "T"
         assert items[0]["id"] is None, "discovered rows carry no manifest id"
 

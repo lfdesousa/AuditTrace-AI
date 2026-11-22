@@ -16,6 +16,7 @@ from audittrace.services.context_builder import (
 )
 from audittrace.services.conversational import MockConversationalService
 from audittrace.services.episodic import MockEpisodicService
+from audittrace.services.memory_manifest import MockMemoryManifestService
 from audittrace.services.procedural import MockProceduralService
 from audittrace.services.semantic import MockSemanticService
 
@@ -70,6 +71,7 @@ async def populated_builder(user_context):
         procedural=procedural,
         conversational=conversational,
         semantic=semantic,
+        manifest=MockMemoryManifestService(),
     )
 
 
@@ -81,6 +83,7 @@ def empty_builder():
         procedural=MockProceduralService(),
         conversational=MockConversationalService(),
         semantic=MockSemanticService(),
+        manifest=MockMemoryManifestService(),
     )
 
 
@@ -154,6 +157,7 @@ class TestDefaultContextBuilder:
             procedural=MockProceduralService(),
             conversational=MockConversationalService(),
             semantic=MockSemanticService(),
+            manifest=MockMemoryManifestService(),
         )
         ctx = await builder.build_system_context(
             user_context, project="P", query="server configuration"
@@ -189,6 +193,7 @@ class TestDefaultContextBuilder:
             procedural=MockProceduralService(),
             conversational=MockConversationalService(),
             semantic=MockSemanticService(),
+            manifest=MockMemoryManifestService(),
         )
         # Should not raise
         ctx = await builder.build_system_context(
@@ -219,6 +224,7 @@ class TestDefaultContextBuilder:
             procedural=BrokenProcedural(),
             conversational=MockConversationalService(),
             semantic=MockSemanticService(),
+            manifest=MockMemoryManifestService(),
         )
         ctx, stats = await builder.build_system_context_with_stats(
             user_context, project="P", query="cache"
@@ -238,6 +244,7 @@ class TestDefaultContextBuilder:
             procedural=MockProceduralService(),
             conversational=BrokenConversational(),
             semantic=MockSemanticService(),
+            manifest=MockMemoryManifestService(),
         )
         ctx, stats = await builder.build_system_context_with_stats(
             user_context, project="P", query="cache"
@@ -257,6 +264,7 @@ class TestDefaultContextBuilder:
             procedural=MockProceduralService(),
             conversational=MockConversationalService(),
             semantic=BrokenSemantic(),
+            manifest=MockMemoryManifestService(),
         )
         ctx, stats = await builder.build_system_context_with_stats(
             user_context, project="P", query="cache"
@@ -277,6 +285,7 @@ class TestDefaultContextBuilder:
             procedural=MockProceduralService(),
             conversational=MockConversationalService(),
             semantic=semantic,
+            manifest=MockMemoryManifestService(),
         )
         ctx = await builder.build_system_context(
             user_context, project="P", query="cache"
@@ -482,6 +491,7 @@ class TestNamingConventionInjection:
             procedural=MockProceduralService(),
             conversational=MockConversationalService(),
             semantic=MockSemanticService(),
+            manifest=MockMemoryManifestService(),
         )
         ctx, _ = await empty.build_system_context_with_stats(
             user_context, project="P", query=None

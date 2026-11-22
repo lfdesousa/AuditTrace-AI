@@ -97,6 +97,7 @@ from audittrace.dependencies import (
     get_session_memory_service,
 )
 from audittrace.identity import UserContext
+from audittrace.services.memory_tombstone import any_hidden
 from audittrace.services.recall_telemetry import emit_recall_telemetry
 from audittrace.services.semantic import MAX_RECALL_WINDOW, SearchPage
 from audittrace.tools import register_memory_tool
@@ -406,6 +407,7 @@ def _recall_identity_fields(metadata: dict[str, Any]) -> dict[str, Any]:
     # ``memory:semantic:read`` would decouple recall from read and conflate the
     # decisions domain with the general RAG corpus, so it stays as-is.
     required_scope="memory:episodic:read",
+    cacheable=False,
 )
 async def recall_decisions(
     user_context: UserContext, args: dict[str, Any]
@@ -533,6 +535,7 @@ async def recall_decisions(
     # collection; the semantic service applies the per-user ``where`` from the
     # threaded ``user_context`` and needs no scope of its own.
     required_scope="memory:procedural:read",
+    cacheable=False,
 )
 async def recall_skills(
     user_context: UserContext, args: dict[str, Any]
@@ -907,6 +910,7 @@ async def recall_attachments(
         "required": ["query"],
     },
     required_scope="memory:semantic:read",
+    cacheable=False,
 )
 async def recall_semantic(
     user_context: UserContext, args: dict[str, Any]
@@ -993,6 +997,7 @@ async def recall_semantic(
         "required": ["file"],
     },
     required_scope="memory:episodic:read",
+    cacheable=False,
 )
 async def read_decision(
     user_context: UserContext, args: dict[str, Any]
@@ -1018,6 +1023,12 @@ async def read_decision(
 
     episodic = get_episodic_service()
     doc = await episodic.read(user_context, file)
+    # A tombstone the caller may not read is the never-existed result below.
+    # The lookup is not wrapped: a failure is the tool's error arm (no content).
+    if doc is not None and await any_hidden(
+        get_memory_manifest_service(), "episodic", [file], user_context
+    ):
+        doc = None
     if doc is None:
         return {
             "error": "not_found",
@@ -1061,6 +1072,7 @@ async def read_decision(
         "required": ["file"],
     },
     required_scope="memory:procedural:read",
+    cacheable=False,
 )
 async def read_skill(user_context: UserContext, args: dict[str, Any]) -> dict[str, Any]:
     """Wrap ``ProceduralService.read`` in a full-content tool result."""
@@ -1085,6 +1097,10 @@ async def read_skill(user_context: UserContext, args: dict[str, Any]) -> dict[st
 
     procedural = get_procedural_service()
     doc = await procedural.read(user_context, file)
+    if doc is not None and await any_hidden(
+        get_memory_manifest_service(), "procedural", [file], user_context
+    ):
+        doc = None
     if doc is None:
         return {
             "error": "not_found",

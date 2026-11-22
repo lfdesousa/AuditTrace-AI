@@ -23,6 +23,11 @@ from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
 from audittrace.services.conversational import ConversationalService
 from audittrace.services.episodic import EpisodicService
+from audittrace.services.memory_manifest import MemoryManifestService
+from audittrace.services.memory_tombstone import (
+    without_tombstoned_chunks,
+    without_tombstoned_files,
+)
 from audittrace.services.procedural import ProceduralService
 from audittrace.services.semantic import SemanticService
 
@@ -126,7 +131,13 @@ class DefaultContextBuilder(ContextBuilderService):
         procedural: ProceduralService,
         conversational: ConversationalService,
         semantic: SemanticService,
+        *,
+        manifest: MemoryManifestService,
     ):
+        # REQUIRED (no default): a builder wired without the manifest cannot
+        # tell a tombstone from a live document, and an unfiltered builder is
+        # the defect this argument closes (SPEC SOFTDELETE-DIRECT-READ B14).
+        self._manifest = manifest
         self._episodic = episodic
         self._procedural = procedural
         self._conversational = conversational
@@ -173,7 +184,12 @@ class DefaultContextBuilder(ContextBuilderService):
 
         # Layer 1: Episodic — ADRs
         try:
-            matched_adrs = await self._episodic.search(user_context, query)
+            matched_adrs = await without_tombstoned_files(
+                self._manifest,
+                "episodic",
+                await self._episodic.search(user_context, query),
+                user_context,
+            )
             if matched_adrs:
                 adr_lines = ["## Architecture Decisions"]
                 for adr in matched_adrs:
@@ -189,7 +205,12 @@ class DefaultContextBuilder(ContextBuilderService):
 
         # Layer 2: Procedural — Skills
         try:
-            matched_skills = await self._procedural.search(user_context, query)
+            matched_skills = await without_tombstoned_files(
+                self._manifest,
+                "procedural",
+                await self._procedural.search(user_context, query),
+                user_context,
+            )
             if matched_skills:
                 skill_lines = ["## Relevant Skills"]
                 for s in matched_skills:
@@ -218,7 +239,9 @@ class DefaultContextBuilder(ContextBuilderService):
 
         # Layer 4: Semantic — ChromaDB RAG
         try:
-            rag_docs = await self._semantic.search(user_context, query, k=4)
+            rag_docs = await without_tombstoned_chunks(
+                self._manifest, await self._semantic.search(user_context, query, k=4)
+            )
             if rag_docs:
                 rag_lines = ["## Relevant Context (RAG)"]
                 for d in rag_docs:
