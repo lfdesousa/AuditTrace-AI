@@ -15,10 +15,18 @@ auth:bearer {
 }
 
 tests {
-  test("returns 200", function() {
-    expect(res.getStatus()).to.equal(200);
+  test("returns the expected status (expectedReadStatus, default 200)", function() {
+    expect(res.getStatus()).to.equal(Number(bru.getEnvVar("expectedReadStatus")));
   });
-  test("returns content + manifest", function() {
+  test("a refused read carries no content, title, size or deleted marker", function() {
+    if (res.getStatus() === 200) { return; }
+    const text = JSON.stringify(res.getBody());
+    expect(res.getBody()).to.not.have.property("content");
+    expect(res.getBody()).to.not.have.property("manifest");
+    expect(text).to.not.contain("deleted");
+  });
+  test("returns content + manifest (a 200 only)", function() {
+    if (res.getStatus() !== 200) { return; }
     const body = res.getBody();
     expect(body.content).to.be.a("string");
     expect(body.manifest).to.be.an("object");
@@ -27,6 +35,10 @@ tests {
 }
 
 docs {
+  `expectedReadStatus` (default 200) is the status the run expects: 404 for a document
+  the caller soft-deleted (a tombstone answers exactly as a key that never existed does,
+  for every caller who is not an admin); 200 for an admin or a live document.
+
   Reads ADR content + manifest metadata. 404 when the file
   doesn't exist; manifest may be null if the underlying S3 object
   was uploaded via the legacy /memory/upload path (no manifest row).

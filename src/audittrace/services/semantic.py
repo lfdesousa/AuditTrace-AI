@@ -146,6 +146,20 @@ def _recall_key_fn(sort: str) -> Callable[[Document], Any]:
     return _distance_key
 
 
+def tombstone_candidates(doc: Document) -> set[str]:
+    """Every manifest storage key the document's soft-delete tombstone can
+    carry (LC-9 ADDENDUM-1 C3 reader #5, ADDENDUM-5 section 4): exactly ONE
+    key per row, decided by the row's own stamp (:func:`new_form_owner`),
+    never by the caller or the id string: the owner-keyed
+    ``{owner}/{collection}/{logical_id}`` for a NEW-form chunk, the bare
+    ``{collection}/{chunk_id}`` for a legacy one. The one derivation recall
+    and ``/context`` share (SOFTDELETE-DIRECT-READ B18)."""
+    meta = doc.metadata
+    collection = str(meta.get("collection"))
+    chunk_id = str(meta.get("chunk_id"))
+    return deleted_key_candidates(collection, chunk_id, new_form_owner(meta))
+
+
 class SemanticService(ABC):
     """Abstract semantic memory service — vector search."""
 
@@ -554,16 +568,8 @@ class ChromaSemanticService(SemanticService):
 
     @staticmethod
     def _tombstone_candidates(doc: Document) -> set[str]:
-        """Every manifest storage key the document's soft-delete tombstone can
-        carry (LC-9 ADDENDUM-1 C3 reader #5, ADDENDUM-5 section 4): exactly ONE
-        key per row, decided by the row's own stamp (:func:`new_form_owner`),
-        never by the caller or the id string: the owner-keyed
-        ``{owner}/{collection}/{logical_id}`` for a NEW-form chunk, the bare
-        ``{collection}/{chunk_id}`` for a legacy one."""
-        meta = doc.metadata
-        collection = str(meta.get("collection"))
-        chunk_id = str(meta.get("chunk_id"))
-        return deleted_key_candidates(collection, chunk_id, new_form_owner(meta))
+        """See :func:`tombstone_candidates` (kept as the recall filter's name)."""
+        return tombstone_candidates(doc)
 
     @staticmethod
     def _shape_query_results(results: dict[str, Any], col_name: str) -> list[Document]:

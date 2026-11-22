@@ -58,6 +58,7 @@ async def emit_write_audit(
     collection: str | None = None,
     key: str | None = None,
     tier: str,
+    outcome: str = "success",
     detail_extra: dict[str, Any] | None = None,
 ) -> None:
     """Fail-closed wrapper around :func:`emit_memory_audit_event` for every
@@ -83,6 +84,7 @@ async def emit_write_audit(
             collection=collection,
             key=key,
             tier=tier,
+            outcome=outcome,
             detail_extra=detail_extra,
         )
     except Exception as exc:

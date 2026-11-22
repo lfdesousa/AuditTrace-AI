@@ -19,10 +19,18 @@ query {
 }
 
 tests {
-  test("returns 200", function() {
-    expect(res.getStatus()).to.equal(200);
+  test("returns the expected status (expectedReadStatus, default 200)", function() {
+    expect(res.getStatus()).to.equal(Number(bru.getEnvVar("expectedReadStatus")));
   });
-  test("returns reassembled content + chunk_count", function() {
+  test("a refused read carries no content, title, size or deleted marker", function() {
+    if (res.getStatus() === 200) { return; }
+    const text = JSON.stringify(res.getBody());
+    expect(res.getBody()).to.not.have.property("content");
+    expect(res.getBody()).to.not.have.property("manifest");
+    expect(text).to.not.contain("deleted");
+  });
+  test("returns reassembled content + chunk_count (a 200 only)", function() {
+    if (res.getStatus() !== 200) { return; }
     const body = res.getBody();
     expect(body.content).to.be.a("string");
     expect(body.chunk_count).to.be.at.least(1);
@@ -30,6 +38,9 @@ tests {
 }
 
 docs {
+  `expectedReadStatus` (default 200): 404 once any chunk of the document is soft-deleted
+  (for every caller who is not an admin), 200 for an admin or a live document.
+
   Fleet Bruno memory logging. WU-1 whole-document read:
   reassembles every chunk of the document whose chunk-0 id is exampleDocId
   (= sha256("<collection>:<filename>:0")[:16], see routes/memory.py::_doc_id),

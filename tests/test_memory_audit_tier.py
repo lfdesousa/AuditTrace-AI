@@ -182,6 +182,9 @@ class TestRowShape:
             row,
             [*row, "mode", "dry_run", "total_chunks"],
             [*row, "hard"],
+            # #472 (B16): the fold tombstoned by the source delete is audited
+            # too; its tier is the row-level field, never a detail_extra key.
+            [*row, "hard", "cascade_from", "chunks"],
         ]
 
 

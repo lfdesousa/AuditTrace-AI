@@ -27,6 +27,7 @@ from tests.memory_truncation_support import (
 from tests.memory_truncation_support_a1 import (
     STEP,
     STUB_VECTOR,
+    as_admin,
     chroma_collection,
     hard_delete_chunk,
     sha256_text,
@@ -84,14 +85,24 @@ class TestWholeDocumentIntegrity:
         hard_delete_chunk(client, "decisions", "headless.md", 0)
         chunk3 = m._doc_id("decisions", "headless.md", 3)
 
-        back = client.get(
+        # SOFTDELETE-DIRECT-READ ADDENDUM-2 C1: the delete tombstones the whole
+        # document, so the 409 is what the reader who still sees it gets.
+        with as_admin(client):
+            back = client.get(
+                f"/memory/semantic/decisions/{chunk3}",
+                params={"whole_document": "true"},
+            )
+        owner = client.get(
             f"/memory/semantic/decisions/{chunk3}", params={"whole_document": "true"}
         )
+        never = client.get("/memory/semantic/decisions/0000000000000000")
 
         assert back.status_code == 409
         assert back.json() == {
             "detail": f"semantic document incomplete: 0 of {total} chunks readable"
         }
+        assert owner.status_code == never.status_code == 404
+        assert owner.content == never.content
 
     @pytest.mark.parametrize("new_chunks", [110, 120])
     def test_failed_refold_is_refused_never_read_mixed(
