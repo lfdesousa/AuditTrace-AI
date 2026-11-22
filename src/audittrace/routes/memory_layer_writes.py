@@ -77,12 +77,17 @@ async def record_layer_write(
             op="write",
             layer=layer,
             key=filename,
+            tier=tier,
             detail_extra={"manifest": "concurrent_write"},
         )
         raise concurrent_write_as_409(exc) from exc
     except ManifestAuthorizationError as exc:
         raise manifest_authorization_as_403(exc) from exc
     await emit_write_audits(
-        user=user, layer=layer, filename=filename, copied_from=copied_from
+        user=user,
+        layer=layer,
+        filename=filename,
+        copied_from=copied_from,
+        tier=entry.tier,
     )
     return entry

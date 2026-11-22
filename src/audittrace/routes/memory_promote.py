@@ -233,6 +233,7 @@ async def _emit_promote_audit(
     layer: str,
     collection: str | None,
     key: str,
+    tier: str,
     detail_extra: dict[str, Any],
     op: Literal["write", "delete"] = "write",
 ) -> None:
@@ -249,6 +250,7 @@ async def _emit_promote_audit(
             layer=layer,
             collection=collection,
             key=key,
+            tier=tier,
             detail_extra=detail_extra,
         )
     except Exception as exc:
@@ -523,8 +525,8 @@ async def promote_session_to_durable(
         layer=target_layer,
         collection=collection,
         key=durable_key,
+        tier="private",
         detail_extra={
-            "tier": "private",
             "promoted_from": session_key,
             "promoted_at_ms": promoted_at_ms,
             "promoted_by": promoted_by,
@@ -539,6 +541,7 @@ async def promote_session_to_durable(
             layer=target_layer,
             collection=collection,
             key=durable_key,
+            tier="private",
             detail_extra={"reason": "copy_forward"},
             op="delete",
         )

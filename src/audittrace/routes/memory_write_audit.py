@@ -22,6 +22,7 @@ async def emit_write_audits(
     layer: str,
     filename: str,
     copied_from: str | None,
+    tier: str,
     collection: str | None = None,
 ) -> None:
     """One ``emit_write_audit`` per manifest mutation (ADDENDUM-1 S2): the
@@ -34,6 +35,7 @@ async def emit_write_audits(
         layer=layer,
         collection=collection,
         key=filename,
+        tier=tier,
         detail_extra={"copied_from": copied_from} if copied_from else None,
     )
     if copied_from:
@@ -43,6 +45,7 @@ async def emit_write_audits(
             layer=layer,
             collection=collection,
             key=filename,
+            tier=tier,
             detail_extra={"reason": "copy_forward"},
         )
 
@@ -54,6 +57,7 @@ async def emit_write_audit(
     layer: str,
     collection: str | None = None,
     key: str | None = None,
+    tier: str,
     outcome: str = "success",
     detail_extra: dict[str, Any] | None = None,
 ) -> None:
@@ -79,6 +83,7 @@ async def emit_write_audit(
             layer=layer,
             collection=collection,
             key=key,
+            tier=tier,
             outcome=outcome,
             detail_extra=detail_extra,
         )

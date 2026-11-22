@@ -40,9 +40,9 @@ async def tombstone_source_folds(
     No source row means nothing was folded under it (and the source delete that
     follows answers its own 404). A failure propagates: nothing is deleted.
     Each returned row carries the SOURCE row's tier (B20: ``source.tier``, never
-    a request value). ``tier`` travels in the ``detail`` until
-    ``emit_write_audit`` takes a ``tier`` parameter (#61 WU-1); whichever of the
-    two merges second converts the two call sites of :func:`audit_source_folds`.
+    a request value). The tier rides in each fold's ``detail`` here and
+    :func:`audit_source_folds` hands it to ``emit_write_audit`` as the row-level
+    ``tier`` (#61 WU-1): ``detail_extra`` never restates a row field.
     """
     source = await manifest.resolve_read(layer, filename, user)
     if source is None:
@@ -74,11 +74,16 @@ async def tombstone_source_folds(
 async def audit_source_folds(user: UserContext, cascaded: list[FoldRow]) -> None:
     """One ``delete`` row per fold document tombstoned (B16)."""
     for collection, chunk0, detail in cascaded:
+        # Build a new dict: the caller's fold rows are not mutated, and
+        # ``emit_write_audit`` refuses a ``detail_extra`` that restates the
+        # row-level ``tier``.
+        detail_extra = {k: v for k, v in detail.items() if k != "tier"}
         await emit_write_audit(
             user=user,
             op="delete",
             layer="semantic",
             collection=collection,
             key=chunk0,
-            detail_extra=detail,
+            tier=detail["tier"],
+            detail_extra=detail_extra,
         )
