@@ -65,7 +65,11 @@ from audittrace.identity import (
     build_secret_window_index as _secret_window_index,  # noqa: F401
 )
 from audittrace.media.payload_scrub import scrub_base64_runs, scrub_data_url_payloads
-from audittrace.media.redaction import redact_content, redact_message_list
+from audittrace.media.redaction import (
+    redact_content,
+    redact_message_list,
+    redact_request_fields,
+)
 
 
 def _is_expected_client_error(exc: BaseException) -> bool:
@@ -1391,18 +1395,53 @@ def log_call(
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         log = logger or logging.getLogger(func.__module__)
         is_async = asyncio.iscoroutinefunction(func)
+        try:
+            _param_names = list(inspect.signature(func).parameters)
+        except (TypeError, ValueError):  # pragma: no cover - no signature
+            _param_names = []
+        _returns_messages = "messages" in _param_names
+
+        def _safe_value(name: str, value: Any) -> Any:
+            """#474: a ``messages`` parameter, or a request-body parameter named ``payload``,
+            is redacted for telemetry by name (a positional argument has no key the
+            renderer could see): non-object messages replaced, message keys outside the
+            OpenAI schema and request fields outside it become markers."""
+            if name == "messages" and isinstance(value, list):
+                return redact_message_list(value)
+            if name == "payload" and isinstance(value, dict):
+                return redact_request_fields(value)
+            return value
+
+        def _safe_args(
+            args: tuple[Any, ...], kwargs: dict[str, Any]
+        ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+            safe_args = tuple(
+                _safe_value(_param_names[i], a) if i < len(_param_names) else a
+                for i, a in enumerate(args)
+            )
+            return safe_args, {k: _safe_value(k, v) for k, v in kwargs.items()}
+
+        def _safe_result(result: Any) -> Any:
+            """A function that takes ``messages`` and returns a list hands telemetry the
+            merged messages (a ``dict(m)`` copy of a non-object message included)."""
+            if _returns_messages and isinstance(result, list):
+                return redact_message_list(result)
+            return result
 
         def _log_input(op: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
             if include_input and log.isEnabledFor(logging.DEBUG):
+                safe_args, safe_kwargs = _safe_args(args, kwargs)
                 log.debug(
                     f"INPUT {op}",
                     extra={
                         "operation": op,
                         "call_args": render_payload(
-                            args[1:] if len(args) > 1 else (),
+                            safe_args[1:] if len(safe_args) > 1 else (),
                             limit=_DEBUG_LOG_MAX_LEN,
                         ),
-                        "call_kwargs": render_payload(kwargs, limit=_DEBUG_LOG_MAX_LEN),
+                        "call_kwargs": render_payload(
+                            safe_kwargs, limit=_DEBUG_LOG_MAX_LEN
+                        ),
                     },
                 )
 
@@ -1413,7 +1452,9 @@ def log_call(
                     extra={
                         "operation": op,
                         "result": (
-                            render_payload(result, limit=_DEBUG_LOG_MAX_LEN)
+                            render_payload(
+                                _safe_result(result), limit=_DEBUG_LOG_MAX_LEN
+                            )
                             if result is not None
                             else None
                         ),
@@ -1493,21 +1534,9 @@ def log_call(
                     "NoneType",
                 )
             )
-            real_args = args[1:] if starts_with_self else args
-            # #474: a parameter named ``messages`` is a messages list; its elements that
-            # are not objects are never traced (the renderer cannot tell otherwise: the
-            # positional argument has no key).
-            try:
-                names = list(inspect.signature(func).parameters)
-                names = names[1:] if starts_with_self else names
-                real_args = tuple(
-                    redact_message_list(a)
-                    if i < len(names) and names[i] == "messages" and isinstance(a, list)
-                    else a
-                    for i, a in enumerate(real_args)
-                )
-            except (TypeError, ValueError):  # pragma: no cover - no signature
-                pass
+            safe_args, safe_kwargs = _safe_args(args, kwargs)
+            real_args = safe_args[1:] if starts_with_self else safe_args
+            kwargs = safe_kwargs
             payload: dict[str, Any] = {}
             if real_args:
                 payload["args"] = real_args
@@ -1539,7 +1568,7 @@ def log_call(
                 return
             try:
                 telemetry.set_current_span_attributes(
-                    {"output.value": _serialize_for_span(result)}
+                    {"output.value": _serialize_for_span(_safe_result(result))}
                 )
             except Exception:  # pragma: no cover
                 pass

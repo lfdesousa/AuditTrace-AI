@@ -85,13 +85,98 @@ def placeholder_message(message: Any) -> dict[str, Any]:
     return {"redacted": f"[REDACTED:media message {kind}{size}]"}
 
 
+#: The keys of a message object in the OpenAI chat-completions request schema (messages of
+#: role developer/system/user/assistant/tool/function): ``role``, ``content``, ``name``,
+#: ``tool_calls``, ``tool_call_id``, ``refusal``, ``function_call``, ``audio``. ``content`` is
+#: redacted by ``redact_content``; ``tool_calls`` and ``function_call`` hold the tool name and
+#: its JSON ``arguments`` (text, traced as written like any text); ``audio`` is a reference
+#: ({"id": ...}), not a payload. Any other key is fail-closed: its value is never traced.
+_MESSAGE_KEYS = frozenset(
+    {
+        "role",
+        "content",
+        "name",
+        "tool_calls",
+        "tool_call_id",
+        "refusal",
+        "function_call",
+        "audio",
+    }
+)
+
+#: The fields of a chat-completions request body in the OpenAI schema, plus the two the
+#: service itself reads (``context_query``, ``project``). A request field not listed here
+#: is replaced by a marker in telemetry; ``messages`` is redacted message by message.
+_REQUEST_KEYS = frozenset(
+    {
+        "messages", "model", "audio", "frequency_penalty", "function_call", "functions",
+        "logit_bias", "logprobs", "max_completion_tokens", "max_tokens", "metadata",
+        "modalities", "n", "parallel_tool_calls", "prediction", "presence_penalty",
+        "prompt_cache_key", "reasoning_effort", "response_format", "safety_identifier",
+        "seed", "service_tier", "stop", "store", "stream", "stream_options",
+        "temperature", "tool_choice", "tools", "top_logprobs", "top_p", "user",
+        "verbosity", "web_search_options", "context_query", "project",
+    }
+)  # fmt: skip
+
+
+def _size(value: Any) -> str:
+    if isinstance(value, str):
+        return f" chars={len(value)}"
+    if isinstance(value, (list, tuple)):
+        return f" items={len(value)}"
+    if isinstance(value, dict):
+        return f" keys={len(value)}"
+    return ""
+
+
+def _redact_unknown_keys(
+    mapping: dict[str, Any], allowed: frozenset[str], label: str
+) -> dict[str, Any]:
+    """A copy of ``mapping`` in which every key outside ``allowed`` holds only a marker.
+
+    The key name is kept when it passes the type-name bound (at most 32 plain identifier
+    characters, so at most 24 bytes can ride in it: the accepted bound), else it becomes
+    ``unknown`` (``unknown_2``, ... when several collide). Nothing is walked: any depth.
+    """
+    out: dict[str, Any] = {}
+    unknown = 0
+    for key, value in mapping.items():
+        if key in allowed:
+            out[key] = value
+            continue
+        name = _type_name(key)
+        if name == "unknown":
+            unknown += 1
+            name = "unknown" if unknown == 1 else f"unknown_{unknown}"
+        while name in out:
+            name = f"{name}_"
+        out[name] = f"[REDACTED:media {label} key {type(value).__name__}{_size(value)}]"
+    return out
+
+
+def redact_message_keys(message: dict[str, Any]) -> dict[str, Any]:
+    """A message object with every key outside the OpenAI message keys replaced by a marker."""
+    return _redact_unknown_keys(message, _MESSAGE_KEYS, "message")
+
+
+def redact_request_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """A chat request body with every field outside the OpenAI schema replaced by a marker."""
+    safe = _redact_unknown_keys(payload, _REQUEST_KEYS, "request field")
+    if isinstance(safe.get("messages"), list):
+        safe["messages"] = redact_message_list(safe["messages"])
+    return safe
+
+
 def redact_message_list(messages: list[Any]) -> list[Any]:
-    """The elements of a ``messages`` list that are not objects, replaced (objects as they are).
+    """The elements of a ``messages`` list made safe: non-objects replaced, object keys filtered.
 
     For the renderer, which redacts each message object's ``content`` itself when it reaches it.
     """
     return [
-        message if isinstance(message, dict) else placeholder_message(message)
+        redact_message_keys(message)
+        if isinstance(message, dict)
+        else placeholder_message(message)
         for message in messages
     ]
 
@@ -171,11 +256,13 @@ def redact_media_payloads(
     for mi, message in enumerate(messages):
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
-            out.append(
-                placeholder_message(message)
-                if not isinstance(message, dict)
-                else {**message, "content": redact_content(content)}
-            )
+            if not isinstance(message, dict):
+                out.append(placeholder_message(message))
+            else:
+                safe = redact_message_keys(message)
+                if "content" in message:
+                    safe["content"] = redact_content(content)
+                out.append(safe)
             continue
         parts = [
             {
@@ -190,5 +277,5 @@ def redact_media_payloads(
             )
             for pi, part in enumerate(content)
         ]
-        out.append({**message, "content": parts})
+        out.append({**redact_message_keys(message), "content": parts})
     return out

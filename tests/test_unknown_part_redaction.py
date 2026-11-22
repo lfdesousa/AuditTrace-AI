@@ -99,6 +99,13 @@ MESSAGE_SHAPES: dict[str, list[Any]] = {
     "non-object-list": [_Q, [_BLOB]],
     "non-object-str": [_Q, SHORT],
     "non-object-number-list": [_Q, [1, [SHORT]]],
+    # a message object: only the OpenAI message keys are traced, any other key is a marker
+    "roleless-blob-key": [{"blob": SHORT}, _Q],
+    "roleless-parts-key": [{"parts": [_BLOB]}, _Q],
+    "role-bearing-extra-key": [{"role": "user", "content": QUESTION, "blob": SHORT}],
+    # the route turns a [key, value] pair into {key: value} (dict(m)) before the model call
+    "mangled-pairs": [_Q, [["blob", SHORT]]],
+    "mangled-pairs-first": [[["blob", SHORT]], _Q],
     "non-object-only": [[_BLOB]],
     "non-object-str-only": [SHORT],
 }
@@ -432,6 +439,90 @@ class TestMessageShapesOnFourArms:
         assert response.status_code == 200
         sent = [m for b in upstream_bodies(fake) for m in b["messages"]]
         assert messages[0] in sent, "ADR-024: forwarded as it came"
+
+
+#: top-level request fields that are not OpenAI chat-completions fields
+REQUEST_EXTRAS: dict[str, dict[str, Any]] = {
+    "input-nested-unknown-part": {"input": [[_BLOB]]},
+    "blob-field": {"blob_field": SHORT},
+    "prediction-content-part": {"prediction": {"type": "content", "content": [_BLOB]}},
+}
+
+
+@pytest.fixture(params=sorted(REQUEST_EXTRAS))
+def request_extra(request: pytest.FixtureRequest) -> str:
+    return str(request.param)
+
+
+class TestRequestFieldsOnFourArms:
+    """An unknown top-level field of the request body is rendered as a marker."""
+
+    def test_no_telemetry_site_carries_it_and_upstream_gets_it(
+        self,
+        client: Any,
+        arm: tuple[str, bool],
+        request_extra: str,
+        langfuse_on: None,
+        debug_logs: None,
+    ) -> None:
+        mode, stream = arm
+        extra = REQUEST_EXTRAS[request_extra]
+        before = copy.deepcopy(extra)
+        fake = ok_fake(mode, stream)
+        response = post_chat(client, fake, stream=stream, messages=[_Q], extra=extra)
+        assert response.status_code == 200
+        assert extra == before
+        for key, value in extra.items():
+            assert all(b.get(key) == value for b in upstream_bodies(fake)), key
+        spans = [json.loads(s) for s in net._SPAN_END_SNAPSHOTS]
+        assert any(s["name"] == "chat-extract-query" for s in spans), "control"
+        carrying = sorted(
+            {
+                f"{s['name']} :: {k}"
+                for s in spans
+                for k, v in s["attributes"].items()
+                if SHORT in str(v)
+            }
+        )
+        assert carrying == []
+        records = list(net._LOG_RECORD_SNAPSHOTS)
+        assert any("chat" in r for r in records), "control: chat log records seen"
+        assert [r[:100] for r in records if SHORT in r] == []
+        assert [p[:100] for p in non_upstream_posts(fake) if SHORT in p] == []
+
+
+class TestMessageKeysAreAnAllowList:
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "role",
+            "content",
+            "name",
+            "tool_calls",
+            "tool_call_id",
+            "refusal",
+            "function_call",
+            "audio",
+        ],
+    )
+    def test_the_openai_message_keys_pass(self, key: str) -> None:
+        value: Any = "v" if key != "tool_calls" else [{"id": "c", "type": "function"}]
+        out = redact_media_payloads([{key: value}], None)
+        assert out == [{key: value}]
+
+    def test_any_other_key_is_a_marker_and_its_name_is_bounded(self) -> None:
+        message = {"role": "user", "content": "q", "blob": SHORT, SHORT: "x", "n": 3}
+        out = redact_media_payloads([message], None)[0]
+        assert out["blob"] == "[REDACTED:media message key str chars=96]"
+        assert out["unknown"] == "[REDACTED:media message key str chars=1]"
+        assert out["n"] == "[REDACTED:media message key int]"
+        assert SHORT not in json.dumps(out)
+        assert (out["role"], out["content"]) == ("user", "q")
+
+    def test_tool_call_arguments_are_text_traced_as_written(self) -> None:
+        calls = [{"id": "c", "function": {"name": "f", "arguments": '{"q": 1}'}}]
+        out = redact_media_payloads([{"role": "assistant", "tool_calls": calls}], None)
+        assert out[0]["tool_calls"] == calls
 
 
 class TestTheQueryIsReadLikeTheRedaction:

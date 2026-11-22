@@ -102,6 +102,7 @@ def post_chat(
     stream: bool,
     messages: list[dict[str, Any]],
     headers: dict[str, str] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> Any:
     with _patch_async_client(fake), _patch_tool_loop_client(fake):
         return client.post(
@@ -111,6 +112,7 @@ def post_chat(
                 "messages": messages,
                 "project": "AuditTrace",
                 "stream": stream,
+                **(extra or {}),
             },
             headers=headers or {},
         )

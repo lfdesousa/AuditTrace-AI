@@ -148,10 +148,18 @@ service does not know (for example a custom `blob` part) is replaced whole by a 
 keeps its type name and its number of keys. The same holds for a shape the OpenAI schema
 does not allow: a message `content` that is neither a string nor a list (a dict, a number) is
 replaced whole by a marker that records its type and size, and a list element that is not a part
-object (a bare string, a number, a nested list) is treated as an unknown part. A message that
-is not an object, and a message without a `role`, are redacted the same way (the marker records the
-container type and its size). How the route answers such a request is not changed by this: some of
-them already end in an error of their own, and the telemetry written before that error is clean. The model server
+object (a bare string, a number, a nested list) is treated as an unknown part. A message that is not an object is replaced whole by a marker that records its container type
+and size. A message object keeps only the keys of the OpenAI chat message schema (`role`,
+`content`, `name`, `tool_calls`, `tool_call_id`, `refusal`, `function_call`, `audio`); the value of
+any other key is replaced by a marker, whether or not the message has a `role`. The `arguments` of
+a tool call are text and are traced as written, like any text. The same rule applies to the
+request body: a field outside the OpenAI chat-completions request schema (plus `context_query` and
+`project`, which the service reads) is replaced by a marker where the request is traced. A marker
+keeps the key's name when it is at most 32 plain identifier characters, so a name can carry at most
+24 bytes; otherwise the name is `unknown`. These rules apply where the route copies a message (a
+`[key, value]` pair that the route turns into an object) as well. How the route answers a
+malformed request is not changed by this: some of them already end in an error of their own, and
+the telemetry written before that error is clean. The model server
 still receives every part unchanged, and the audit record never holds a payload.
 
 The types the service treats as text are `text`, `refusal` and `image_url` (the OpenAI
