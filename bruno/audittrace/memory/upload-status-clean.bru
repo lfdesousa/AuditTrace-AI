@@ -23,7 +23,7 @@ tests {
   });
 
   test("scan_id echoed in response", function() {
-    expect(res.body.scan_id).to.equal(bru.getVar("cleanScanId"));
+    expect(res.body.scan_id).to.equal(bru.getVar("cleanScanId") || bru.getEnvVar("cleanScanId"));
   });
 
   test("scan_status is in the closed set (migration 012)", function() {
@@ -52,7 +52,9 @@ tests {
 docs {
   ADR-048 PR-B3 status-poll endpoint — clean-PDF chain. Pairs
   with ``upload-pdf-clean.bru`` — the upload sets ``cleanScanId``
-  via ``vars:post-response``, this request reads it.
+  via ``vars:post-response``, this request reads it. A standalone run
+  may pass it instead: ``--env-var cleanScanId=<id>`` (the scan_id test
+  reads the runtime var, else the env var).
 
   Bruno asserts SHAPE (status is in the closed set, scan_id
   echoed, fields present) — not TIMING. The actual flip from
