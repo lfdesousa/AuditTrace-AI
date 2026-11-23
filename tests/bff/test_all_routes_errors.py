@@ -146,6 +146,7 @@ LABELS: dict[str, str] = {
     "/console/agents": "console_agents",
     "/console/conversation-tags": "console_conversation_tags",
     "/console/tool-favorites": "console_tool_favorites",
+    "/console/evidence": "console_evidence",
 }
 NOT_PROXIES = {"/health", "/v1/chat/completions"}
 
@@ -166,7 +167,12 @@ def _proxy_routes() -> dict[str, tuple[str, str, str]]:
         )
         methods = route.methods or set()
         method = "POST" if "POST" in methods else sorted(methods)[0]
-        path = route.path.replace("{path:path}", "x").replace("{filename}", "n.txt")
+        path = (
+            route.path.replace("{path:path}", "x")
+            .replace("{filename}", "n.txt")
+            .replace("{client_message_id}", "m-1")
+            .replace("{interaction_id:int}", "1")
+        )
         found[f"{method} {route.path}"] = (method, path, label)
     return found
 
@@ -174,9 +180,10 @@ def _proxy_routes() -> dict[str, tuple[str, str, str]]:
 ROUTES = _proxy_routes()
 
 
-def test_the_app_has_the_nineteen_proxy_routes() -> None:
-    """The cells below would be vacuous over a wrong route list."""
-    assert len(ROUTES) == 19
+def test_the_app_has_the_twentyone_proxy_routes() -> None:
+    """The cells below would be vacuous over a wrong route list. (19 + the two
+    GET-only evidence routes of CONSOLE-AUDIT-EVIDENCE WU-C.)"""
+    assert len(ROUTES) == 21
     assert {label for _m, _p, label in ROUTES.values()} == set(LABELS.values())
 
 
@@ -230,7 +237,11 @@ def _kc(status: int, error: str) -> Respond:
 
 
 def _good() -> str:
-    return "Bearer " + make_token(sub="alice")
+    # ``audittrace:audit``: the evidence routes' caller-scope pre-check (WU-C)
+    # refuses a token without it before any exchange; no other route reads it.
+    return "Bearer " + make_token(
+        sub="alice", extra_claims={"scope": "audittrace:audit"}
+    )
 
 
 # failure id -> (Authorization | None, upstream attribute, respond, code, sub)

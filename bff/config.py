@@ -137,6 +137,10 @@ class Settings(BaseSettings):
     # ``/console/tool-favorites``, so this proxy's BFF-facing path
     # matches the orchestrator mount 1:1.
     orchestrator_console_tool_favorites_path_prefix: str = "/console/tool-favorites"
+    # CONSOLE-AUDIT-EVIDENCE WU-C: the memory server's evidence mount
+    # (``GET /evidence/messages/{id}`` / ``/evidence/interactions/{id}``). The BFF
+    # side is ``/console/evidence/...`` (two explicit GET routes).
+    orchestrator_evidence_path_prefix: str = "/evidence"
     orchestrator_timeout_seconds: float = 120.0
     # ADDENDUM-2 item 2: the durable record of a refused chat turn. Off unless
     # the deployment says the memory server accepts it (the chart does).
@@ -222,6 +226,13 @@ class Settings(BaseSettings):
     # (LC10A-CHAT-EXCHANGE-SCOPE). No fallback audience: min_length=1.
     chat_exchange_audience: str = Field(
         default="audittrace-librechat-chat", min_length=1
+    )
+    # The dedicated token-exchange audience of the evidence proxy
+    # (CONSOLE-AUDIT-EVIDENCE, operator ruling Q6): a public client whose DEFAULT
+    # scopes are exactly bff.console_evidence_scopes.EVIDENCE_SCOPES. No fallback
+    # audience: min_length=1.
+    evidence_exchange_audience: str = Field(
+        default="audittrace-librechat-evidence", min_length=1
     )
     exchange_subject_token_type: str = "urn:ietf:params:oauth:token-type:access_token"
     exchange_requested_token_type: str = "urn:ietf:params:oauth:token-type:access_token"
