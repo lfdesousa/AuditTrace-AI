@@ -1,0 +1,36 @@
+meta {
+  name: PUT /memory/semantic/{collection}/{doc_id} — a soft-deleted corpus document is refused (409)
+  type: http
+  seq: 8
+}
+
+put {
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{exampleDocId}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "text": "Bruno smoke fragment — must NOT be stored."
+  }
+}
+
+tests {
+  test("returns 409 (nothing is written)", function() {
+    expect(res.getStatus()).to.equal(409);
+  });
+  test("says the row is soft-deleted", function() {
+    expect(res.getBody().detail).to.contain("is soft-deleted");
+  });
+}
+
+docs {
+  Run with `exampleCollection` and `exampleDocId` set (`--env-var`) to a corpus document
+  that `05-delete.bru` has soft-deleted. The PUT is refused before any write; the text
+  the document had stays readable by `03-read.bru`. A 200 here is a FAIL.
+}
