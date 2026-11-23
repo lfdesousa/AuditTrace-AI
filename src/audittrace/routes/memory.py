@@ -121,12 +121,15 @@ from audittrace.routes.memory_write_refusal import (
     refuse_oversize_or_413,
 )
 from audittrace.routes.memory_write_support import (
+    authorized_update_tier,
     concurrent_write_as_409,
     corpus_read_cleared,
     corpus_write_authorized,
     has_corpus_scope,
     legacy_copy_forward_source,
     manifest_authorization_as_403,
+    refuse_corpus_update_of_file_layer,
+    refuse_update_of_corpus_fold_chunk,
     semantic_key,
 )
 from audittrace.services.embedder import embed_via_nomic
@@ -2025,6 +2028,11 @@ async def update_episodic(
         await authorize_write(manifest, user, "episodic", filename)
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
+    refuse_corpus_update_of_file_layer(
+        "episodic",
+        filename,
+        await authorized_update_tier(manifest, user, "episodic", filename),
+    )
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
@@ -2307,6 +2315,11 @@ async def update_procedural(
         await authorize_write(manifest, user, "procedural", filename)
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
+    refuse_corpus_update_of_file_layer(
+        "procedural",
+        filename,
+        await authorized_update_tier(manifest, user, "procedural", filename),
+    )
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
@@ -3049,8 +3062,12 @@ async def update_semantic(
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
         await require_visible_row_or_404(manifest, user, key)
+        tier = await authorized_update_tier(manifest, user, "semantic", key)
+        await refuse_update_of_corpus_fold_chunk(service, collection, document_id, tier)
         try:
-            await service.upsert(user, collection, document_id, text, metadata)
+            await service.upsert(
+                user, collection, document_id, text, metadata, tier=tier
+            )
         except ChromaIdConflictError as exc:
             raise chroma_id_conflict_409(exc) from exc
         except Exception as exc:

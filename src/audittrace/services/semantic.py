@@ -306,6 +306,19 @@ class SemanticService(ABC):
         a private-tier document returns the SAME ``None`` as a genuine
         miss; no existence disclosure)."""
 
+    async def stored_corpus_rows(
+        self, collection: str, document_id: str
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """The STORED metadata of the corpus-tier rows at the bare
+        *document_id*, ``(shared, corpus)``: the row a fold writes and the row
+        a corpus ``upsert`` writes. ``None`` where there is none. Not abstract,
+        and fail-closed: a service that cannot say what is stored raises, so a
+        corpus update through it is never a write-through."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot read the stored corpus rows of "
+            f"{collection}/{document_id}"
+        )
+
     async def get_documents(
         self,
         user_context: UserContext,
@@ -1052,6 +1065,30 @@ class ChromaSemanticService(SemanticService):
         await col.delete(ids=[document_id])
         return True
 
+    async def stored_corpus_rows(
+        self, collection: str, document_id: str
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """The STORED metadata of the corpus-tier rows at the bare
+        *document_id*: ``(shared, corpus)``. *shared* is the row in the
+        collection private chunks share, where every fold writes (corpus-tier
+        by its ``tier`` stamp, not a new-form private row); *corpus* is the row
+        in the corpus collection, where a corpus ``upsert`` writes. No
+        ownership resolution and no ``except``: a failed read raises."""
+        shared = (
+            await self._fetch_by_ids(self._physical(collection), [document_id])
+        ).get(document_id)
+        corpus = (
+            await self._fetch_by_ids(self._physical_corpus(collection), [document_id])
+        ).get(document_id)
+        shared_meta = (
+            shared[1]
+            if shared is not None
+            and new_form_owner(shared[1]) is None
+            and shared[1].get("tier") == "corpus"
+            else None
+        )
+        return shared_meta, (corpus[1] if corpus is not None else None)
+
     @log_call(logger=logger)
     async def get_document(
         self,
@@ -1230,6 +1267,11 @@ class UserScopedSemanticService(SemanticService):
             self._bound_user, collection, document_id
         )
 
+    async def stored_corpus_rows(
+        self, collection: str, document_id: str
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        return await self._inner.stored_corpus_rows(collection, document_id)
+
     @log_call(logger=logger)
     async def get_document(
         self,
@@ -1366,6 +1408,16 @@ class MockSemanticService(SemanticService):
             if d.metadata.get("document_id") == document_id:
                 return d
         return None
+
+    async def stored_corpus_rows(
+        self, collection: str, document_id: str
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        # mock: one store. A corpus-tier document is the corpus row.
+        for d in self._docs.get(collection, []):
+            if d.metadata.get("document_id") == document_id:
+                if d.metadata.get("tier") == "corpus":
+                    return None, dict(d.metadata)
+        return None, None
 
     def reset(self) -> None:
         """Clear all documents."""
