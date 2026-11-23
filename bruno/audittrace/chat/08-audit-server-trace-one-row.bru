@@ -15,17 +15,23 @@ auth:bearer {
 }
 
 tests {
-  test("precondition: 05 stashed the server ids (not vacuous)", function() {
-    expect(bru.getVar("serverTraceId")).to.match(/^[0-9a-f]{32}$/);
-    expect(bru.getVar("serverInteractionId")).to.match(/^[0-9]+$/);
+  // Each id is the runtime var stashed by 04/05 (chained run) or, failing
+  // that, an env var passed with --env-var (standalone run).
+  const fromRunOrEnv = (n) => bru.getVar(n) || bru.getEnvVar(n);
+  const serverTraceId = fromRunOrEnv("serverTraceId");
+  const serverInteractionId = fromRunOrEnv("serverInteractionId");
+  const inboundSessionId = fromRunOrEnv("inboundSessionId");
+  test("precondition: 05 stashed the server ids or they were passed as --env-var (not vacuous)", function() {
+    expect(String(serverTraceId)).to.match(/^[0-9a-f]{32}$/);
+    expect(String(serverInteractionId)).to.match(/^[0-9]+$/);
   });
   test("returns 200 with exactly the interaction written by 04", function() {
     expect(res.getStatus()).to.equal(200);
     const rows = res.getBody().interactions;
     expect(rows).to.have.lengthOf(1);
-    expect(String(rows[0].id)).to.equal(bru.getVar("serverInteractionId"));
-    expect(rows[0].trace_id).to.equal(bru.getVar("serverTraceId"));
-    expect(rows[0].session_id).to.equal(bru.getVar("inboundSessionId"));
+    expect(String(rows[0].id)).to.equal(String(serverInteractionId));
+    expect(rows[0].trace_id).to.equal(serverTraceId);
+    expect(rows[0].session_id).to.equal(inboundSessionId);
   });
 }
 

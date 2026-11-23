@@ -309,7 +309,26 @@ class InteractionListItem(BaseModel):
     # any field not declared).
     created_at: str | None = None
     # Migration 017 (ADR-058 WS-A3): content-integrity hash.
-    content_hash: str | None = None
+    content_hash: str | None = Field(
+        default=None,
+        description=(
+            "SHA-256 over the canonical JSON of the row's content fields. "
+            "input_media is part of the hashed content only when it is not null; "
+            "see the audit record integrity note for the exact recipe."
+        ),
+    )
+    # Migration 040 (LIBRECHAT-IMAGE-SLICE): the image parts of the request.
+    input_media: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Images carried by the chat request of this row: one entry per image "
+            "part with its position, declared media type, decoded size in bytes "
+            "and SHA-256 of the decoded bytes; never the image. null means no "
+            "image recorded, which is not always the same as no image sent: rows "
+            "written before this field existed, rows written by a server of an "
+            "earlier release, and rows that are not chat turns are always null."
+        ),
+    )
 
 
 class InteractionListResponse(BaseModel):

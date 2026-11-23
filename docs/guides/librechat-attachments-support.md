@@ -11,7 +11,7 @@ them work with an AuditTrace deployment today, and what you see when one does no
 | OCR on uploaded scans | planned, through the document pipeline | later |
 | keeping a provider upload in session memory | planned | later |
 | the newer upstream delivery setting (`defaultLLMDeliveryPath`) | arrives with a future upstream sync | later |
-| Images (`image_url` parts) | accepted by the deployed model through the API (it runs with a vision projector); attaching an image from the LibreChat menu is planned | **API: supported; LibreChat menu: later** |
+| Images (`image_url` parts) | accepted, also from the LibreChat menu (**Upload to Provider** with an image): the deployed model reads the image (it runs with a vision projector); the audit record names each image by its declared type, size and sha256, and never keeps the image | **supported** |
 
 ## What the error looks like
 
@@ -35,3 +35,14 @@ LibreChat shows the `message`. Choose **Upload as Text** for the same file and s
   Any other rejected request keeps its previous behaviour.
 - The audit record of the failed turn keeps the model server's original text, so the event is
   reconstructible.
+- Every image sent in a message is named in the audit record of that turn (`input_media`): its position,
+  the media type the client declared, its size in bytes and the sha256 of its bytes. The image itself is
+  not kept, in the record or in traces.
+- An image must travel inside the message. A link to an image is refused with `image_url_not_supported`
+  (HTTP 400): this service does not fetch images. A damaged inline image is refused with
+  `image_data_invalid` (HTTP 400): attach it again. A link in any other media part (audio or video) is
+  refused with `media_link_not_supported` (HTTP 400). A refused turn is recorded as a failed turn; the
+  link itself is stored nowhere.
+- In the audit record, an empty `input_media` means **no image recorded**. Turns from before this
+  feature, and rows that are not chat turns, are always empty; see the
+  [audit record integrity note](../reference/audittrace/audit-record-integrity.md).

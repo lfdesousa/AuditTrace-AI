@@ -1,0 +1,40 @@
+meta {
+  name: GET /openapi.json
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/openapi.json
+  body: none
+  auth: none
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("is an OpenAPI 3 document with paths", function() {
+    const body = res.getBody();
+    expect(body.openapi).to.be.a("string");
+    expect(body.openapi.startsWith("3.")).to.equal(true);
+    expect(body.paths).to.have.property("/health");
+    expect(body.paths).to.have.property("/v1/chat/completions");
+  });
+  test("InteractionListItem declares input_media (null or object) and content_hash", function() {
+    const item = res.getBody().components.schemas.InteractionListItem;
+    expect(item.properties).to.have.property("input_media");
+    expect(item.properties).to.have.property("content_hash");
+    const kinds = item.properties.input_media.anyOf.map(function(s) { return s.type; });
+    expect(kinds).to.include("object");
+    expect(kinds).to.include("null");
+  });
+}
+
+docs {
+  The served OpenAPI contract of the running image (the vendored snapshot is
+  `tests/fixtures/openapi.snapshot.yaml`). Unauthenticated: FastAPI's own route, no
+  dependency, the same as `GET /health` (`tests/_x_trace_id_header_support.py` expects 200
+  without a token). Run it against a release candidate to read what that image publishes
+  for `GET /interactions` (the `input_media` field).
+}

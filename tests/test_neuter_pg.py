@@ -7,8 +7,6 @@ import json
 import os
 import shutil
 import subprocess
-import threading
-import time
 
 import pytest
 
@@ -131,32 +129,33 @@ def test_real_container_lifecycle_settings_and_catalog():
         stop_container(handle)
 
 
-def test_poll_db_leak_actually_repolls_and_catches_a_recovery(tmp_path):
+def test_poll_db_leak_actually_repolls_and_catches_a_recovery(tmp_path, monkeypatch):
     """ESC-3 (review round 1): the reviewer's escape drops the
     ``while ...:`` re-check entirely (``while False and ...``), so
     ``poll_db_leak`` would only ever look ONCE, at t=0. Real polling must
-    catch a catalog that's dirty at t=0 but RECOVERS (a schema dropped by a
-    slightly-delayed cleanup) before the deadline -- proven here with a
-    background thread that clears the leaked schema mid-poll, independent
-    of anything ``run_one_neuter`` orchestrates."""
+    catch a catalog that's dirty at t=0 but RECOVERS before the deadline.
+
+    Structural, no wall clock and no shared file: ``db_snapshot`` is replaced
+    by a counter that reports the leaked schema for the first two reads and a
+    clean catalog from the third. Re-polling is proven by the read count
+    (>= 3), not by a sleep racing a writer thread (the earlier thread +
+    ``Path.write_text`` form could read a truncated state file and raise
+    ``JSONDecodeError``). The loop is bounded by the recovery counter, so a
+    large ``deadline_s`` never makes the test wait."""
     handle = start_container("esc3", 1, fake=True, fake_dir=tmp_path)
-    before = db_snapshot(handle)
-    state = json.loads(handle.fake_state_path.read_text())
-    state["schemata"].append("leaked_schema")
-    handle.fake_state_path.write_text(json.dumps(state))
+    before = (frozenset(), 0)
+    dirty = (frozenset({"leaked_schema"}), 0)
+    reads: list[int] = []
 
-    def _recover() -> None:
-        time.sleep(0.12)
-        recovered = json.loads(handle.fake_state_path.read_text())
-        recovered["schemata"] = []
-        handle.fake_state_path.write_text(json.dumps(recovered))
+    def _snapshot(_handle):
+        reads.append(1)
+        return dirty if len(reads) < 3 else before
 
-    threading.Thread(target=_recover, daemon=True).start()
-    # dirty at t=0, recovers ~0.12s in -- a real poll (interval < recovery
-    # time, deadline > recovery time) must observe the recovery and report
-    # NO leak; a disabled loop would report the t=0 reading forever.
-    leaked = poll_db_leak(handle, before, deadline_s=0.6, interval_s=0.05)
+    monkeypatch.setattr("scripts.neuter.pg.db_snapshot", _snapshot)
+    leaked = poll_db_leak(handle, before, deadline_s=3600.0, interval_s=0.0)
     assert leaked is False
+    # a disabled ``while`` re-check reads exactly once and reports the t=0 leak
+    assert len(reads) == 3
 
 
 def test_foreign_product_pg_container_running_false_when_none(monkeypatch):

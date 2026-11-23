@@ -1,0 +1,59 @@
+meta {
+  name: GET /interactions?session_id= (audit row of the image turn: input_media)
+  type: http
+  seq: 20
+}
+
+get {
+  url: {{baseUrl}}/interactions?session_id={{imagePartSessionId}}&limit=5
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200 with exactly one row for the session", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().interactions).to.be.an("array").with.lengthOf(1);
+  });
+  test("the row records one image: type, size, sha256, position", function() {
+    const m = res.getBody().interactions[0].input_media;
+    expect(m.schema).to.equal(1);
+    expect(m.count).to.equal(1);
+    expect(m.items).to.be.an("array").with.lengthOf(1);
+    const i = m.items[0];
+    expect(i.kind).to.equal("image");
+    expect(i.status).to.equal("recorded");
+    expect(i.source).to.equal("data_uri");
+    expect(i.media_type).to.equal("image/png");
+    expect(i.bytes).to.equal(Number(bru.getEnvVar("imagePartBytes")));
+    expect(i.sha256).to.equal(bru.getEnvVar("imagePartSha256"));
+    expect(i.message_index).to.equal(0);
+    expect(i.part_index).to.equal(1);
+  });
+  test("the row carries no image data", function() {
+    const raw = JSON.stringify(res.getBody());
+    expect(raw).to.not.contain("base64,");
+    expect(raw).to.not.contain("iVBORw0KGgo");
+  });
+  test("trace_id is 32 lowercase hex (stashed for audit/02)", function() {
+    const r = res.getBody().interactions[0];
+    expect(r.trace_id).to.match(/^[0-9a-f]{32}$/);
+    bru.setVar("imagePartTraceId", r.trace_id);
+  });
+}
+
+docs {
+  LIBRECHAT-IMAGE-SLICE. Run right after chat/16 (same collection run, so the
+  stashed `imagePartSessionId` is set). Reads the audit row of the image turn
+  through the public API (scope audittrace:audit) and checks `input_media`:
+  one image, its declared media type, its decoded size and the sha256 of its
+  decoded bytes (`imagePartBytes`, `imagePartSha256`: defaults in
+  environments/*.bru, they describe the default `imagePartData`). The row
+  never holds the image. For a LibreChat turn, read the row with
+  `audit/01-list-interactions.bru --env-var auditSince=<ISO time>` and compare
+  `input_media.items[0].sha256` with `sha256sum` of the file you attached.
+}
