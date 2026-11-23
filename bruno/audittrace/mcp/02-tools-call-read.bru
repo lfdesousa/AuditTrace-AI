@@ -38,7 +38,7 @@ body:json {
     "method": "tools/call",
     "params": {
       "name": "{{mcpRecallTool}}",
-      "arguments": { "query": "{{mcpRecallQuery}}", "k": 3 }
+      "arguments": { "query": "{{mcpRecallQuery}}", "k": {{mcpRecallK}} }
     }
   }
 }
@@ -87,6 +87,9 @@ docs {
   `mcpRecallTool` (default `recall_semantic`) picks the recall tool: `recall_decisions`,
   `recall_skills` or `recall_semantic`. After a source is soft-deleted none of them returns
   a match from it, in the same session or another.
+
+  `mcpRecallK` (default 3, in both environments) is the `k` sent in the tool arguments: the
+  number of hits requested. Pass `--env-var mcpRecallK=10` to ask for more.
 
   `mcpRecallQuery` defaults to a generic term so this passes on a
   fresh/empty semantic collection too — `total: 0, matches: []` is a
