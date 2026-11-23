@@ -1086,6 +1086,11 @@ console:
     # scopes, created by the ensure-memory-scopes hook (and declared in
     # realm-audittrace.json). Never empty: there is no fallback audience.
     chatExchangeAudience: audittrace-librechat-chat
+    # The evidence proxy's token-exchange audience (CONSOLE-AUDIT-EVIDENCE): a
+    # dedicated client whose only DEFAULT scope is audittrace:audit, created by
+    # the ensure-memory-scopes hook (and declared in realm-audittrace.json).
+    # Never empty: there is no fallback audience.
+    evidenceExchangeAudience: audittrace-librechat-evidence
 
   # ── D2 — LibreChat: the sovereign fork (M3-WU-D2-4 cutover) ─────────────
   # M3-WU-D2-4 (2026-08-31) supersedes the D1 "stock image, no source edit"

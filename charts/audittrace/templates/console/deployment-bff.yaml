@@ -98,6 +98,8 @@ spec:
               value: {{ .Values.console.bff.exchangeAudience | quote }}
             - name: AUDITTRACE_BFF_CHAT_EXCHANGE_AUDIENCE
               value: {{ .Values.console.bff.chatExchangeAudience | quote }}
+            - name: AUDITTRACE_BFF_EVIDENCE_EXCHANGE_AUDIENCE
+              value: {{ .Values.console.bff.evidenceExchangeAudience | quote }}
             {{- if not $useVault }}
             # Non-Vault branch (D4 vault.enabled=false dev fallback, OR
             # M3-WU-3c D1 console.bff.secretSource=values regardless of

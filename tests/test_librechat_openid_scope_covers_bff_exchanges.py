@@ -73,10 +73,13 @@ class TestDerivedExchangeScopes:
         ):
             assert must in scopes
         # The chat route's own scope joined the union with bff/chat_scopes.py
-        # (LC10A-CHAT-EXCHANGE-SCOPE): pinned by equality, so no other
-        # audittrace:* scope (audit, admin, context) can ever join silently.
+        # (LC10A-CHAT-EXCHANGE-SCOPE) and the evidence proxy's single scope with
+        # bff/console_evidence_scopes.py (CONSOLE-AUDIT-EVIDENCE, ADDENDUM-A7 C2):
+        # pinned by equality, so no other audittrace:* scope (admin, context) can
+        # ever join silently.
         assert {s for s in scopes if s.startswith("audittrace:")} == {
-            "audittrace:query"
+            "audittrace:query",
+            "audittrace:audit",
         }
         assert not any(s.startswith("memory:corpus") for s in scopes)
 
@@ -147,11 +150,16 @@ class TestHookOffersEveryExchangeScopeToLibrechat:
         # audittrace:query is the realm-defined route scope: a default of the
         # login client since the first import and, for the chat turn, of the
         # chat audience (bound below), so it is exempt here like the reads.
+        # audittrace:audit (CONSOLE-AUDIT-EVIDENCE, ADDENDUM-A7 C2) is the same
+        # kind: a realm-defined default of audittrace-librechat since the first
+        # import (hook comment: both are realm-defined defaults) and the single
+        # default of the evidence audience (bound in its own test below). The
+        # exemption is exactly these two names, never a wider set.
         unbound = sorted(
             bff_exchange_scopes()
             - bound
             - BASELINE_REALM_DEFAULT_READS
-            - {"audittrace:query"}
+            - {"audittrace:query", "audittrace:audit"}
         )
         assert not unbound, (
             f"not bound to {LIBRECHAT} by the provisioning hook: {unbound} "
@@ -171,6 +179,31 @@ class TestHookOffersEveryExchangeScopeToLibrechat:
             r'\s*bind_scope "\$\{CHAT_AUD_CLIENT_ID\}" "\$\{SCOPE\}" "default"',
             text,
         ), "the chat scopes are no longer bound as DEFAULT to the chat audience"
+
+    def test_the_evidence_scope_is_hook_bound_as_default_to_the_evidence_audience(
+        self,
+    ) -> None:
+        from bff.console_evidence_scopes import EVIDENCE_SCOPES
+
+        text = SCRIPT.read_text(encoding="utf-8")
+        arr = re.search(r"^\s*EVID_AUD_DEFAULT_SCOPES=\((.*?)\)$", text, re.M)
+        assert arr is not None, "the hook lost its evidence audience scope array"
+        assert tuple(re.findall(r'"([^"]+)"', arr.group(1))) == EVIDENCE_SCOPES
+        assert re.search(
+            r'for SCOPE in "\$\{EVID_AUD_DEFAULT_SCOPES\[@\]\}"; do\s*\n'
+            r'\s*evid_aud_resolve_scope "\$\{SCOPE\}"\s*\n'
+            r'\s*bind_scope "\$\{EVID_AUD_CLIENT_ID\}" "\$\{SCOPE\}" "default"',
+            text,
+        ), "the evidence scope is no longer bound as DEFAULT to the evidence audience"
+
+    def test_the_audit_exemption_is_real_a_realm_default_of_the_login_client(
+        self,
+    ) -> None:
+        """The exemption for ``audittrace:audit`` is true on the realm file: the
+        login client carries it as a DEFAULT, so no hook binding is needed."""
+        client = _client(_chart_realm(True), LIBRECHAT)
+        assert client is not None
+        assert "audittrace:audit" in set(client.get("defaultClientScopes", []))
 
     def test_the_baseline_exemption_is_real_and_not_widened(self) -> None:
         client = _client(_chart_realm(True), LIBRECHAT)

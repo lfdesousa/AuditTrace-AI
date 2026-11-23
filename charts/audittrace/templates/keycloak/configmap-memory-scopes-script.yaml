@@ -1741,6 +1741,192 @@ data:
     done
     chat_aud_verify "${CHAT_AUD_UUID}"
 
+    # ----- CONSOLE-AUDIT-EVIDENCE WU-C: the evidence token-exchange audience client (audittrace-librechat-evidence) -----
+    # The BFF's evidence proxy exchanges to THIS client (bff/console_evidence_scopes.py):
+    # a public client with every flow off whose only DEFAULT scope is audittrace:audit
+    # and which has no optional scope, so Keycloak's legacy token exchange grants
+    # exactly that and nothing else (bff/exchange.py). Same shape as the chat audience
+    # above, copied layer for layer. Created on an existing realm
+    # (realm-audittrace.json only imports on the first run), never by hand.
+    # Idempotent: an existing client is verified, never `kcadm update`d; any drift
+    # fails closed via the Job's shared `acl_e2e_fail` reporter. The pinned JSON below
+    # is byte-identical in scripts/setup-memory-scopes.sh and the chart ConfigMap
+    # (parity-guarded). Step 4c below authorizes the BFF to exchange for it.
+    EVID_AUD_CLIENT_ID="audittrace-librechat-evidence"
+    EVID_AUD_CLIENT_JSON='{"clientId":"audittrace-librechat-evidence","description":"Token-exchange audience for the evidence proxy (CONSOLE-AUDIT-EVIDENCE). No flow of its own: its only DEFAULT scope is audittrace:audit (bff/console_evidence_scopes.py), so an exchange to this audience grants exactly that and nothing else.","enabled":true,"protocol":"openid-connect","publicClient":true,"standardFlowEnabled":false,"directAccessGrantsEnabled":false,"implicitFlowEnabled":false,"serviceAccountsEnabled":false,"fullScopeAllowed":false,"attributes":{"token-exchange.authorized-source-client":"audittrace-librechat-bff"},"defaultClientScopes":["audittrace:audit"],"optionalClientScopes":[],"protocolMappers":[{"name":"aud-audittrace-server","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper","config":{"included.custom.audience":"audittrace-server","id.token.claim":"false","access.token.claim":"true"}}]}'
+    EVID_AUD_DEFAULT_SCOPES=("audittrace:audit")
+    ACL_E2E_STAGE="pre-step:init"
+
+    # Whitespace-stripped JSON of one kcadm GET.
+    evid_aud_compact() {
+      local raw
+      raw=$(acl_e2e_kc get "$1" -r "${REALM}") || acl_e2e_fail read-failed "cannot read the evidence audience client"
+      echo "${raw//[[:space:]]/}"
+    }
+
+    # Names of the evidence audience client's default|optional scopes, one per line.
+    evid_aud_scope_names() {
+      local out line
+      out=$(acl_e2e_kc get "clients/$1/$2-client-scopes" -r "${REALM}" \
+              --fields name --format csv --noquotes) \
+        || acl_e2e_fail read-failed "cannot read the $2 scopes of the evidence audience client"
+      while IFS= read -r line; do
+        line="${line//\"/}"
+        [[ -n "${line}" ]] && echo "${line}"
+      done <<< "${out}"
+      return 0
+    }
+
+    evid_aud_in_default_set() {
+      local want
+      for want in "${EVID_AUD_DEFAULT_SCOPES[@]}"; do
+        [[ "$1" == "${want}" ]] && return 0
+      done
+      return 1
+    }
+
+    # audittrace:audit is a REALM-defined client scope (never created by this
+    # script), so its id is resolved from the live realm; an absent one fails closed.
+    evid_aud_resolve_scope() {
+      local name="$1" found="" csv sid sname
+      [[ -n "${SCOPE_ID[${name}]:-}" ]] && return 0
+      # Pure bash (no awk in this image): list first so a kcadm failure reaches
+      # the read-failed branch directly, then take the FIRST row whose 2nd CSV
+      # field equals the name exactly (a prefix of another name never matches).
+      csv=$(acl_e2e_kc get client-scopes -r "${REALM}" \
+              --fields id,name --format csv --noquotes) \
+        || acl_e2e_fail read-failed "cannot list the realm client scopes (evidence audience client)"
+      while IFS=, read -r sid sname _; do
+        if [[ "${sname}" == "${name}" ]]; then
+          found="${sid}"
+          break
+        fi
+      done <<< "${csv}"
+      [[ -n "${found}" ]] \
+        || acl_e2e_fail id-unresolvable "a pinned evidence audience client scope is absent from the realm"
+      SCOPE_ID["${name}"]="${found}"
+    }
+
+    # Remove every default/optional scope NOT in the pinned set (Keycloak may add
+    # realm-default scopes on create): default keeps audittrace:audit, optional
+    # keeps none.
+    evid_aud_strip_scopes() {
+      local uuid="$1" kind out sid sname keep
+      ACL_E2E_STAGE="strip"
+      for kind in "default" "optional"; do
+        out=$(acl_e2e_kc get "clients/${uuid}/${kind}-client-scopes" -r "${REALM}" \
+                --fields id,name --format csv --noquotes) \
+          || acl_e2e_fail strip-list-failed "cannot list ${kind} scopes (evidence audience client)"
+        while IFS=, read -r sid sname; do
+          sid="${sid//\"/}"; sname="${sname//\"/}"
+          [[ -z "${sid}" ]] && continue
+          keep=0
+          if [[ "${kind}" == "default" ]] && evid_aud_in_default_set "${sname}"; then
+            keep=1
+          fi
+          if [[ "${keep}" -eq 0 ]]; then
+            acl_e2e_kc delete "clients/${uuid}/${kind}-client-scopes/${sid}" \
+              -r "${REALM}" >/dev/null \
+              || acl_e2e_fail strip-delete-failed "could not strip unpinned ${kind} scope (evidence audience client)"
+            echo "  ✓ ${EVID_AUD_CLIENT_ID}: stripped unpinned ${kind} scope ${sname}"
+          fi
+        done <<< "${out}"
+      done
+    }
+
+    # VERIFY (equality on the compared keys): every flow off, fullScopeAllowed
+    # false, the authorized-source-client attribute, the default scopes EXACTLY the
+    # audittrace:audit alone, NO optional scope, and exactly one protocol mapper (the audience
+    # mapper). Any difference -> exit non-zero with a closed-vocabulary diff (counts
+    # and shapes, never a byte of the response).
+    evid_aud_verify() {
+      local uuid="$1" diffs="" compact item name names n=0 unexpected=0
+      ACL_E2E_STAGE="verify-client"
+      compact=$(evid_aud_compact "clients/${uuid}") \
+        || acl_e2e_fail read-failed "cannot read the evidence audience client"
+      for item in \
+          '"clientId":"audittrace-librechat-evidence"' '"publicClient":true' \
+          '"standardFlowEnabled":false' '"directAccessGrantsEnabled":false' \
+          '"implicitFlowEnabled":false' '"serviceAccountsEnabled":false' \
+          '"fullScopeAllowed":false' \
+          '"token-exchange.authorized-source-client":"audittrace-librechat-bff"'; do
+        [[ "${compact}" == *"${item}"* ]] || diffs+=" missing:${item}"
+      done
+      ACL_E2E_STAGE="verify-default-scopes"
+      names=$(evid_aud_scope_names "${uuid}" default) \
+        || acl_e2e_fail read-failed "cannot read default scopes (evidence audience client)"
+      while IFS= read -r name; do
+        [[ -z "${name}" ]] && continue
+        n=$((n + 1))
+        evid_aud_in_default_set "${name}" || unexpected=$((unexpected + 1))
+      done <<< "${names}"
+      [[ "${unexpected}" -eq 0 ]] || diffs+=" unexpected-default-scope:count=${unexpected}"
+      [[ "${n}" -eq "${#EVID_AUD_DEFAULT_SCOPES[@]}" ]] || diffs+=" default-scope-count:${n}"
+      ACL_E2E_STAGE="verify-optional-scopes"
+      names=$(evid_aud_scope_names "${uuid}" optional) \
+        || acl_e2e_fail read-failed "cannot read optional scopes (evidence audience client)"
+      n=0
+      while IFS= read -r name; do
+        [[ -z "${name}" ]] && continue
+        n=$((n + 1))
+      done <<< "${names}"
+      [[ "${n}" -eq 0 ]] || diffs+=" unexpected-optional-scope:count=${n}"
+      ACL_E2E_STAGE="verify-mappers"
+      names=$(acl_e2e_kc get "clients/${uuid}/protocol-mappers/models" -r "${REALM}" \
+                --fields name --format csv --noquotes) \
+        || acl_e2e_fail read-failed "cannot read protocol mappers (evidence audience client)"
+      n=0
+      unexpected=0
+      while IFS= read -r name; do
+        name="${name//\"/}"
+        [[ -z "${name}" ]] && continue
+        n=$((n + 1))
+        [[ "${name}" == "aud-audittrace-server" ]] || unexpected=$((unexpected + 1))
+      done <<< "${names}"
+      [[ "${unexpected}" -eq 0 ]] || diffs+=" unexpected-mapper:count=${unexpected}"
+      [[ "${n}" -eq 1 ]] || diffs+=" mapper-count:${n}"
+      if [[ "${#diffs}" -gt 0 ]]; then
+        acl_e2e_fail drift "drift from the pinned client (fail closed, no kcadm update):${diffs} (evidence audience client)"
+      fi
+      echo "  ✓ ${EVID_AUD_CLIENT_ID}: verified equal to the pinned block"
+    }
+
+    evid_aud_lookup() {
+      local out
+      out=$(acl_e2e_kc get clients -r "${REALM}" -q "clientId=${EVID_AUD_CLIENT_ID}" \
+              --fields id,clientId --format csv --noquotes) \
+        || acl_e2e_fail lookup-failed "client lookup failed (evidence audience client)"
+      echo "${out//\"/}"
+    }
+
+    echo "▶ ensuring the evidence token-exchange audience client ${EVID_AUD_CLIENT_ID}..."
+    ACL_E2E_STAGE="lookup"
+    EVID_AUD_FOUND=$(evid_aud_lookup) || acl_e2e_fail lookup-failed "client lookup failed (evidence audience client)"
+    if [[ -z "${EVID_AUD_FOUND//[[:space:]]/}" ]]; then
+      ACL_E2E_STAGE="create"
+      printf '%s' "${EVID_AUD_CLIENT_JSON}" | acl_e2e_kc create clients -r "${REALM}" -f - >/dev/null \
+        || acl_e2e_fail create-failed "create failed (evidence audience client)"
+      echo "  ✓ ${EVID_AUD_CLIENT_ID}: created"
+      ACL_E2E_STAGE="lookup"
+      EVID_AUD_UUID=$(evid_aud_lookup) || acl_e2e_fail lookup-failed "client lookup failed (evidence audience client)"
+      EVID_AUD_UUID="${EVID_AUD_UUID%%,*}"
+      [[ -n "${EVID_AUD_UUID}" ]] || acl_e2e_fail id-unresolvable "created but id not resolvable (evidence audience client)"
+    else
+      [[ "$(echo "${EVID_AUD_FOUND}" | grep -c .)" -eq 1 ]] \
+        || acl_e2e_fail ambiguous-match "more than one client matches (refusing) (evidence audience client)"
+      EVID_AUD_UUID="${EVID_AUD_FOUND%%,*}"
+    fi
+    # Strip then bind on EVERY run (both are idempotent): a client created by the
+    # realm import, by an earlier run, or by hand converges to exactly the one
+    # defaults, and the verify below then pins the result.
+    evid_aud_strip_scopes "${EVID_AUD_UUID}"
+    ACL_E2E_STAGE="bind"
+    for SCOPE in "${EVID_AUD_DEFAULT_SCOPES[@]}"; do
+      evid_aud_resolve_scope "${SCOPE}"
+      bind_scope "${EVID_AUD_CLIENT_ID}" "${SCOPE}" "default"
+    done
+    evid_aud_verify "${EVID_AUD_UUID}"
+
     # ── Step 3: ensure user-identity protocol mappers ─────────────
     #
     # Without these mappers on user-facing clients, JWTs carry only a
@@ -1934,6 +2120,32 @@ data:
     acl_e2e_kc update "clients/${REALM_MGMT_UUID}/authz/resource-server/permission/scope/${TOKEN_EXCHANGE_CHAT_PERM_ID}" \
       -r "${REALM}" -s "policies=[\"${TOKEN_EXCHANGE_POLICY_ID}\"]" >/dev/null
     echo "  ✓ ${TOKEN_EXCHANGE_SOURCE_CLIENT} authorized to exchange for ${TOKEN_EXCHANGE_CHAT_TARGET_CLIENT}"
+
+    # ── Step 4c: authorize the same exchange for the EVIDENCE audience (CONSOLE-AUDIT-EVIDENCE) ──
+    # The evidence proxy exchanges to `audittrace-librechat-evidence`, a THIRD target
+    # of the same source client. Same three idempotent kcadm calls as Step 4b, the same
+    # Client policy (TOKEN_EXCHANGE_POLICY_ID, resolved above) attached to the
+    # evidence client's own token-exchange scope-permission. Without it the exchange
+    # answers `access_denied` and the evidence routes answer 502 (no fallback audience).
+    TOKEN_EXCHANGE_EVIDENCE_TARGET_CLIENT="audittrace-librechat-evidence"
+    echo "▶ authorizing ${TOKEN_EXCHANGE_SOURCE_CLIENT} to exchange for ${TOKEN_EXCHANGE_EVIDENCE_TARGET_CLIENT}..."
+    ACL_E2E_STAGE="token-exchange-evidence"
+    if ! EVIDENCE_TARGET_UUID=$(find_client_id "${TOKEN_EXCHANGE_EVIDENCE_TARGET_CLIENT}"); then
+      echo "❌ target client ${TOKEN_EXCHANGE_EVIDENCE_TARGET_CLIENT} not found — cannot authorize exchange." >&2
+      exit 1
+    fi
+    acl_e2e_kc update "clients/${EVIDENCE_TARGET_UUID}/management/permissions" \
+      -r "${REALM}" -s enabled=true >/dev/null
+    TOKEN_EXCHANGE_EVIDENCE_PERM_ID=$(acl_e2e_kc get "clients/${EVIDENCE_TARGET_UUID}/management/permissions" -r "${REALM}" \
+      | grep '"token-exchange"' | sed -E 's/.*"token-exchange" *: *"([^"]+)".*/\1/')
+    if [[ -z "${TOKEN_EXCHANGE_EVIDENCE_PERM_ID}" ]]; then
+      echo "❌ could not resolve the token-exchange scope-permission id for ${TOKEN_EXCHANGE_EVIDENCE_TARGET_CLIENT}." >&2
+      exit 1
+    fi
+    echo "  ✓ token-exchange permission id (evidence audience): ${TOKEN_EXCHANGE_EVIDENCE_PERM_ID}"
+    acl_e2e_kc update "clients/${REALM_MGMT_UUID}/authz/resource-server/permission/scope/${TOKEN_EXCHANGE_EVIDENCE_PERM_ID}" \
+      -r "${REALM}" -s "policies=[\"${TOKEN_EXCHANGE_POLICY_ID}\"]" >/dev/null
+    echo "  ✓ ${TOKEN_EXCHANGE_SOURCE_CLIENT} authorized to exchange for ${TOKEN_EXCHANGE_EVIDENCE_TARGET_CLIENT}"
 
     echo "✅ memory-scopes provisioning complete."
 
