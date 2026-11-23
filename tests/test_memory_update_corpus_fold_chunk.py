@@ -501,6 +501,9 @@ class TestTheStoredRowsTheRefusalReads:
         assert fold(client, "episodic", PRIVATE_SOURCE, "decisions").status_code == 200
         (private_id,) = stored()[SHARED]
         assert private_id.startswith(f"{USER}__")
+        own_chunk = f"/memory/semantic/decisions/{private_id.split('__', 1)[1]}"
+        owner_read = client.get(own_chunk)
+        assert (owner_read.status_code, owner_read.json()["content"]) == (200, "plan")
         owner_before = stored()[SHARED]
         assert owner_before[private_id][1]["source"] == PRIVATE_SOURCE
         with as_caller(client, CURATOR, admin=True):
@@ -526,6 +529,9 @@ class TestTheStoredRowsTheRefusalReads:
         rows = stored()
         assert rows[SHARED] == owner_before
         assert rows[CORPUS][private_id][0] == "edited"
+        # The owner still reads its own chunk through the route, unchanged.
+        owner_after = client.get(own_chunk)
+        assert (owner_after.status_code, owner_after.json()["content"]) == (200, "plan")
 
     def test_a_corpus_row_readers_get_that_no_fold_wrote_is_refused_whole(
         self, client: TestClient
@@ -555,3 +561,39 @@ class TestTheStoredRowsTheRefusalReads:
         assert put.json() == {"detail": STORED_ELSEWHERE_REFUSAL}
         assert stored() == before
         assert audit_rows("doc-c") == rows
+
+    def test_a_legacy_private_row_at_a_corpus_id_is_not_a_corpus_fold_row(
+        self, client: TestClient
+    ) -> None:
+        """B1 of review r1 (the legacy form of S1). A private fold chunk written
+        before LC-9 sits at the bare id in ``<c>_v2`` with its owner's ``user_id``
+        and ``source`` and NO ``tier`` and NO ``id_form``: ``new_form_owner``
+        returns ``None`` for it, so only the ``tier == "corpus"`` condition of the
+        shared-row filter keeps it out. Dropped, the editor's PUT is a 409 that
+        names the owner's private source and the corpus document is not updated."""
+        with as_caller(client, CURATOR, admin=True):
+            made = client.post(
+                "/memory/semantic",
+                params={"promote": "corpus"},
+                json={"collection": "decisions", "document_id": "doc-c", "text": "v1"},
+            )
+        assert made.status_code == 200, made.text
+        legacy = {"user_id": USER, "source": PRIVATE_SOURCE, "chunk_index": 0}
+        rewrite(SHARED, {"doc-c": ("owner text", legacy)})
+        owner_before = stored()[SHARED]
+        read_before = client.get(URL["semantic"])
+
+        with as_caller(client, EDITOR, admin=True):
+            put = client.put(URL["semantic"], json={"text": "edited"})
+
+        assert put.status_code == 200, put.text
+        assert put.json()["tier"] == "corpus"
+        assert PRIVATE_SOURCE not in put.text
+        rows = stored()
+        assert rows[SHARED] == owner_before
+        assert rows[CORPUS]["doc-c"][0] == "edited"
+        read_after = client.get(URL["semantic"])
+        assert (read_after.status_code, read_after.json()["content"]) == (
+            read_before.status_code,
+            read_before.json()["content"],
+        )
