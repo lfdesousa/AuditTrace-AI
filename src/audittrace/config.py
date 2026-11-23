@@ -162,6 +162,13 @@ class Settings(BaseSettings):
     # The client a subject token must have been issued to (its ``azp``).
     refusal_ingest_subject_client: str = "audittrace-librechat"
 
+    # CONSOLE-AUDIT-EVIDENCE: the database roles that read ``interactions`` across users
+    # by design, served in ``visibility.answer.service_readers``. A comma-separated list
+    # of role names rendered by the chart from the summariser role, or the literal
+    # ``operator-managed`` (the chart renders it when the summariser SQL is not
+    # rendered). Fail closed: unset or blank is ``operator-managed``, i.e. "unverified".
+    evidence_service_readers: str = "operator-managed"
+
     # Redis-backed token cache (DESIGN §15.4 / §15.4a). The cache holds
     # validated JWT claims keyed on sha256(token) so the hot path skips
     # JWKS validation entirely.

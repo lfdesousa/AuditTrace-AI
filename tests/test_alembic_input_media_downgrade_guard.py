@@ -20,6 +20,10 @@ from sqlalchemy import Engine, create_engine, inspect, text
 
 from audittrace.integrity import content_hash
 
+# CONSOLE-AUDIT-EVIDENCE: 041 now sits on 040. The guard belongs to 040's downgrade, so each
+# test first steps the database down to 040 (SQLite DDL is not transactional: a refusal
+# AFTER 041 had been undone would not roll that back) and then takes the single step.
+REV_040 = "ae606b421cf9"
 MEDIA = '{"count":1,"items":[],"schema":1}'
 FIELDS: dict[str, object] = {
     "project": "p",
@@ -88,9 +92,11 @@ def test_downgrade_refuses_while_a_row_records_an_image(engine: Engine) -> None:
     _migrate(engine, "head")
     _insert(engine, None)
     _insert(engine, MEDIA)
+    _migrate(engine, REV_040)
     before = _state(engine)
+    assert before[1] == REV_040, "control: the database is at 040"
     head = ScriptDirectory.from_config(_cfg()).get_current_head()
-    assert before[1] == head, "control: the database is at head"
+    assert head != REV_040, "control: 040 is no longer the head"
     with pytest.raises(RuntimeError, match=r"input_media.*\b1 row"):
         _migrate(engine, "-1")
     assert _state(engine) == before, "a refused downgrade changes nothing"
@@ -99,6 +105,7 @@ def test_downgrade_refuses_while_a_row_records_an_image(engine: Engine) -> None:
 def test_downgrade_proceeds_when_no_row_records_an_image(engine: Engine) -> None:
     _migrate(engine, "head")
     _insert(engine, None)
+    _migrate(engine, REV_040)
     columns_before, _, _ = _state(engine)
     assert "input_media" in columns_before
     _migrate(engine, "-1")
@@ -111,6 +118,7 @@ def test_the_refusal_says_what_would_be_lost(engine: Engine) -> None:
     _migrate(engine, "head")
     _insert(engine, MEDIA)
     _insert(engine, MEDIA)
+    _migrate(engine, REV_040)
     with pytest.raises(RuntimeError) as caught:
         _migrate(engine, "-1")
     message = str(caught.value)

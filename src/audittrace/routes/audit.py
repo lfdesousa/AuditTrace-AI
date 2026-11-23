@@ -39,6 +39,8 @@ from audittrace.models import (
     SessionListResponse,
     ToolCallListResponse,
 )
+from audittrace.routes._id_bounds import in_int4_range
+from audittrace.routes._message_id_bind import message_id_rejection
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,10 @@ def _row_to_dict(row: InteractionRow) -> dict[str, Any]:
         # Migration 040: the stored canonical JSON, returned parsed (null = no
         # image recorded). ``getattr``: the schema-drift stand-in has no column.
         "input_media": _parsed_input_media(row),
+        # Migration 041: the console message id the turn carried (correlation
+        # metadata, NOT hashed). ``getattr``: the schema-drift stand-in and any older
+        # duck-typed row has no column.
+        "client_message_id": getattr(row, "client_message_id", None),
     }
 
 
@@ -152,6 +158,15 @@ async def list_interactions(
             "other filter."
         ),
     ),
+    client_message_id: str | None = Query(
+        None,
+        description=(
+            "Filter by the console message id the turn carried in "
+            "X-AuditTrace-Message-Id (migration 041). Same shape as the header "
+            "(1-255 of [A-Za-z0-9._:-], not '.' or '..'); composes with every other "
+            "filter."
+        ),
+    ),
     limit: int = Query(100, ge=1, le=1000, description="Max rows (1-1000)."),
     offset: int = Query(0, ge=0, description="Pagination offset."),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:audit"]),
@@ -163,6 +178,10 @@ async def list_interactions(
     the row count matching the filters *for the caller*; it's what paginators
     need to render page counts.
     """
+    if client_message_id is not None and message_id_rejection(client_message_id):
+        raise HTTPException(
+            status_code=422, detail={"invalid_fields": ["client_message_id"]}
+        )
     try:
         pg = get_postgres_factory()
     except Exception as exc:
@@ -188,6 +207,8 @@ async def list_interactions(
             stmt = stmt.where(InteractionRow.event_class == event_class)
         if trace_id is not None:
             stmt = stmt.where(InteractionRow.trace_id == trace_id)
+        if client_message_id is not None:
+            stmt = stmt.where(InteractionRow.client_message_id == client_message_id)
 
         total = (
             await db.execute(select(func.count()).select_from(stmt.subquery()))
@@ -278,6 +299,10 @@ async def list_tool_calls(
     is not yours" would turn this endpoint into an existence oracle for
     other users' rows. Both cases return an empty list.
     """
+    if not in_int4_range(interaction_id):
+        # Not a possible key (``interactions.id`` is 32-bit): the driver would refuse to
+        # bind it (a 500 on PostgreSQL). Answer as for any unknown id.
+        return {"interaction_id": interaction_id, "tool_calls": [], "total": 0}
     try:
         pg = get_postgres_factory()
     except Exception as exc:

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from audittrace.routes._message_id_bind import message_id_rejection
 
 
 class RefusalIngestRequest(BaseModel):
@@ -31,3 +33,16 @@ class RefusalIngestRequest(BaseModel):
     subject_token: str = Field(min_length=1, repr=False)
     session_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:-]{1,128}$")
     inbound_trace_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    # CONSOLE-AUDIT-EVIDENCE (A6 S1/Q7): the console message id the refused turn carried,
+    # so ``GET /evidence/messages/{id}`` finds the refusal row. Unhashed by construction.
+    client_message_id: str | None = None
+
+    @field_validator("client_message_id")
+    @classmethod
+    def _message_id_shape(cls, value: str | None) -> str | None:
+        """The chain predicate with ``re.fullmatch`` (A7 C3). ``Field(pattern=...)`` is
+        not usable: the predicate has a lookahead, which pydantic's default Rust regex
+        engine rejects. The 422 names the field, never the value."""
+        if value is not None and message_id_rejection(value) is not None:
+            raise ValueError("invalid client_message_id")
+        return value

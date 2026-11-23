@@ -13,6 +13,8 @@ from sqlalchemy import create_engine, inspect
 
 from audittrace.db.models import InteractionRecord
 
+REV_040 = "ae606b421cf9"
+
 
 @pytest.fixture
 def migrated_columns() -> dict[str, dict[str, object]]:
@@ -54,6 +56,9 @@ def test_downgrade_one_step_removes_only_that_column() -> None:
     with engine.begin() as conn:
         cfg.attributes["connection"] = conn
         command.upgrade(cfg, "head")
+        # CONSOLE-AUDIT-EVIDENCE: 041 now sits on 040; step down to 040 first so the
+        # single step under test is still the one that removes ``input_media``.
+        command.downgrade(cfg, REV_040)
         before = {c["name"] for c in inspect(conn).get_columns("interactions")}
         command.downgrade(cfg, "-1")
         after = {c["name"] for c in inspect(conn).get_columns("interactions")}

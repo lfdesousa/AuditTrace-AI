@@ -186,3 +186,13 @@ function call, `reasoning_content`, and the free-form definitions of the request
 export-time scrub drops data-URL payloads and runs of more than 128 characters of
 standard-alphabet base64 from every string; a shorter run, a URL-safe run or one broken into short
 lines, written in text, stays.
+
+## The evidence routes recompute this hash for you
+
+`GET /evidence/messages/{client_message_id}` and `GET /evidence/interactions/{id}` (scope
+`audittrace:audit`, your own rows only) return, under `integrity`, the stored `content_hash`,
+the `hashed_fields` names, the recipe text (`hash_inputs`) and a verdict recomputed from the
+stored row: `match`, `mismatch`, or `unavailable`. `unavailable` means the row has no stored
+hash (rows older than migration 017, `memory_access` rows and scan `security` rows are written
+without one); it is never reported as a mismatch. `client_message_id` (migration 041) and the
+recall record of a tool call are correlation metadata and are never part of the hashed content.
