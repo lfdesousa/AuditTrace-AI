@@ -110,11 +110,11 @@ import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 
-from scripts.deploy import mesh, registry, verify_alias
+from scripts.deploy import mesh, registry, verify_alias, verify_workloads
 from scripts.deploy.frontdoor import (
     DEFAULT_FRONT_DOOR as _DEFAULT_FRONT_DOOR,
 )
@@ -125,6 +125,11 @@ from scripts.deploy.frontdoor import (
     resolve_front_door,
 )
 from scripts.deploy.runner import extract_digest, normalize_version
+from scripts.deploy.verify_workloads import (
+    CONSOLE_ANCHOR_SUFFIX,
+    FIRST_PARTY_WORKLOADS,
+    FirstPartyWorkload,
+)
 
 logger = logging.getLogger("audittrace.deploy.verify")
 
@@ -371,55 +376,6 @@ PROBES = (
     "first-party-images-match-published",
     "log-trace-id",
 )
-
-
-class FirstPartyWorkload(NamedTuple):
-    """One first-party workload probe 11 compares to the registry.
-
-    ``deployment`` is the chart's fullname under the DEFAULT release (the
-    probe derives the live name from ``--release``), ``component`` the pod
-    selector value, ``container`` the container whose ``imageID`` is read,
-    ``repo_path`` the registry repository (``registry.resolve(repo_path=...)``)
-    and ``console_gated`` marks a workload the chart renders only with the
-    console (so its expectation follows the console's other Deployment).
-
-    Mirrors the chart's own naming (``templates/reaper``,
-    ``templates/console/deployment-bff.yaml``) and the deploy runner's
-    selector/container pairs, DUPLICATED here rather than imported from the
-    runner (independence contract: two separately-derived readings of the same
-    cluster, not one shared code path). Pinned by EQUALITY to the rendered chart
-    (``tests/test_verify_probe11.py`` G7'), not by prefix.
-
-    Excluded by definition, each named in that test: ``audittrace-memory-server``
-    (probe 2's item), ``audittrace-librechat`` (the fork's own pin, not
-    versioned by ``--target-version``), ``audittrace-test-rls`` (a test Pod,
-    render-level only) and ``audittrace-llm-stub`` (kind-only posture).
-    """
-
-    deployment: str
-    component: str
-    container: str
-    repo_path: str
-    console_gated: bool = False
-
-    @property
-    def label(self) -> str:
-        return self.deployment.removeprefix("audittrace-")
-
-
-FIRST_PARTY_WORKLOADS = (
-    FirstPartyWorkload(
-        "audittrace-pod-reaper", "pod-reaper", "pod-reaper", "memory-server"
-    ),
-    FirstPartyWorkload(
-        "audittrace-librechat-bff", "librechat-bff", "bff", "bff", console_gated=True
-    ),
-)
-
-# The console's OTHER Deployment: it renders together with the BFF (same
-# ``console.enabled`` gate), so its presence is the signal that the BFF is
-# EXPECTED (an absent BFF beside a present console is a finding, not "absent").
-CONSOLE_ANCHOR_SUFFIX = "librechat"
 
 
 # ── external-effect indirections (monkeypatched in tests) ────────────────────
@@ -1684,14 +1640,12 @@ class VerifyRunner:
             },
         )
 
-    def _deployment_exists(self, deployment: str) -> bool | None:
-        """Whether ``deployment`` is present in this namespace. ``True`` /
-        ``False`` (NotFound) when determinable, ``None`` when the read failed
-        for any OTHER reason (an unreachable cluster, RBAC, ...): kept DISTINCT
-        from ``False`` so the probe FAILs fail-closed on an unreadable cluster
-        instead of reading it as "absent" (proven by
-        ``test_hostile_deploy_report_cannot_move_the_verdict``: EVERY probe
-        must FAIL when every cluster read fails)."""
+    def _read_deployment(self, deployment: str) -> tuple[bool | None, dict[str, Any]]:
+        """``(present, document)``: ``present`` is ``True`` / ``False``
+        (NotFound), or ``None`` when the read failed for any OTHER reason (kept
+        DISTINCT from ``False`` so an unreadable cluster FAILs fail-closed, see
+        ``test_hostile_deploy_report_cannot_move_the_verdict``); ``document`` is
+        the parsed Deployment (``{}`` when absent or not JSON)."""
         proc = _run(
             [
                 "kubectl",
@@ -1705,13 +1659,23 @@ class VerifyRunner:
             ]
         )
         if proc.returncode == 0:
-            return True
+            try:
+                doc = json.loads(proc.stdout)
+            except ValueError:
+                return True, {}
+            return True, doc if isinstance(doc, dict) else {}
         if "NotFound" in proc.stderr:
-            return False
-        return None
+            return False, {}
+        return None, {}
 
-    def _live_workload_digest(self, workload: FirstPartyWorkload) -> str | None:
-        """The live digest of ``workload``, requiring EVERY matching pod to
+    def _live_workload_digest(
+        self,
+        workload: FirstPartyWorkload,
+        container: str | None = None,
+        init: bool = False,
+    ) -> str | None:
+        """The live digest of ``container`` (default: the workload's main
+        container; ``init`` reads ``initContainerStatuses``), requiring EVERY matching pod to
         agree (fix-round should-fix) — never just the first token. Two pods, one
         stale, used to PASS on the first (possibly stale) one; now any
         disagreement is ``None`` (unreadable), mirroring the deploy runner's own
@@ -1724,9 +1688,8 @@ class VerifyRunner:
         a correct release."""
         jsonpath = (
             '{.items[?(@.status.phase=="Running")]'
-            '.status.containerStatuses[?(@.name=="'
-            + workload.container
-            + '")].imageID}'
+            f".status.{'initContainerStatuses' if init else 'containerStatuses'}"
+            '[?(@.name=="' + (container or workload.container) + '")].imageID}'
         )
         proc = _run(
             [
@@ -1753,20 +1716,31 @@ class VerifyRunner:
             return next(iter(digests))
         return None
 
-    def _compare_workload(
-        self, workload: FirstPartyWorkload
+    def _compare_container(
+        self,
+        workload: FirstPartyWorkload,
+        ref_: verify_workloads.ContainerRef,
     ) -> tuple[dict[str, Any], str | None, str | None]:
-        """Compare one PRESENT workload with the registry.
+        """Compare one container of a PRESENT workload with the registry.
 
         Returns ``(item evidence, failure line or None, note or None)`` — the
         note is the ``ALIAS:`` line of an alias the policy accepts. The item's ``match``
         is one of :mod:`scripts.deploy.verify_alias`'s kinds, or ``no-live-digest``
         / ``no-published-digest`` / ``unresolved`` when no comparison happened.
         """
-        label = workload.label
+        label = workload.label + (
+            "" if ref_.name == workload.container else f"/{ref_.name}"
+        )
+        if ref_.repo_path is None:
+            return (
+                {"match": verify_alias.UNRESOLVED},
+                f"{label}: a first-party container the registry module cannot "
+                "resolve (not compared)",
+                None,
+            )
         try:
             ref = registry.resolve(
-                self.cfg.image_tag, self.cfg.registry, repo_path=workload.repo_path
+                self.cfg.image_tag, self.cfg.registry, repo_path=ref_.repo_path
             )
         except registry.DigestResolutionError as exc:
             return (
@@ -1775,7 +1749,7 @@ class VerifyRunner:
                 f"{self.cfg.image_tag}: {exc}",
                 None,
             )
-        live = self._live_workload_digest(workload)
+        live = self._live_workload_digest(workload, ref_.name, ref_.is_init)
         item: dict[str, Any] = {
             "live_digest": live,
             "published_digest": ref.digest,
@@ -1797,7 +1771,7 @@ class VerifyRunner:
                 None,
             )
         match = verify_alias.classify(
-            live, ref.digest, self.cfg.registry, repo_path=workload.repo_path
+            live, ref.digest, self.cfg.registry, repo_path=ref_.repo_path
         )
         item["match"] = match.kind
         if match.kind == verify_alias.EXACT:
@@ -1810,7 +1784,7 @@ class VerifyRunner:
                 ref.digest,
                 match,
                 self.cfg.registry,
-                repo_path=workload.repo_path,
+                repo_path=ref_.repo_path,
             )
             if registry.ALIAS_POLICY == "fail":
                 return item, line, None
@@ -1821,6 +1795,30 @@ class VerifyRunner:
             f"({match.kind}: {match.reason or 'running an unpublished image'})",
             None,
         )
+
+    def _compare_workload(
+        self, workload: FirstPartyWorkload, deployment: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[str], list[str]]:
+        """Compare EVERY first-party container of a PRESENT workload (A1), main
+        first: ``(item, failure lines, notes)``. Extras sit under
+        ``containers``; a failing extra sets the item's ``match`` to its own."""
+        item: dict[str, Any] = {}
+        failures: list[str] = []
+        notes: list[str] = []
+        extras: dict[str, dict[str, Any]] = {}
+        for ref_ in verify_workloads.containers_to_check(workload, deployment):
+            sub, failure, note = self._compare_container(workload, ref_)
+            failures += [failure] if failure else []
+            notes += [note] if note else []
+            if ref_.name == workload.container and not ref_.is_init:
+                item = sub
+            else:
+                extras[ref_.name] = sub
+                if sub["match"] not in (verify_alias.EXACT, verify_alias.ALIAS):
+                    item["match"] = sub["match"]
+        if extras:
+            item["containers"] = extras
+        return item, failures, notes
 
     def probe_first_party_images_match_published(self) -> ProbeResult:
         """Every first-party workload ``--target-version`` versions, other than
@@ -1853,11 +1851,12 @@ class VerifyRunner:
         index digest) follows the ONE policy ``registry.ALIAS_POLICY``
         (default FAIL), with an ``ALIAS:`` diagnosis line either way.
         """
-        anchor = self._deployment_exists(f"{self.cfg.release}-{CONSOLE_ANCHOR_SUFFIX}")
-        existence = {
-            w.label: self._deployment_exists(f"{self.cfg.release}-{w.label}")
+        anchor, _ = self._read_deployment(f"{self.cfg.release}-{CONSOLE_ANCHOR_SUFFIX}")
+        reads = {
+            w.label: self._read_deployment(f"{self.cfg.release}-{w.label}")
             for w in FIRST_PARTY_WORKLOADS
         }
+        existence = {label: state for label, (state, _) in reads.items()}
         console_absent = anchor is False and all(
             existence[w.label] is False
             for w in FIRST_PARTY_WORKLOADS
@@ -1887,11 +1886,11 @@ class VerifyRunner:
                 items[workload.label] = {"match": "absent"}
                 failures.append(f"{workload.label}: expected but absent")
             else:
-                items[workload.label], failure, note = self._compare_workload(workload)
-                if failure:
-                    failures.append(failure)
-                if note:
-                    notes.append(note)
+                items[workload.label], found, seen = self._compare_workload(
+                    workload, reads[workload.label][1]
+                )
+                failures += found
+                notes += seen
         checked = sum(
             1
             for item in items.values()

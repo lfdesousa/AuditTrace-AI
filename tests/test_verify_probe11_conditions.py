@@ -35,6 +35,7 @@ from tests.test_verify_probe11 import (
     RC2_BODY,
     RC2_DIGEST,
     RC3_BODY,
+    RC3_DIGEST,
     TAG,
     Registry,
     _cfg,
@@ -168,12 +169,17 @@ def test_c1_a_live_digest_the_registry_does_not_serve_is_unresolved(
     _assert_negative(res, "unresolved")
 
 
-def test_c1_a_single_manifest_never_aliases_an_index(tmp_path, monkeypatch, policy):
-    """No ``manifests`` key = a bare image manifest = {"manifest": digest}; two
-    different digests never share a platform set. Neuter: treat it as an empty
-    index and compare {} == {} -> alias -> RED."""
-    single = json.dumps({"schemaVersion": 2, "layers": []}).encode()
-    _assert_negative(_probe(tmp_path, monkeypatch, live_body=single), "mismatch")
+def test_c1_two_single_manifests_never_alias(tmp_path, monkeypatch, policy):
+    """No ``manifests`` key = a bare image manifest = {"manifest": <its digest>}.
+    Two DIFFERENT bare manifests must be a mismatch. Neuter: key the bare
+    manifest without its digest (``{"manifest": ""}``) -> both sides equal ->
+    alias -> RED (the previous test paired a bare manifest with an index, which
+    that neuter could not change: an equivalent mutant)."""
+    live = json.dumps({"schemaVersion": 2, "layers": [1]}).encode()
+    pub = json.dumps({"schemaVersion": 2, "layers": [2]}).encode()
+    _assert_negative(
+        _probe(tmp_path, monkeypatch, live_body=live, pub_body=pub), "mismatch"
+    )
 
 
 @pytest.mark.parametrize(
@@ -494,23 +500,68 @@ _KINDS = (
     "Pod",
 )
 FIRST_PARTY_PREFIXES = ("docker.io/lfds/", "localhost:5000/audittrace/")
-# Rendered third-party REBUILDS that carry "audittrace" in the name (measured on
-# the gate: five frozen images). Anything else with "audittrace" in its image
+# Rendered third-party REBUILDS that carry "audittrace" in the name: the EXACT
+# measured repositories (five frozen images, 2026-11-24 render of both cells),
+# never a prefix glob (A2: a first-party image pushed to ghcr under a new
+# name must not pass as a mirror). Anything else with "audittrace" in its image
 # name that is not first-party must be added here deliberately.
-MIRROR_ALLOWLIST = ("ghcr.io/lfdesousa/audittrace-",)
-# Named exclusions (workload -> why it is not a probe-11 item).
+MIRROR_ALLOWLIST = frozenset(
+    {
+        "ghcr.io/lfdesousa/audittrace-chroma",
+        "ghcr.io/lfdesousa/audittrace-mc",
+        "ghcr.io/lfdesousa/audittrace-minio",
+        "ghcr.io/lfdesousa/audittrace-postgresql",
+        "ghcr.io/lfdesousa/audittrace-redis-exporter",
+    }
+)
+# Named exclusions, keyed (kind, name, container, image repository) so an EXTRA
+# first-party container on any of them is a difference too (A1).
 EXCLUSIONS = {
-    ("Deployment", "audittrace-memory-server"): "probe 2's item",
+    (
+        "Deployment",
+        "audittrace-memory-server",
+        "memory-server",
+        "docker.io/lfds/audittrace-memory-server",
+    ): "check 2's item",
     (
         "Deployment",
         "audittrace-librechat",
+        "librechat",
+        "docker.io/lfds/audittrace-librechat",
     ): "the fork's own pin, not versioned by --target-version",
-    ("Pod", "audittrace-test-rls"): "a test Pod, render-level only",
+    (
+        "Deployment",
+        "audittrace-librechat",
+        "wait-for-oidc-discovery",
+        "docker.io/lfds/audittrace-librechat",
+    ): "the fork's own pin (init container)",
+    (
+        "Pod",
+        "audittrace-test-rls",
+        "tests",
+        "docker.io/lfds/audittrace-tests",
+    ): "a test Pod, render-level only",
     (
         "Deployment",
         "audittrace-llm-stub",
+        "llm-stub",
+        "docker.io/lfds/audittrace-llm-stub",
     ): "kind-only (llmStub.enabled), never in production",
 }
+
+
+def _table_triples() -> set[tuple[str, str, str, str]]:
+    """The probe's workload table as (kind, name, container, image repository),
+    the repository taken from the registry module's hub backend."""
+    return {
+        (
+            "Deployment",
+            w.deployment,
+            w.container,
+            registry._backend("hub", w.repo_path)[0],
+        )
+        for w in verify.FIRST_PARTY_WORKLOADS
+    }
 
 
 def _pod_spec(doc: dict[str, Any]) -> dict[str, Any] | None:
@@ -530,13 +581,19 @@ def _prefixes(monkeypatch_env: str | None) -> tuple[str, ...]:
     return FIRST_PARTY_PREFIXES + extra
 
 
+def _repo(image: str) -> str:
+    """``repo`` of ``repo[:tag][@digest]``."""
+    head, _, tail = image.partition("@")[0].rpartition("/")
+    return f"{head}/{tail.partition(':')[0]}"
+
+
 def _scan(
     rendered: str, prefixes: tuple[str, ...]
-) -> tuple[set[tuple[str, str]], set[str]]:
-    """(first-party workloads, images naming 'audittrace' that are neither
-    first-party nor on the mirror allowlist). Every kind, every container, init
-    included."""
-    workloads: set[tuple[str, str]] = set()
+) -> tuple[set[tuple[str, str, str, str]], set[str]]:
+    """(first-party (kind, name, container, repository) triples, repositories
+    naming 'audittrace' that are neither first-party nor on the EXACT mirror
+    allowlist). Every kind, every container, init included."""
+    triples: set[tuple[str, str, str, str]] = set()
     unclassified: set[str] = set()
     for doc in yaml.safe_load_all(rendered):
         if not doc or doc.get("kind") not in _KINDS:
@@ -546,11 +603,19 @@ def _scan(
             (pod or {}).get("containers") or []
         ):
             image = str(container.get("image", ""))
+            repository = _repo(image)
             if image.startswith(prefixes):
-                workloads.add((doc["kind"], doc["metadata"]["name"]))
-            elif "audittrace" in image and not image.startswith(MIRROR_ALLOWLIST):
-                unclassified.add(image)
-    return workloads, unclassified
+                triples.add(
+                    (
+                        doc["kind"],
+                        doc["metadata"]["name"],
+                        container["name"],
+                        repository,
+                    )
+                )
+            elif "audittrace" in image and repository not in MIRROR_ALLOWLIST:
+                unclassified.add(repository)
+    return triples, unclassified
 
 
 def _render(*extra: str) -> str:
@@ -580,8 +645,7 @@ def test_g7_every_rendered_first_party_workload_is_a_table_row_or_a_named_exclus
         _render("--set", "llmStub.enabled=true", "--set", "externalLLM.enabled=false"),
         prefixes,
     )
-    table = {("Deployment", w.deployment) for w in verify.FIRST_PARTY_WORKLOADS}
-    assert base_workloads | stub_workloads == table | set(EXCLUSIONS)
+    assert base_workloads | stub_workloads == _table_triples() | set(EXCLUSIONS)
     assert base_unclassified | stub_unclassified == set()
 
 
@@ -662,8 +726,8 @@ def test_g7_neuter_a_new_first_party_workload_of_any_kind_is_caught(doc, expecte
     """The neuter, executed: each shape appears in the difference set, so the
     equality in the render test would be RED."""
     found, _ = _scan(yaml.safe_dump(doc), FIRST_PARTY_PREFIXES)
-    table = {("Deployment", w.deployment) for w in verify.FIRST_PARTY_WORKLOADS}
-    assert found - (table | set(EXCLUSIONS)) == {expected}
+    extra = found - (_table_triples() | set(EXCLUSIONS))
+    assert {(kind, name) for kind, name, _, _ in extra} == {expected}
 
 
 def test_g7_neuter_an_unclassified_audittrace_image_is_caught():
@@ -678,7 +742,7 @@ def test_g7_neuter_an_unclassified_audittrace_image_is_caught():
                 "spec": {
                     "containers": [
                         {"name": "a", "image": "quay.io/acme/audittrace-new:1"},
-                        {"name": "b", "image": "ghcr.io/lfdesousa/audittrace-frozen:1"},
+                        {"name": "b", "image": "ghcr.io/lfdesousa/audittrace-minio:1"},
                         {"name": "c", "image": "docker.io/library/nginx:1"},
                     ]
                 }
@@ -686,7 +750,7 @@ def test_g7_neuter_an_unclassified_audittrace_image_is_caught():
         },
     }
     found, unclassified = _scan(yaml.safe_dump(doc), FIRST_PARTY_PREFIXES)
-    assert found == set() and unclassified == {"quay.io/acme/audittrace-new:1"}
+    assert found == set() and unclassified == {"quay.io/acme/audittrace-new"}
 
 
 def test_g7_the_env_var_prefix_override_is_honoured():
@@ -705,7 +769,8 @@ def test_g7_the_env_var_prefix_override_is_honoured():
         },
     }
     found, unclassified = _scan(yaml.safe_dump(doc), _prefixes("quay.io/acme/ , "))
-    assert found == {("Deployment", "d")} and unclassified == set()
+    assert found == {("Deployment", "d", "a", "quay.io/acme/audittrace-new")}
+    assert unclassified == set()
     assert _prefixes(None) == FIRST_PARTY_PREFIXES
 
 
@@ -715,3 +780,200 @@ def test_g7_the_probe_prefixes_equal_the_runners_default_prefixes():
     from scripts.deploy.runner.images import FIRST_PARTY_PREFIXES as RUNNER
 
     assert FIRST_PARTY_PREFIXES == tuple(RUNNER)
+
+
+def _deployment(name, containers=(), init=()):
+    spec = {"containers": list(containers), "initContainers": list(init)}
+    return yaml.safe_dump(
+        {
+            "kind": "Deployment",
+            "metadata": {"name": name},
+            "spec": {"template": {"spec": spec}},
+        }
+    )
+
+
+def test_g7_neuter_an_extra_first_party_init_container_on_the_pod_reaper_is_caught():
+    """A1, the reviewer's sneak case: the table workload keeps its (kind, name)
+    but gains an init container on the BFF image. Keyed by (kind, name) the set
+    equality stayed GREEN; keyed per container it is a difference.
+    Neuter: key by (kind, name) only -> the extra container is invisible -> RED."""
+    reaper = next(w for w in verify.FIRST_PARTY_WORKLOADS if w.label == "pod-reaper")
+    doc = _deployment(
+        reaper.deployment,
+        containers=[
+            {"name": "pod-reaper", "image": "docker.io/lfds/audittrace-memory-server:1"}
+        ],
+        init=[{"name": "sneak", "image": "docker.io/lfds/audittrace-librechat-bff:1"}],
+    )
+    found, _ = _scan(doc, FIRST_PARTY_PREFIXES)
+    extra = found - (_table_triples() | set(EXCLUSIONS))
+    assert extra == {
+        (
+            "Deployment",
+            reaper.deployment,
+            "sneak",
+            "docker.io/lfds/audittrace-librechat-bff",
+        )
+    }
+    assert {(k, n) for k, n, _, _ in found} <= {
+        (k, n) for k, n, _, _ in _table_triples() | set(EXCLUSIONS)
+    }, "the (kind, name) view alone cannot see it"
+
+
+def test_g7_neuter_a_first_party_image_under_a_ghcr_mirror_name_is_caught():
+    """A2, the reviewer's sneak case: ``ghcr.io/lfdesousa/audittrace-memory-server``
+    is not one of the five measured mirrors. Neuter: the old prefix glob
+    ``ghcr.io/lfdesousa/audittrace-`` -> it passes as a mirror -> RED."""
+    doc = _deployment(
+        "d",
+        containers=[
+            {"name": "a", "image": "ghcr.io/lfdesousa/audittrace-memory-server:1.34.0"},
+            {"name": "b", "image": "ghcr.io/lfdesousa/audittrace-minio:1"},
+        ],
+    )
+    found, unclassified = _scan(doc, FIRST_PARTY_PREFIXES)
+    assert found == set()
+    assert unclassified == {"ghcr.io/lfdesousa/audittrace-memory-server"}
+
+
+def test_g7_the_probe_prefixes_equal_the_verifiers_own_copy():
+    """verify_workloads keeps its OWN copy of the prefixes (independence); pin
+    it to this test's derivation and to the runner's default."""
+    from scripts.deploy import verify_workloads
+
+    assert verify_workloads.FIRST_PARTY_PREFIXES == FIRST_PARTY_PREFIXES
+    assert verify_workloads.first_party_prefixes() == _prefixes(
+        os.environ.get("AUDITTRACE_FIRST_PARTY_IMAGE_PREFIXES")
+    )
+
+
+# ── A1 at the probe: EVERY first-party container of an expected workload ────
+
+REAPER_DEPLOYMENT = "audittrace-pod-reaper"
+EXTRA_IMAGE = "docker.io/lfds/audittrace-librechat-bff:1.34.0"
+
+
+def _reaper_with_extra(image: str, *, init: bool = True, live: str | None = RC3_DIGEST):
+    """kubectl stub: the stock healthy cluster, but the pod-reaper Deployment
+    carries an EXTRA container ``sneak`` on ``image`` whose live imageID is
+    ``live``."""
+    inner = _kube()
+    main = {"name": "pod-reaper", "image": "docker.io/lfds/audittrace-memory-server:1"}
+    extra = {"name": "sneak", "image": image}
+    spec = {"containers": [main] + ([] if init else [extra])}
+    if init:
+        spec["initContainers"] = [extra]
+    doc = json.dumps({"spec": {"template": {"spec": spec}}})
+
+    def run(cmd):
+        joined = " ".join(cmd)
+        if f"get deployment {REAPER_DEPLOYMENT}" in joined:
+            return subprocess.CompletedProcess(["x"], 0, doc, "")
+        if "imageID" in joined and "pod-reaper" in joined and '"sneak"' in joined:
+            key = "initContainerStatuses" if init else "containerStatuses"
+            assert key in joined
+            return subprocess.CompletedProcess(
+                ["x"], 0, f"repo@{live}" if live else "", ""
+            )
+        return inner(cmd)
+
+    return run
+
+
+def test_probe11_an_extra_first_party_init_container_is_compared(tmp_path, monkeypatch):
+    """A1: the extra init container's live digest differs from its published one
+    -> FAIL naming ``pod-reaper/sneak``. Neuter: ``containers_to_check`` returns
+    only the main container (the old behaviour) -> PASS -> RED."""
+    res = probe11(
+        tmp_path,
+        monkeypatch,
+        Registry(),
+        _reaper_with_extra(EXTRA_IMAGE, live=RC2_DIGEST),
+    )
+    assert res.status == verify.FAIL
+    assert "pod-reaper/sneak" in res.detail
+    item = res.evidence["items"]["pod-reaper"]
+    assert item["containers"]["sneak"]["live_digest"] == RC2_DIGEST
+
+
+@pytest.mark.parametrize("init", [True, False])
+def test_probe11_an_equal_extra_container_passes_and_is_evidenced(
+    tmp_path, monkeypatch, init
+):
+    res = probe11(
+        tmp_path, monkeypatch, Registry(), _reaper_with_extra(EXTRA_IMAGE, init=init)
+    )
+    assert res.status == verify.PASS and res.detail.endswith("(checked 2 of 2)")
+    assert (
+        res.evidence["items"]["pod-reaper"]["containers"]["sneak"]["match"] == "exact"
+    )
+
+
+def test_probe11_an_unreadable_extra_container_is_not_checked(tmp_path, monkeypatch):
+    """No live digest for the extra container: FAIL and the workload does not
+    count as checked (1 of 2). Neuter: drop the item-match update for a failing
+    extra -> checked 2 -> RED."""
+    res = probe11(
+        tmp_path, monkeypatch, Registry(), _reaper_with_extra(EXTRA_IMAGE, live=None)
+    )
+    assert res.status == verify.FAIL
+    assert "pod-reaper/sneak: workload exists but no live pod digest" in res.detail
+    assert res.detail.endswith("(checked 1 of 2)")
+
+
+def test_probe11_a_first_party_image_the_registry_cannot_resolve_fails_closed(
+    tmp_path, monkeypatch
+):
+    """The fork image on the reaper: first-party by prefix, no ``repo_path``.
+    Neuter: skip a container whose repo_path is None -> PASS -> RED."""
+    res = probe11(
+        tmp_path,
+        monkeypatch,
+        Registry(),
+        _reaper_with_extra("docker.io/lfds/audittrace-librechat:6143572"),
+    )
+    assert res.status == verify.FAIL
+    assert (
+        "pod-reaper/sneak: a first-party container the registry module cannot resolve"
+        in res.detail
+    )
+
+
+def test_probe11_a_third_party_extra_container_is_ignored(tmp_path, monkeypatch):
+    res = probe11(
+        tmp_path,
+        monkeypatch,
+        Registry(),
+        _reaper_with_extra("docker.io/istio/proxyv2:1.2"),
+    )
+    assert res.status == verify.PASS
+    assert "containers" not in res.evidence["items"]["pod-reaper"]
+
+
+def test_probe11_the_env_prefix_makes_an_extra_image_first_party(tmp_path, monkeypatch):
+    """AUDITTRACE_FIRST_PARTY_IMAGE_PREFIXES extends the verifier's own prefix
+    set: an image under it is ours, unresolvable, so FAIL."""
+    monkeypatch.setenv("AUDITTRACE_FIRST_PARTY_IMAGE_PREFIXES", "quay.io/acme/")
+    res = probe11(
+        tmp_path, monkeypatch, Registry(), _reaper_with_extra("quay.io/acme/x:1")
+    )
+    assert res.status == verify.FAIL and "pod-reaper/sneak" in res.detail
+
+
+def test_probe11_a_registry_port_in_an_extra_image_is_not_a_tag(tmp_path, monkeypatch):
+    """``localhost:5000/audittrace/librechat-bff@sha256:..`` (no tag) parses to
+    its repository (the port is not a tag separator) and is classified as the
+    BFF. Neuter: ``rpartition(":")`` on the whole image -> repository
+    ``localhost`` -> not first-party -> ignored -> the item has no ``containers``
+    -> RED."""
+    res = probe11(
+        tmp_path,
+        monkeypatch,
+        Registry(),
+        _reaper_with_extra(f"localhost:5000/audittrace/librechat-bff@{RC3_DIGEST}"),
+    )
+    assert res.status == verify.PASS
+    assert (
+        res.evidence["items"]["pod-reaper"]["containers"]["sneak"]["match"] == "exact"
+    )
