@@ -8,6 +8,7 @@ unknown backend).
 
 from __future__ import annotations
 
+import hashlib
 import json
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -85,7 +86,40 @@ def test_resolve_bff_repo_path_hits_the_bff_repository(monkeypatch):
 
 def test_resolve_bff_repo_path_unknown_registry_backend_raises(monkeypatch):
     with pytest.raises(ValueError, match="unknown registry backend"):
-        registry.resolve("1.29.1", "local", repo_path="bff")
+        registry.resolve("1.29.1", "nowhere", repo_path="bff")
+
+
+def test_resolve_local_bff_repo_path_uses_the_local_registry(monkeypatch):
+    """AC5 (VERIFY-PROBE11): the BFF is pushed to ``localhost:5000`` by every
+    ``--registry local`` rc deploy; ``resolve(repo_path="bff")`` reads it there.
+    Neuter: remove ``_EXTRA_REPO_PATHS["bff"]["local"]`` -> ValueError -> RED."""
+    urls: list[str] = []
+
+    def _get(url, headers=None):
+        urls.append(url)
+        return 200, {"docker-content-digest": "sha256:" + "a" * 64}, b"{}"
+
+    monkeypatch.setattr(registry, "_http_get", _get)
+    ref = registry.resolve("1.34.0-rc3-cc47cc7", "local", repo_path="bff")
+    assert ref.repository == "localhost:5000/audittrace/librechat-bff"
+    assert urls == [
+        "http://localhost:5000/v2/audittrace/librechat-bff/manifests/1.34.0-rc3-cc47cc7"
+    ]
+
+
+@pytest.mark.parametrize(
+    "repository,expected",
+    [
+        ("docker.io/lfds/audittrace-memory-server", ("hub", "memory-server")),
+        ("localhost:5000/audittrace/memory-server", ("local", "memory-server")),
+        ("docker.io/lfds/audittrace-librechat-bff", ("hub", "bff")),
+        ("localhost:5000/audittrace/librechat-bff", ("local", "bff")),
+        ("docker.io/lfds/audittrace-librechat", None),
+        ("docker.io/lfds/audittrace-tests", None),
+    ],
+)
+def test_locate_repository_maps_known_repositories_only(repository, expected):
+    assert registry.locate_repository(repository) == expected
 
 
 def test_resolve_hub_auth_non_200(monkeypatch):
@@ -231,3 +265,158 @@ def test_resolve_local_timeout_is_soft(monkeypatch):
     # a local-registry timeout is soft: unpinned ref, no exception
     assert ref.digest is None
     assert ref.pinned is False
+
+
+# ── fetch_by_digest / slsa_build_revision / alias_diagnosis (VERIFY-PROBE11) ──
+
+_BODY = b'{"schemaVersion": 2}'
+_BODY_DIGEST = "sha256:" + hashlib.sha256(_BODY).hexdigest()
+
+
+def test_fetch_by_digest_returns_a_body_that_hashes_to_the_digest(monkeypatch):
+    seen: list[tuple[str, dict]] = []
+
+    def _get(url, headers=None):
+        seen.append((url, headers))
+        return 200, {}, _BODY
+
+    monkeypatch.setattr(registry, "_http_get", _get)
+    out = registry.fetch_by_digest(
+        "manifests", _BODY_DIGEST, "local", repo_path="memory-server"
+    )
+    assert out == _BODY
+    assert (
+        seen[0][0]
+        == f"http://localhost:5000/v2/audittrace/memory-server/manifests/{_BODY_DIGEST}"
+    )
+    assert "image.index" in seen[0][1]["Accept"]
+
+
+def test_fetch_by_digest_blobs_accept_anything(monkeypatch):
+    seen: list[dict] = []
+    monkeypatch.setattr(
+        registry,
+        "_http_get",
+        lambda url, headers=None: (seen.append(headers), (200, {}, _BODY))[1],
+    )
+    registry.fetch_by_digest("blobs", _BODY_DIGEST, "local", repo_path="bff")
+    assert seen[0]["Accept"] == "*/*"
+
+
+def test_fetch_by_digest_hub_sends_the_anonymous_bearer_token(monkeypatch):
+    seen: list[dict | None] = []
+
+    def _get(url, headers=None):
+        if url.startswith(registry.HUB_AUTH):
+            return 200, {}, b'{"token": "t0k"}'
+        seen.append(headers)
+        return 200, {}, _BODY
+
+    monkeypatch.setattr(registry, "_http_get", _get)
+    registry.fetch_by_digest("manifests", _BODY_DIGEST, "hub", repo_path="bff")
+    assert seen[0]["Authorization"] == "Bearer t0k"
+
+
+@pytest.mark.parametrize("digest", ["sha256:LIVE", "md5:abc", "", "sha256:" + "A" * 64])
+def test_fetch_by_digest_refuses_a_malformed_digest_without_any_read(
+    monkeypatch, digest
+):
+    monkeypatch.setattr(
+        registry, "_http_get", lambda *a, **k: pytest.fail("no read for a bad digest")
+    )
+    with pytest.raises(DigestResolutionError, match="not a sha256 digest"):
+        registry.fetch_by_digest("manifests", digest, "local", repo_path="bff")
+
+
+def test_fetch_by_digest_refuses_a_body_that_does_not_hash_to_the_digest(monkeypatch):
+    """B2.6. Neuter: skip the hash comparison -> this returns the wrong bytes -> RED."""
+    monkeypatch.setattr(
+        registry, "_http_get", lambda url, headers=None: (200, {}, _BODY + b"\n")
+    )
+    with pytest.raises(DigestResolutionError, match="hashes to"):
+        registry.fetch_by_digest("manifests", _BODY_DIGEST, "local", repo_path="bff")
+
+
+def test_fetch_by_digest_non_200_and_transport_errors_are_resolution_errors(
+    monkeypatch,
+):
+    monkeypatch.setattr(registry, "_http_get", lambda url, headers=None: (404, {}, b""))
+    with pytest.raises(DigestResolutionError, match="HTTP 404"):
+        registry.fetch_by_digest("manifests", _BODY_DIGEST, "local", repo_path="bff")
+
+    def _boom(url, headers=None):
+        raise TimeoutError("slow")
+
+    monkeypatch.setattr(registry, "_http_get", _boom)
+    with pytest.raises(DigestResolutionError, match="failed"):
+        registry.fetch_by_digest("manifests", _BODY_DIGEST, "local", repo_path="bff")
+
+
+def _att_registry(revision_blob: bytes | None):
+    """A local registry stub serving an index -> attestation manifest -> blob."""
+    blob_digest = "sha256:" + hashlib.sha256(revision_blob or b"").hexdigest()
+    att_manifest = json.dumps({"layers": [{"digest": blob_digest}]}).encode()
+    att_digest = "sha256:" + hashlib.sha256(att_manifest).hexdigest()
+    index = json.dumps(
+        {
+            "manifests": [
+                {
+                    "digest": "sha256:" + "b" * 64,
+                    "platform": {"os": "linux", "architecture": "amd64"},
+                },
+                {
+                    "digest": att_digest,
+                    "platform": {"os": "unknown", "architecture": "unknown"},
+                },
+            ]
+        }
+    ).encode()
+    served = {att_digest: att_manifest}
+    if revision_blob is not None:
+        served[blob_digest] = revision_blob
+
+    def _get(url, headers=None):
+        ref = url.rsplit("/", 1)[-1]
+        return (200, {}, served[ref]) if ref in served else (404, {}, b"")
+
+    return index, _get
+
+
+def test_slsa_build_revision_reads_vcs_revision_from_the_attestation(monkeypatch):
+    rev = "f04c5c491b55cc03daaf73157a5d7a5cb40ad64b"
+    index, get = _att_registry(
+        json.dumps({"predicate": {"vcs:revision": rev}}).encode()
+    )
+    monkeypatch.setattr(registry, "_http_get", get)
+    assert registry.slsa_build_revision(index, "local", repo_path="bff") == rev
+
+
+def test_slsa_build_revision_is_na_when_the_attestation_is_unreadable(monkeypatch):
+    """Never a guess: no blob (404), no attestation child, or a non-index body -> n/a."""
+    index, get = _att_registry(None)
+    monkeypatch.setattr(registry, "_http_get", get)
+    assert registry.slsa_build_revision(index, "local", repo_path="bff") == "n/a"
+    assert registry.slsa_build_revision(b"not json", "local", repo_path="bff") == "n/a"
+    assert registry.slsa_build_revision(b"[]", "local", repo_path="bff") == "n/a"
+    no_att = json.dumps(
+        {"manifests": [{"digest": "sha256:" + "b" * 64, "platform": {"os": "linux"}}]}
+    ).encode()
+    assert registry.slsa_build_revision(no_att, "local", repo_path="bff") == "n/a"
+
+
+def test_alias_diagnosis_line_format():
+    line = registry.alias_diagnosis(
+        "librechat-bff",
+        "sha256:" + "1" * 64,
+        "sha256:" + "2" * 64,
+        {"linux/amd64": "sha256:" + "3" * 64},
+        "aaa",
+        "n/a",
+    )
+    assert line == (
+        "ALIAS: librechat-bff live index 111111111111 != published index 222222222222; "
+        "shared platform manifests {linux/amd64: 333333333333}; "
+        "build revisions live=aaa published=n/a; "
+        "remedy: operator accepts the alias, or clean the node image cache "
+        "(crictl rmi <config>) and re-verify"
+    )

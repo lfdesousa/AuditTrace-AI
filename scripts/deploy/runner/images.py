@@ -71,6 +71,7 @@ import yaml
 
 from scripts.deploy import registry
 from scripts.deploy import runner as _runner_pkg
+from scripts.deploy.runner import alias
 from scripts.deploy.runner.config import MEMORY_SERVER_COMPONENT
 
 if TYPE_CHECKING:
@@ -628,26 +629,40 @@ class FirstPartyImagesMixin:
                         container=container_name,
                         is_init=is_init,
                     )
+                    alias_line = None
                     if live_status == "render_only":
                         equal = render_match
                     elif live_digest is None:
                         equal = False
                     else:
                         equal = render_match and live_digest == digest
-                    rows.append(
-                        {
-                            "component": component,
-                            "kind": kind,
-                            "workload": name,
-                            "container": container_name,
-                            "is_init": is_init,
-                            "repository": repository,
-                            "rendered": rendered,
-                            "chart": chart_ref,
-                            "live": live_digest,
-                            "unpinned": False,
-                            "status": live_status,
-                            "equal": equal,
-                        }
-                    )
+                        if render_match and not equal and digest is not None:
+                            # A live digest that differs from the pin may be a
+                            # content-equal alias (VERIFY-PROBE11, ADDENDUM-2 C2):
+                            # the deployer's OWN classifier; a repository the
+                            # registry module cannot resolve keeps raw equality (S1).
+                            verdict = alias.classify(
+                                live_digest, digest, repository, component
+                            )
+                            if verdict is not None and verdict.kind == alias.ALIAS:
+                                live_status = "content_equal_alias"
+                                alias_line = verdict.line
+                                equal = registry.ALIAS_POLICY == "pass"
+                    row = {
+                        "component": component,
+                        "kind": kind,
+                        "workload": name,
+                        "container": container_name,
+                        "is_init": is_init,
+                        "repository": repository,
+                        "rendered": rendered,
+                        "chart": chart_ref,
+                        "live": live_digest,
+                        "unpinned": False,
+                        "status": live_status,
+                        "equal": equal,
+                    }
+                    if alias_line:
+                        row["alias"] = alias_line
+                    rows.append(row)
         return rows

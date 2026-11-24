@@ -2397,6 +2397,84 @@ def test_cli_returns_eight_on_first_party_mismatch(tmp_path, monkeypatch):
     assert rc == 8
 
 
+def test_cli_returns_eight_not_one_on_a_fork_image_digest_mismatch(
+    tmp_path, monkeypatch
+):
+    """VERIFY-PROBE11 S1: the fork image (``audittrace-librechat``) has no
+    registry ``repo_path``; a live digest that differs from the chart pin is a
+    plain unequal row and the process exits 8 — never a crash (1) from trying to
+    classify an unknown repository, and never a registry read for that row.
+    Neuter: classify every first-party row (``registry.resolve``/``_backend`` raise
+    ValueError for the fork repository) -> rc 1 -> RED."""
+    manifest_yaml = json.dumps(
+        _manifest_deployment_doc(
+            "audittrace-librechat",
+            "librechat",
+            "docker.io/lfds/audittrace-librechat:768de61@sha256:" + "b" * 64,
+        )
+    )
+    live_pods = json.dumps(
+        {
+            "items": [
+                {
+                    "metadata": {},
+                    "status": {
+                        "phase": "Running",
+                        "containerStatuses": [
+                            {
+                                "name": "librechat",
+                                "imageID": "repo@sha256:" + "a" * 64,
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+    )
+    disp = _Dispatcher(
+        rules=[
+            ("helm get manifest", _proc(0, manifest_yaml)),
+            ("helm upgrade", _proc(0, "deployed")),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 9, "info": {"status": "deployed"}})),
+            ),
+            ("jsonpath={.spec.replicas}", _proc(0, "1")),
+            ("component=librechat", _proc(0, live_pods)),
+            ("status.phase", _proc(0, "Running")),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    monkeypatch.setattr(runner, "_sleep", lambda s: None)
+    monkeypatch.setattr(registry, "resolve", lambda v, reg: _pinned_ref())
+    monkeypatch.setattr(
+        registry,
+        "_http_get",
+        lambda *a, **k: pytest.fail("the fork image must not be classified"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_read_chart_values",
+        lambda *a, **k: {
+            "console": {
+                "librechat": {
+                    "image": {
+                        "repository": "docker.io/lfds/audittrace-librechat",
+                        "tag": "768de61",
+                        "digest": "sha256:" + "b" * 64,
+                    }
+                }
+            },
+            "tests": {"image": {"tag": "9.9.9"}},
+        },
+    )
+    monkeypatch.setattr(mesh, "MeshGate", lambda *a, **k: _healthy_gate())
+    rc = runner.main(
+        ["--target-version", "v9.9.9", "--out-dir", str(tmp_path / "runs")]
+    )
+    assert rc == 8
+
+
 def test_noop_path_d3_recheck_clears_converged_and_exits_eight(tmp_path, monkeypatch):
     """B-3 / V-1 (fix round 1): P2 reads an ALL-EQUAL manifest and records
     `noop` (`self.converged = True`); P4 independently re-reads the

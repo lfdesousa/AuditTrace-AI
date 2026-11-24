@@ -26,6 +26,17 @@ from scripts.deploy.runner.images import (
     committed_first_party_digests,
     mismatched_components,
 )
+from tests.test_verify_probe11 import (
+    ATT,
+    RC2_BODY,
+    RC2_DIGEST,
+    RC3_BODY,
+    RC3_DIGEST,
+    Registry,
+    child,
+    dgst,
+    index_body,
+)
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -1135,3 +1146,145 @@ def test_selector_from_manifest_doc_none_when_absent_or_malformed():
         images._selector_from_manifest_doc({"spec": {"selector": {"matchLabels": {}}}})
         is None
     )
+
+
+# ── VERIFY-PROBE11: content-equal alias on the deployer's P4 rows ───────────
+#
+# The deployer judges with its OWN classifier (``scripts/deploy/runner/alias.py``,
+# ADDENDUM-2 C2); the policy constant is the one shared decision. Registry
+# traffic is stubbed at ``registry._http_get`` with the MEASURED rc2/rc3 BFF
+# index bodies (tests/fixtures/registry), never at the classifier.
+
+
+_LOCAL_BFF = "localhost:5000/audittrace/librechat-bff"
+_LOCAL_BFF_VALUES = {
+    "console": {
+        "enabled": True,
+        "bff": {
+            "image": {
+                "repository": _LOCAL_BFF,
+                "tag": "1.34.0-rc3-cc47cc7",
+                "digest": RC3_DIGEST,
+            }
+        },
+    }
+}
+
+
+def _bff_alias_rows(tmp_path, monkeypatch, *, live_digest, live_body):
+    monkeypatch.setattr(
+        registry,
+        "_http_get",
+        Registry(bff_tag_body=RC3_BODY, extra={"live": live_body}),
+    )
+    manifest = _manifest_yaml(
+        _deployment_doc(
+            "audittrace-librechat-bff",
+            "bff",
+            f"{_LOCAL_BFF}:1.34.0-rc3-cc47cc7@{RC3_DIGEST}",
+        )
+    )
+    disp = _Dispatcher(
+        rules=[
+            ("helm get manifest", _proc(0, manifest)),
+            ("get deployment audittrace-librechat-bff -n", _proc(0, "")),
+            ("component=librechat-bff", _pods_json([_pod("bff", live_digest)])),
+        ]
+    )
+    r = _runner(tmp_path, monkeypatch, disp)
+    return r._first_party_image_rows(chart_values=_LOCAL_BFF_VALUES)
+
+
+@pytest.mark.parametrize("policy", ["fail", "pass"])
+def test_row_content_equal_alias_status_follows_the_policy(
+    tmp_path, monkeypatch, policy
+):
+    """Live = rc2 index, chart pin = rc3 index, same amd64 manifest. The row is
+    ``content_equal_alias`` with the ALIAS line; ``equal`` follows the ONE policy.
+    Neuter: keep raw equality (``live == digest``) -> status stays ``ok`` -> RED."""
+    monkeypatch.setattr(registry, "ALIAS_POLICY", policy)
+    rows = _bff_alias_rows(
+        tmp_path, monkeypatch, live_digest=RC2_DIGEST, live_body=RC2_BODY
+    )
+    (row,) = rows
+    assert row["status"] == "content_equal_alias"
+    assert row["equal"] is (policy == "pass")
+    assert row["alias"].startswith(
+        "ALIAS: bff live index 0580d1fb82fd != published index 861b43561e63"
+    )
+    assert "remedy" in row["alias"]
+    assert mismatched_components(rows) == ([] if policy == "pass" else ["bff"])
+
+
+@pytest.mark.parametrize("policy", ["fail", "pass"])
+def test_row_differing_platform_is_not_an_alias_under_either_policy(
+    tmp_path, monkeypatch, policy
+):
+    """Neuter: classify any index pair as an alias -> RED under 'pass'."""
+    monkeypatch.setattr(registry, "ALIAS_POLICY", policy)
+    other = index_body([child("sha256:" + "d" * 64), ATT])
+    rows = _bff_alias_rows(
+        tmp_path, monkeypatch, live_digest=dgst(other), live_body=other
+    )
+    (row,) = rows
+    assert row["status"] != "content_equal_alias" and row["equal"] is False
+    assert "alias" not in row
+
+
+def test_row_unreadable_registry_keeps_the_unequal_status_quo(tmp_path, monkeypatch):
+    """An unresolvable body never makes a row equal (fail closed)."""
+    monkeypatch.setattr(registry, "ALIAS_POLICY", "pass")
+    rows = _bff_alias_rows(
+        tmp_path, monkeypatch, live_digest="sha256:" + "7" * 64, live_body=b"{}"
+    )
+    assert rows[0]["equal"] is False and rows[0]["status"] != "content_equal_alias"
+
+
+def test_row_without_a_repo_path_keeps_raw_equality_and_never_reads_the_registry(
+    tmp_path, monkeypatch
+):
+    """S1: the fork image (``audittrace-librechat``) and the tests image have no
+    ``repo_path``; a digest mismatch there stays an unequal row (exit 8 upstream),
+    never a crash and never a registry read — even though both digests are valid
+    sha256 values a classifier could fetch. Neuter: map an unmapped repository to
+    a default repo_path (``located or ("hub", "memory-server")``) -> a registry
+    read -> RED."""
+    monkeypatch.setattr(registry, "ALIAS_POLICY", "pass")
+    monkeypatch.setattr(
+        registry,
+        "_http_get",
+        lambda *a, **k: pytest.fail("no registry read for this row"),
+    )
+    pinned = "sha256:" + "b" * 64
+    values = {
+        "console": {
+            "librechat": {
+                "image": {
+                    "repository": "docker.io/lfds/audittrace-librechat",
+                    "tag": "768de61",
+                    "digest": pinned,
+                }
+            }
+        }
+    }
+    manifest = _manifest_yaml(
+        _deployment_doc(
+            "audittrace-librechat",
+            "librechat",
+            f"docker.io/lfds/audittrace-librechat:768de61@{pinned}",
+        )
+    )
+    disp = _Dispatcher(
+        rules=[
+            ("helm get manifest", _proc(0, manifest)),
+            ("get deployment audittrace-librechat -n", _proc(0, "")),
+            (
+                "component=librechat",
+                _pods_json([_pod("librechat", "sha256:" + "a" * 64)]),
+            ),
+        ]
+    )
+    r = _runner(tmp_path, monkeypatch, disp)
+    rows = r._first_party_image_rows(chart_values=values)
+    assert rows[0]["equal"] is False
+    assert mismatched_components(rows) == ["librechat"]
