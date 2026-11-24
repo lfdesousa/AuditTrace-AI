@@ -67,15 +67,15 @@ CI_TEST_JOB_GOLDEN: dict = {
         )
     },
     "steps": [
-        {"uses": "actions/checkout@v6", "with": {"fetch-depth": 0}},
+        {"uses": "actions/checkout", "with": {"fetch-depth": 0}},
         {
             "name": "Set up Python 3.12",
-            "uses": "actions/setup-python@v6",
+            "uses": "actions/setup-python",
             "with": {"python-version": "3.12"},
         },
         {
             "name": "Cache pip dependencies",
-            "uses": "actions/cache@v5",
+            "uses": "actions/cache",
             "with": {
                 "path": "~/.cache/pip",
                 "key": (
@@ -133,7 +133,7 @@ CI_TEST_JOB_GOLDEN: dict = {
         {
             "name": "Upload coverage XML",
             "if": "always()",
-            "uses": "actions/upload-artifact@v7",
+            "uses": "actions/upload-artifact",
             "with": {
                 "name": "coverage-xml",
                 "path": "coverage.xml",
@@ -143,7 +143,7 @@ CI_TEST_JOB_GOLDEN: dict = {
         {
             "name": "Upload coverage HTML report",
             "if": "always()",
-            "uses": "actions/upload-artifact@v7",
+            "uses": "actions/upload-artifact",
             "with": {
                 "name": "coverage-html",
                 "path": "htmlcov/",
@@ -197,9 +197,23 @@ def _load_ci() -> dict:
     return yaml.safe_load(CI.read_text())
 
 
+def _action_only(step: dict) -> dict:
+    """Drop the ref from ``uses``: the pin is the SHA guard's business, not this golden's."""
+    if "uses" not in step:
+        return step
+    return {**step, "uses": str(step["uses"]).partition("@")[0]}
+
+
 def test_ci_test_job_matches_exact_golden():
-    data = _load_ci()
-    assert data["jobs"]["test"] == CI_TEST_JOB_GOLDEN
+    job = _load_ci()["jobs"]["test"]
+    job = {**job, "steps": [_action_only(s) for s in job["steps"]]}
+    assert job == CI_TEST_JOB_GOLDEN
+
+
+def test_ci_test_job_golden_carries_no_ref():
+    uses = [s["uses"] for s in CI_TEST_JOB_GOLDEN["steps"] if "uses" in s]
+    assert uses, "the golden has no uses: step; the check would be vacuous"
+    assert all("@" not in u for u in uses)
 
 
 def test_ci_workflow_level_keys_match_exact_golden():
