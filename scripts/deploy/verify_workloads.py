@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from typing import Any, NamedTuple
 
-from scripts.deploy import registry
+from scripts.deploy import registry, verify_alias
 
 # The verifier's OWN first-party image prefixes (duplicated, not imported from
 # ``scripts/deploy/runner/images.py``): an image under one of these is ours, so a
@@ -119,3 +119,13 @@ def containers_to_check(
             located = registry.locate_repository(repository)
             refs.append(ContainerRef(name, is_init, located[1] if located else None))
     return refs
+
+
+def any_alias(items: dict[str, dict[str, Any]]) -> bool:
+    """The probe-level ``alias`` fact: True when ANY compared container, extras
+    included (``item["containers"]``), is a content-equal alias (R2-2)."""
+    return any(
+        entry.get("match") == verify_alias.ALIAS
+        for item in items.values()
+        for entry in (item, *(item.get("containers") or {}).values())
+    )

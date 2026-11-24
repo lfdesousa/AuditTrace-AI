@@ -977,3 +977,96 @@ def test_probe11_a_registry_port_in_an_extra_image_is_not_a_tag(tmp_path, monkey
     assert (
         res.evidence["items"]["pod-reaper"]["containers"]["sneak"]["match"] == "exact"
     )
+
+
+# ── round 3: R2-1 (unreadable Deployment read) and R2-2 (alias fact) ────────
+
+
+def _garble(inner, deployment: str, stdout: str):
+    """kubectl stub: ``kubectl get deployment <deployment>`` exits 0 with a body
+    that is not a usable JSON object; everything else from ``inner``."""
+
+    def run(cmd):
+        if f"get deployment {deployment} " in " ".join(cmd) + " ":
+            return subprocess.CompletedProcess(["x"], 0, stdout, "")
+        return inner(cmd)
+
+    return run
+
+
+GARBLED = ["garbled{", "", "[]", '"a string"', "42", "null"]
+
+
+@pytest.mark.parametrize("stdout", GARBLED)
+def test_probe11_a_non_object_workload_read_is_unreadable_never_absent_or_clean(
+    tmp_path, monkeypatch, stdout
+):
+    """R2-1: rc 0 with a body that is not a JSON object must FAIL naming the
+    workload, even though an extra first-party container sits on it (the case
+    that used to PASS with the A1 check silently off). Neuter: restore
+    ``return True, {}`` for a non-JSON / non-object body -> PASS -> RED."""
+    inner = _reaper_with_extra(EXTRA_IMAGE, live=RC2_DIGEST)
+    res = probe11(
+        tmp_path, monkeypatch, Registry(), _garble(inner, REAPER_DEPLOYMENT, stdout)
+    )
+    assert res.status == verify.FAIL
+    assert "pod-reaper: Deployment unreadable" in res.detail
+    assert res.evidence["items"]["pod-reaper"]["match"] == "unreadable"
+    assert res.detail.endswith("(checked 1 of 2)")
+
+
+@pytest.mark.parametrize("stdout", ["garbled{", "[]"])
+def test_probe11_a_non_object_console_anchor_read_fails_closed(
+    tmp_path, monkeypatch, stdout
+):
+    """The console anchor (``audittrace-librechat``) read is unreadable: named,
+    and the BFF stays expected. Neuter: the old ``return True, {}`` -> the anchor
+    reads as present, no failure line -> RED."""
+    res = probe11(
+        tmp_path,
+        monkeypatch,
+        Registry(),
+        _garble(_kube(present=("reaper",)), "audittrace-librechat", stdout),
+    )
+    assert res.status == verify.FAIL
+    assert "could not determine whether the console is deployed" in res.detail
+
+
+@pytest.mark.parametrize("stdout", ["garbled{", "[]"])
+def test_probe11_a_non_object_bff_read_is_unreadable(tmp_path, monkeypatch, stdout):
+    res = probe11(
+        tmp_path,
+        monkeypatch,
+        Registry(),
+        _garble(_kube(), "audittrace-librechat-bff", stdout),
+    )
+    assert res.status == verify.FAIL
+    assert "librechat-bff: Deployment unreadable" in res.detail
+
+
+@pytest.mark.parametrize("pol,status", [("fail", verify.FAIL), ("pass", verify.PASS)])
+def test_probe11_an_aliased_extra_container_sets_the_alias_fact(
+    tmp_path, monkeypatch, pol, status
+):
+    """R2-2: only the EXTRA container is a content-equal alias (live = rc2 index,
+    published = rc3 index); the main container is exact. ``evidence["alias"]``
+    must be True under both policies, consistent with the ALIAS line.
+    Neuter: derive ``alias`` from the main containers only -> False -> RED."""
+    monkeypatch.setattr(registry, "ALIAS_POLICY", pol)
+    res = probe11(
+        tmp_path,
+        monkeypatch,
+        Registry(),
+        _reaper_with_extra(EXTRA_IMAGE, live=RC2_DIGEST),
+    )
+    item = res.evidence["items"]["pod-reaper"]
+    assert item["match"] == "exact"
+    assert item["containers"]["sneak"]["match"] == "content-equal-alias"
+    assert res.status == status
+    assert res.evidence["alias"] is True
+    assert "ALIAS: pod-reaper/sneak" in res.detail
+
+
+def test_probe11_no_alias_anywhere_leaves_the_alias_fact_false(tmp_path, monkeypatch):
+    res = probe11(tmp_path, monkeypatch, Registry(), _reaper_with_extra(EXTRA_IMAGE))
+    assert res.status == verify.PASS and res.evidence["alias"] is False

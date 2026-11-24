@@ -1641,11 +1641,11 @@ class VerifyRunner:
         )
 
     def _read_deployment(self, deployment: str) -> tuple[bool | None, dict[str, Any]]:
-        """``(present, document)``: ``present`` is ``True`` / ``False``
-        (NotFound), or ``None`` when the read failed for any OTHER reason (kept
-        DISTINCT from ``False`` so an unreadable cluster FAILs fail-closed, see
-        ``test_hostile_deploy_report_cannot_move_the_verdict``); ``document`` is
-        the parsed Deployment (``{}`` when absent or not JSON)."""
+        """``(present, document)``: ``True`` / ``False`` (NotFound), or ``None``
+        (unreadable, kept DISTINCT from ``False`` so the probe FAILs closed, see
+        ``test_hostile_deploy_report_cannot_move_the_verdict``) when the read
+        failed for any other reason or returned rc 0 with a body that is not a
+        JSON object. ``document`` is the parsed Deployment (``{}`` otherwise)."""
         proc = _run(
             [
                 "kubectl",
@@ -1662,8 +1662,8 @@ class VerifyRunner:
             try:
                 doc = json.loads(proc.stdout)
             except ValueError:
-                return True, {}
-            return True, doc if isinstance(doc, dict) else {}
+                return None, {}  # rc 0 but not JSON: unreadable, never absent
+            return (True, doc) if isinstance(doc, dict) else (None, {})
         if "NotFound" in proc.stderr:
             return False, {}
         return None, {}
@@ -1902,7 +1902,7 @@ class VerifyRunner:
             "checked": checked,
             "expected": len(expected),
             "items": items,
-            "alias": any(i["match"] == verify_alias.ALIAS for i in items.values()),
+            "alias": verify_workloads.any_alias(items),
         }
         if failures:
             return self._record(
