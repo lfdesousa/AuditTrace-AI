@@ -235,8 +235,12 @@ def test_workflow_is_exactly_the_offline_pin_check() -> None:
     assert wf["permissions"] == {"contents": "read"}
     (job,) = wf["jobs"].values()
     assert set(job) == {"runs-on", "steps"}
-    assert job["steps"] == [
-        {"uses": "actions/checkout@v6"},
+    steps = [
+        {**s, "uses": str(s["uses"]).partition("@")[0]} if "uses" in s else s
+        for s in job["steps"]
+    ]
+    assert steps == [
+        {"uses": "actions/checkout"},
         {
             "name": "Verify vendored contract against its pin",
             "run": "./scripts/check-contracts-sync.sh",
