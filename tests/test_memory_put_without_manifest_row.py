@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -184,6 +185,23 @@ class TestAdminHardDeleteRemovesAnOwnOrphan:
         gone = client.delete(URL[layer], params={"hard": "true"})
         assert gone.status_code == 403
         assert stored(layer, USER) == ("orphan-v1", "private")
+
+    def test_a_store_failure_is_502_and_audits_nothing(
+        self, client: TestClient, layer: str
+    ) -> None:
+        seed_private_orphan(layer, USER, "orphan-v1")
+        service = dependencies.container._instances[layer]
+        with (
+            patch.object(
+                type(service), "delete", AsyncMock(side_effect=RuntimeError("down"))
+            ),
+            as_caller(client, USER, admin=True),
+        ):
+            gone = client.delete(URL[layer], params={"hard": "true"})
+        assert gone.status_code == 502
+        assert gone.json()["detail"] == "down"
+        assert stored(layer, USER) == ("orphan-v1", "private")
+        assert audit_rows(KEY[layer]) == []
 
     def test_a_soft_delete_of_an_orphan_stays_404_and_removes_nothing(
         self, client: TestClient, layer: str
