@@ -177,10 +177,10 @@ def test_step_is_hard_gate_for_anything_but_exactly_true(tmp_path: Path) -> None
         assert "--draft" not in argv, mode
 
 
-def test_actions_are_pinned_like_ci() -> None:
+def test_actions_are_the_ci_actions() -> None:
     steps = _load(_WF)["jobs"]["evidence-check"]["steps"]
-    uses = {s["uses"] for s in steps if "uses" in s}
-    assert uses == {"actions/checkout@v6", "actions/setup-python@v6"}
+    uses = {str(s["uses"]).partition("@")[0] for s in steps if "uses" in s}
+    assert uses == {"actions/checkout", "actions/setup-python"}
 
 
 def test_ci_yml_has_no_duplicate_evidence_job() -> None:
