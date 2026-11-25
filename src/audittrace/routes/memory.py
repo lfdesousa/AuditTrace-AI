@@ -128,7 +128,9 @@ from audittrace.routes.memory_write_support import (
     has_corpus_scope,
     legacy_copy_forward_source,
     manifest_authorization_as_403,
+    purge_own_orphan_object,
     refuse_corpus_update_of_file_layer,
+    refuse_file_update_without_visible_row,
     refuse_update_of_corpus_fold_chunk,
     semantic_key,
 )
@@ -2033,6 +2035,9 @@ async def update_episodic(
         filename,
         await authorized_update_tier(manifest, user, "episodic", filename),
     )
+    await refuse_file_update_without_visible_row(
+        service, manifest, user, "episodic", filename, "ADR"
+    )
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
@@ -2124,7 +2129,20 @@ async def delete_episodic(
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not hard:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Admin repair: a private object no manifest row owns (what a PUT used
+        # to leave behind) is removed here, the caller's own only.
+        purged = await purge_own_orphan_object(service, user, "episodic", filename)
+        await emit_write_audit(
+            user=user,
+            op="delete",
+            layer="episodic",
+            key=filename,
+            tier="private",
+            detail_extra={"hard": True, "orphan": True},
+        )
+        return purged
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
@@ -2320,6 +2338,9 @@ async def update_procedural(
         filename,
         await authorized_update_tier(manifest, user, "procedural", filename),
     )
+    await refuse_file_update_without_visible_row(
+        service, manifest, user, "procedural", filename, "SKILL"
+    )
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
@@ -2398,7 +2419,20 @@ async def delete_procedural(
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not hard:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Admin repair: a private object no manifest row owns (what a PUT used
+        # to leave behind) is removed here, the caller's own only.
+        purged = await purge_own_orphan_object(service, user, "procedural", filename)
+        await emit_write_audit(
+            user=user,
+            op="delete",
+            layer="procedural",
+            key=filename,
+            tier="private",
+            detail_extra={"hard": True, "orphan": True},
+        )
+        return purged
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:

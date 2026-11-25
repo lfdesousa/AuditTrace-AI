@@ -179,6 +179,59 @@ def refuse_corpus_update_of_file_layer(layer: str, filename: str, tier: str) -> 
         )
 
 
+async def refuse_file_update_without_visible_row(
+    service: Any, manifest: Any, user: UserContext, layer: str, key: str, noun: str
+) -> None:
+    """Refuse BEFORE any content write when the caller can see no manifest row
+    of the file *key* (the file-layer twin of ``require_visible_row_or_404``).
+
+    A ``PUT`` updates an existing, recorded item. With no visible row the old
+    order wrote the object first and failed on the row after
+    (``record_update`` ``LookupError``), leaving an object no row owns: a
+    private copy that shadowed a corpus file, out of reach of a soft delete.
+    A corpus file with no row (a skill indexed from the shared store) is the
+    corpus refusal (409), the same text as with a row; any other key is the
+    404 ``record_update`` would have given, now before the write."""
+    if await manifest.resolve_read(layer, key, user) is not None:
+        return
+    found = await service.read(user, key)
+    if found is not None:
+        refuse_corpus_update_of_file_layer(layer, key, found.metadata.get("tier", ""))
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"{noun} has no manifest row: "
+            f"no manifest row for layer={layer!r} key={key!r}"
+        ),
+    )
+
+
+async def purge_own_orphan_object(
+    service: Any, user: UserContext, layer: str, key: str
+) -> dict[str, Any]:
+    """The admin ``?hard=true`` repair of a file with NO manifest row: remove
+    the CALLER'S OWN private object (the service derives the key from the
+    caller's id, so another user's object and the corpus object are out of
+    reach) and say so. 404 when the caller stores none, so a missing key stays
+    a 404. The caller audits the removal."""
+    try:
+        removed = await service.delete(user, key)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not removed:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no manifest row for layer={layer!r} key={key!r}",
+        )
+    return {
+        "layer": layer,
+        "key": key,
+        "tier": "private",
+        "deleted": True,
+        "orphan": True,
+    }
+
+
 def manifest_authorization_as_403(exc: ManifestAuthorizationError) -> HTTPException:
     """Map :class:`ManifestAuthorizationError` to the route-layer HTTP 403
     every other authorization failure in the memory routes uses — never let it

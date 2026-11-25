@@ -1,0 +1,47 @@
+meta {
+  name: DELETE /memory/procedural/{file}?hard=true — remove the caller's own orphan private object
+  type: http
+  seq: 8
+}
+
+delete {
+  url: {{baseUrl}}/memory/procedural/{{exampleSkillFile}}?hard=true
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  hard: true
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("says it removed an orphan private object of that key", function() {
+    const e = res.getBody();
+    expect(e.orphan).to.equal(true);
+    expect(e.deleted).to.equal(true);
+    expect(e.tier).to.equal("private");
+    expect(e.layer).to.equal("procedural");
+    expect(e.key).to.equal(bru.getEnvVar("exampleSkillFile"));
+  });
+}
+
+docs {
+  The admin repair of a private object that no manifest row owns (what a PUT over a corpus
+  skill used to leave behind, shadowing it). Run with `exampleSkillFile` set (`--env-var`).
+  It removes ONLY the caller's own private object of that name: another user's object and
+  the corpus skill are untouched, and the removal writes one audit row
+  (`op=delete`, tier `private`, `orphan=true`). Afterwards `03-read.bru` answers the corpus
+  skill again (tier `corpus`).
+
+  Login: `audittrace:admin` in addition to `memory:procedural:write`. Without admin the answer
+  is 403 `?hard=true requires audittrace:admin scope` and nothing is removed. When the caller
+  stores no private object of that name the answer is 404 and nothing is audited. A row that
+  exists is a normal delete: use `05-delete.bru`.
+}
