@@ -6493,7 +6493,12 @@ class TestHardDeleteAdminGate:
 
             client.app.dependency_overrides[auth_require_user] = lambda: non_admin
             try:
-                r = client.delete("/memory/episodic/ADR-hd.md?hard=true")
+                # The caller's OWN row exists: ?hard=true on a row stays admin-only
+                # (without a row the owner removes their own orphan object).
+                client.post(
+                    "/memory/episodic", json={"filename": "ADR-hd2.md", "content": "x"}
+                )
+                r = client.delete("/memory/episodic/ADR-hd2.md?hard=true")
             finally:
                 client.app.dependency_overrides.pop(auth_require_user, None)
         assert r.status_code == 403
@@ -9042,6 +9047,12 @@ class TestHardDeleteRequiresAdmin:
     ) -> None:
         self._as_non_admin(client)
         try:
+            # The caller's OWN row exists: ?hard=true on a row stays admin-only
+            # (without a row the owner removes their own orphan object).
+            made = client.post(
+                "/memory/procedural", json={"filename": "SKILL-x.md", "content": "x"}
+            )
+            assert made.status_code == 200, made.text
             r = client.delete("/memory/procedural/SKILL-x.md?hard=true")
             assert r.status_code == 403
             assert "audittrace:admin" in r.json()["detail"]
