@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._bruno_blocks import _block, _code_lines, _strip_comments
+
 COLLECTION = Path(__file__).resolve().parents[1] / "bruno" / "audittrace"
 IDENT = COLLECTION / "identities"
 ENVS = ("cluster", "local")
@@ -72,28 +74,6 @@ for _name in (
     "14-restricted-evidence-by-interaction.bru",
 ):
     STATUS_BY_FILE[_name] = 403  # the restricted client holds no audittrace:audit
-
-
-def _block(text: str, name: str) -> str:
-    """Return the inner text of the top-level ``name { ... }`` block ('' if absent)."""
-    m = re.search(rf"^{re.escape(name)} \{{\n", text, re.M)
-    if not m:
-        return ""
-    depth, i = 1, m.end()
-    while i < len(text) and depth:
-        depth += {"{": 1, "}": -1}.get(text[i], 0)
-        i += 1
-    return text[m.end() : i - 1]
-
-
-def _strip_comments(code: str) -> str:
-    code = re.sub(r"/\*.*?\*/", "", code, flags=re.S)
-    return re.sub(r"//[^\n]*", "", code)
-
-
-def _code_lines(path: Path, block: str = "tests") -> list[str]:
-    inner = _strip_comments(_block(path.read_text(), block))
-    return [ln.strip() for ln in inner.splitlines() if ln.strip()]
 
 
 def _token(path: Path) -> str:

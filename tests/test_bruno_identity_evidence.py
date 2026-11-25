@@ -15,12 +15,14 @@ from pathlib import Path
 
 import pytest
 
+from tests._bruno_blocks import _code_lines
+
 COLLECTION = Path(__file__).resolve().parent.parent / "bruno" / "audittrace"
 IDENT = COLLECTION / "identities"
 ENVS = ("cluster", "cluster-session-e2e", "local")
 
-NOT_FOUND = '    expect(res.getBody()).to.deep.equal({ detail: "Not Found" });'
-FORBIDDEN = '    expect(res.getBody()).to.deep.equal({ detail: "Required scope: audittrace:audit" });'
+NOT_FOUND = 'expect(res.getBody()).to.deep.equal({ detail: "Not Found" });'
+FORBIDDEN = 'expect(res.getBody()).to.deep.equal({ detail: "Required scope: audittrace:audit" });'
 # file -> (url, token slot, status, exact body line)
 REQUESTS = {
     "10-userb-evidence-by-usera-message.bru": (
@@ -67,7 +69,7 @@ def test_request_url_token_exact_status_and_exact_body(name: str) -> None:
     assert f"  url: {url}\n" in text
     assert f"auth:bearer {{\n  token: {{{{{token}}}}}\n}}" in text
     assert text.count(f"expect(res.getStatus()).to.equal({status});") == 1
-    assert body_line in text
+    assert _code_lines(IDENT / name).count(body_line) == 1  # code, not a comment
     # house rule: never an either-or status
     assert not re.search(r"oneOf\(\s*\[\s*40[34]", text)
 
@@ -79,21 +81,51 @@ def test_docs_name_the_login_and_the_restore(name: str) -> None:
     assert f"--env-key {slot}" in docs
     assert "scripts/audittrace-login" in docs
     assert "Restore the default" in docs
+    flat = " ".join(docs.split())
+    assert "rewrites the CLI token store under `~/.config/audittrace`" in flat
+    assert "leaves the `.env` default pair" in flat
+    assert "as the operator's own Keycloak user" in flat
     if slot == "tokenUserA":
         assert "CLIENT_ID=audittrace-restricted" in docs
     else:
         assert "CLIENT_ID" in docs and "unset" in docs
 
 
-def test_request_10_stores_what_the_control_compares() -> None:
-    first, control = (_text(n) for n in sorted(REQUESTS)[:2])
-    assert 'bru.setVar("evidenceNotYoursBody", JSON.stringify(res.getBody()));' in first
-    assert 'bru.setVar("evidenceNotYoursStatus", res.getStatus());' in first
-    assert 'bru.getVar("evidenceNotYoursBody")' in control
-    assert 'bru.getVar("evidenceNotYoursStatus")' in control
-    assert "expect(JSON.stringify(res.getBody())).to.equal(body);" in control
-    assert "expect(String(res.status)).to.equal(String(status));" in control
-    assert "throw new Error(" in control  # fail closed when 10 did not run first
+POST_LINES = [
+    'bru.setVar("evidenceNotYoursBody", JSON.stringify(res.getBody()));',
+    'bru.setVar("evidenceNotYoursStatus", res.getStatus());',
+]
+CONTROL_LINES = [
+    'const status = bru.getVar("evidenceNotYoursStatus");',
+    'const body = bru.getVar("evidenceNotYoursBody");',
+    "if (status === undefined || body === undefined) {",
+    'throw new Error("run identities/10-userb-evidence-by-usera-message.bru first in the same run");',
+    "expect(String(res.status)).to.equal(String(status));",
+    "expect(JSON.stringify(res.getBody())).to.equal(body);",
+]
+
+
+@pytest.mark.parametrize("line", POST_LINES, ids=["setvar-body", "setvar-status"])
+def test_request_10_stores_status_and_body_as_code(line: str) -> None:
+    code = _code_lines(IDENT / sorted(REQUESTS)[0], "script:post-response")
+    assert code.count(line) == 1
+
+
+@pytest.mark.parametrize(
+    "line",
+    CONTROL_LINES,
+    ids=["get-status", "get-body", "guard", "throw", "cmp-status", "cmp-body"],
+)
+def test_control_compares_with_request_10_as_code_and_fails_closed(line: str) -> None:
+    code = _code_lines(IDENT / sorted(REQUESTS)[1])
+    assert code.count(line) == 1
+
+
+def test_the_throw_sits_inside_its_guard() -> None:
+    code = _code_lines(IDENT / sorted(REQUESTS)[1])
+    guard = code.index("if (status === undefined || body === undefined) {")
+    assert code[guard + 1].startswith("throw new Error(")
+    assert code[guard + 2] == "}"
 
 
 @pytest.mark.parametrize("env", ENVS)

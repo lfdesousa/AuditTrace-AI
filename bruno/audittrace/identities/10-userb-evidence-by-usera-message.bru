@@ -33,10 +33,9 @@ docs {
   Expected: 404 `{"detail":"Not Found"}`, the same answer as an id that does not
   exist (run 11 next: it asserts the two bodies are identical).
 
-  Token slot: `{{tokenUserB}}`, filled by `scripts/audittrace-login --env-key tokenUserB`,
-  logged in as a DIFFERENT Keycloak user than the one who owns the console turn, with the
-  default client. Restore the default login afterwards (it is overwritten by slot
-  logins): `AUDITTRACE_EXTRA_SCOPES="memory:episodic:write memory:procedural:write
-  memory:decisions:write memory:semantic:write" scripts/audittrace-login` with
-  `CLIENT_ID` unset.
+  Token slot: `{{tokenUserB}}`, filled by `scripts/audittrace-login --env-key tokenUserB`, logged in as a DIFFERENT Keycloak user than the one who owns the console turn, with the default client.
+  Every login rewrites the CLI token store under `~/.config/audittrace`; `--env-key`
+  leaves the `.env` default pair (`accessToken`) untouched, so only the slot changes
+  in the collection. Restore the default login afterwards, as the operator's own
+  Keycloak user: `AUDITTRACE_EXTRA_SCOPES="memory:episodic:write memory:procedural:write memory:decisions:write memory:semantic:write" scripts/audittrace-login` with `CLIENT_ID` unset.
 }
