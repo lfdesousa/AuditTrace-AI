@@ -1,0 +1,42 @@
+meta {
+  name: GET /evidence/messages/{id} — user B asks for user A's message id
+  type: http
+  seq: 11
+}
+
+get {
+  url: {{baseUrl}}/evidence/messages/{{clientMessageId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{tokenUserB}}
+}
+
+script:post-response {
+  bru.setVar("evidenceNotYoursBody", JSON.stringify(res.getBody()));
+  bru.setVar("evidenceNotYoursStatus", res.getStatus());
+}
+
+tests {
+  test("404 with the framework's own Not Found body", function() {
+    expect(res.getStatus()).to.equal(404);
+    expect(res.getBody()).to.deep.equal({ detail: "Not Found" });
+  });
+}
+
+docs {
+  CONSOLE-AUDIT-EVIDENCE WU-A, second identity. `clientMessageId` is the message id
+  of a console turn owned by user A (pass `--env-var clientMessageId=<id>`); this
+  request is sent as user B, who holds `audittrace:audit` but owns no such row.
+  Expected: 404 `{"detail":"Not Found"}`, the same answer as an id that does not
+  exist (run 11 next: it asserts the two bodies are identical).
+
+  Token slot: `{{tokenUserB}}`, filled by `scripts/audittrace-login --env-key tokenUserB`,
+  logged in as a DIFFERENT Keycloak user than the one who owns the console turn, with the
+  default client. Restore the default login afterwards (it is overwritten by slot
+  logins): `AUDITTRACE_EXTRA_SCOPES="memory:episodic:write memory:procedural:write
+  memory:decisions:write memory:semantic:write" scripts/audittrace-login` with
+  `CLIENT_ID` unset.
+}

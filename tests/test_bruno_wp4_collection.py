@@ -52,10 +52,26 @@ TOKEN_BY_FILE = {
     "08-curator-update-usera-key.bru": "accessToken",
     "08b-usera-read-after-curator-attempt.bru": "tokenUserA",
     "09-operator-audit-list.bru": "accessToken",
+    "10-userb-evidence-by-usera-message.bru": "tokenUserB",
+    "11-userb-evidence-unknown-message-control.bru": "tokenUserB",
+    "12-userb-evidence-by-usera-interaction.bru": "tokenUserB",
+    "13-restricted-evidence-by-message.bru": "tokenUserA",
+    "14-restricted-evidence-by-interaction.bru": "tokenUserA",
 }
 # expected single status per identity request (the curator write answers 404)
 STATUS_BY_FILE = {name: 200 for name in TOKEN_BY_FILE}
 STATUS_BY_FILE["08-curator-update-usera-key.bru"] = 404
+for _name in (
+    "10-userb-evidence-by-usera-message.bru",
+    "11-userb-evidence-unknown-message-control.bru",
+    "12-userb-evidence-by-usera-interaction.bru",
+):
+    STATUS_BY_FILE[_name] = 404  # not found / not yours: one status
+for _name in (
+    "13-restricted-evidence-by-message.bru",
+    "14-restricted-evidence-by-interaction.bru",
+):
+    STATUS_BY_FILE[_name] = 403  # the restricted client holds no audittrace:audit
 
 
 def _block(text: str, name: str) -> str:
