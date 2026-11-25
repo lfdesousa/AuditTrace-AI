@@ -27,8 +27,11 @@ tests {
 }
 
 docs {
-  Run after `04d` (and, for the AC-21 leg, after `05-delete.bru` and `04c`) with the same
-  `exampleCollection` and `exampleDocId`. A refused `04c` PUT writes nothing, so the text
-  stays the one `04d` wrote. Login: `memory:semantic:read` and
-  `memory:corpus:<collection>:read` (the corpus read gate answers 403 without it).
+  Run after `04d`, with the same `exampleCollection` and `exampleDocId`; run it BEFORE
+  `05-delete.bru` (200, the text `04d` wrote) and again AFTER `05-delete.bru` and `04c`. A refused
+  `04c` PUT writes nothing, so the text stays the one `04d` wrote.
+
+  Login: `memory:semantic:read` and `memory:corpus:<collection>:read` (the corpus read gate
+  answers 403 without it). After the soft delete the document is hidden from a caller without
+  `audittrace:admin`: the second read answers 404 for them, 200 with `audittrace:admin`.
 }

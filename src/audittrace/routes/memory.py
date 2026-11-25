@@ -2004,6 +2004,29 @@ async def read_episodic(
     }
 
 
+async def _delete_file_without_row(
+    service: Any, user: UserContext, layer: str, filename: str, hard: bool
+) -> dict[str, Any]:
+    """DELETE of a file the caller sees no manifest row for: a soft delete has
+    nothing to tombstone (404); ``?hard=true`` removes the caller's OWN private
+    object (the one a PUT used to leave without a row) and audits it."""
+    if not hard:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no manifest row for layer={layer!r} key={filename!r}",
+        )
+    purged = await purge_own_orphan_object(service, user, layer, filename)
+    await emit_write_audit(
+        user=user,
+        op="delete",
+        layer=layer,
+        key=filename,
+        tier="private",
+        detail_extra={"hard": True, "orphan": True},
+    )
+    return purged
+
+
 @router.put("/episodic/{filename}")
 async def update_episodic(
     filename: str,
@@ -2097,11 +2120,6 @@ async def delete_episodic(
     ``audittrace:admin``), and a hard purge is audited with
     ``detail_extra={"hard": True}`` same as every other delete."""
     _validate_filename_or_400(filename, "episodic")
-    if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
-        raise HTTPException(
-            status_code=403,
-            detail="?hard=true requires audittrace:admin scope",
-        )
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
     # SPEC security-memory-write-authorization-choke (2026-08-30) — the
@@ -2112,6 +2130,16 @@ async def delete_episodic(
         await authorize_write(manifest, user, "episodic", filename)
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
+    # No visible row: nothing of the folds or the manifest to change. The owner
+    # removes their OWN row-less private object with ``?hard=true`` (any caller
+    # holding this layer's write scope), audited ``orphan``; never the corpus copy.
+    if await manifest.resolve_read("episodic", filename, user) is None:
+        return await _delete_file_without_row(service, user, "episodic", filename, hard)
+    if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="?hard=true requires audittrace:admin scope",
+        )
     # B8: the folds of this source are tombstoned BEFORE the source row.
     cascaded = await tombstone_source_folds(
         get_semantic_service(),
@@ -2129,20 +2157,7 @@ async def delete_episodic(
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
-        if not hard:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        # Admin repair: a private object no manifest row owns (what a PUT used
-        # to leave behind) is removed here, the caller's own only.
-        purged = await purge_own_orphan_object(service, user, "episodic", filename)
-        await emit_write_audit(
-            user=user,
-            op="delete",
-            layer="episodic",
-            key=filename,
-            tier="private",
-            detail_extra={"hard": True, "orphan": True},
-        )
-        return purged
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
@@ -2389,11 +2404,6 @@ async def delete_procedural(
     """Soft-delete by default; ``?hard=true`` also purges the S3 object
     (ADR-062 §6 — same discipline as ``delete_episodic``)."""
     _validate_filename_or_400(filename, "procedural")
-    if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
-        raise HTTPException(
-            status_code=403,
-            detail="?hard=true requires audittrace:admin scope",
-        )
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
     # SPEC security-memory-write-authorization-choke (2026-08-30) — the
@@ -2402,6 +2412,18 @@ async def delete_procedural(
         await authorize_write(manifest, user, "procedural", filename)
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
+    # No visible row: nothing of the folds or the manifest to change. The owner
+    # removes their OWN row-less private object with ``?hard=true`` (any caller
+    # holding this layer's write scope), audited ``orphan``; never the corpus copy.
+    if await manifest.resolve_read("procedural", filename, user) is None:
+        return await _delete_file_without_row(
+            service, user, "procedural", filename, hard
+        )
+    if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="?hard=true requires audittrace:admin scope",
+        )
     # B8: the folds of this source are tombstoned BEFORE the source row.
     cascaded = await tombstone_source_folds(
         get_semantic_service(),
@@ -2419,20 +2441,7 @@ async def delete_procedural(
             caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
-        if not hard:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        # Admin repair: a private object no manifest row owns (what a PUT used
-        # to leave behind) is removed here, the caller's own only.
-        purged = await purge_own_orphan_object(service, user, "procedural", filename)
-        await emit_write_audit(
-            user=user,
-            op="delete",
-            layer="procedural",
-            key=filename,
-            tier="private",
-            detail_extra={"hard": True, "orphan": True},
-        )
-        return purged
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:

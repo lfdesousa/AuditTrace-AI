@@ -18,6 +18,7 @@ Semantic is pinned as the control: its PUT already checked the row first.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterator
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -92,6 +93,52 @@ def stored(layer: str, user_id: str) -> tuple[str, str] | None:
     return None if doc is None else (doc.page_content, doc.metadata["tier"])
 
 
+def audit_details(key: str) -> list[dict[str, Any]]:
+    """The stored ``detail`` of every DELETE audit row of *key* (op, tier dropped)."""
+    from sqlalchemy import select
+
+    from audittrace.db.models import InteractionRecord
+    from audittrace.dependencies import get_postgres_factory
+    from audittrace.services.memory_audit import MEMORY_AUDIT_EVENT_CLASS
+
+    async def read() -> list[dict[str, Any]]:
+        factory = get_postgres_factory().get_session_factory()
+        async with factory() as db:
+            found = await db.execute(
+                select(InteractionRecord.error_detail)
+                .where(InteractionRecord.event_class == MEMORY_AUDIT_EVENT_CLASS)
+                .order_by(InteractionRecord.id)
+            )
+            return [json.loads(detail) for (detail,) in found.all()]
+
+    return [
+        {"hard": d.get("hard"), "orphan": d.get("orphan"), "layer": d["layer"]}
+        for d in asyncio.run(read())
+        if d.get("key") == key and d.get("op") == "delete"
+    ]
+
+
+@pytest.mark.parametrize("layer", FILE_LAYERS)
+class TestPutOverTheCallersOwnSoftDeletedRow:
+    def test_is_409_before_any_write_and_the_content_stays(
+        self, client: TestClient, layer: str
+    ) -> None:
+        made = client.post(
+            f"/memory/{layer}", json={"filename": KEY[layer], "content": "v1"}
+        )
+        assert made.status_code == 200, made.text
+        assert client.delete(URL[layer]).status_code == 200
+        rows = audit_rows(KEY[layer])
+        put = client.put(URL[layer], json={BODY[layer]: "v2-after-tombstone"})
+        assert put.status_code == 409
+        assert put.json()["detail"] == (
+            f"manifest row for layer={layer!r} key={KEY[layer]!r} is soft-deleted; "
+            "use record_create to revive"
+        )
+        assert stored(layer, USER) == ("v1", "private")
+        assert audit_rows(KEY[layer]) == rows
+
+
 @pytest.mark.parametrize("layer", FILE_LAYERS)
 class TestPutWritesNothingWithoutARow:
     @pytest.mark.parametrize("admin", [False, True], ids=["user", "admin"])
@@ -144,14 +191,15 @@ class TestPutWritesNothingWithoutARow:
 
 
 @pytest.mark.parametrize("layer", FILE_LAYERS)
-class TestAdminHardDeleteRemovesAnOwnOrphan:
+class TestOwnerHardDeleteRemovesAnOwnOrphan:
+    @pytest.mark.parametrize("admin", [False, True], ids=["owner", "admin"])
     def test_it_removes_only_the_callers_private_object_and_audits_it(
-        self, client: TestClient, layer: str
+        self, client: TestClient, layer: str, admin: bool
     ) -> None:
         seed_corpus_without_row(layer)
         seed_private_orphan(layer, USER, "orphan-v1")
         seed_private_orphan(layer, READER, "reader-private")
-        with as_caller(client, USER, admin=True):
+        with as_caller(client, USER, admin=admin):
             gone = client.delete(URL[layer], params={"hard": "true"})
         assert gone.status_code == 200, gone.text
         assert gone.json() == {
@@ -167,6 +215,9 @@ class TestAdminHardDeleteRemovesAnOwnOrphan:
         assert stored(layer, READER) == ("reader-private", "private")
         assert not has_row(layer)
         assert audit_rows(KEY[layer]) == [("delete", "private")]
+        assert audit_details(KEY[layer]) == [
+            {"hard": True, "orphan": True, "layer": layer}
+        ]
 
     def test_a_second_hard_delete_finds_nothing_and_is_404(
         self, client: TestClient, layer: str
@@ -178,13 +229,36 @@ class TestAdminHardDeleteRemovesAnOwnOrphan:
         assert stored(layer, USER) == ("corpus-v1", "corpus")
         assert audit_rows(KEY[layer]) == []
 
-    def test_without_admin_the_hard_delete_is_403_and_the_orphan_stays(
+    def test_a_hard_delete_of_a_row_that_exists_still_needs_admin(
         self, client: TestClient, layer: str
     ) -> None:
-        seed_private_orphan(layer, USER, "orphan-v1")
+        made = client.post(
+            f"/memory/{layer}", json={"filename": KEY[layer], "content": "v1"}
+        )
+        assert made.status_code == 200, made.text
         gone = client.delete(URL[layer], params={"hard": "true"})
         assert gone.status_code == 403
-        assert stored(layer, USER) == ("orphan-v1", "private")
+        assert gone.json()["detail"] == "?hard=true requires audittrace:admin scope"
+        assert stored(layer, USER) == ("v1", "private")
+        assert audit_rows(KEY[layer]) == [("write", "private")]
+
+    def test_the_route_needs_the_layers_write_scope(self, layer: str) -> None:
+        """The orphan delete is open to the owner with the layer's write scope
+        and to nobody without it: the scope is the route's own dependency."""
+        from audittrace.routes.memory import router
+
+        (route,) = [
+            r
+            for r in router.routes
+            if getattr(r, "path", "") == f"/{layer}/{{filename}}"
+            and "DELETE" in getattr(r, "methods", set())
+        ]
+        scopes = {
+            scope
+            for dep in route.dependant.dependencies  # type: ignore[attr-defined]
+            for scope in (dep.own_oauth_scopes or [])
+        }
+        assert scopes == {f"memory:{layer}:write"}
 
     def test_a_store_failure_is_502_and_audits_nothing(
         self, client: TestClient, layer: str

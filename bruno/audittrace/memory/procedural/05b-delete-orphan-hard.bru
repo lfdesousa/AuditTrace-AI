@@ -33,15 +33,15 @@ tests {
 }
 
 docs {
-  The admin repair of a private object that no manifest row owns (what a PUT over a corpus
-  skill used to leave behind, shadowing it). Run with `exampleSkillFile` set (`--env-var`).
-  It removes ONLY the caller's own private object of that name: another user's object and
-  the corpus skill are untouched, and the removal writes one audit row
-  (`op=delete`, tier `private`, `orphan=true`). Afterwards `03-read.bru` answers the corpus
-  skill again (tier `corpus`).
+  Removes a private object that no manifest row owns (what a PUT over a corpus skill used to
+  leave behind, shadowing it). Run with `exampleSkillFile` set (`--env-var`). The OWNER removes
+  their own: no admin is needed. It removes ONLY the caller's own private object of that name:
+  another user's object and the corpus skill are untouched, and the removal writes one audit
+  row (`op=delete`, tier `private`, `hard=true`, `orphan=true`). Afterwards `03-read.bru`
+  answers the corpus skill again (tier `corpus`).
 
-  Login: `audittrace:admin` in addition to `memory:procedural:write`. Without admin the answer
-  is 403 `?hard=true requires audittrace:admin scope` and nothing is removed. When the caller
-  stores no private object of that name the answer is 404 and nothing is audited. A row that
-  exists is a normal delete: use `05-delete.bru`.
+  Login: `memory:procedural:write` (the default login has it). Without it the answer is 403
+  and nothing is removed. When the caller stores no private object of that name the answer is
+  404 and nothing is audited. A key that HAS a manifest row is a normal delete: soft by
+  `05-delete.bru`; `?hard=true` on it needs `audittrace:admin` (403 otherwise).
 }

@@ -129,3 +129,16 @@ def test_the_docs_name_scopes_the_server_declares() -> None:
     named = set(re.findall(r"memory:(?:corpus:semantic|semantic):(?:read|write)", docs))
     assert {"memory:corpus:semantic:write", "memory:semantic:write"} <= named
     assert named <= set(ALL_SCOPES)
+
+
+def test_the_read_after_the_soft_delete_is_documented_as_admin_only() -> None:
+    """A soft-deleted document is hidden from a caller without the admin scope, so
+    the AC-21 read after the delete needs it: both docs and the login line say so."""
+    read_docs = "\n".join(_code_lines(READ.read_text(), "docs"))
+    assert "AFTER `05-delete.bru`" in read_docs
+    assert "404 for them, 200 with `audittrace:admin`" in read_docs
+    create_docs = "\n".join(_code_lines(CREATE.read_text(), "docs"))
+    assert "that last read needs the admin" in create_docs
+    assert 'memory:corpus:semantic:read audittrace:admin" scripts/audittrace-login' in (
+        create_docs
+    )

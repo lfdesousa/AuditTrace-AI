@@ -192,7 +192,18 @@ async def refuse_file_update_without_visible_row(
     A corpus file with no row (a skill indexed from the shared store) is the
     corpus refusal (409), the same text as with a row; any other key is the
     404 ``record_update`` would have given, now before the write."""
-    if await manifest.resolve_read(layer, key, user) is not None:
+    row = await manifest.resolve_read(layer, key, user)
+    if row is not None:
+        # ``resolve_read`` returns tombstones: a soft-deleted row is refused here,
+        # with the text ``record_update`` gives, not after the object is written.
+        if row.deleted_at_ms is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"manifest row for layer={layer!r} key={key!r} is soft-deleted; "
+                    "use record_create to revive"
+                ),
+            )
         return
     found = await service.read(user, key)
     if found is not None:

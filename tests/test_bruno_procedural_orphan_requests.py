@@ -71,9 +71,19 @@ def test_the_repair_request_asserts_the_exact_status_and_the_route_shape() -> No
         assert expected in lines
 
 
-def test_the_repair_docs_name_the_admin_scope() -> None:
+def test_the_repair_login_line_is_the_write_scope_alone() -> None:
+    """The owner removes their own orphan: the Login line names the layer's write
+    scope and not the admin scope; the admin scope is named only for a row that exists."""
     docs = "\n".join(_code_lines(REPAIR.read_text(), "docs"))
-    assert "audittrace:admin" in docs and "memory:procedural:write" in docs
+    login = [ln for ln in docs.splitlines() if ln.startswith("Login:")]
+    assert login == [
+        "Login: `memory:procedural:write` (the default login has it). Without it the answer is 403"
+    ]
+    assert "no admin is needed" in docs
+    assert (
+        "needs `audittrace:admin` (403 otherwise)" in docs
+        and docs.count("audittrace:admin") == 1
+    )
 
 
 @pytest.mark.parametrize("env", ENV_FILES, ids=lambda p: p.name)
