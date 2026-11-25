@@ -1,0 +1,34 @@
+meta {
+  name: GET /memory/semantic/{collection}/{doc_id} — read the text 04d wrote (tier corpus)
+  type: http
+  seq: 11
+}
+
+get {
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{exampleDocId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("the content is exactly the text 04d wrote", function() {
+    expect(res.getBody().content).to.equal("Scratch corpus document, UPDATED by 04d.");
+  });
+  test("the manifest row is corpus tier", function() {
+    expect(res.getBody().manifest.tier).to.equal("corpus");
+  });
+}
+
+docs {
+  Run after `04d` (and, for the AC-21 leg, after `05-delete.bru` and `04c`) with the same
+  `exampleCollection` and `exampleDocId`. A refused `04c` PUT writes nothing, so the text
+  stays the one `04d` wrote. Login: `memory:semantic:read` and
+  `memory:corpus:<collection>:read` (the corpus read gate answers 403 without it).
+}
