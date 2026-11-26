@@ -143,6 +143,9 @@ def _row(request: RefusalIngestRequest, user_id: str, trace_id: str | None) -> A
         "model": None,
         "duration_ms": None,
         "event_class": None,
+        # Migration 041: correlation metadata, unhashed by construction
+        # (``content_hash`` reads only the integrity field tuples).
+        "client_message_id": request.client_message_id,
     }
     return InteractionRow(**fields, content_hash=_content_hash(fields))
 

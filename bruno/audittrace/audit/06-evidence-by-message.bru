@@ -1,0 +1,34 @@
+meta {
+  name: GET /evidence/messages/{id} — the evidence of one console message
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/evidence/messages/{{clientMessageId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("200 with contract audittrace.evidence.v1 for the caller's own row", function() {
+    expect(res.getStatus()).to.equal(200);
+    const body = res.getBody();
+    expect(body.contract).to.equal("audittrace.evidence.v1");
+    expect(body.lookup.by).to.equal("client_message_id");
+    expect(body.lookup.value).to.equal(bru.getEnvVar("clientMessageId"));
+    expect(body.interaction.client_message_id).to.equal(bru.getEnvVar("clientMessageId"));
+    expect(body.integrity.recomputed).to.be.oneOf(["match", "mismatch", "unavailable"]);
+  });
+}
+
+docs {
+  CONSOLE-AUDIT-EVIDENCE WU-A. Needs `audittrace:audit` (RLS-scoped: own rows only).
+  `clientMessageId` is the LibreChat message id of the ANSWER (the id the dialog
+  shows). Unknown, malformed and not-yours ids are byte-identical 404s (no existence
+  oracle). Pass it with `--env-var clientMessageId=<id>`.
+}

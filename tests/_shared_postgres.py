@@ -28,6 +28,7 @@ SHARED_POSTGRES_MODULES: frozenset[str] = frozenset(
         "tests/test_alembic_input_media_downgrade_guard_pg.py",
         "tests/test_console_acl_routes_rls_postgres.py",
         "tests/test_console_store_rls_postgres.py",
+        "tests/test_evidence_rls_postgres.py",
         "tests/test_lc9_migration_034_pg.py",
         "tests/test_lc9_wp2a_pg.py",
         "tests/test_lc9_wp2b_pg.py",

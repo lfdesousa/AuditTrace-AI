@@ -1,0 +1,29 @@
+meta {
+  name: GET /interactions?client_message_id= — rows of one console message
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{baseUrl}}/interactions?client_message_id={{clientMessageId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200 with only rows of that message id", function() {
+    expect(res.getStatus()).to.equal(200);
+    const rows = res.getBody().interactions;
+    expect(rows).to.be.an("array");
+    rows.forEach(r => expect(r.client_message_id).to.equal(bru.getEnvVar("clientMessageId")));
+  });
+}
+
+docs {
+  CONSOLE-AUDIT-EVIDENCE WU-A. Composes with every other filter; RLS-scoped. Needs
+  `audittrace:audit`.
+}
