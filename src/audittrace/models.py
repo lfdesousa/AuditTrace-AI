@@ -329,6 +329,15 @@ class InteractionListItem(BaseModel):
             "earlier release, and rows that are not chat turns are always null."
         ),
     )
+    # Migration 041 (CONSOLE-AUDIT-EVIDENCE): not part of the hashed content.
+    client_message_id: str | None = Field(
+        default=None,
+        description=(
+            "The console message id the chat turn carried in X-AuditTrace-Message-Id; "
+            "null when absent, malformed, or on rows written before migration 041. "
+            "Correlation metadata: it is not part of the content hash."
+        ),
+    )
 
 
 class InteractionListResponse(BaseModel):

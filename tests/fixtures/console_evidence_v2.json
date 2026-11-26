@@ -1,0 +1,130 @@
+{
+  "contract": "audittrace.evidence.v1",
+  "lookup": {
+    "by": "client_message_id",
+    "value": "00000000-0000-4000-8000-00000000000b",
+    "candidates": 1
+  },
+  "interaction": {
+    "id": 1,
+    "trace_id": "00000000000000000000000000000001",
+    "session_id": "00000000-0000-4000-8000-00000000000a",
+    "client_message_id": "00000000-0000-4000-8000-00000000000b",
+    "source": "librechat",
+    "project": "default",
+    "model": "audittrace-chat",
+    "timestamp": "2026-01-01T00:00:00.000000",
+    "created_at": "2026-01-01T00:00:00.000001+00:00",
+    "duration_ms": 1000,
+    "prompt_tokens": 10,
+    "completion_tokens": 5,
+    "status": "success",
+    "failure_class": null,
+    "error_detail": null,
+    "event_class": null,
+    "user_id": "00000000-0000-4000-8000-000000000001",
+    "question": "fixture question",
+    "answer": "fixture answer"
+  },
+  "integrity": {
+    "content_hash": "32dbeb0ddcfeb4ca7806dc640ab386fe89fedefb69c8e92aaa7f11d59af3c659",
+    "recomputed": "match",
+    "hashed_fields": [
+      "project",
+      "source",
+      "question",
+      "answer",
+      "prompt_tokens",
+      "completion_tokens",
+      "timestamp",
+      "session_id",
+      "model",
+      "user_id",
+      "status",
+      "failure_class",
+      "error_detail",
+      "duration_ms",
+      "trace_id",
+      "event_class"
+    ],
+    "hash_inputs": "interaction[hashed_fields] — every hashed field is served; recompute = sha256(json.dumps({k: interaction[k] for k in hashed_fields}, sort_keys=True, separators=(',', ':'), default=str))"
+  },
+  "tool_calls": [
+    {
+      "id": "00000000-0000-4000-8000-0000000000c1",
+      "tool_name": "recall_semantic",
+      "granted_scope": "memory:semantic:read",
+      "args": "{\"query\": \"fixture query\", \"k\": 2}",
+      "started_at": "2026-01-01T00:00:00.000000",
+      "duration_ms": 100,
+      "error": null,
+      "recall_matches": [
+        {
+          "id": "0000000000000001",
+          "source_ref": "fixture-corpus-doc.md",
+          "sha256": null,
+          "distance": 0.1,
+          "collection": "fixture",
+          "tier": "corpus",
+          "owner_is_caller": false
+        },
+        {
+          "id": "0000000000000002",
+          "source_ref": "fixture-private-doc.md",
+          "sha256": null,
+          "distance": 0.2,
+          "collection": "fixture",
+          "tier": "private",
+          "owner_is_caller": true
+        }
+      ],
+      "recall_matches_truncated": false
+    }
+  ],
+  "sources": {
+    "status": "recorded",
+    "items": [
+      {
+        "source_ref": "fixture-corpus-doc.md",
+        "id": "0000000000000001",
+        "sha256": null,
+        "collection": "fixture",
+        "tool_name": "recall_semantic",
+        "visibility": {
+          "tier": "corpus",
+          "owner_is_caller": false,
+          "basis": "recall-metadata:tier"
+        }
+      },
+      {
+        "source_ref": "fixture-private-doc.md",
+        "id": "0000000000000002",
+        "sha256": null,
+        "collection": "fixture",
+        "tool_name": "recall_semantic",
+        "visibility": {
+          "tier": "private",
+          "owner_is_caller": true,
+          "basis": "recall-metadata:tier"
+        }
+      }
+    ]
+  },
+  "visibility": {
+    "answer": {
+      "api_readers": [
+        "owner"
+      ],
+      "owner_is_caller": true,
+      "basis": "postgres-rls:tenant_isolation_interactions",
+      "service_readers": [
+        {
+          "role": "audittrace_summariser",
+          "purpose": "session summarisation",
+          "basis": "BYPASSRLS + GRANT SELECT ON public.interactions"
+        }
+      ],
+      "operator_access": "database administrators"
+    }
+  }
+}

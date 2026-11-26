@@ -194,6 +194,10 @@ class TestToolCallSchema:
             "downstream_tool",
             "args_digest",
             "result_digest",
+            # Migration 041 (CONSOLE-AUDIT-EVIDENCE) — the recall record, nullable;
+            # NULL = not captured. Additive.
+            "recall_matches",
+            "recall_matches_truncated",
         }
 
 

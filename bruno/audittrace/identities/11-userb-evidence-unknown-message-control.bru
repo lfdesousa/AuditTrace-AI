@@ -1,0 +1,45 @@
+meta {
+  name: GET /evidence/messages/{id} — user B, unknown id (control for 10)
+  type: http
+  seq: 12
+}
+
+get {
+  url: {{baseUrl}}/evidence/messages/{{unknownMessageId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{tokenUserB}}
+}
+
+tests {
+  test("404 with the framework's own Not Found body", function() {
+    expect(res.getStatus()).to.equal(404);
+    expect(res.getBody()).to.deep.equal({ detail: "Not Found" });
+  });
+  test("same status and body as request 10 (user A's id asked by user B)", function() {
+    const status = bru.getVar("evidenceNotYoursStatus");
+    const body = bru.getVar("evidenceNotYoursBody");
+    if (status === undefined || body === undefined) {
+      throw new Error("run identities/10-userb-evidence-by-usera-message.bru first in the same run");
+    }
+    expect(String(res.status)).to.equal(String(status));
+    expect(JSON.stringify(res.getBody())).to.equal(body);
+  });
+}
+
+docs {
+  CONSOLE-AUDIT-EVIDENCE WU-A, the control. Same route, same caller (user B), an id
+  nobody owns: `--env-var unknownMessageId=<random id>` (for example the output of
+  `uuidgen`; accepted shape is 1-255 characters of letters, digits and `._:-`).
+  Run it AFTER request 10 in the same `bru run`: it compares its status and body with
+  the ones request 10 stored, and fails when request 10 did not run first.
+
+  Token slot: `{{tokenUserB}}`, filled by `scripts/audittrace-login --env-key tokenUserB`, logged in as a DIFFERENT Keycloak user than the one who owns the console turn, with the default client.
+  Every login rewrites the CLI token store under `~/.config/audittrace`; `--env-key`
+  leaves the `.env` default pair (`accessToken`) untouched, so only the slot changes
+  in the collection. Restore the default login afterwards, as the operator's own
+  Keycloak user: `AUDITTRACE_EXTRA_SCOPES="memory:episodic:write memory:procedural:write memory:decisions:write memory:semantic:write" scripts/audittrace-login` with `CLIENT_ID` unset.
+}

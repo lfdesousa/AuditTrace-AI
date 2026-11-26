@@ -1,0 +1,35 @@
+meta {
+  name: GET /evidence/interactions/{id} — the evidence of one audit row
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/evidence/interactions/{{evidenceInteractionId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("200 with contract audittrace.evidence.v1 looked up by interaction id", function() {
+    expect(res.getStatus()).to.equal(200);
+    const body = res.getBody();
+    expect(body.contract).to.equal("audittrace.evidence.v1");
+    expect(body.lookup.by).to.equal("interaction_id");
+    expect(String(body.interaction.id)).to.equal(bru.getEnvVar("evidenceInteractionId"));
+    expect(body.integrity.recomputed).to.be.oneOf(["match", "mismatch", "unavailable"]);
+  });
+}
+
+docs {
+  CONSOLE-AUDIT-EVIDENCE WU-A. Any audit row of the caller (chat, mcp, memory-audit,
+  a refused turn). Rows without a content hash (memory-audit, scan security rows)
+  answer `integrity.recomputed: "unavailable"`. Unknown, not-yours and malformed ids (not
+  ASCII digits, below 1, above 2147483647) are the same byte-identical 404: never a 422, never
+  a 500. Pass the id with
+  `--env-var evidenceInteractionId=<id>`.
+}
