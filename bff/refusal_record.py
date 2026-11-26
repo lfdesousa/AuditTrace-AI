@@ -76,6 +76,11 @@ async def send(
         "session_id": None if session_id == "-" else session_id,
         "inbound_trace_id": None if trace_id == "-" else trace_id,
     }
+    message_id = chat_refusals._message_id(headers)
+    if message_id is not None:
+        # Rolling rule (A7 C3): the memory server rolls out first, so a new BFF
+        # never posts this key to an old pod (which would answer 422).
+        body["client_message_id"] = message_id
     url = (
         settings.orchestrator_base_url.rstrip("/") + settings.orchestrator_refusal_path
     )

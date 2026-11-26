@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from bff.chat_refusal import ChatRefusal
 from bff.exchange_failure import ExchangeFailure
 from bff.inbound_token_failure import InboundTokenFailure
+from bff.message_id import is_valid_message_id
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,15 @@ def for_exchange_failure(failure: ExchangeFailure) -> ChatRefusal:
 def _session_id(headers: Mapping[str, str]) -> str:
     value = (headers.get("x-session-id") or "").strip()
     return value if _SESSION_ID.fullmatch(value) else "-"
+
+
+def _message_id(headers: Mapping[str, str]) -> str | None:
+    """The caller's console message id, or None when absent or rejected.
+
+    Carried in the durable refusal record so a refused turn is found by the
+    evidence view. The value is never logged."""
+    value = (headers.get("x-audittrace-message-id") or "").strip()
+    return value if is_valid_message_id(value) else None
 
 
 def _inbound_trace_id(headers: Mapping[str, str]) -> str:

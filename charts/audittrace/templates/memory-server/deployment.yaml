@@ -84,6 +84,19 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+            # CONSOLE-AUDIT-EVIDENCE (ADDENDUM-A1 section 2, A2 section 3): the
+            # database roles that read the audit table cross-user, served in the
+            # evidence view. The summariser role only when the chart renders its
+            # SQL (the same condition as templates/postgres/configmap-summariser-
+            # sql.yaml); otherwise the reader is not chart-verified. Guard G19
+            # (tests/test_evidence_service_readers_chart.py) equates it to the
+            # rendered grants.
+            - name: AUDITTRACE_EVIDENCE_SERVICE_READERS
+              {{- if and .Values.postgresql.enabled .Values.memoryServer.summariser.manageRole }}
+              value: {{ .Values.memoryServer.summariser.roleName | quote }}
+              {{- else }}
+              value: "operator-managed"
+              {{- end }}
             {{- if include "audittrace.langfuseKeysFromSecret" . }}
             # ── Langfuse key pair (WP-13): never a chart value ─────────
             # secretKeyRef on the operator-created Secret. Absent when

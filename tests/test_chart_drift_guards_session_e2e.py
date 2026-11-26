@@ -407,5 +407,17 @@ class TestLibrechatYamlSessionHeader:
             == "Bearer {{LIBRECHAT_OPENID_ACCESS_TOKEN}}"
         )
 
-    def test_the_two_headers_are_the_whole_set(self) -> None:
-        assert set(self._headers()) == {"Authorization", "X-Session-Id"}
+    def test_the_message_id_header_carries_the_body_message_id(self) -> None:
+        """CONSOLE-AUDIT-EVIDENCE WU-C (G15): the evidence dialog finds the audit
+        row through this header. Neuter: delete the line / rename the placeholder
+        -> RED."""
+        assert (
+            self._headers()["X-AuditTrace-Message-Id"] == "{{LIBRECHAT_BODY_MESSAGEID}}"
+        )
+
+    def test_the_three_headers_are_the_whole_set(self) -> None:
+        assert set(self._headers()) == {
+            "Authorization",
+            "X-Session-Id",
+            "X-AuditTrace-Message-Id",
+        }

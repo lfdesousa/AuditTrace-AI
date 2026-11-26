@@ -169,6 +169,19 @@ from bff.console_conversations_proxy import (
     proxy_console_conversations_request,
 )
 from bff.console_conversations_scopes import CONSOLE_CONVERSATIONS_SCOPE_STRING
+from bff.console_evidence_caller_scope import (
+    evidence_insufficient_scope_response,
+    missing_evidence_scopes,
+)
+from bff.console_evidence_proxy import (
+    ConsoleEvidenceProxyError,
+    EvidenceKind,
+    proxy_console_evidence_request,
+)
+from bff.console_evidence_scopes import (
+    EVIDENCE_SCOPE_CEILING,
+    EVIDENCE_SCOPE_STRING,
+)
 from bff.console_file_records_proxy import (
     ConsoleFileRecordsProxyError,
     proxy_console_file_records_request,
@@ -195,9 +208,16 @@ from bff.exchange import TokenExchangeError, exchange_token
 from bff.logging_setup import configure_logging
 from bff.memory_proxy import MemoryProxyError, proxy_memory_request
 from bff.memory_scopes import MEMORY_SCOPE_STRING
+from bff.message_id import is_valid_message_id
 from bff.path_guard import PathGuard
 from bff.proxy import ProxyError, proxy_chat_completions
-from bff.route_refusals import framework_error, refuse_route, route_last_resort
+from bff.route_refusals import (
+    NOT_FOUND,
+    framework_error,
+    refuse_route,
+    respond,
+    route_last_resort,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -335,6 +355,7 @@ def create_app() -> FastAPI:
                 settings,
                 http_client,
                 session_id=request.headers.get("x-session-id"),
+                message_id=request.headers.get("x-audittrace-message-id"),
             )
         except ProxyError as exc:
             return refusal_record.attach(
@@ -1417,6 +1438,100 @@ def create_app() -> FastAPI:
         shape."""
         return await _console_tool_favorites_proxy_impl(
             path, request, settings, http_client
+        )
+
+    async def _console_evidence_proxy_impl(
+        kind: EvidenceKind,
+        identifier: str,
+        request: Request,
+        settings: Settings,
+        http_client: httpx.AsyncClient,
+    ) -> StreamingResponse | JSONResponse:
+        """Shared body of the two evidence routes (CONSOLE-AUDIT-EVIDENCE WU-C).
+
+        Order, each step fail-closed: the id shape (no token, no network) ->
+        the inbound token -> the caller-scope pre-check (403 BEFORE any
+        exchange) -> an exchange for exactly ``audittrace:audit`` from the
+        dedicated evidence audience, bounded by a ceiling (an over-grant is a
+        502 before the ``granted=`` line) -> a byte-faithful GET upstream."""
+        if kind == "messages" and not is_valid_message_id(identifier):
+            return respond(NOT_FOUND)
+        token = _extract_bearer_token(request.headers.get("authorization"))
+        try:
+            claims = await validate_inbound_token(token, settings, http_client)
+        except InboundTokenError as exc:
+            return refuse_route(
+                "console_evidence",
+                for_inbound_failure(exc.failure),
+                request.headers,
+                sub=None,
+                cause=exc,
+            )
+
+        assert token is not None
+        inbound_sub = claims["sub"]
+        request.state.verified_sub = inbound_sub
+        inbound_scopes = frozenset(str(claims.get("scope", "")).split())
+        missing = missing_evidence_scopes(inbound_scopes)
+        if missing:
+            return evidence_insufficient_scope_response(inbound_sub, missing)
+        try:
+            minted_token = await exchange_token(
+                token,
+                inbound_sub,
+                settings,
+                http_client,
+                requested_scope=EVIDENCE_SCOPE_STRING,
+                audience=settings.evidence_exchange_audience,
+                scope_ceiling=EVIDENCE_SCOPE_CEILING
+                & (inbound_scopes | OIDC_PROTOCOL_SCOPES),
+            )
+        except TokenExchangeError as exc:
+            return refuse_route(
+                "console_evidence",
+                for_exchange_failure(exc.failure),
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
+            )
+
+        try:
+            return await proxy_console_evidence_request(
+                kind, identifier, minted_token, settings, http_client
+            )
+        except ConsoleEvidenceProxyError as exc:
+            return refuse_route(
+                "console_evidence",
+                UPSTREAM_UNAVAILABLE,
+                request.headers,
+                sub=inbound_sub,
+                cause=exc,
+            )
+
+    @app.get("/console/evidence/messages/{client_message_id}", response_model=None)
+    @route_last_resort("console_evidence")
+    async def console_evidence_by_message(
+        client_message_id: str,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The audit evidence of one console message, by its message id."""
+        return await _console_evidence_proxy_impl(
+            "messages", client_message_id, request, settings, http_client
+        )
+
+    @app.get("/console/evidence/interactions/{interaction_id:int}", response_model=None)
+    @route_last_resort("console_evidence")
+    async def console_evidence_by_interaction(
+        interaction_id: int,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The audit evidence of one audit row, by its interaction id."""
+        return await _console_evidence_proxy_impl(
+            "interactions", str(interaction_id), request, settings, http_client
         )
 
     return app
