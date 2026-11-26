@@ -158,6 +158,11 @@ class InteractionRecord(Base):
     # of the request (declared type, decoded size, sha256), never the bytes. NULL =
     # no image RECORDED (rows before 040, rows of an older pod, non-chat writers).
     input_media: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Migration 041 (CONSOLE-AUDIT-EVIDENCE): the console message id the turn carried in
+    # ``X-AuditTrace-Message-Id`` (shape: ``routes/_message_id_bind``). Correlation
+    # metadata, NOT hashed (``integrity._CONTENT_FIELDS`` is untouched), NULL when absent
+    # or malformed and on every row older than 041.
+    client_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ToolCall(Base):
@@ -227,6 +232,15 @@ class ToolCall(Base):
     # failure, of the error payload) — set on the result row only; NULL on
     # the request row (the result is not known yet when it is written).
     result_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Migration 041 (CONSOLE-AUDIT-EVIDENCE). NULL = not captured (rows before the
+    # sources work unit, no recall, an errored call); ``[]`` = captured, zero matches.
+    # The flag is NULL exactly when the list is NULL, a boolean otherwise (ADDENDUM-A4).
+    recall_matches: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    recall_matches_truncated: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True
+    )
 
 
 class MemoryItem(Base):

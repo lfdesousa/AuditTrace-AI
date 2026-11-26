@@ -63,6 +63,12 @@ from audittrace.routes._memory_tool_loop import (
     _tool_call_signatures,
     run_memory_tool_loop,
 )
+from audittrace.routes._message_id_bind import (
+    bound_message_id,
+    current_message_id,
+    header_message_id,
+    stream_with_bound_message_id,
+)
 from audittrace.routes._model_route import resolve_chat_upstream, upstream_host
 from audittrace.routes._session_bind import (
     header_session_id,
@@ -521,6 +527,7 @@ async def _persist_interaction(
     duration_ms: int | None = None,
     trace_id: str | None = None,
     input_media: str | None = None,
+    client_message_id: str | None = None,
 ) -> int | None:
     """Persist a question/answer pair to PostgreSQL ``interactions``.
 
@@ -541,8 +548,16 @@ async def _persist_interaction(
     pass ``status="failed"`` with a ``failure_class`` when the upstream
     call timed out or errored so the failure is auditable alongside the
     successes.
+
+    CONSOLE-AUDIT-EVIDENCE: ``client_message_id`` (migration 041) is the console message
+    id. Explicit when the caller carries it (the async consumer, which has no request
+    context); otherwise inherited from the request-scoped binding, so every persist
+    path of a chat turn (success, failed, refused, timeout) records it. It is NOT part
+    of the hashed field set below.
     """
     try:
+        if client_message_id is None:
+            client_message_id = current_message_id()
         # Auto-capture trace_id from the active span when caller doesn't pass
         # one explicitly. Same value across all persist calls in a request
         # because the FastAPI server span stays active throughout, so this
@@ -578,7 +593,11 @@ async def _persist_interaction(
                 # Migration 040: part of the hashed content only when set.
                 "input_media": input_media,
             }
-            record = InteractionRecord(**_fields, content_hash=_content_hash(_fields))
+            record = InteractionRecord(
+                **_fields,
+                client_message_id=client_message_id,
+                content_hash=_content_hash(_fields),
+            )
             db.add(record)
             await db.commit()
             await db.refresh(record)
@@ -686,6 +705,15 @@ async def _persist_or_enqueue(
     settings = get_settings()
     if persist_mode == "async" and settings.async_persist_enabled:
         from audittrace.services.async_persist import get_async_persist_producer
+
+        # The consumer writes the row with no request context of its own: carry the
+        # console message id in the payload explicitly (CONSOLE-AUDIT-EVIDENCE). Only
+        # when there is one, so a turn without it enqueues the payload it always did
+        # (an older consumer rejects the unknown key: drain the stream first on a
+        # mixed-version rollout with async persistence on).
+        message_id = current_message_id()
+        if message_id is not None:
+            kwargs.setdefault("client_message_id", message_id)
 
         try:
             producer = get_async_persist_producer()
@@ -1714,7 +1742,12 @@ async def _handle_tools_mode(
             )
 
         return StreamingResponse(
-            stream_with_bound_session(session_id, _iter_tools_stream_and_capture()),
+            stream_with_bound_session(
+                session_id,
+                stream_with_bound_message_id(
+                    current_message_id(), _iter_tools_stream_and_capture()
+                ),
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -2013,6 +2046,11 @@ async def _chat_completions_impl(
     # SESSION-ID-BIND: every log line below carries ``session_id``; restored
     # when ``chat_completions`` exits ``request_scope`` (AC-6.3).
     request_scope.enter_context(bound_session_id(session_id))
+    # CONSOLE-AUDIT-EVIDENCE: the console message id, read once and bound for every
+    # persist below (``_persist_interaction`` reads it); the streaming branches re-bind
+    # inside their body generator. Never hashed, never a 4xx.
+    client_message_id = header_message_id(http_request)
+    request_scope.enter_context(bound_message_id(client_message_id))
 
     # An image the audit cannot name, or a media link the model host would fetch,
     # is refused BEFORE the mode and stream branches: one branch for every refusal.
@@ -2299,7 +2337,10 @@ async def _chat_completions_impl(
             )
 
         return StreamingResponse(
-            stream_with_bound_session(session_id, _iter_and_capture()),
+            stream_with_bound_session(
+                session_id,
+                stream_with_bound_message_id(client_message_id, _iter_and_capture()),
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )

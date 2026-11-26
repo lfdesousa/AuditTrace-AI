@@ -2075,6 +2075,13 @@ components:
         answer:
           title: Answer
           type: string
+        client_message_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: 'The console message id the chat turn carried in X-AuditTrace-Message-Id; null when absent, malformed,
+            or on rows written before migration 041. Correlation metadata: it is not part of the content hash.'
+          title: Client Message Id
         completion_tokens:
           default: 0
           title: Completion Tokens
@@ -4682,6 +4689,86 @@ paths:
       summary: Get Context
       tags:
       - context
+  /evidence/interactions/{interaction_id}:
+    get:
+      description: 'Evidence for one of the caller''s audit rows by its id (any row type: chat,
+
+        ``mcp``, ``memory-audit``, a refused turn).
+
+
+        The id is taken as text and checked here: anything that cannot be a row key (not
+
+        ASCII digits, below 1, above the 32-bit key range) is the same 404 as an unknown id,
+
+        never a 422 and never a driver error.'
+      operationId: evidence_by_interaction_evidence_interactions__interaction_id__get
+      parameters:
+      - in: path
+        name: interaction_id
+        required: true
+        schema:
+          title: Interaction Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                title: Response Evidence By Interaction Evidence Interactions  Interaction Id  Get
+                type: object
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - audittrace:audit
+      summary: Evidence By Interaction
+      tags:
+      - audit
+  /evidence/messages/{client_message_id}:
+    get:
+      description: 'Evidence for the caller''s newest audit row of one console message.
+
+
+        ``lookup.candidates`` counts the caller''s rows carrying the id (a regenerate mints a
+
+        new id; a continue may reuse one). An id that does not have the accepted shape is the
+
+        same 404 as an unknown one.'
+      operationId: evidence_by_message_evidence_messages__client_message_id__get
+      parameters:
+      - in: path
+        name: client_message_id
+        required: true
+        schema:
+          title: Client Message Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                title: Response Evidence By Message Evidence Messages  Client Message Id  Get
+                type: object
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - audittrace:audit
+      summary: Evidence By Message
+      tags:
+      - audit
   /health:
     get:
       description: Health check endpoint for Kubernetes/docker probes.
@@ -4803,6 +4890,18 @@ paths:
           description: Filter by OpenTelemetry trace_id (32 lowercase hex). Narrows *within* the caller's own RLS-scoped rows;
             composes with every other filter.
           title: Trace Id
+      - description: Filter by the console message id the turn carried in X-AuditTrace-Message-Id (migration 041). Same shape
+          as the header (1-255 of [A-Za-z0-9._:-], not '.' or '..'); composes with every other filter.
+        in: query
+        name: client_message_id
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Filter by the console message id the turn carried in X-AuditTrace-Message-Id (migration 041). Same
+            shape as the header (1-255 of [A-Za-z0-9._:-], not '.' or '..'); composes with every other filter.
+          title: Client Message Id
       - description: Max rows (1-1000).
         in: query
         name: limit

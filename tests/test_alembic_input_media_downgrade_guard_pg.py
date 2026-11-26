@@ -67,6 +67,11 @@ _SKIP_REASON = (
 if _ADMIN_URL is None:
     warnings.warn(_SKIP_REASON, UserWarning, stacklevel=1)
 
+# CONSOLE-AUDIT-EVIDENCE: 041 now sits on 040. PostgreSQL DDL is transactional, so one
+# downgrade to the revision UNDER 040 runs 041 then 040 in one transaction; the guard's
+# refusal at 040 rolls 041's drop back too, which is what ``at_head`` below pins.
+BELOW_040 = "5b4bd766374f"
+
 pytestmark = pytest.mark.skipif(_ADMIN_URL is None, reason=_SKIP_REASON)
 
 
@@ -157,14 +162,14 @@ class TestCountUnderForcedRowSecurity:
         assert lane.scalar(IMAGE_ROWS) == 2, "control: the rows exist"
         assert lane.scalar(IMAGE_ROWS, lane.as_owner) == 0, "why a plain count fails"
         with pytest.raises(RuntimeError, match="2 rows record an image"):
-            lane.migrate(lane.as_owner, "downgrade", "-1")
+            lane.migrate(lane.as_owner, "downgrade", BELOW_040)
 
 
 class TestForceIsRestored:
     def test_after_a_refused_downgrade_nothing_changed(self, lane: Lane) -> None:
         lane.write_rows(image_rows=2)
         with pytest.raises(RuntimeError, match="refusing to drop"):
-            lane.migrate(lane.as_owner, "downgrade", "-1")
+            lane.migrate(lane.as_owner, "downgrade", BELOW_040)
         assert lane.state() == {
             "column": True,
             "forced": True,
@@ -176,7 +181,7 @@ class TestForceIsRestored:
 
     def test_after_a_successful_downgrade_force_is_on_again(self, lane: Lane) -> None:
         lane.write_rows(image_rows=0)
-        lane.migrate(lane.as_owner, "downgrade", "-1")
+        lane.migrate(lane.as_owner, "downgrade", BELOW_040)
         assert lane.state() == {
             "column": False,
             "forced": True,
@@ -194,7 +199,7 @@ class TestNonOwnerFailsClosed:
         lane.write_rows(image_rows=image_rows)
         before = lane.state()
         with pytest.raises(ProgrammingError, match="must be owner of table"):
-            lane.migrate(lane.as_other, "downgrade", "-1")
+            lane.migrate(lane.as_other, "downgrade", BELOW_040)
         assert lane.state() == before
         assert before["column"] is True and before["forced"] is True
         assert lane.scalar(IMAGE_ROWS) == image_rows
