@@ -17,10 +17,13 @@ tests can substitute it without real sockets.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import urllib.request
 from dataclasses import dataclass
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,21 @@ HUB_AUTH = "https://auth.docker.io/token"
 HUB_SERVICE = "registry.docker.io"
 
 LOCAL_REGISTRY = "http://localhost:5000"
+
+# THE alias policy (operator ruling Q1, 2026-11-24, decisions-in/2026-11-24-
+# probe11-q1-alias-policy-fail.md). A *content-equal alias* is a live image
+# whose index digest differs from the published one while every platform
+# manifest (the bytes that run) is identical: containerd reports the first
+# index digest it recorded for a content it already had. ``"fail"`` (the
+# ruling): the recorded provenance must be the published build, so an alias is
+# a FAIL carrying an ``ALIAS:`` diagnosis. ``"pass"``: PASS, same diagnosis.
+#
+# This is ONE decision, read by the verifier (probes 2 and 11) and by the
+# deployer (runner P4). The JUDGMENT is NOT shared: the verifier classifies in
+# ``scripts/deploy/verify_alias.py`` and the runner in
+# ``scripts/deploy/runner/alias.py`` (independence contract, verify.py header);
+# only the registry READS below are shared.
+ALIAS_POLICY: Literal["fail", "pass"] = "fail"
 
 # The registry may store a fat manifest list (multi-arch) or a single image
 # manifest; we accept both so the ``Docker-Content-Digest`` header comes back
@@ -65,17 +83,23 @@ _BACKENDS = {
 
 # Additional first-party images this module can resolve besides
 # memory-server, keyed by ``repo_path`` -> {backend -> (repository,
-# registry-API path, base URL)} (D5: the verify runner's BFF probe). Only a
-# ``hub`` entry exists for ``"bff"`` — the BFF is published to Docker Hub
-# only (``publish.yml``, spec F8); there is no local-registry counterpart,
-# so the verify probe reports ``skipped`` under ``--registry local`` rather
-# than ever calling :func:`resolve` with ``repo_path="bff"`` there.
+# registry-API path, base URL)} (D5: the verify runner's BFF probe). The BFF
+# is published to Docker Hub (``publish.yml``) AND pushed to the local
+# registry by every ``--registry local`` rc deploy (measured 2026-11-24:
+# ``localhost:5000`` holds ``audittrace/librechat-bff`` rc tags). A tag that
+# was never pushed locally resolves to an UNPINNED ref (``digest=None``) and the
+# verifier FAILs on it, exactly as probe 2 does for memory-server.
 _EXTRA_REPO_PATHS: dict[str, dict[str, tuple[str, str, str]]] = {
     "bff": {
         "hub": (
             "docker.io/lfds/audittrace-librechat-bff",
             "lfds/audittrace-librechat-bff",
             HUB_REGISTRY,
+        ),
+        "local": (
+            "localhost:5000/audittrace/librechat-bff",
+            "audittrace/librechat-bff",
+            LOCAL_REGISTRY,
         ),
     },
 }
@@ -185,6 +209,34 @@ def _manifest_digest(base: str, repo_path: str, tag: str, token: str | None) -> 
     return digest
 
 
+def _backend(registry: str, repo_path: str) -> tuple[str, str, str]:
+    """``(repository, registry-API path, base URL)`` for a backend and
+    ``repo_path``; an unknown pair is a :class:`ValueError` (fail loud)."""
+    backends = (
+        _BACKENDS
+        if repo_path == "memory-server"
+        else _EXTRA_REPO_PATHS.get(repo_path, {})
+    )
+    if registry not in backends:
+        raise ValueError(f"unknown registry backend: {registry!r}")
+    return backends[registry]
+
+
+def locate_repository(repository: str) -> tuple[str, str] | None:
+    """``(registry, repo_path)`` for a rendered first-party repository string
+    (``docker.io/lfds/audittrace-librechat-bff`` -> ``("hub", "bff")``), or
+    ``None`` when this module cannot resolve that repository (the fork image,
+    the tests image, anything unknown). A pure table lookup, no I/O."""
+    for repo_path, backends in (
+        ("memory-server", _BACKENDS),
+        *_EXTRA_REPO_PATHS.items(),
+    ):
+        for name, (known, _api_path, _base) in backends.items():
+            if known == repository:
+                return name, repo_path
+    return None
+
+
 def resolve(
     version: str, registry: str = "hub", *, repo_path: str = "memory-server"
 ) -> ImageRef:
@@ -203,14 +255,7 @@ def resolve(
     BFF probe). An unknown ``(repo_path, registry)`` pair raises the SAME
     :class:`ValueError` shape as an unknown backend — fail loud either way.
     """
-    backends = (
-        _BACKENDS
-        if repo_path == "memory-server"
-        else _EXTRA_REPO_PATHS.get(repo_path, {})
-    )
-    if registry not in backends:
-        raise ValueError(f"unknown registry backend: {registry!r}")
-    repository, api_path, base = backends[registry]
+    repository, api_path, base = _backend(registry, repo_path)
 
     if registry == "hub":
         token = _get_hub_token(api_path)
@@ -227,3 +272,102 @@ def resolve(
         logger.warning("local registry digest unresolved for %s: %s", version, exc)
         digest = None
     return ImageRef(repository, version, digest, registry)
+
+
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def fetch_by_digest(
+    kind: Literal["manifests", "blobs"],
+    digest: str,
+    registry: str,
+    *,
+    repo_path: str,
+) -> bytes:
+    """GET ``/v2/<repo>/<kind>/<digest>`` and return the body ONLY when
+    ``sha256(body) == digest`` (B2.6). A registry that serves other bytes for a
+    digest, a non-200, a malformed digest or any transport failure is a
+    :class:`DigestResolutionError` — the caller never reasons over unverified
+    bytes. A READ only: no policy, no judgment (the verifier and the deployer
+    each judge the bytes with their own classifier)."""
+    if not _DIGEST_RE.fullmatch(digest):
+        raise DigestResolutionError(f"not a sha256 digest: {digest!r}")
+    _repository, api_path, base = _backend(registry, repo_path)
+    token = _get_hub_token(api_path) if registry == "hub" else None
+    url = f"{base}/v2/{api_path}/{kind}/{digest}"
+    headers = {"Accept": _MANIFEST_ACCEPT if kind == "manifests" else "*/*"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        status, _resp_headers, body = _http_get(url, headers)
+    except OSError as exc:
+        raise DigestResolutionError(
+            f"{kind} fetch for {repo_path}@{digest} failed: {exc}"
+        ) from exc
+    if status != 200:
+        raise DigestResolutionError(
+            f"{kind} fetch for {repo_path}@{digest} returned HTTP {status}"
+        )
+    actual = "sha256:" + hashlib.sha256(body).hexdigest()
+    if actual != digest:
+        raise DigestResolutionError(
+            f"{kind} body for {repo_path}@{digest} hashes to {actual}"
+        )
+    return body
+
+
+_IN_TOTO_REVISION_RE = re.compile(r'"vcs:revision"\s*:\s*"([0-9a-f]{40})"')
+NO_BUILD_REVISION = "n/a"
+
+
+def slsa_build_revision(index_body: bytes, registry: str, *, repo_path: str) -> str:
+    """The ``vcs:revision`` of an image index's SLSA provenance, for the ALIAS
+    diagnosis TEXT only (never a verdict input): index -> attestation child
+    (``unknown/unknown``) -> its manifest -> in-toto blob, every by-digest fetch
+    hash-checked (:func:`fetch_by_digest`). ``"n/a"`` when the attestation is
+    absent or anything fails to read — never a guess."""
+    try:
+        index = json.loads(index_body)
+        children = index.get("manifests") if isinstance(index, dict) else None
+        for child in children or []:
+            platform = child.get("platform") or {}
+            if platform.get("os") != "unknown" or not child.get("digest"):
+                continue
+            manifest = json.loads(
+                fetch_by_digest(
+                    "manifests", child["digest"], registry, repo_path=repo_path
+                )
+            )
+            for layer in manifest.get("layers") or []:
+                blob = fetch_by_digest(
+                    "blobs", layer["digest"], registry, repo_path=repo_path
+                )
+                found = _IN_TOTO_REVISION_RE.search(blob.decode("utf-8", "replace"))
+                if found:
+                    return found.group(1)
+    except (DigestResolutionError, ValueError, KeyError, AttributeError, TypeError):
+        logger.debug("no SLSA build revision readable for %s", repo_path)
+    return NO_BUILD_REVISION
+
+
+def alias_diagnosis(
+    item: str,
+    live: str,
+    published: str,
+    platforms: dict[str, str],
+    live_revision: str,
+    published_revision: str,
+) -> str:
+    """The ``ALIAS:`` line, identical for probe 2, probe 11 and the runner
+    detail (AC4'). Text only."""
+    shared = ", ".join(
+        f"{key}: {digest.split(':')[-1][:12]}"
+        for key, digest in sorted(platforms.items())
+    )
+    return (
+        f"ALIAS: {item} live index {live.split(':')[-1][:12]} != published index "
+        f"{published.split(':')[-1][:12]}; shared platform manifests {{{shared}}}; "
+        f"build revisions live={live_revision} published={published_revision}; "
+        "remedy: operator accepts the alias, or clean the node image cache "
+        "(crictl rmi <config>) and re-verify"
+    )

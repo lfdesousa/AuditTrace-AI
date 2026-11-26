@@ -73,13 +73,19 @@ gate's result — the same independence contract the core probes hold):
   predating #387 P2b) or ``"unknown"`` (the health handler's own best-effort
   telemetry degraded, same pattern as ``async_persist_dlq_depth``) — certify must
   not be brittle against a telemetry-field hiccup.
-* **first-party-images-match-published** — the LIVE BFF pod digest == the
-  published digest for ``--target-version`` on the registry (D5). PASS
-  with ``{"bff": "absent"}`` when no BFF Deployment exists (the common
-  laptop posture); PASS with ``{"bff": "skipped", ...}`` under
-  ``--registry local`` (the BFF is hub-only, S3b). The deploy runner's own
-  D3 check (``scripts/deploy/runner/images.py``) compares render-vs-chart
-  and chart-vs-live; THIS probe is the only one that ties the BFF to what
+* **first-party-images-match-published** — every first-party workload
+  ``--target-version`` versions besides memory-server (the pod-reaper, and the
+  console BFF when the console is deployed): the LIVE pod digest == the
+  published digest on the registry named by ``--registry`` (hub AND local;
+  VERIFY-PROBE11-FALSE-PASS). D6: never PASS on zero items — an expected item
+  that is absent, unreadable or unequal FAILs, and the detail ends
+  ``(checked n of n_expected)``. A content-equal alias (same platform manifests
+  under another build's index digest) follows the one policy
+  ``registry.ALIAS_POLICY`` (default FAIL, with an ``ALIAS:`` diagnosis), as
+  probe 2 does; the classifier is :mod:`scripts.deploy.verify_alias`, separate
+  from the deployer's. The deploy runner's own D3 check
+  (``scripts/deploy/runner/images.py``) compares render-vs-chart and
+  chart-vs-live; THIS probe is the only one that ties these workloads to what
   was actually PUBLISHED, independently re-derived.
 
 **Method discipline:** front door + read-only ``kubectl``/``helm`` only. NO
@@ -108,7 +114,7 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 
-from scripts.deploy import mesh, registry
+from scripts.deploy import mesh, registry, verify_alias, verify_workloads
 from scripts.deploy.frontdoor import (
     DEFAULT_FRONT_DOOR as _DEFAULT_FRONT_DOOR,
 )
@@ -119,6 +125,11 @@ from scripts.deploy.frontdoor import (
     resolve_front_door,
 )
 from scripts.deploy.runner import extract_digest, normalize_version
+from scripts.deploy.verify_workloads import (
+    CONSOLE_ANCHOR_SUFFIX,
+    FIRST_PARTY_WORKLOADS,
+    FirstPartyWorkload,
+)
 
 logger = logging.getLogger("audittrace.deploy.verify")
 
@@ -365,17 +376,6 @@ PROBES = (
     "first-party-images-match-published",
     "log-trace-id",
 )
-
-# The BFF Deployment this probe reads — mirrors the chart's own naming
-# (``templates/console/deployment-bff.yaml``) and the deploy runner's
-# ``_CONSOLE_COMPONENT_SELECTORS["bff"]`` selector/container pair
-# (``scripts/deploy/runner/config.py``), duplicated here rather than
-# imported — this runner NEVER imports from the deploy runner package
-# (independence contract: two separately-derived readings of the same
-# cluster, not one shared code path).
-BFF_DEPLOYMENT_SUFFIX = "librechat-bff"
-BFF_CONTAINER = "bff"
-BFF_COMPONENT_SELECTOR = "app.kubernetes.io/component=librechat-bff"
 
 
 # ── external-effect indirections (monkeypatched in tests) ────────────────────
@@ -894,7 +894,9 @@ class VerifyRunner:
             # guard.md) ──
             "cluster-api:kubectl:bff-deployment",
             "cluster-api:kubectl:bff-pod-imageID",
+            "cluster-api:kubectl:pod-reaper-pod-imageID",
             f"registry:{self.cfg.registry}:bff-published-digest",
+            f"registry:{self.cfg.registry}:platform-manifests",
             # ── LOG-TRACE-ID D7: the log sink the audit row's id is joined to ──
             f"loki:{self.cfg.loki_url}",
         ]
@@ -1161,11 +1163,23 @@ class VerifyRunner:
                 {"published_digest": ref.digest, "live_digest": None},
             )
         if live != ref.digest:
+            match = verify_alias.classify(
+                live, ref.digest, self.cfg.registry, repo_path="memory-server"
+            )
+            if match.alias:
+                return self._alias_result(
+                    PROBES[1], "memory-server", live, ref.digest, match, "memory-server"
+                )
             return self._record(
                 PROBES[1],
                 FAIL,
                 "live digest does NOT match the published digest (running an unpublished image)",
-                {"published_digest": ref.digest, "live_digest": live},
+                {
+                    "published_digest": ref.digest,
+                    "live_digest": live,
+                    "match": match.kind,
+                    "alias": False,
+                },
             )
         return self._record(
             PROBES[1],
@@ -1590,30 +1604,54 @@ class VerifyRunner:
             evidence,
         )
 
-    # -- probe 11: first-party-images-match-published (D5) --
+    # -- probe 11: first-party-images-match-published (D5; VERIFY-PROBE11) --
 
-    def _bff_deployment_name(self) -> str:
-        return f"{self.cfg.release}-{BFF_DEPLOYMENT_SUFFIX}"
+    def _alias_result(
+        self,
+        name: str,
+        item: str,
+        live: str,
+        published: str,
+        match: verify_alias.Match,
+        repo_path: str,
+    ) -> ProbeResult:
+        """A content-equal alias, under the ONE policy (``registry.ALIAS_POLICY``):
+        the ``ALIAS:`` diagnosis is the detail either way; the status follows
+        the policy."""
+        line = verify_alias.diagnosis(
+            item,
+            live,
+            published,
+            match,
+            self.cfg.registry,
+            repo_path=repo_path,
+        )
+        status = PASS if registry.ALIAS_POLICY == "pass" else FAIL
+        return self._record(
+            name,
+            status,
+            line,
+            {
+                "published_digest": published,
+                "live_digest": live,
+                "match": match.kind,
+                "alias": True,
+                "platforms": match.platforms,
+            },
+        )
 
-    def _bff_deployment_exists(self) -> bool | None:
-        """Whether the BFF Deployment is present in this namespace — the
-        PASS-with-``absent`` gate (D5): ``console.enabled=false`` is the
-        common laptop posture, and that must never FAIL this probe.
-
-        Returns ``True``/``False`` when determinable, or ``None`` when the
-        read failed for a reason OTHER than "not found" (a genuinely
-        unreachable cluster, an RBAC error, ...) — kept DISTINCT from
-        ``False`` so the probe FAILs fail-closed on an unreadable cluster
-        rather than silently reporting the unrelated-but-similar-looking
-        ``absent`` PASS (proven by
-        ``test_hostile_deploy_report_cannot_move_the_verdict``: EVERY probe
-        must FAIL when every cluster read fails, this one included)."""
+    def _read_deployment(self, deployment: str) -> tuple[bool | None, dict[str, Any]]:
+        """``(present, document)``: ``True`` / ``False`` (NotFound), or ``None``
+        (unreadable, kept DISTINCT from ``False`` so the probe FAILs closed, see
+        ``test_hostile_deploy_report_cannot_move_the_verdict``) when the read
+        failed for any other reason or returned rc 0 with a body that is not a
+        JSON object. ``document`` is the parsed Deployment (``{}`` otherwise)."""
         proc = _run(
             [
                 "kubectl",
                 "get",
                 "deployment",
-                self._bff_deployment_name(),
+                deployment,
                 "-n",
                 self.cfg.namespace,
                 "-o",
@@ -1621,26 +1659,37 @@ class VerifyRunner:
             ]
         )
         if proc.returncode == 0:
-            return True
+            try:
+                doc = json.loads(proc.stdout)
+            except ValueError:
+                return None, {}  # rc 0 but not JSON: unreadable, never absent
+            return (True, doc) if isinstance(doc, dict) else (None, {})
         if "NotFound" in proc.stderr:
-            return False
-        return None
+            return False, {}
+        return None, {}
 
-    def _live_bff_digest(self) -> str | None:
-        """The live BFF digest, requiring EVERY matching pod to agree
-        (fix-round should-fix) — never just the first token. Two pods, one
+    def _live_workload_digest(
+        self,
+        workload: FirstPartyWorkload,
+        container: str | None = None,
+        init: bool = False,
+    ) -> str | None:
+        """The live digest of ``container`` (default: the workload's main
+        container; ``init`` reads ``initContainerStatuses``), requiring EVERY matching pod to
+        agree (fix-round should-fix) — never just the first token. Two pods, one
         stale, used to PASS on the first (possibly stale) one; now any
-        disagreement is ``None`` (unreadable), mirroring the deploy
-        runner's own S1 all-pods-agree rule
+        disagreement is ``None`` (unreadable), mirroring the deploy runner's own
+        S1 all-pods-agree rule
         (``scripts.deploy.runner.images._live_row_digest``).
 
         Only pods in phase ``Running`` are read (2026-11-05, v1.30.1 verify):
-        a ``Succeeded``/``Failed`` pod left over from an older ReplicaSet
-        serves nothing, yet its old imageID made the set disagree and the
-        probe FAIL on a correct release."""
+        a ``Succeeded``/``Failed`` pod left over from an older ReplicaSet serves
+        nothing, yet its old imageID made the set disagree and the probe FAIL on
+        a correct release."""
         jsonpath = (
             '{.items[?(@.status.phase=="Running")]'
-            '.status.containerStatuses[?(@.name=="' + BFF_CONTAINER + '")].imageID}'
+            f".status.{'initContainerStatuses' if init else 'containerStatuses'}"
+            '[?(@.name=="' + (container or workload.container) + '")].imageID}'
         )
         proc = _run(
             [
@@ -1648,7 +1697,7 @@ class VerifyRunner:
                 "get",
                 "pods",
                 "-l",
-                BFF_COMPONENT_SELECTOR,
+                f"app.kubernetes.io/component={workload.component}",
                 "-n",
                 self.cfg.namespace,
                 "-o",
@@ -1667,78 +1716,202 @@ class VerifyRunner:
             return next(iter(digests))
         return None
 
-    def probe_first_party_images_match_published(self) -> ProbeResult:
-        """The BFF's live pod digest matches the published ``--target-version``
-        digest on the registry (D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-
-        stale-override-guard.md) — ties the console BFF to the registry, the
-        one check NEITHER the deploy runner's render-level D3 nor a chart-
-        file read can give: a wrong CHART pin would move both sides of D3
-        together (Addendum A A1) but can never fool a THIRD, independent
-        read of what was actually published.
+    def _compare_container(
+        self,
+        workload: FirstPartyWorkload,
+        ref_: verify_workloads.ContainerRef,
+    ) -> tuple[dict[str, Any], str | None, str | None]:
+        """Compare one container of a PRESENT workload with the registry.
 
-        Scoped to ``--registry hub`` (S3b): the BFF is published to Docker
-        Hub only (``publish.yml``, spec F8), so under ``--registry local``
-        this probe reports PASS with ``{"bff": "skipped", "reason":
-        "registry local"}`` rather than ever resolving or FAILing. PASS
-        with ``{"bff": "absent"}`` when no BFF Deployment exists in the
-        namespace (``console.enabled=false``, the common laptop posture) —
-        absence is not a finding. FAILs when the Deployment EXISTS but no
-        live pod digest is readable, when the registry cannot resolve the
-        published digest, or when the two digests disagree.
+        Returns ``(item evidence, failure line or None, note or None)`` — the
+        note is the ``ALIAS:`` line of an alias the policy accepts. The item's ``match``
+        is one of :mod:`scripts.deploy.verify_alias`'s kinds, or ``no-live-digest``
+        / ``no-published-digest`` / ``unresolved`` when no comparison happened.
         """
-        if self.cfg.registry != "hub":
-            return self._record(
-                PROBES[10],
-                PASS,
-                f"skipped (registry={self.cfg.registry!r}); the BFF is published to hub only",
-                {"bff": "skipped", "reason": "registry local"},
-            )
-        exists = self._bff_deployment_exists()
-        if exists is None:
-            return self._record(
-                PROBES[10],
-                FAIL,
-                "could not determine whether a BFF Deployment exists (unreadable cluster read)",
-                {"bff": "unreadable"},
-            )
-        if not exists:
-            return self._record(
-                PROBES[10],
-                PASS,
-                "no BFF Deployment in this namespace — nothing to certify",
-                {"bff": "absent"},
+        label = workload.label + (
+            "" if ref_.name == workload.container else f"/{ref_.name}"
+        )
+        if ref_.repo_path is None:
+            return (
+                {"match": verify_alias.UNRESOLVED},
+                f"{label}: a first-party container the registry module cannot "
+                "resolve (not compared)",
+                None,
             )
         try:
             ref = registry.resolve(
-                self.cfg.image_tag, self.cfg.registry, repo_path="bff"
+                self.cfg.image_tag, self.cfg.registry, repo_path=ref_.repo_path
             )
         except registry.DigestResolutionError as exc:
-            return self._record(
-                PROBES[10],
-                FAIL,
-                f"could not resolve the published BFF digest for {self.cfg.image_tag}: {exc}",
-                {"error": str(exc)},
+            return (
+                {"match": verify_alias.UNRESOLVED, "error": str(exc)},
+                f"{label}: could not resolve the published digest for "
+                f"{self.cfg.image_tag}: {exc}",
+                None,
             )
-        live = self._live_bff_digest()
+        live = self._live_workload_digest(workload, ref_.name, ref_.is_init)
+        item: dict[str, Any] = {
+            "live_digest": live,
+            "published_digest": ref.digest,
+            "repository": ref.repository,
+        }
         if live is None:
-            return self._record(
-                PROBES[10],
-                FAIL,
-                "BFF Deployment exists but no live pod digest is readable",
-                {"published_digest": ref.digest, "live_digest": None},
+            item["match"] = "no-live-digest"
+            return (
+                item,
+                f"{label}: workload exists but no live pod digest is readable",
+                None,
             )
-        if live != ref.digest:
-            return self._record(
-                PROBES[10],
-                FAIL,
-                "live BFF digest does NOT match the published digest (running an unpublished image)",
-                {"published_digest": ref.digest, "live_digest": live},
+        if ref.digest is None:
+            item["match"] = "no-published-digest"
+            return (
+                item,
+                f"{label}: registry {self.cfg.registry} returned no digest for "
+                f"{self.cfg.image_tag} (tag not pushed?)",
+                None,
             )
+        match = verify_alias.classify(
+            live, ref.digest, self.cfg.registry, repo_path=ref_.repo_path
+        )
+        item["match"] = match.kind
+        if match.kind == verify_alias.EXACT:
+            return item, None, None
+        if match.alias:
+            item["platforms"] = match.platforms
+            line = verify_alias.diagnosis(
+                label,
+                live,
+                ref.digest,
+                match,
+                self.cfg.registry,
+                repo_path=ref_.repo_path,
+            )
+            if registry.ALIAS_POLICY == "fail":
+                return item, line, None
+            return item, None, line
+        return (
+            item,
+            f"{label}: live digest does NOT match the published digest "
+            f"({match.kind}: {match.reason or 'running an unpublished image'})",
+            None,
+        )
+
+    def _compare_workload(
+        self, workload: FirstPartyWorkload, deployment: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[str], list[str]]:
+        """Compare EVERY first-party container of a PRESENT workload (A1), main
+        first: ``(item, failure lines, notes)``. Extras sit under
+        ``containers``; a failing extra sets the item's ``match`` to its own."""
+        item: dict[str, Any] = {}
+        failures: list[str] = []
+        notes: list[str] = []
+        extras: dict[str, dict[str, Any]] = {}
+        for ref_ in verify_workloads.containers_to_check(workload, deployment):
+            sub, failure, note = self._compare_container(workload, ref_)
+            failures += [failure] if failure else []
+            notes += [note] if note else []
+            if ref_.name == workload.container and not ref_.is_init:
+                item = sub
+            else:
+                extras[ref_.name] = sub
+                if sub["match"] not in (verify_alias.EXACT, verify_alias.ALIAS):
+                    item["match"] = sub["match"]
+        if extras:
+            item["containers"] = extras
+        return item, failures, notes
+
+    def probe_first_party_images_match_published(self) -> ProbeResult:
+        """Every first-party workload ``--target-version`` versions, other than
+        memory-server (probe 2's item), has a live pod digest equal to the
+        published digest on the registry named by ``--registry`` (D5, spec
+        2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-guard.md; reworked by
+        VERIFY-PROBE11-FALSE-PASS, 2026-11-24).
+
+        Items: :data:`FIRST_PARTY_WORKLOADS` — the pod-reaper (memory-server
+        image) and the console BFF. Ties each to the registry, the one check
+        NEITHER the deploy runner's render-level D3 nor a chart-file read can
+        give: a wrong CHART pin moves both sides of D3 together (Addendum A A1)
+        but cannot fool a THIRD, independent read of what was published.
+
+        **D6 (SDLC-ADR-006): never PASS on zero items.** ``expected`` is DERIVED,
+        not observed: the reaper always (shipped posture ``reaper.enabled=true``,
+        no overlay), the BFF unless the console is definitively absent (no
+        ``audittrace-librechat`` Deployment AND no BFF Deployment — the two
+        render together or not at all). An expected item that is absent,
+        unreadable, unresolved or unequal FAILs naming it; the detail always
+        ends ``(checked n of n_expected)``. SKIPPED is NOT an outcome here.
+        ``registry local`` compares too (the rc deploys push the BFF to
+        ``localhost:5000``; a tag missing there FAILs). Known limits: a posture
+        with ``reaper.enabled=false`` FAILs by design (no verifier flag reads
+        chart values); a deploy that loses BOTH console Deployments yields
+        ``expected = {pod-reaper}`` and PASSes 1 of 1 (pods-ready and the chart
+        render guard that).
+
+        A content-equal alias (same platform manifests under another build's
+        index digest) follows the ONE policy ``registry.ALIAS_POLICY``
+        (default FAIL), with an ``ALIAS:`` diagnosis line either way.
+        """
+        anchor, _ = self._read_deployment(f"{self.cfg.release}-{CONSOLE_ANCHOR_SUFFIX}")
+        reads = {
+            w.label: self._read_deployment(f"{self.cfg.release}-{w.label}")
+            for w in FIRST_PARTY_WORKLOADS
+        }
+        existence = {label: state for label, (state, _) in reads.items()}
+        console_absent = anchor is False and all(
+            existence[w.label] is False
+            for w in FIRST_PARTY_WORKLOADS
+            if w.console_gated
+        )
+        expected = [
+            w
+            for w in FIRST_PARTY_WORKLOADS
+            if not w.console_gated or not console_absent
+        ]
+        items: dict[str, dict[str, Any]] = {}
+        failures: list[str] = []
+        notes: list[str] = []
+        if anchor is None and not console_absent:
+            failures.append(
+                f"{CONSOLE_ANCHOR_SUFFIX}: could not determine whether the console "
+                "is deployed (unreadable cluster read)"
+            )
+        for workload in expected:
+            present = existence[workload.label]
+            if present is None:
+                items[workload.label] = {"match": "unreadable"}
+                failures.append(
+                    f"{workload.label}: Deployment unreadable (cluster read failed)"
+                )
+            elif not present:
+                items[workload.label] = {"match": "absent"}
+                failures.append(f"{workload.label}: expected but absent")
+            else:
+                items[workload.label], found, seen = self._compare_workload(
+                    workload, reads[workload.label][1]
+                )
+                failures += found
+                notes += seen
+        checked = sum(
+            1
+            for item in items.values()
+            if item["match"]
+            in (verify_alias.EXACT, verify_alias.ALIAS, verify_alias.MISMATCH)
+        )
+        count = f"(checked {checked} of {len(expected)})"
+        evidence = {
+            "checked": checked,
+            "expected": len(expected),
+            "items": items,
+            "alias": verify_workloads.any_alias(items),
+        }
+        if failures:
+            return self._record(
+                PROBES[10], FAIL, "; ".join(failures) + f" {count}", evidence
+            )
+        names = ", ".join(w.label for w in expected)
+        summary = [*notes, f"live {names} digest matches the published digest"]
         return self._record(
-            PROBES[10],
-            PASS,
-            "live BFF digest matches the published digest",
-            {"published_digest": ref.digest, "live_digest": live},
+            PROBES[10], PASS, "; ".join(summary) + f" {count}", evidence
         )
 
     # -- probe 12: log-trace-id (LOG-TRACE-ID D7) --

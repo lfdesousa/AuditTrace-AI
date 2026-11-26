@@ -7,7 +7,11 @@ repos:
         # diffs against upstream stay readable.
         exclude: ^docs/reference/
       - id: end-of-file-fixer
-        exclude: ^docs/reference/
+        # tests/fixtures/registry/ holds the MEASURED registry index bodies;
+        # sha256(body) == the index digest is asserted by
+        # test_fixtures_are_the_measured_indexes, so a fixer-added newline would
+        # break the byte identity they exist to prove.
+        exclude: ^(docs/reference/|tests/fixtures/registry/)
       - id: check-yaml
         exclude: ^charts/
       - id: check-added-large-files
