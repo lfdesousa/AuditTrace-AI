@@ -36,6 +36,9 @@ data:
             # LC-10a (AC-P2 P-1 GREEN only WITH this line): the chat's own id rides
             # to the BFF as X-Session-Id; the BFF forwards it, the server decides.
             X-Session-Id: '{{ "{{LIBRECHAT_BODY_CONVERSATIONID}}" }}'
+            # CONSOLE-AUDIT-EVIDENCE (G15): the message's own id rides to the BFF as
+            # X-AuditTrace-Message-Id so the evidence dialog finds its audit row.
+            X-AuditTrace-Message-Id: '{{ "{{LIBRECHAT_BODY_MESSAGEID}}" }}'
           models:
             default: ["audittrace-chat"]
             fetch: false

@@ -2268,6 +2268,14 @@ _ALLOWED_FAIL_HOMES = (
     "chat_aud_scope_names",
     "chat_aud_strip_scopes",
     "chat_aud_verify",
+    # CONSOLE-AUDIT-EVIDENCE WU-C: the evidence audience client's helpers (a
+    # copy of the chat audience's, same shape, same rules).
+    "evid_aud_compact",
+    "evid_aud_lookup",
+    "evid_aud_resolve_scope",
+    "evid_aud_scope_names",
+    "evid_aud_strip_scopes",
+    "evid_aud_verify",
 )
 
 
@@ -4318,8 +4326,13 @@ class TestRunFullWholeScriptCoverage:
                 # never anything to strip in a RunFull state; exercised by
                 # tests/test_chat_audience_hook.py).
                 (1600, 1602),
-                # was (1623, 1624): shifted by the blocks above it.
-                (1818, 1819),
+                # CONSOLE-AUDIT-EVIDENCE WU-C: the evidence audience client's strip
+                # delete (same reason as the chat audience's above; exercised by
+                # tests/test_evidence_audience_hook.py).
+                (1786, 1788),
+                # was (1818, 1819): shifted +186 by the evidence audience block
+                # (client block + Step 4c) inserted above it.
+                (2004, 2005),
             }
         else:
             # LC10A-HOOK-AWK: rows after the session resolver moved +8, after the
@@ -4337,6 +4350,9 @@ class TestRunFullWholeScriptCoverage:
                 # LC10A-CHAT-EXCHANGE-SCOPE: the chat audience client's strip
                 # delete (reason as (1584,1586) of the ConfigMap site).
                 (1531, 1533),
+                # CONSOLE-AUDIT-EVIDENCE WU-C: the evidence audience client's strip
+                # delete (same reason; exercised by tests/test_evidence_audience_hook.py).
+                (1717, 1719),
             }
         # Named per range (line numbers re-measured after every edit
         # that shifts them — e.g. this round's R4/B3 production fixes;

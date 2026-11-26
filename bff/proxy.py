@@ -45,6 +45,7 @@ async def proxy_chat_completions(
     settings: Settings,
     http_client: httpx.AsyncClient,
     session_id: str | None = None,
+    message_id: str | None = None,
 ) -> StreamingResponse:
     """Forward ``raw_body`` unchanged to the orchestrator's
     ``/v1/chat/completions`` and stream the response back byte-identical.
@@ -69,6 +70,9 @@ async def proxy_chat_completions(
     # blank -> no header, byte-for-byte the previous request.
     if session_id is not None and session_id.strip():
         headers["X-Session-Id"] = session_id.strip()
+    # CONSOLE-AUDIT-EVIDENCE (G12''): the console message's own id, same rule.
+    if message_id is not None and message_id.strip():
+        headers["X-AuditTrace-Message-Id"] = message_id.strip()
     request = http_client.build_request(
         "POST",
         url,

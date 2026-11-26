@@ -47,14 +47,16 @@ def _proxy_modules() -> list[str]:
 PROXY_MODULES = _proxy_modules()
 
 
-def test_all_ten_proxy_modules_are_found() -> None:
-    """The structural cells below would be vacuous over an empty list."""
-    assert len(PROXY_MODULES) == 10
+def test_all_eleven_proxy_modules_are_found() -> None:
+    """The structural cells below would be vacuous over an empty list. (Ten, plus
+    the evidence proxy of CONSOLE-AUDIT-EVIDENCE WU-C.)"""
+    assert len(PROXY_MODULES) == 11
+    assert "bff.console_evidence_proxy" in PROXY_MODULES
 
 
 @pytest.mark.parametrize("module", PROXY_MODULES)
 def test_no_strip_set_contains_the_trace_header(module: str) -> None:
-    """AC-R10 (structural): ``x-trace-id`` is in none of the ten strip sets."""
+    """AC-R10 (structural): ``x-trace-id`` is in none of the eleven strip sets."""
     stripped = importlib.import_module(module)._STRIPPED_RESPONSE_HEADERS
     assert "x-trace-id" not in {h.lower() for h in stripped}
 
@@ -113,3 +115,17 @@ async def test_memory_proxy_keeps_the_upstream_trace_header() -> None:
         )
         await _drain(response)
     assert response.headers["x-trace-id"] == TRACE_ID
+
+
+async def test_evidence_proxy_keeps_the_upstream_trace_header() -> None:
+    """AC-R10 (behavioural, ``/console/evidence``): same, through the evidence
+    proxy. Neuter: add ``"x-trace-id"`` to its strip set -> this cell RED."""
+    from bff.console_evidence_proxy import proxy_console_evidence_request
+
+    async with _client() as client:
+        response = await proxy_console_evidence_request(
+            "messages", "m-1", "tok", _settings(), client
+        )
+        await _drain(response)
+    assert response.headers["x-trace-id"] == TRACE_ID
+    assert "connection" not in response.headers

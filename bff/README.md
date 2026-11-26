@@ -113,6 +113,15 @@ exchange. Keycloak 24's legacy exchange grants the target's DEFAULT scopes
 plus requested optionals the subject holds, and, when `scope` is omitted,
 the subject token's own scopes (not "the target's defaults").
 
+The console's audit-evidence proxy (`GET /console/evidence/messages/{id}` and
+`/console/evidence/interactions/{id}`; CONSOLE-AUDIT-EVIDENCE) copies that
+pattern layer for layer: the dedicated `audittrace-librechat-evidence` client
+(`AUDITTRACE_BFF_EVIDENCE_EXCHANGE_AUDIENCE`, chart value
+`console.bff.evidenceExchangeAudience`) whose only DEFAULT scope is
+`bff/console_evidence_scopes.py::EVIDENCE_SCOPES` (`audittrace:audit`), a 403
+pre-check before any exchange, and `EVIDENCE_SCOPE_CEILING` (a mint outside it is
+a 502 before the `granted=` log line). Roll the memory server out before the BFF.
+
 **Deviation note (documented per the builder's fail-closed-choice
 discipline, CONFIRMED by live evidence 2026-08-29):** wiring the
 Keycloak-server-side "legacy token exchange" admin fine-grained
