@@ -5398,11 +5398,15 @@ paths:
 
         corpus content — ``?hard=true`` is NOT the default delete path (the
 
-        ``hard`` query param defaults to ``False`` and additionally requires
+        ``hard`` query param defaults to ``False``; for a key with a manifest row
 
-        ``audittrace:admin``), and a hard purge is audited with
+        it additionally requires ``audittrace:admin``), and a hard purge is audited
 
-        ``detail_extra={"hard": True}`` same as every other delete.'
+        with ``detail_extra={"hard": True}`` same as every other delete. The
+
+        caller''s own row-less private object is hard-deleted with the layer write
+
+        scope alone (audited ``orphan``).'
       operationId: delete_episodic_memory_episodic__filename__delete
       parameters:
       - in: path
@@ -5411,13 +5415,17 @@ paths:
         schema:
           title: Filename
           type: string
-      - description: If true, also remove the underlying S3 object. Requires audittrace:admin in addition to memory:episodic:write.
+      - description: If true, also remove the underlying S3 object. For a key that has a manifest row this requires audittrace:admin
+          in addition to memory:episodic:write; the caller's own row-less private object is removed with memory:episodic:write
+          alone.
         in: query
         name: hard
         required: false
         schema:
           default: false
-          description: If true, also remove the underlying S3 object. Requires audittrace:admin in addition to memory:episodic:write.
+          description: If true, also remove the underlying S3 object. For a key that has a manifest row this requires audittrace:admin
+            in addition to memory:episodic:write; the caller's own row-less private object is removed with memory:episodic:write
+            alone.
           title: Hard
           type: boolean
       responses:

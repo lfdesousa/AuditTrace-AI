@@ -287,6 +287,65 @@ class TestOwnerHardDeleteRemovesAnOwnOrphan:
         assert stored(layer, USER) == ("orphan-v1", "private")
 
 
+def reader_row(layer: str) -> dict[str, Any] | None:
+    """The OTHER user's manifest row of the key, read as that user (None if none)."""
+    from audittrace.identity import UserContext
+
+    reader = UserContext(
+        user_id=READER, username="r", agent_type="test", scopes=(), is_admin=False
+    )
+    row = asyncio.run(manifest().resolve_read(layer, KEY[layer], reader))
+    return None if row is None else dict(row.to_dict())
+
+
+@pytest.mark.parametrize("layer", FILE_LAYERS)
+@pytest.mark.parametrize("hard", [True, False], ids=["hard", "soft"])
+class TestNonAdminDeleteLeaksNothingAboutAnotherUsersFile:
+    """R2-B1: ``DELETE`` by a NON-admin who holds the layer write scope must not
+    tell an unknown key from another user's row-less object or from another
+    user's row + object: same 404, byte-equal body, nothing of the other user
+    touched, no audit row. Falsifiability: a path that answers 403 (or a
+    different body) once another user holds that name turns this RED."""
+
+    @pytest.mark.parametrize("other", ["row-less-object", "row-and-object"])
+    def test_every_case_is_the_unknown_key_404_and_touches_nothing(
+        self, client: TestClient, layer: str, hard: bool, other: str
+    ) -> None:
+        params = {"hard": "true"} if hard else {}
+        with as_caller(client, USER):
+            unknown = client.delete(URL[layer], params=params)
+        assert unknown.status_code == 404, unknown.text
+        assert unknown.json() == {
+            "detail": f"no manifest row for layer={layer!r} key={KEY[layer]!r}"
+        }
+
+        if other == "row-less-object":
+            seed_private_orphan(layer, READER, "reader-private")
+            audit_before: list[tuple[str, str]] = []
+        else:
+            with as_caller(client, READER):
+                made = client.post(
+                    f"/memory/{layer}",
+                    json={"filename": KEY[layer], "content": "reader-private"},
+                )
+            assert made.status_code == 200, made.text
+            audit_before = [("write", "private")]
+        row_before = reader_row(layer)
+        assert (row_before is None) == (other == "row-less-object")
+
+        with as_caller(client, USER):
+            answer = client.delete(URL[layer], params=params)
+
+        assert answer.status_code == 404
+        assert answer.content == unknown.content
+        # The other user's object and row read back unchanged.
+        assert stored(layer, READER) == ("reader-private", "private")
+        assert reader_row(layer) == row_before
+        # The caller stored nothing, and no audit row was written by the delete.
+        assert stored(layer, USER) is None
+        assert audit_rows(KEY[layer]) == audit_before
+
+
 def test_control_semantic_put_with_no_row_is_404_and_writes_nothing(
     client: TestClient,
 ) -> None:

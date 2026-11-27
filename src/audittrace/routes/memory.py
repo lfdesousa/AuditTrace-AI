@@ -2105,8 +2105,10 @@ async def delete_episodic(
     hard: bool = Query(
         False,
         description=(
-            "If true, also remove the underlying S3 object. Requires "
-            "audittrace:admin in addition to memory:episodic:write."
+            "If true, also remove the underlying S3 object. For a key that "
+            "has a manifest row this requires audittrace:admin in addition "
+            "to memory:episodic:write; the caller's own row-less private "
+            "object is removed with memory:episodic:write alone."
         ),
     ),
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:write"]),
@@ -2116,9 +2118,11 @@ async def delete_episodic(
 
     ADR-062 §6 (WU-A5): the manifest soft-delete is authoritative for
     corpus content — ``?hard=true`` is NOT the default delete path (the
-    ``hard`` query param defaults to ``False`` and additionally requires
-    ``audittrace:admin``), and a hard purge is audited with
-    ``detail_extra={"hard": True}`` same as every other delete."""
+    ``hard`` query param defaults to ``False``; for a key with a manifest row
+    it additionally requires ``audittrace:admin``), and a hard purge is audited
+    with ``detail_extra={"hard": True}`` same as every other delete. The
+    caller's own row-less private object is hard-deleted with the layer write
+    scope alone (audited ``orphan``)."""
     _validate_filename_or_400(filename, "episodic")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
