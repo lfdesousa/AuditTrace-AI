@@ -15,8 +15,12 @@ from typing import Any
 import pytest
 
 from audittrace.identity import UserContext
-from audittrace.routes import memory_write_audit
-from audittrace.routes.memory_delete_cascade import FoldRow, audit_source_folds
+from audittrace.routes import memory_delete_cascade, memory_write_audit
+from audittrace.routes.memory_delete_cascade import (
+    FoldRow,
+    audit_source_folds,
+    tombstone_source_folds,
+)
 
 
 def _user() -> UserContext:
@@ -68,3 +72,33 @@ async def test_cascade_row_tier_is_the_source_tier_and_not_in_detail(
         assert "tier" not in call["detail_extra"]
         assert set(call["detail_extra"]) == {"hard", "cascade_from", "chunks"}
     assert folds == before  # the caller's rows are not mutated
+
+
+async def test_no_source_row_means_no_fold_is_touched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard of ``tombstone_source_folds``: a source the caller sees no row
+    for has no folds to cascade, so nothing is tombstoned and ``[]`` comes back.
+    The delete routes answer a row-less key before they get here (the owner
+    removes their own orphan object), so this guard is the one place that still
+    holds the contract if a row vanishes between the route's check and this call.
+    Removing the guard makes ``source.tier`` / the cascade run on ``None``."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    manifest = MagicMock()
+    manifest.resolve_read = AsyncMock(return_value=None)
+    cascade = AsyncMock(side_effect=AssertionError("cascade must not run"))
+    monkeypatch.setattr(memory_delete_cascade, "tombstone_fold_copies", cascade)
+
+    folds = await tombstone_source_folds(
+        MagicMock(),
+        manifest,
+        _user(),
+        "episodic",
+        "a.md",
+        caller_can_write_shared=False,
+    )
+
+    assert folds == []
+    manifest.resolve_read.assert_awaited_once()
+    cascade.assert_not_awaited()

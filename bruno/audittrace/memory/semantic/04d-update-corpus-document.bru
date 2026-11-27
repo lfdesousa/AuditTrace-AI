@@ -1,0 +1,41 @@
+meta {
+  name: PUT /memory/semantic/{collection}/{doc_id} — update a live corpus document (200, tier corpus)
+  type: http
+  seq: 10
+}
+
+put {
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{exampleDocId}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "text": "Scratch corpus document, UPDATED by 04d."
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("the update is written to the corpus tier", function() {
+    expect(res.getBody().tier).to.equal("corpus");
+  });
+  test("modified_at_ms is greater than created_at_ms", function() {
+    const e = res.getBody();
+    expect(e.modified_at_ms).to.be.greaterThan(e.created_at_ms);
+  });
+}
+
+docs {
+  Run after `02c-create-corpus-document.bru`, with the same `exampleCollection` and
+  `exampleDocId`. The document is an unstamped corpus document, so the PUT writes through
+  to the corpus: the answer is 200 with tier `corpus` (a 409 or a `private` tier is a
+  FAIL). Login: `memory:semantic:write` and `memory:corpus:<collection>:write` (see 02c).
+}

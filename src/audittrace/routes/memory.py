@@ -121,12 +121,17 @@ from audittrace.routes.memory_write_refusal import (
     refuse_oversize_or_413,
 )
 from audittrace.routes.memory_write_support import (
+    authorized_update_tier,
     concurrent_write_as_409,
     corpus_read_cleared,
     corpus_write_authorized,
     has_corpus_scope,
     legacy_copy_forward_source,
     manifest_authorization_as_403,
+    purge_own_orphan_object,
+    refuse_corpus_update_of_file_layer,
+    refuse_file_update_without_visible_row,
+    refuse_update_of_corpus_fold_chunk,
     semantic_key,
 )
 from audittrace.services.embedder import embed_via_nomic
@@ -1999,6 +2004,29 @@ async def read_episodic(
     }
 
 
+async def _delete_file_without_row(
+    service: Any, user: UserContext, layer: str, filename: str, hard: bool
+) -> dict[str, Any]:
+    """DELETE of a file the caller sees no manifest row for: a soft delete has
+    nothing to tombstone (404); ``?hard=true`` removes the caller's OWN private
+    object (the one a PUT used to leave without a row) and audits it."""
+    if not hard:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no manifest row for layer={layer!r} key={filename!r}",
+        )
+    purged = await purge_own_orphan_object(service, user, layer, filename)
+    await emit_write_audit(
+        user=user,
+        op="delete",
+        layer=layer,
+        key=filename,
+        tier="private",
+        detail_extra={"hard": True, "orphan": True},
+    )
+    return purged
+
+
 @router.put("/episodic/{filename}")
 async def update_episodic(
     filename: str,
@@ -2025,6 +2053,14 @@ async def update_episodic(
         await authorize_write(manifest, user, "episodic", filename)
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
+    refuse_corpus_update_of_file_layer(
+        "episodic",
+        filename,
+        await authorized_update_tier(manifest, user, "episodic", filename),
+    )
+    await refuse_file_update_without_visible_row(
+        service, manifest, user, "episodic", filename, "ADR"
+    )
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
@@ -2069,8 +2105,10 @@ async def delete_episodic(
     hard: bool = Query(
         False,
         description=(
-            "If true, also remove the underlying S3 object. Requires "
-            "audittrace:admin in addition to memory:episodic:write."
+            "If true, also remove the underlying S3 object. For a key that "
+            "has a manifest row this requires audittrace:admin in addition "
+            "to memory:episodic:write; the caller's own row-less private "
+            "object is removed with memory:episodic:write alone."
         ),
     ),
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:write"]),
@@ -2080,15 +2118,12 @@ async def delete_episodic(
 
     ADR-062 §6 (WU-A5): the manifest soft-delete is authoritative for
     corpus content — ``?hard=true`` is NOT the default delete path (the
-    ``hard`` query param defaults to ``False`` and additionally requires
-    ``audittrace:admin``), and a hard purge is audited with
-    ``detail_extra={"hard": True}`` same as every other delete."""
+    ``hard`` query param defaults to ``False``; for a key with a manifest row
+    it additionally requires ``audittrace:admin``), and a hard purge is audited
+    with ``detail_extra={"hard": True}`` same as every other delete. The
+    caller's own row-less private object is hard-deleted with the layer write
+    scope alone (audited ``orphan``)."""
     _validate_filename_or_400(filename, "episodic")
-    if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
-        raise HTTPException(
-            status_code=403,
-            detail="?hard=true requires audittrace:admin scope",
-        )
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
     # SPEC security-memory-write-authorization-choke (2026-08-30) — the
@@ -2099,6 +2134,16 @@ async def delete_episodic(
         await authorize_write(manifest, user, "episodic", filename)
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
+    # No visible row: nothing of the folds or the manifest to change. The owner
+    # removes their OWN row-less private object with ``?hard=true`` (any caller
+    # holding this layer's write scope), audited ``orphan``; never the corpus copy.
+    if await manifest.resolve_read("episodic", filename, user) is None:
+        return await _delete_file_without_row(service, user, "episodic", filename, hard)
+    if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="?hard=true requires audittrace:admin scope",
+        )
     # B8: the folds of this source are tombstoned BEFORE the source row.
     cascaded = await tombstone_source_folds(
         get_semantic_service(),
@@ -2307,6 +2352,14 @@ async def update_procedural(
         await authorize_write(manifest, user, "procedural", filename)
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
+    refuse_corpus_update_of_file_layer(
+        "procedural",
+        filename,
+        await authorized_update_tier(manifest, user, "procedural", filename),
+    )
+    await refuse_file_update_without_visible_row(
+        service, manifest, user, "procedural", filename, "SKILL"
+    )
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
@@ -2355,11 +2408,6 @@ async def delete_procedural(
     """Soft-delete by default; ``?hard=true`` also purges the S3 object
     (ADR-062 §6 — same discipline as ``delete_episodic``)."""
     _validate_filename_or_400(filename, "procedural")
-    if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
-        raise HTTPException(
-            status_code=403,
-            detail="?hard=true requires audittrace:admin scope",
-        )
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
     # SPEC security-memory-write-authorization-choke (2026-08-30) — the
@@ -2368,6 +2416,18 @@ async def delete_procedural(
         await authorize_write(manifest, user, "procedural", filename)
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
+    # No visible row: nothing of the folds or the manifest to change. The owner
+    # removes their OWN row-less private object with ``?hard=true`` (any caller
+    # holding this layer's write scope), audited ``orphan``; never the corpus copy.
+    if await manifest.resolve_read("procedural", filename, user) is None:
+        return await _delete_file_without_row(
+            service, user, "procedural", filename, hard
+        )
+    if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="?hard=true requires audittrace:admin scope",
+        )
     # B8: the folds of this source are tombstoned BEFORE the source row.
     cascaded = await tombstone_source_folds(
         get_semantic_service(),
@@ -3049,8 +3109,12 @@ async def update_semantic(
         except ManifestAuthorizationError as exc:
             raise _raise_manifest_authorization_as_403(exc) from exc
         await require_visible_row_or_404(manifest, user, key)
+        tier = await authorized_update_tier(manifest, user, "semantic", key)
+        await refuse_update_of_corpus_fold_chunk(service, collection, document_id, tier)
         try:
-            await service.upsert(user, collection, document_id, text, metadata)
+            await service.upsert(
+                user, collection, document_id, text, metadata, tier=tier
+            )
         except ChromaIdConflictError as exc:
             raise chroma_id_conflict_409(exc) from exc
         except Exception as exc:

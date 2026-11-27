@@ -1,0 +1,39 @@
+meta {
+  name: PUT /memory/semantic/{collection}/{doc_id} — a chunk of a folded corpus document is refused (409)
+  type: http
+  seq: 7
+}
+
+put {
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{exampleDocId}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "text": "Bruno smoke fragment — must NOT be stored."
+  }
+}
+
+tests {
+  test("returns 409 (nothing is written)", function() {
+    expect(res.getStatus()).to.equal(409);
+  });
+  test("names the fold and says to re-fold the source", function() {
+    expect(res.getBody().detail).to.contain(
+      "Not supported: updating one chunk of a folded corpus document; re-fold the source."
+    );
+  });
+}
+
+docs {
+  Run with `exampleCollection` and `exampleDocId` set (`--env-var`) to a chunk id of a
+  corpus FOLD (a document with `chunk_count >= 2` in `03b-read-whole-document.bru`).
+  A PUT on a chunk of a folded corpus document is refused before any write: no content
+  change, no manifest change, no audit row. A 200 here is a FAIL.
+}

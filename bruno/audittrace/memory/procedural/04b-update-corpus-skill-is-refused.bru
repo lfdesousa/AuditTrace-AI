@@ -1,0 +1,41 @@
+meta {
+  name: PUT /memory/procedural/{file} — a corpus skill is refused (409), nothing is written
+  type: http
+  seq: 7
+}
+
+put {
+  url: {{baseUrl}}/memory/procedural/{{exampleSkillFile}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "content": "Bruno smoke skill — must NOT be stored."
+  }
+}
+
+tests {
+  test("returns 409 (nothing is written)", function() {
+    expect(res.getStatus()).to.equal(409);
+  });
+  test("names the corpus skill and the layer", function() {
+    expect(res.getBody().detail).to.contain(
+      "Not supported: updating a corpus document of the procedural layer."
+    );
+  });
+}
+
+docs {
+  Run with `exampleSkillFile` set (`--env-var`) to a corpus skill of the shared store (for
+  example `SKILL-WRITING.md`). The PUT is refused before any write, whether or not the skill
+  has a manifest row: no object, no manifest row, no audit row. A read afterwards still
+  answers tier `corpus` with the same content. A 200 or a 404 here is a FAIL.
+
+  Login: the default one (`memory:procedural:write`).
+}

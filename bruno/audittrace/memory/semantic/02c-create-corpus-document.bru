@@ -1,0 +1,60 @@
+meta {
+  name: POST /memory/semantic — create a scratch UNSTAMPED corpus document (tier=corpus)
+  type: http
+  seq: 9
+}
+
+post {
+  url: {{baseUrl}}/memory/semantic
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "collection": "{{exampleCollection}}",
+    "document_id": "{{exampleDocId}}",
+    "text": "Scratch corpus document, created by 02c.",
+    "title": "Scratch corpus document",
+    "tier": "corpus"
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("the manifest row is corpus tier", function() {
+    expect(res.getBody().tier).to.equal("corpus");
+  });
+  test("manifest key is <collection>/<doc_id> and the row is live", function() {
+    const e = res.getBody();
+    const expected = `${bru.getEnvVar("exampleCollection")}/${bru.getEnvVar("exampleDocId")}`;
+    expect(e.key).to.equal(expected);
+    expect(e.deleted_at_ms).to.equal(null);
+  });
+}
+
+docs {
+  Creates ONE corpus-tier semantic document that is not a fold chunk (a fold stamps every
+  chunk; this document carries no fold stamp). The route is `POST /memory/semantic` with
+  `"tier": "corpus"` in the body (the `?promote=corpus` query does the same).
+
+  Login needed: `memory:semantic:write` AND `memory:corpus:<collection>:write`, where the
+  collection is one of the three corpus collections (`decisions`, `skills`, `semantic`);
+  `audittrace:admin` also passes. Without the corpus scope the answer is 403
+  `Required scope: memory:corpus:<collection>:write` and nothing is written. Add the scopes
+  with `AUDITTRACE_EXTRA_SCOPES="memory:semantic:write memory:corpus:semantic:write memory:corpus:semantic:read audittrace:admin" scripts/audittrace-login`.
+
+  Run with `--env-var exampleCollection=semantic --env-var exampleDocId=<scratch id>` (a
+  fresh id, never a real document: a create over an existing corpus row overwrites it).
+  Sequence for the update-then-delete leg: `02c` (this), `04d` (update), `03c` (read, 200),
+  `05-delete.bru` (soft-delete, which is also the clean-up; `deleteHard=true` needs
+  `audittrace:admin`), `04c` (409), then `03c` again: after a soft delete the document is
+  hidden from a caller without `audittrace:admin` (404), so that last read needs the admin
+  login too. The tombstoned manifest row stays.
+}
