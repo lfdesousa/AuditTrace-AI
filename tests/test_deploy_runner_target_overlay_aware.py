@@ -65,16 +65,16 @@ CHART_VALUES_FILE = CHART_DIR / "values.yaml"
 LAPTOP_VALUES_FILE = CHART_DIR / "values-laptop.yaml"
 
 # The real, committed digests this repo pins today (values.yaml, Phase-E
-# re-pin, 2026-09-18, spec 2026-09-18-SPEC-e2e-deploy-and-mongo-audit.md,
+# re-pin, 2026-09-18 (fork console re-pinned 2026-11-28), spec 2026-09-18-SPEC-e2e-deploy-and-mongo-audit.md,
 # superseding the WU-6 Part C 2026-09-10 pair) — asserted against directly
 # so a regression that silently stops reading them is caught, not just
 # "some string present".
 _REAL_LIBRECHAT_DIGEST = (
-    "sha256:7bce9819ce6b25b5ab353d7e89895333c47161c23a835851718653c052c94510"
+    "sha256:8ca63f03e5b7b42c87d80c0c2bb505a039e72befaca3f5a57ec0f1c7567aff1f"
 )
-# Phase-E re-pin (2026-11-23, release v1.34.0; fork console unchanged at 6143572).
+# Phase-E re-pin (2026-11-28, release v1.35.0; fork console 6143572 -> 279e571).
 _REAL_BFF_DIGEST = (
-    "sha256:d1d32762751a8f8cebfbfda666b9b9aefd2ff73cdcc88d330cc30032d237fa37"
+    "sha256:6d7eae2aff2e783d292bd2d5065fd5e5bbe18c3b643a4fb57f6ee48931d2839b"
 )
 
 # Mirrors the Makefile helm-lint / tests/test_deploy_runner_console_image_pins.py
