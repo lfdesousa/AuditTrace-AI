@@ -1019,8 +1019,12 @@ console:
       # pinned to THIS specific published version, so tag and digest must
       # move together on every bump (mirrors console.librechat.image
       # below, not memoryServer).
-      tag: "1.34.0"
-      # Phase-E re-pin (2026-11-23, release v1.34.0) — the published digest
+      tag: "1.35.0"
+      # Phase-E re-pin (2026-11-28, release v1.35.0) — the published digest
+      # for docker.io/lfds/audittrace-librechat-bff:1.35.0, confirmed live on
+      # Docker Hub 2026-11-28 via TWO independent manifest reads (registry
+      # HEAD and `docker buildx imagetools inspect`), which agree.
+      # Prior pin (2026-11-23, v1.34.0) — the published digest
       # for docker.io/lfds/audittrace-librechat-bff:1.34.0, confirmed live on
       # Docker Hub 2026-11-23 via TWO independent manifest reads (registry
       # HEAD and `docker buildx imagetools inspect`), which agree.
@@ -1058,7 +1062,7 @@ console:
       # hand-edited without re-verifying against the registry. When set,
       # the rendered image ref becomes `<repository>:<tag>@<digest>`
       # (deployment-bff.yaml).
-      digest: "sha256:d1d32762751a8f8cebfbfda666b9b9aefd2ff73cdcc88d330cc30032d237fa37"
+      digest: "sha256:6d7eae2aff2e783d292bd2d5065fd5e5bbe18c3b643a4fb57f6ee48931d2839b"
       pullPolicy: IfNotPresent
     replicaCount: 1
     port: 8766
@@ -1113,8 +1117,14 @@ console:
   librechat:
     image:
       repository: docker.io/lfds/audittrace-librechat
-      tag: "6143572"
-      # Phase-E re-pin (2026-11-10, release v1.32.0): fork main 6143572 (fork PR #15,
+      tag: "279e571"
+      # Phase-E re-pin (2026-11-28, release v1.35.0): fork main 279e571 (merge of
+      # fork PR #17, long-turn token refresh, on top of fork PR #16, console audit
+      # evidence dialog), built 2026-11-28 by the operator from a clean detached
+      # worktree (BUILD_COMMIT=279e571); digest confirmed on Docker Hub 2026-11-28
+      # via TWO independent manifest reads (registry HEAD and `docker buildx
+      # imagetools inspect`), which agree.
+      # Prior pin: Phase-E re-pin (2026-11-10, release v1.32.0): fork main 6143572 (fork PR #15,
       # LC-10a session-id forwarding), the image validated live as the lc10a-6143572
       # candidate (E5/E8, 2026-11-10) and pushed unchanged; digest confirmed on
       # Docker Hub 2026-11-10 via a registry-1.docker.io HEAD (Docker-Content-Digest).
@@ -1135,7 +1145,7 @@ console:
       # like any pinned digest (operator verifies against the registry,
       # never fabricated). When set, the rendered image ref becomes
       # `<repository>:<tag>@<digest>`.
-      digest: "sha256:7bce9819ce6b25b5ab353d7e89895333c47161c23a835851718653c052c94510"
+      digest: "sha256:8ca63f03e5b7b42c87d80c0c2bb505a039e72befaca3f5a57ec0f1c7567aff1f"
     # M3-WU-D2-4 — the fork's sovereign-backend switch. The fork's
     # config.js reads AUDITTRACE_MEMORY_BACKEND and selects the sovereign
     # one-brain path ONLY when it is exactly "sovereign" — any other value
@@ -1305,8 +1315,12 @@ tests:
     # Explicit release version, tag+digest move together on every bump —
     # mirrors console.bff.image / console.librechat.image above, not
     # memoryServer's AppVersion-tracking empty-string convenience.
-    tag: "1.34.0"
-    # Phase-E re-pin (2026-11-23, release v1.34.0): the published digest
+    tag: "1.35.0"
+    # Phase-E re-pin (2026-11-28, release v1.35.0): the published digest
+    # for docker.io/lfds/audittrace-tests:1.35.0, confirmed live on Docker Hub
+    # 2026-11-28 via TWO independent manifest reads (registry HEAD and
+    # `docker buildx imagetools inspect`), which agree.
+    # Prior pin (2026-11-23, v1.34.0): the published digest
     # for docker.io/lfds/audittrace-tests:1.34.0, confirmed live on Docker Hub
     # 2026-11-23 via TWO independent manifest reads (registry HEAD and
     # `docker buildx imagetools inspect`), which agree.
@@ -1334,7 +1348,7 @@ tests:
     # manifest reads (registry HEAD with an OCI-index Accept header, and
     # `docker buildx imagetools inspect`), never fabricated. Tag+digest move
     # together on every bump.
-    digest: "sha256:9226d799f308a48a88dc953818928cff2daaa73019600524bd25d5dd1b2d121c"
+    digest: "sha256:6ab0ac29d030d08f9cc72f7003a8499650b76034e639b67b44a9b8ffcbff1e82"
     pullPolicy: IfNotPresent
   resources:
     requests:

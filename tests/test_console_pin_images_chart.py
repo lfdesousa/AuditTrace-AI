@@ -128,6 +128,12 @@ untouched (no fork change in v1.31.0).
 The fork pin is untouched (one-sided release). Assertions below reflect the
 ``1.33.0`` / ``6143572`` pins.
 
+**Superseded at the v1.35.0 Phase-E re-pin (2026-11-28):** BFF moved to
+``1.35.0`` / ``sha256:6d7eae2a...``, the tests image to ``1.35.0`` /
+``sha256:6ab0ac29...``, and the fork console to ``279e571`` /
+``sha256:8ca63f03...`` (fork PRs #16 and #17; registry HEAD and buildx, which
+agree, 2026-11-28).
+
 **Superseded at the v1.34.0 Phase-E re-pin (2026-11-23):** BFF moved to
 ``1.34.0`` / ``sha256:d1d32762...`` and the tests image to ``1.34.0`` /
 ``sha256:9226d799...`` (registry HEAD and buildx, which agree, 2026-11-23).
@@ -268,13 +274,13 @@ class TestBothImagesRenderWithDigest:
         repo_tag, _, digest = image.partition("@")
         assert digest, f"BFF image {image!r} carries no @digest suffix"
         assert _SHA256_RE.match(digest), f"malformed digest {digest!r}"
-        assert repo_tag.endswith(":1.34.0"), f"unexpected BFF tag: {repo_tag!r}"
+        assert repo_tag.endswith(":1.35.0"), f"unexpected BFF tag: {repo_tag!r}"
 
     def test_bff_digest_matches_pinned_values_digest(self) -> None:
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         pinned = values["console"]["bff"]["image"]["digest"]
         assert pinned == (
-            "sha256:d1d32762751a8f8cebfbfda666b9b9aefd2ff73cdcc88d330cc30032d237fa37"
+            "sha256:6d7eae2aff2e783d292bd2d5065fd5e5bbe18c3b643a4fb57f6ee48931d2839b"
         ), f"BFF digest in values.yaml drifted from the verified pin: {pinned!r}"
         resources = _render(_CONSOLE_ENABLED)
         assert _bff_image(resources).endswith(f"@{pinned}")
@@ -289,13 +295,13 @@ class TestBothImagesRenderWithDigest:
         repo_tag, _, digest = image.partition("@")
         assert digest, f"LibreChat image {image!r} carries no @digest suffix"
         assert _SHA256_RE.match(digest), f"malformed digest {digest!r}"
-        assert repo_tag.endswith(":6143572"), f"unexpected LibreChat tag: {repo_tag!r}"
+        assert repo_tag.endswith(":279e571"), f"unexpected LibreChat tag: {repo_tag!r}"
 
     def test_librechat_digest_matches_pinned_values_digest(self) -> None:
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         pinned = values["console"]["librechat"]["image"]["digest"]
         assert pinned == (
-            "sha256:7bce9819ce6b25b5ab353d7e89895333c47161c23a835851718653c052c94510"
+            "sha256:8ca63f03e5b7b42c87d80c0c2bb505a039e72befaca3f5a57ec0f1c7567aff1f"
         ), f"LibreChat digest in values.yaml drifted from the Phase-E pin: {pinned!r}"
         resources = _render(_CONSOLE_ENABLED)
         assert _librechat_image(resources).endswith(f"@{pinned}")
@@ -341,7 +347,7 @@ class TestBffDigestPlumbing:
             f"suffix entirely, got {image!r} — the conditional either "
             "isn't guarding the digest, or a stale value leaked through"
         )
-        assert image == "docker.io/lfds/audittrace-librechat-bff:1.34.0"
+        assert image == "docker.io/lfds/audittrace-librechat-bff:1.35.0"
 
     def test_restore_setting_digest_brings_the_suffix_back(self) -> None:
         custom_digest = "sha256:" + "ab" * 32
@@ -445,9 +451,9 @@ class TestNoLocalRegistryOrStaleTagSurvives:
         test_rendered_tests_image_equals_v1_28_0_pin_exactly."""
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         image = values["tests"]["image"]
-        assert image["tag"] == "1.34.0"
+        assert image["tag"] == "1.35.0"
         assert image["digest"] == (
-            "sha256:9226d799f308a48a88dc953818928cff2daaa73019600524bd25d5dd1b2d121c"
+            "sha256:6ab0ac29d030d08f9cc72f7003a8499650b76034e639b67b44a9b8ffcbff1e82"
         )
 
 
@@ -531,8 +537,8 @@ class TestD2FourAndEAndHCoexist:
             gate["image"]
             == main["image"]
             == (
-                "docker.io/lfds/audittrace-librechat:6143572"
-                "@sha256:7bce9819ce6b25b5ab353d7e89895333c47161c23a835851718653c052c94510"
+                "docker.io/lfds/audittrace-librechat:279e571"
+                "@sha256:8ca63f03e5b7b42c87d80c0c2bb505a039e72befaca3f5a57ec0f1c7567aff1f"
             )
         )
 
